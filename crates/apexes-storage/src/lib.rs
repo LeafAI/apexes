@@ -6,6 +6,7 @@
 pub mod conversion;
 pub mod error;
 pub mod reader;
+pub mod schema;
 pub mod writer;
 
 pub use error::StorageError;
