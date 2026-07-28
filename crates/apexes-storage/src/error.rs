@@ -1,2 +1,64 @@
-// Populated in Task 2.
-pub struct StorageError;
+use thiserror::Error;
+
+/// Errors returned by `apexes-storage`'s `StorageWriter`/`StorageReader`.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("failed to connect to ClickHouse: {reason}")]
+    ConnectionFailed { reason: String },
+
+    #[error(
+        "write_batch requires a homogeneous batch of the same MarketEvent variant, but found mixed types"
+    )]
+    MixedBatch,
+
+    #[error("write_batch was called with an empty batch")]
+    EmptyBatch,
+
+    #[error("failed to convert Decimal to ClickHouse FixedPoint: {reason}")]
+    DecimalConversionFailed { reason: String },
+
+    #[error("ClickHouse query failed: {reason}")]
+    QueryFailed { reason: String },
+}
+
+impl From<clickhouse::error::Error> for StorageError {
+    fn from(error: clickhouse::error::Error) -> Self {
+        StorageError::QueryFailed {
+            reason: error.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_batch_display() {
+        let err = StorageError::MixedBatch;
+        assert_eq!(
+            err.to_string(),
+            "write_batch requires a homogeneous batch of the same MarketEvent variant, but found mixed types"
+        );
+    }
+
+    #[test]
+    fn empty_batch_display() {
+        let err = StorageError::EmptyBatch;
+        assert_eq!(
+            err.to_string(),
+            "write_batch was called with an empty batch"
+        );
+    }
+
+    #[test]
+    fn decimal_conversion_failed_display() {
+        let err = StorageError::DecimalConversionFailed {
+            reason: "overflow".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to convert Decimal to ClickHouse FixedPoint: overflow"
+        );
+    }
+}
