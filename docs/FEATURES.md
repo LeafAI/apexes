@@ -37,7 +37,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | 1.4.1 | US equity free/low-cost data (IEX Cloud, Alpaca, Polygon free tier) | #10 | 🔲 Not Started | |
 | 1.4.2 | US equity paid full-depth data (Polygon.io paid, Databento, Nasdaq TotalView) | #10 | 🔲 Not Started | |
 | 1.5 | Market data normalization engine (unified Tick/Depth/Bar model) | #0 | ✅ Done | `MarketEvent` enum defined in foundation skeleton design |
-| 1.6 | Historical data storage & backfill (full tick-level, multi-timeframe bars) | #2 | 🔲 Not Started | |
+| 1.6 | Historical data storage & backfill (full tick-level, multi-timeframe bars) | #2 | ✅ Done | ClickHouse-backed via apexes-storage (StorageWriter/StorageReader); backfill from external sources deferred |
 | 1.7 | Market data distribution bus (multi-subscriber broadcast, on-demand downsampling) | #12 | 🔲 Not Started | |
 
 ## 2. Strategy & Algorithm Research Platform
@@ -105,7 +105,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 8.1 | Time-series database (ClickHouse/QuestDB — tick & K-line storage) | #2 | 🔲 Not Started | ClickHouse introduced in #2 (moved up from #12 on 2026-07-28; #2 is now the sole storage backend, no interim local-file phase) |
+| 8.1 | Time-series database (ClickHouse/QuestDB — tick & K-line storage) | #2 | ✅ Done | Implemented in apexes-storage: 4 MergeTree tables (trades/ticks/depth_updates/bars), Decimal(38,10) precision |
 | 8.2 | Relational database (PostgreSQL — config/account/order storage) | #7 / #12 | 🔲 Not Started | Introduced when OMS needs durable order storage |
 | 8.3 | Message bus (NATS JetStream or self-built lock-free ring buffer) | #12 | 🔲 Not Started | |
 | 8.4 | In-memory cache (Redis or self-built shared-memory cache) | #12 | 🔲 Not Started | |
@@ -157,12 +157,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 58 |
+| 🔲 Not Started | 56 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 11 |
+| ✅ Done | 13 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
-**Current active work:** Sub-project `#0` (Foundation skeleton) and sub-project `#1` (Binance Spot market data ingestion) — both implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean). Next: sub-project `#2` (historical data storage) or `#3` (backtest engine), per roadmap.
+**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), and `#2` (historical data storage — ClickHouse via `apexes-storage`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Next: sub-project `#3` (backtest engine), per roadmap.
