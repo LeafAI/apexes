@@ -1,40 +1,19 @@
-use std::error::Error;
-use std::fmt;
+use thiserror::Error;
 
 /// Unified error type for apexes-core. Cloneable — variants that carry
 /// underlying-error context store it as a formatted `String`, not
 /// `Box<dyn Error>`, so `ApexesError` can be cloned freely.
-///
-/// NOTE: `Display` and `Error` are implemented manually rather than via
-/// `thiserror::Error` because thiserror treats any field named `source`
-/// as the error source (requiring `T: Error`), which conflicts with the
-/// `source: Option<String>` context field on `ConnectionFailed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ApexesError {
-    InvalidInstrument {
-        reason: String,
-    },
+    #[error("invalid instrument: {reason}")]
+    InvalidInstrument { reason: String },
 
+    #[error("market data connection failed: {reason}")]
     ConnectionFailed {
         reason: String,
-        source: Option<String>,
+        source_detail: Option<String>,
     },
 }
-
-impl fmt::Display for ApexesError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInstrument { reason } => {
-                write!(f, "invalid instrument: {reason}")
-            }
-            Self::ConnectionFailed { reason, .. } => {
-                write!(f, "market data connection failed: {reason}")
-            }
-        }
-    }
-}
-
-impl Error for ApexesError {}
 
 #[cfg(test)]
 mod tests {
@@ -55,7 +34,7 @@ mod tests {
     fn connection_failed_is_cloneable() {
         let err = ApexesError::ConnectionFailed {
             reason: "timeout".to_string(),
-            source: Some("io error: connection reset".to_string()),
+            source_detail: Some("io error: connection reset".to_string()),
         };
         let cloned = err.clone();
         assert_eq!(err, cloned);
