@@ -11,7 +11,7 @@
 - `BinanceMarketDataProvider`：`apexes-core::MarketDataProvider` 的真实实现
 - 同时支持多个交易对（`subscribe(&[Instrument])` 的 slice 语义）
 - 产出全部 4 种 `MarketEvent` variant：`Trade`、`Tick`（bookTicker）、`Depth`（L2 订单簿）、`Bar`（自研 OHLCV 聚合，覆盖全部 6 个 `BarInterval`）
-- 断线自动重连（指数退避 + 抖动），对下游消费者透明
+- 断线自动重连（指数退避，由 `barter-data` 内置机制提供），对下游消费者透明
 - 单元测试覆盖纯逻辑部分 + 显式标记为 `#[ignore]` 的真实 Binance 集成测试
 
 ### 不包含（明确超出范围）
@@ -29,10 +29,13 @@
 
 1. **`barter-data` 已经完整实现了 Binance 官方文档规定的订单簿同步算法**——REST 快照获取 + WebSocket 增量更新的 `U`/`u`/`pu` 序列号校验 + 缺口检测（`BinanceSpotOrderBookL2Sequencer::validate_sequence`，逻辑与 [Binance 官方"如何正确维护本地订单簿"文档](https://binance-docs.github.io/apidocs/spot/en/#how-to-manage-a-local-order-book-correctly) 完全一致），并通过 `OrderBookEvent::Snapshot`/`Update` 变体向外暴露结果。这正是本子项目原本计划自行实现的、风险最高的部分。
 2. `barter_data::books::OrderBook` 提供 `sequence() -> u64`、`bids() -> &OrderBookSide<Bids>`、`asks() -> &OrderBookSide<Asks>`、`time_engine() -> Option<DateTime<Utc>>` 等公开访问器，足以映射到 Apexes 自己的 `DepthUpdate`。
+3. **`barter-data` 的 `Streams<T>::builder()` API 已经内置多交易对订阅与断线重连**：`.subscribe([...])` 支持一次性订阅多个 `(exchange, base, quote, kind, subscription_kind)` 元组；`ReconnectingStream::with_reconnect_backoff(policy, stream_key)` 提供开箱即用的指数退避重连（`ReconnectionBackoffPolicy { backoff_ms_initial, backoff_multiplier, backoff_ms_max }`，均可配置）。这意味着"多交易对支持"和"断线重连"这两项原计划自行实现的能力，`barter-data` 已经提供。
 
-**决策**：`apexes-market-data` 使用 `barter-data` 承担 WebSocket 连接、Binance 消息解析、**以及订单簿快照/增量同步与缺口检测**的全部工作；`apexes-market-data` 自身只负责把 `barter-data` 的规范化类型（`PublicTrade`、`OrderBookL1`、`OrderBookEvent`）转换为 Apexes 自己的 `MarketEvent`，以及在此之上聚合出 `Bar`（`barter-data` 不提供 K线聚合，且不同交易所的原生 kline 粒度不一致，自行聚合可在未来跨交易所时保持行为一致）。
+**已知限制**：`barter-data` 的 `ReconnectionBackoffPolicy` **不支持抖动（jitter）**——其重连延迟是确定性的 `initial × multiplier^n`（封顶），没有随机化选项。这与本设计文档最初打算的"±25% 抖动，避免多个 symbol 同时掉线时的同步重连风暴"要求冲突。**决策（用户已确认）**：采用 `barter-data` 内置的重连机制（配置为 1 秒初始 / 2x 倍增 / 30 秒封顶，与原计划参数一致），放弃抖动要求——理由是自行包一层抖动逻辑所需的额外复杂度，相对于"避免为一个已经解决的问题重新发明轮子"这一更高优先级的工程原则，不划算；且这一子项目的量级（免费数据源、单一交易所、验证性质）尚不需要应对大规模同步重连风暴的场景。
 
-这一发现将本子项目原本预估的"自行实现订单簿重建"这一最复杂、最高风险的自研逻辑，替换为对已被广泛使用（132K+ 下载量）、经过验证的开源实现的封装，显著降低了本子项目的实现与正确性风险。
+**决策**：`apexes-market-data` 使用 `barter-data` 承担 WebSocket 连接、Binance 消息解析、**订单簿快照/增量同步与缺口检测**、**多交易对订阅编排**、**以及断线重连**的全部工作；`apexes-market-data` 自身只负责把 `barter-data` 的规范化类型（`PublicTrade`、`OrderBookL1`、`OrderBookEvent`）转换为 Apexes 自己的 `MarketEvent`，以及在此之上聚合出 `Bar`（`barter-data` 不提供 K线聚合，且不同交易所的原生 kline 粒度不一致，自行聚合可在未来跨交易所时保持行为一致）。
+
+这一发现将本子项目原本预估的"自行实现订单簿重建 + 自行实现多交易对编排 + 自行实现重连退避"这些原本计划自研的能力，替换为对已被广泛使用（132K+ 下载量）、经过验证的开源实现的直接复用，显著降低了本子项目的实现与正确性风险，也显著缩小了 `BinanceMarketDataProvider` 自身需要编写和维护的代码量。
 
 ---
 
@@ -42,20 +45,25 @@
 BinanceMarketDataProvider::subscribe(&self, instruments: &[Instrument])
   1. 过滤 instruments：venue != Venue::Binance 的实例被跳过并记录 tracing::warn!
      （若过滤后为空，返回 Err(ApexesError::SubscriptionFailed { .. })）
-  2. 为每个通过过滤的 instrument 各自 spawn 4 个 tokio task：
-       ├─ trade_task     → barter-data PublicTrades 流 → MarketEvent::Trade
-       ├─ ticker_task    → barter-data OrderBooksL1（bookTicker）流 → MarketEvent::Tick
-       ├─ depth_task     → barter-data OrderBooksL2 流（快照+增量，序列号校验由 barter-data
-       │                    内部完成）→ DepthConverter → MarketEvent::Depth
-       └─ bar_task       → 复用 trade_task 的原始成交流 → BarAggregator（每个 symbol 6 个
-                            并行 interval 桶）→ MarketEvent::Bar（区间边界关闭时产出）
-  3. 全部 4×N 个 task 将产出的 MarketEvent 推入同一个共享的 tokio::sync::mpsc 通道
-  4. subscribe() 在 spawn 完成后立即返回 Ok(该通道包装为 BoxStream<'static, MarketEvent>)
-     ——不等待任何一个 WebSocket 握手完成（见 §5 "初始连接失败处理"）
+  2. 通过 barter-data 的 Streams::builder() 一次性为全部通过过滤的 instrument 建立 3 类订阅：
+       ├─ Streams::<PublicTrades>::builder().subscribe([...]) → 成交流
+       ├─ Streams::<OrderBooksL1>::builder().subscribe([...]) → bookTicker 流
+       └─ Streams::<OrderBooksL2>::builder().subscribe([...]) → L2 订单簿流（快照+增量，
+          序列号校验/缺口检测/重新同步均由 barter-data 内部完成）
+     每类订阅各自应用 barter-data 内置的 with_reconnect_backoff(policy, stream_key)
+     （policy 配置为 1 秒初始 / 2x 倍增 / 30 秒封顶，见 §五）
+  3. 为每类订阅（Trade/L1/L2）各 spawn 一个 tokio task，负责把 barter-data 的事件转换为 Apexes MarketEvent：
+       ├─ trade_task  → PublicTrades 流条目 → MarketEvent::Trade，同时喂给 BarAggregator
+       │                （见下）产出 MarketEvent::Bar
+       ├─ ticker_task → OrderBooksL1 流条目 → MarketEvent::Tick
+       └─ depth_task  → OrderBooksL2 流条目 → DepthConverter → MarketEvent::Depth
+  4. 全部 task 将产出的 MarketEvent 推入同一个共享的 tokio::sync::mpsc 通道
+  5. subscribe() 在 spawn 完成后立即返回 Ok(该通道包装为 BoxStream<'static, MarketEvent>)
+     ——不等待任何一个 WebSocket 握手完成（见 §四"初始连接失败处理"）
 ```
 
 **从 tokio 胶水代码中抽取出的纯逻辑、可独立单元测试的类型**：
-- `BarAggregator`（`bar_aggregator.rs`）——每个 symbol 维护 6 个并行的 interval 累积桶，`on_trade(price, qty, time) -> Vec<Bar>`（一次成交可能触发 0 个或多个 bar 关闭，取决于跨越了多少个区间边界）
+- `BarAggregator`（`bar_aggregator.rs`）——每个 symbol 维护 6 个并行的 interval 累积桶，`on_trade(price, qty, time) -> Vec<Bar>`（一次成交可能触发 0 个或多个 bar 关闭，取决于跨越了多少个区间边界）。由 `trade_task` 在收到每笔 `PublicTrade` 时驱动，不再是独立的 task/独立的 barter-data 订阅——因为 Bar 完全从成交流派生，复用 `trade_task` 已经拿到的成交数据即可，无需重复订阅。
 - `DepthConverter`（`depth_converter.rs`）——薄转换层，把 `barter_data::books::OrderBook` + `OrderBookEvent::Snapshot`/`Update` 标签转换为 Apexes 的 `DepthUpdate`（映射 `sequence()`/`bids()`/`asks()`/`is_snapshot`）
 
 ### 文件结构
@@ -65,13 +73,12 @@ crates/apexes-market-data/
   Cargo.toml
   src/
     lib.rs
-    provider.rs          # BinanceMarketDataProvider、subscribe()、task 编排
+    provider.rs          # BinanceMarketDataProvider、subscribe()、订阅编排
     bar_aggregator.rs     # BarAggregator（纯逻辑，单元测试）
     depth_converter.rs    # DepthConverter（纯逻辑，单元测试）
-    trade_task.rs         # tokio task：barter-data 成交流 -> MarketEvent::Trade
+    trade_task.rs         # tokio task：barter-data 成交流 -> MarketEvent::Trade + 驱动 BarAggregator -> MarketEvent::Bar
     ticker_task.rs        # tokio task：barter-data bookTicker -> MarketEvent::Tick
     depth_task.rs         # tokio task：barter-data L2 -> DepthConverter -> MarketEvent::Depth
-    bar_task.rs           # tokio task：成交流 -> BarAggregator -> MarketEvent::Bar
 ```
 
 ---
@@ -80,21 +87,21 @@ crates/apexes-market-data/
 
 - **venue 不匹配**：`subscribe()` 静默跳过 `venue != Venue::Binance` 的 `Instrument`，通过 `tracing::warn!` 记录，不中断整个调用——允许调用方传入混合 venue 的列表而不需要提前过滤。
 - **过滤后为空**：若所有 instrument 都被跳过（结果为空列表），返回 `Err(ApexesError::SubscriptionFailed { .. })`——因为一个空订阅永远不会产出任何数据，这本身就是一个真实错误，而非可以静默忽略的边界情况。
-- **初始连接失败处理**：`subscribe()` 在 spawn 完 4×N 个 task 后立即返回 `Ok`，**不等待**任何 WebSocket 握手完成。某个 symbol 的初始连接失败与运行中掉线走同一条重连路径（见下），不存在单独的"初始连接错误"分支——这样可以避免 `subscribe()` 因为等待 N 个握手而变慢，也避免一个坏 symbol 阻塞整个调用。
+- **初始连接失败处理**：`subscribe()` 在 spawn 完 3 个订阅任务（Trade/L1/L2，每个内部覆盖全部通过过滤的 instrument）后立即返回 `Ok`，**不等待**任何 WebSocket 握手完成。某个 symbol 的初始连接失败与运行中掉线走同一条 `barter-data` 内置重连路径（见 §五），不存在单独的"初始连接错误"分支——这样可以避免 `subscribe()` 因为等待握手而变慢，也避免一个坏 symbol 阻塞整个调用。
 
 ---
 
 ## 五、断线重连
 
-**行为**：每个 task 独立拥有一个"重连 + 指数退避"循环，包裹其 `barter-data` 订阅。无论是初始连接失败还是运行中断线，都走同一套重连逻辑；重连对下游消费者透明——返回的 `BoxStream` 永远不会因为某个 symbol 掉线而结束，只是暂时停止产出该 symbol 的事件，重连成功后自动恢复。
+**行为**：复用 `barter-data` 内置的 `ReconnectingStream::with_reconnect_backoff(policy, stream_key)`，不自行实现重连循环。三类订阅（Trade/L1/L2）分别应用该机制；无论是初始连接失败还是运行中断线，都由 `barter-data` 统一处理；重连对下游消费者透明——返回的 `BoxStream` 永远不会因为某个 symbol 掉线而结束，只是暂时停止产出该 symbol 的事件，重连成功后自动恢复。
 
-**退避参数**：
-- 初始延迟：1 秒
-- 倍增系数：2x（每次失败后延迟翻倍）
-- 上限：30 秒
-- 抖动：对每次计算出的延迟施加 ±25% 的随机抖动，避免多个 symbol 同时掉线时产生同步重连风暴
+**退避参数**（通过 `barter_data::streams::reconnect::stream::ReconnectionBackoffPolicy` 配置）：
+- `backoff_ms_initial: 1000`（1 秒）
+- `backoff_multiplier: 2`（每次失败后延迟翻倍）
+- `backoff_ms_max: 30_000`（30 秒封顶）
+- **无抖动**：`barter-data` 的 `ReconnectionBackoffPolicy` 不提供抖动选项，重连延迟是确定性的 `initial × multiplier^n`（封顶）。已确认放弃抖动要求（见 §二"已知限制"），理由是自行包一层抖动逻辑的额外复杂度，相对于复用已验证实现这一更高优先级的原则不划算，且本子项目量级尚不需要应对大规模同步重连风暴。
 
-**Depth 重连语义**：`depth_task` 重连后，`barter-data` 会重新获取订单簿快照；这在 Apexes 层面自然表现为下一条 `DepthUpdate` 的 `is_snapshot: true`——下游消费者据此判断"必须丢弃之前维护的本地状态，从此更新重新开始"，无需额外的错误信号或专门的重连事件类型。这一约定同样适用于 `barter-data` 内部检测到序列号缺口（`DataError::InvalidSequence`）而触发的重新同步：无论重连原因是网络中断还是序列号缺口，都统一表现为下一条 `DepthUpdate.is_snapshot == true`。
+**Depth 重连语义**：`depth_task` 底层的 `barter-data` L2 订阅重连后，会重新获取订单簿快照；这在 Apexes 层面自然表现为下一条 `DepthUpdate` 的 `is_snapshot: true`——下游消费者据此判断"必须丢弃之前维护的本地状态，从此更新重新开始"，无需额外的错误信号或专门的重连事件类型。这一约定同样适用于 `barter-data` 内部检测到序列号缺口（`DataError::InvalidSequence`）而触发的重新同步：无论重连原因是网络中断还是序列号缺口，都统一表现为下一条 `DepthUpdate.is_snapshot == true`。
 
 ---
 
@@ -152,11 +159,12 @@ rust_decimal = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 tracing = "0.1"
-rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 ```
+
+（不再需要 `rand`——重连抖动已放弃，见 §二/§五。）
 
 日志统一使用 `tracing`（`warn!`/`debug!`），不使用 `println!`——与项目 Rust 规范一致。
 
