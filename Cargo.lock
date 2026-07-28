@@ -113,6 +113,7 @@ dependencies = [
  "chrono",
  "futures",
  "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "tokio",
  "tracing",
