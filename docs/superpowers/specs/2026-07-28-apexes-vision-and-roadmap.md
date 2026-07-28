@@ -156,7 +156,16 @@ flowchart TB
 
 所有数据源均实现统一 `MarketDataProvider` trait，配置文件切换即可替换，核心策略/风控代码零改动。
 
-### 2.6 高可用、性能与安全要点
+### 2.6 开源库复用策略
+
+Apexes 优先复用成熟开源库，而非从零造轮子，但**核心类型（`Instrument`/`Order`/`Fill`/`MarketEvent`）必须保持多市场通用**，不能被单一市场（尤其加密货币）的外部库假设绑架。据此确定以下复用边界：
+
+- **`apexes-core` 保持自研**：`Instrument`/`Market`/`Order`/`OrderStatus`/`Fill`/`MarketEvent`/`MarketDataProvider` trait 均在 `apexes-core` 中自定义，全部使用 `rust_decimal::Decimal`、覆盖 A股/H股/美股/加密货币四类市场——这是保证"多市场统一抽象"设计原则（§2.1 第3条）不被破坏的前提。
+- **`barter-rs` 生态（`barter-data` / `barter-execution` / `barter-instrument`）作为加密货币网关的底层连接器**：调研发现 `barter-instrument::ExchangeId` 是不可扩展的封闭枚举，仅覆盖约40家加密货币交易所（BinanceSpot、Okx、Bitfinex 等），完全不包含 A股/H股/美股概念；且 `barter-data` 内部价格字段存在 `f64`（`PublicTrade`/`Candle`）与 `Decimal`（`OrderBookL1`）混用的精度不一致问题。因此**不直接采用 barter-rs 的类型作为 `apexes-core` 的核心类型**，而是在子项目 #1（行情接入）与 #8（首个实盘网关）中，将 `barter-data`/`barter-execution` 作为 Binance/OKX 等交易所 WebSocket/REST 协议细节的底层实现，在网关适配层内部完成 barter 类型 ↔ Apexes 类型的转换，避免从零手写交易所协议代码。
+- **其他候选库**（子项目 #10 及之后按需评估）：`binance-sdk`（Binance 官方 Rust connector）、`ibkr_client_polrtal`/`ibkr-cp-api-client`（IBKR Client Portal API）等，逐一在对应子项目设计阶段单独评估，遵循同样的"底层连接器可借用、核心抽象不外包"原则。
+- **通用基础库直接依赖**：`rust_decimal`、`serde`、`thiserror`、`chrono`、`tokio`、`futures` 等无市场特定假设的基础库，直接作为 `apexes-core` 及各子项目的依赖，无需自研替代。
+
+### 2.7 高可用、性能与安全要点
 
 - **性能**：核心链路全程无锁队列 + 内存池，避免动态分配；CPU 核心绑定 + NUMA 感知；零拷贝序列化；PTP 时钟同步；视延迟要求可选配 DPDK/内核旁路。
 - **高可用**：核心服务多活部署，状态通过 Raft 复制，主节点故障秒级切换；订单状态强持久化，重启后基于交易所回报强制对账，杜绝"幽灵仓位"；消息总线支持重放；全链路健康检查+熔断降级。
@@ -171,14 +180,14 @@ flowchart TB
 | # | 子项目 | Crate（预估） | 依赖 | 一句话目标 |
 |---|---|---|---|---|
 | 0 | 基础骨架（Foundation skeleton） | `apexes-core`, `apexes-cli` | — | 共享类型/trait：Instrument、Order、Fill、MarketDataProvider、ApexesError |
-| 1 | 行情接入（单一免费加密货币源） | `apexes-market-data` | 0 | 一个真实的 `MarketDataProvider` 实现（如 Binance 公开 WS），验证 trait 端到端可用 |
+| 1 | 行情接入（单一免费加密货币源） | `apexes-market-data` | 0 | 一个真实的 `MarketDataProvider` 实现（如 Binance 公开 WS，底层可复用 `barter-data`），验证 trait 端到端可用 |
 | 2 | 历史数据存储（最小可用） | `apexes-storage` | 0, 1 | 本地持久化 tick/bar 数据（先用本地文件/Parquet 或 sqlite，暂缓 ClickHouse） |
 | 3 | 回测引擎 | `apexes-backtest` | 0, 2 | Tick 重放 + 撮合模拟器 + 成本模型 |
 | 4 | 策略 SDK | `apexes-strategy` | 0 | Rust trait 策略 API，可在回测中运行 |
 | 5 | 风控引擎（事前风控） | `apexes-risk` | 0 | 限额检查、黑白名单、自成交防范——回测/模拟/实盘共用 |
 | 6 | 模拟交易（Paper Trading） | `apexes-paper` | 1, 3, 4, 5 | 实时行情 + 复用回测撮合内核，与实盘一致的 OrderStatus 生命周期 |
 | 7 | OMS | `apexes-oms` | 0, 5 | 真实订单生命周期、持久化、断线重连对账 |
-| 8 | 首个实盘网关（加密货币 CEX） | `apexes-gateway-crypto` | 0, 7 | 在一个交易所真实下单，打通回测→模拟→实盘闭环 |
+| 8 | 首个实盘网关（加密货币 CEX） | `apexes-gateway-crypto` | 0, 7 | 在一个交易所真实下单（底层可复用 `barter-execution`），打通回测→模拟→实盘闭环 |
 | 9 | EMS / 执行算法 | `apexes-ems` | 7, 8 | TWAP/VWAP/冰山、智能路由 |
 | 10 | 其他市场网关 | `apexes-gateway-ashare`, `-hshare`, `-usequity` | 7, 8 | 加密货币路径验证后，扩展到 A股/H股/美股 |
 | 11 | 账户与资金管理 | `apexes-account` | 7 | 多市场持仓、盈亏、汇率折算 |
