@@ -2,6 +2,7 @@ use crate::error::ApexesError;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// The broad market a symbol trades in (A-shares, H-shares, US equities, crypto).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MarketType {
     AShare,
@@ -10,6 +11,7 @@ pub enum MarketType {
     Crypto,
 }
 
+/// A trading venue (exchange) where instruments are listed and orders are routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Venue {
     Sse,
@@ -33,6 +35,7 @@ impl Venue {
     }
 }
 
+/// The kind of tradable asset (spot, derivatives, equity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssetClass {
     Spot,

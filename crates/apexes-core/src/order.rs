@@ -1,5 +1,9 @@
 use crate::error::ApexesError;
+use crate::instrument::Venue;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Lifecycle state of an order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,11 +45,6 @@ impl OrderStatus {
     }
 }
 
-use crate::instrument::Venue;
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use uuid::Uuid;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OrderId(pub Uuid);
 
@@ -61,6 +60,7 @@ pub enum OrderType {
     Limit,
 }
 
+/// An order to buy or sell a quantity of an instrument at a venue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
@@ -70,6 +70,7 @@ pub struct Order {
     pub side: Side,
     pub order_type: OrderType,
     pub quantity: Decimal,
+    /// `None` for Market orders; `Some` for Limit orders.
     pub price: Option<Decimal>,
     pub filled_quantity: Decimal,
     pub status: OrderStatus,

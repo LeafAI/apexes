@@ -15,6 +15,7 @@ pub enum MarketEvent {
     Trade(TradeEvent),
 }
 
+/// A best bid/ask quote update for a symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tick {
     pub symbol: String,
@@ -26,12 +27,19 @@ pub struct Tick {
     pub timestamp: DateTime<Utc>,
 }
 
+/// An order book depth update (full snapshot or incremental).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DepthUpdate {
     pub symbol: String,
     pub venue: Venue,
+    /// Sorted best-to-worst (bid: highest price first).
     pub bids: Vec<PriceLevel>,
+    /// Sorted best-to-worst (ask: lowest price first).
     pub asks: Vec<PriceLevel>,
+    /// Sequence number for ordering incremental updates and detecting gaps (data-source dependent; not all sources provide one).
+    pub sequence: Option<u64>,
+    /// true if this is a full snapshot; false if this is an incremental update.
+    pub is_snapshot: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -41,6 +49,7 @@ pub struct PriceLevel {
     pub quantity: Decimal,
 }
 
+/// An OHLCV candlestick bar over a fixed interval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
     pub symbol: String,
@@ -65,12 +74,14 @@ pub enum BarInterval {
     OneDay,
 }
 
+/// A single executed trade (public market trade, not an own fill).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeEvent {
     pub symbol: String,
     pub venue: Venue,
     pub price: Decimal,
     pub quantity: Decimal,
+    /// Aggressor (taker) side, if known. Not all data sources provide this.
     pub side: Option<Side>,
     pub trade_id: Option<String>,
     pub timestamp: DateTime<Utc>,
@@ -129,6 +140,30 @@ mod tests {
                 price: dec!(190.55),
                 quantity: dec!(150),
             }],
+            sequence: Some(12345),
+            is_snapshot: false,
+            timestamp: Utc::now(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let round_tripped: MarketEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, round_tripped);
+    }
+
+    #[test]
+    fn depth_snapshot_without_sequence_serde_round_trip() {
+        let event = MarketEvent::Depth(DepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(64999.5),
+                quantity: dec!(1.5),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(65000.5),
+                quantity: dec!(2.0),
+            }],
+            sequence: None,
+            is_snapshot: true,
             timestamp: Utc::now(),
         });
         let json = serde_json::to_string(&event).unwrap();
