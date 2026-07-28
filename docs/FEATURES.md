@@ -36,7 +36,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | 1.3.2 | H-share paid HKEX direct connect (OMD-C) | #10 | 🔲 Not Started | |
 | 1.4.1 | US equity free/low-cost data (IEX Cloud, Alpaca, Polygon free tier) | #10 | 🔲 Not Started | |
 | 1.4.2 | US equity paid full-depth data (Polygon.io paid, Databento, Nasdaq TotalView) | #10 | 🔲 Not Started | |
-| 1.5 | Market data normalization engine (unified Tick/Depth/Bar model) | #0 | 📝 Designing | `MarketEvent` enum defined in foundation skeleton design |
+| 1.5 | Market data normalization engine (unified Tick/Depth/Bar model) | #0 | ✅ Done | `MarketEvent` enum defined in foundation skeleton design |
 | 1.6 | Historical data storage & backfill (full tick-level, multi-timeframe bars) | #2 | 🔲 Not Started | |
 | 1.7 | Market data distribution bus (multi-subscriber broadcast, on-demand downsampling) | #12 | 🔲 Not Started | |
 
@@ -66,14 +66,14 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 |---|---|---|---|---|
 | 4.1 | Virtual account & virtual fund management | #6 | 🔲 Not Started | |
 | 4.2 | Real-time-feed-driven paper matching engine (reuses backtest matching kernel) | #6 | 🔲 Not Started | |
-| 4.3 | Order lifecycle state machine consistent with live trading | #0 / #6 | 📝 Designing | `OrderStatus` state machine defined in foundation skeleton; reused as-is by paper trading |
+| 4.3 | Order lifecycle state machine consistent with live trading | #0 / #6 | ✅ Done | `OrderStatus` state machine defined in foundation skeleton; reused as-is by paper trading |
 
 ## 5. Live Trading System
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
 | 5.1.1 | Order generation & pre-trade validation | #7 | 🔲 Not Started | |
-| 5.1.2 | Order state machine (New→PartiallyFilled→Filled/Cancelled/Rejected) | #0 | 📝 Designing | Core type-level definition; OMS (#7) builds the runtime around it |
+| 5.1.2 | Order state machine (New→PartiallyFilled→Filled/Cancelled/Rejected) | #0 | ✅ Done | Core type-level definition; OMS (#7) builds the runtime around it |
 | 5.1.3 | Persistence & reconnect state recovery (reconciliation) | #7 | 🔲 Not Started | Flagged as non-negotiable quality bar (see vision doc §1) |
 | 5.2.1 | Smart order routing (SOR) — multi-exchange/multi-market-maker price comparison | #9 | 🔲 Not Started | |
 | 5.2.2 | Execution algorithms (TWAP/VWAP/Iceberg/POV) | #9 | 🔲 Not Started | |
@@ -143,13 +143,13 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 0.1 | Cargo workspace layout (`apexes-core`, `apexes-cli`) | #0 | 📝 Designing | |
-| 0.2 | `Instrument` type (unified identity across crypto/A-share/H-share/US equity) | #0 | 📝 Designing | Two-level `MarketType`/`Venue` + `AssetClass` enums, decided |
-| 0.3 | `Order` / `Fill` types + `OrderStatus` state machine | #0 | 📝 Designing | Full state machine with validated transitions, decided |
-| 0.4 | `MarketDataProvider` trait | #0 | 📝 Designing | Async streaming trait signature, decided |
-| 0.5 | `MarketEvent` model (Tick/Depth/Bar/Trade) | #0 | 📝 Designing | Full enum with real payload fields, decided |
-| 0.6 | `ApexesError` unified error type | #0 | 📝 Designing | Single `thiserror` enum, decided |
-| 0.7 | `apexes-cli` skeleton (`--version`/`--help` only) | #0 | 📝 Designing | |
+| 0.1 | Cargo workspace layout (`apexes-core`, `apexes-cli`) | #0 | ✅ Done | |
+| 0.2 | `Instrument` type (unified identity across crypto/A-share/H-share/US equity) | #0 | ✅ Done | Two-level `MarketType`/`Venue` + `AssetClass` enums, decided |
+| 0.3 | `Order` / `Fill` types + `OrderStatus` state machine | #0 | ✅ Done | Full state machine with validated transitions, decided |
+| 0.4 | `MarketDataProvider` trait | #0 | ✅ Done | Async streaming trait signature, decided |
+| 0.5 | `MarketEvent` model (Tick/Depth/Bar/Trade) | #0 | ✅ Done | Full enum with real payload fields, decided |
+| 0.6 | `ApexesError` unified error type | #0 | ✅ Done | Single `thiserror` enum, decided |
+| 0.7 | `apexes-cli` skeleton (`--version`/`--help` only) | #0 | ✅ Done | |
 
 ---
 
@@ -158,10 +158,10 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | Status | Count |
 |---|---|
 | 🔲 Not Started | 59 |
-| 📝 Designing | 10 |
+| 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 0 |
+| ✅ Done | 10 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
