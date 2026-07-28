@@ -131,6 +131,7 @@ dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
 ]
