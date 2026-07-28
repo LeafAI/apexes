@@ -877,8 +877,15 @@ pub struct DepthUpdate {
     pub venue: Venue,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
+    pub sequence: Option<u64>,
+    pub is_snapshot: bool,
     pub timestamp: DateTime<Utc>,
 }
+
+// NOTE: `sequence`/`is_snapshot` were added to `DepthUpdate` after Task 6's
+// original review, per the final whole-branch review's I-1 finding — real
+// incremental depth feeds need a sequence number to apply updates in order
+// and detect gaps. See design spec §4.3 for the full rationale.
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PriceLevel {

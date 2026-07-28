@@ -272,6 +272,8 @@ pub struct Fill {
 **关键决策**：
 - `MarketEvent` 为完整枚举（`Tick`/`Depth`/`Bar`/`Trade`），每个 variant 携带真实字段，而非占位符——符合顶层设计 §2.2 第 1.5 条"统一 Tick/Depth/Bar 模型"的要求。
 - `MarketDataProvider` 使用 `#[async_trait]`（而非原生 RPITIT）以保持**对象安全**，从而支持 `Vec<Box<dyn MarketDataProvider>>`——这是顶层设计"免费优先、付费可插拔"原则（§2.1 第4条）的前提：数据源需要能在运行时通过配置动态切换，而非仅能编译期泛型选择。代价是每次调用有少量 boxing 开销，在这一阶段可接受。
+- `DepthUpdate` 携带 `sequence: Option<u64>` 与 `is_snapshot: bool` 字段——真实的增量订单簿推送（Binance diff-depth 的 `U`/`u`、OKX `books` 的 `seqId`/`checksum`、CTP 等）都依赖序列号才能正确按序应用增量、检测缺口并触发重新快照。这两个字段在基础骨架阶段即代价很低，但如果推迟到子项目 #1 才添加，将是对一个已被下游大量模式匹配的核心类型的破坏性变更，因此在此阶段就定型。`sequence` 为 `Option`，因为部分数据源（或全量快照场景）可能不提供；`is_snapshot` 标识该事件是全量快照还是增量更新。
+- 以下语义约定仅存在于设计文档中是不够的，必须体现为代码内的 doc comment（对应 §7 验收标准"带有基本 doc comment"的要求）：`DepthUpdate.bids` 按价格从优到劣（买一在前，即价格从高到低）排序，`DepthUpdate.asks` 按价格从优到劣（卖一在前，即价格从低到高）排序——注意买卖两侧排序方向相反；`Order.price` 为 `None` 表示市价单（Market），为 `Some` 表示限价单（Limit）；`TradeEvent.side` 表示主动成交方（taker/aggressor）方向，并非所有数据源都能提供，因此为 `Option`。
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,8 +299,10 @@ pub struct Tick {
 pub struct DepthUpdate {
     pub symbol: String,
     pub venue: Venue,
-    pub bids: Vec<PriceLevel>,   // 按价格从优到劣排序
-    pub asks: Vec<PriceLevel>,   // 按价格从优到劣排序
+    pub bids: Vec<PriceLevel>,   // 按价格从优到劣排序（买一在前，价格从高到低）
+    pub asks: Vec<PriceLevel>,   // 按价格从优到劣排序（卖一在前，价格从低到高）
+    pub sequence: Option<u64>,   // 数据源提供的序列号，用于按序应用增量、检测缺口
+    pub is_snapshot: bool,       // true=全量快照，false=增量更新
     pub timestamp: DateTime<Utc>,
 }
 
