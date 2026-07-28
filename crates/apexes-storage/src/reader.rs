@@ -40,12 +40,19 @@ impl StorageReader {
         event_type: EventType,
     ) -> Result<Vec<MarketEvent>, StorageError> {
         let venue_str = format!("{venue:?}");
-        let start = date_range.start.and_hms_opt(0, 0, 0).ok_or_else(|| StorageError::QueryFailed {
-            reason: "invalid range start date".to_string(),
-        })?;
-        let end = date_range.end.and_hms_opt(0, 0, 0).ok_or_else(|| StorageError::QueryFailed {
-            reason: "invalid range end date".to_string(),
-        })?;
+        let start =
+            date_range
+                .start
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| StorageError::QueryFailed {
+                    reason: "invalid range start date".to_string(),
+                })?;
+        let end = date_range
+            .end
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| StorageError::QueryFailed {
+                reason: "invalid range end date".to_string(),
+            })?;
 
         match event_type {
             EventType::Trade => self.read_trades(symbol, &venue_str, start, end).await,
