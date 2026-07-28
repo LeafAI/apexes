@@ -25,7 +25,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 1.1.1 | CEX REST/WebSocket market data (Binance, OKX, Coinbase, etc.) | #1 | 🔲 Not Started | First real `MarketDataProvider` impl target |
+| 1.1.1 | CEX REST/WebSocket market data (Binance, OKX, Coinbase, etc.) | #1 | ✅ Done | Binance Spot implemented via apexes-market-data (BinanceMarketDataProvider); OKX/Coinbase/other CEX deferred |
 | 1.1.2 | DEX on-chain data (The Graph, DEX pool event parsing) | #10 | 🔲 Not Started | |
 | 1.1.3 | Public chain RPC access & node management (free: Infura/Alchemy; paid: self-hosted full node/QuickNode) | #10 | 🔲 Not Started | |
 | 1.1.4 | Mempool monitoring & block event subscription | #10 | 🔲 Not Started | |
@@ -157,11 +157,11 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 59 |
+| 🔲 Not Started | 58 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 10 |
+| ✅ Done | 11 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
