@@ -69,6 +69,8 @@ BinanceMarketDataProvider::subscribe(&self, instruments: &[Instrument])
 - `BarAggregator`（`bar_aggregator.rs`）——每个 symbol 维护 6 个并行的 interval 累积桶，`on_trade(price, qty, time) -> Vec<Bar>`（一次成交可能触发 0 个或多个 bar 关闭，取决于跨越了多少个区间边界）。由 `trade_task` 在收到每笔 `PublicTrade` 时驱动，不再是独立的 task/独立的 barter-data 订阅——因为 Bar 完全从成交流派生，复用 `trade_task` 已经拿到的成交数据即可，无需重复订阅。
 - `DepthConverter`（`depth_converter.rs`）——薄转换层，把 `barter_data::books::OrderBook` + `OrderBookEvent::Snapshot`/`Update` 标签转换为 Apexes 的 `DepthUpdate`（映射 `sequence()`/`bids()`/`asks()`/`is_snapshot`）
 
+**`ticker_task` 的空盘口处理**：`barter-data` 的 `OrderBookL1.best_bid`/`best_ask`是 `Option<Level>`（某一侧盘口为空时为 `None`），而 Apexes 的 `Tick` 要求 `bid_price`/`bid_size`/`ask_price`/`ask_size` 均为必填 `Decimal`。当 `best_bid` 或 `best_ask` 为 `None` 时，`ticker_task` **跳过该次更新，不产出 `MarketEvent::Tick`**，并通过 `tracing::debug!`（而非 `warn!`）记录——空盘口是真实市场可能出现的合法状态（虽然罕见），不是异常，因此不应该以 `warn` 级别记录；等待后续两侧都有报价的更新即可。
+
 ### 文件结构
 
 ```
