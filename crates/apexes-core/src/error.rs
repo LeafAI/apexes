@@ -1,3 +1,4 @@
+use crate::order::OrderStatus;
 use thiserror::Error;
 
 /// Unified error type for apexes-core. Cloneable — variants that carry
@@ -7,6 +8,9 @@ use thiserror::Error;
 pub enum ApexesError {
     #[error("invalid instrument: {reason}")]
     InvalidInstrument { reason: String },
+
+    #[error("invalid order state transition: {from:?} -> {to:?}")]
+    InvalidStateTransition { from: OrderStatus, to: OrderStatus },
 
     #[error("market data connection failed: {reason}")]
     ConnectionFailed {

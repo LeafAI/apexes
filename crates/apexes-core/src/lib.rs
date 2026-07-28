@@ -7,6 +7,8 @@
 
 pub mod error;
 pub mod instrument;
+pub mod order;
 
 pub use error::ApexesError;
 pub use instrument::{AssetClass, Instrument, MarketType, Venue};
+pub use order::OrderStatus;
