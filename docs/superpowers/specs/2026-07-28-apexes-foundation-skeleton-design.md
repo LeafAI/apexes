@@ -354,7 +354,9 @@ pub trait MarketDataProvider: Send + Sync {
 
 ### 4.4 `ApexesError`
 
-**关键决策**：为可能携带底层错误的变体预留 `source: Option<String>` 字段（而非 `#[source] Box<dyn Error>`），使 `ApexesError` 能够 `derive(Clone)`——因为 `Box<dyn Error>` 不支持 `Clone`。代价是放弃标准 `std::error::Error::source()` 错误链能力，改用格式化字符串保留上下文；若后续子项目确实需要结构化错误链，需再单独决策。
+**关键决策**：为可能携带底层错误的变体预留 `source_detail: Option<String>` 字段（而非 `#[source] Box<dyn Error>`），使 `ApexesError` 能够 `derive(Clone)`——因为 `Box<dyn Error>` 不支持 `Clone`。代价是放弃标准 `std::error::Error::source()` 错误链能力，改用格式化字符串保留上下文；若后续子项目确实需要结构化错误链，需再单独决策。
+
+**字段命名说明**：字段名为 `source_detail` 而非 `source`——`thiserror` 的 derive 宏会将任何名为 `source` 的字段特殊处理为错误链的 `std::error::Error::source()`，强制要求其类型实现 `std::error::Error`，这与 `Option<String>`（为保持 `Clone` 而选择的类型）冲突，编译期即报错（`E0599`，已用 `thiserror 2.0.19` 独立验证复现）。重命名为 `source_detail` 可在保留 `#[derive(thiserror::Error)]` 的前提下规避此冲突。
 
 ```rust
 #[derive(Debug, Clone, Error)]
@@ -368,7 +370,7 @@ pub enum ApexesError {
     #[error("market data connection failed: {reason}")]
     ConnectionFailed {
         reason: String,
-        source: Option<String>,   // 格式化后的底层错误信息，保持 ApexesError 可 Clone
+        source_detail: Option<String>,   // 格式化后的底层错误信息，保持 ApexesError 可 Clone
     },
 
     #[error("subscription failed for {symbol} on {venue:?}: {reason}")]
@@ -376,7 +378,7 @@ pub enum ApexesError {
         symbol: String,
         venue: Venue,
         reason: String,
-        source: Option<String>,
+        source_detail: Option<String>,
     },
 }
 ```

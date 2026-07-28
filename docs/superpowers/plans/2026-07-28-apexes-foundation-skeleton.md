@@ -116,7 +116,7 @@ git commit -S -s -m "chore: scaffold apexes-core crate in workspace"
 
 **Interfaces:**
 - Consumes: nothing new
-- Produces: `pub enum ApexesError` with variants `InvalidInstrument { reason: String }`, `InvalidStateTransition { from: OrderStatus, to: OrderStatus }`, `ConnectionFailed { reason: String, source: Option<String> }`, `SubscriptionFailed { symbol: String, venue: Venue, reason: String, source: Option<String> }`. This task defines the enum shape referencing `OrderStatus`/`Venue` types that don't exist yet — Rust allows forward references across modules, but the crate won't compile until Task 3 (which adds `OrderStatus`) and Task 4 (which adds `Venue`) land. To keep every task independently buildable, this task uses placeholder generic bounds — see Step 1 for the actual resolution.
+- Produces: `pub enum ApexesError` with variants `InvalidInstrument { reason: String }`, `InvalidStateTransition { from: OrderStatus, to: OrderStatus }`, `ConnectionFailed { reason: String, source_detail: Option<String> }`, `SubscriptionFailed { symbol: String, venue: Venue, reason: String, source_detail: Option<String> }`. Note: the field is named `source_detail`, not `source` — `thiserror`'s derive macro special-cases any field literally named `source` (requiring it to implement `std::error::Error`), which conflicts with `Option<String>`; `source_detail` avoids that conflict while keeping `#[derive(thiserror::Error)]`. This task defines the enum shape referencing `OrderStatus`/`Venue` types that don't exist yet — Rust allows forward references across modules, but the crate won't compile until Task 3 (which adds `OrderStatus`) and Task 4 (which adds `Venue`) land. To keep every task independently buildable, this task uses placeholder generic bounds — see Step 1 for the actual resolution.
 
 **Note on ordering:** `ApexesError::InvalidStateTransition` needs `OrderStatus`, and `SubscriptionFailed` needs `Venue`. To keep this task compilable on its own (bite-sized, independently testable), we define `ApexesError` in this task with only the two variants that don't depend on other modules (`InvalidInstrument`, `ConnectionFailed`), then extend it with `InvalidStateTransition` and `SubscriptionFailed` in Task 3 and Task 4 respectively once `OrderStatus` and `Venue` exist.
 
@@ -136,10 +136,12 @@ pub enum ApexesError {
     #[error("market data connection failed: {reason}")]
     ConnectionFailed {
         reason: String,
-        source: Option<String>,
+        source_detail: Option<String>,
     },
 }
 ```
+
+Note: the field is named `source_detail`, not `source` — `thiserror`'s derive macro treats any field literally named `source` as the error's `std::error::Error::source()` chain target, requiring it to implement `std::error::Error`. `Option<String>` doesn't satisfy that, which fails to compile (`E0599`). `source_detail` avoids the conflict while keeping the `#[derive(thiserror::Error)]` macro.
 
 - [ ] **Step 2: Write a construction + Display test**
 
@@ -165,7 +167,7 @@ mod tests {
     fn connection_failed_is_cloneable() {
         let err = ApexesError::ConnectionFailed {
             reason: "timeout".to_string(),
-            source: Some("io error: connection reset".to_string()),
+            source_detail: Some("io error: connection reset".to_string()),
         };
         let cloned = err.clone();
         assert_eq!(err, cloned);
@@ -460,7 +462,7 @@ pub enum ApexesError {
     #[error("market data connection failed: {reason}")]
     ConnectionFailed {
         reason: String,
-        source: Option<String>,
+        source_detail: Option<String>,
     },
 }
 ```
@@ -1050,7 +1052,7 @@ git commit -S -s -m "feat(apexes-core): add MarketEvent model (Tick, Depth, Bar,
 
 **Interfaces:**
 - Consumes: `Instrument` (Task 3), `MarketEvent` (Task 6), `ApexesError` (Task 2/4)
-- Produces: `pub trait MarketDataProvider: Send + Sync { async fn subscribe(&self, instruments: &[Instrument]) -> Result<BoxStream<'static, MarketEvent>, ApexesError>; }` (via `#[async_trait]`). `ApexesError` gains `SubscriptionFailed { symbol: String, venue: Venue, reason: String, source: Option<String> }`.
+- Produces: `pub trait MarketDataProvider: Send + Sync { async fn subscribe(&self, instruments: &[Instrument]) -> Result<BoxStream<'static, MarketEvent>, ApexesError>; }` (via `#[async_trait]`). `ApexesError` gains `SubscriptionFailed { symbol: String, venue: Venue, reason: String, source_detail: Option<String> }`.
 
 - [ ] **Step 1: Add `SubscriptionFailed` to `ApexesError`**
 
@@ -1070,7 +1072,7 @@ Add the variant to the enum (after `ConnectionFailed`):
         symbol: String,
         venue: Venue,
         reason: String,
-        source: Option<String>,
+        source_detail: Option<String>,
     },
 ```
 
@@ -1085,7 +1087,7 @@ Append to the `#[cfg(test)] mod tests` block in `crates/apexes-core/src/error.rs
             symbol: "BTCUSDT".to_string(),
             venue: crate::instrument::Venue::Binance,
             reason: "rate limited".to_string(),
-            source: None,
+            source_detail: None,
         };
         assert_eq!(
             err.to_string(),
