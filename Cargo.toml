@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core"]
+members = ["crates/apexes-core", "crates/apexes-cli"]
 
 [workspace.package]
 edition = "2024"

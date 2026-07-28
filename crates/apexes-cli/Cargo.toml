@@ -1,0 +1,13 @@
+[package]
+name = "apexes-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apexes"
+path = "src/main.rs"
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+clap = { workspace = true }
