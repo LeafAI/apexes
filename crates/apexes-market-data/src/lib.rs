@@ -4,7 +4,9 @@
 
 pub mod bar_aggregator;
 pub mod depth_converter;
+pub mod depth_task;
 pub mod provider;
+pub mod symbol;
 pub mod ticker_task;
 pub mod trade_task;
 

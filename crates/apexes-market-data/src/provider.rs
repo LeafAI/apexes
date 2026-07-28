@@ -1,6 +1,7 @@
 use apexes_core::{ApexesError, AssetClass, Instrument, MarketDataProvider, MarketEvent, Venue};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Filters `instruments` down to those tradable via this provider: Binance
 /// venue and Spot asset class. Non-matching instruments are skipped with a
@@ -68,8 +69,63 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             });
         }
 
-        // Task 7 replaces this with the real subscription wiring.
-        unimplemented!("subscription wiring lands in Task 7")
+        let symbols: Vec<String> = filtered.iter().map(|i| i.symbol.clone()).collect();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        spawn_task_thread("trade_task", {
+            let symbols = symbols.clone();
+            let tx = tx.clone();
+            move || crate::trade_task::run(symbols, tx)
+        });
+        spawn_task_thread("ticker_task", {
+            let symbols = symbols.clone();
+            let tx = tx.clone();
+            move || crate::ticker_task::run(symbols, tx)
+        });
+        spawn_task_thread("depth_task", move || crate::depth_task::run(symbols, tx));
+
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+    }
+}
+
+/// Runs a market-data task on a dedicated OS thread with its own
+/// current-thread tokio runtime. This is required because `barter-data`
+/// 0.11's `StreamBuilder::init()` awaits `Pin<Box<dyn Future>>` (non-`Send`)
+/// subscription futures, so the task futures cannot be `tokio::spawn`ed
+/// onto a multi-threaded runtime. The task future is constructed inside the
+/// thread (via `make_task`) to avoid moving a non-`Send` future across
+/// threads. `Runtime::block_on` itself has no `Send` bound.
+fn spawn_task_thread<F, Fut>(task_name: &'static str, make_task: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let spawned = std::thread::Builder::new()
+        .name(task_name.to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        task_name,
+                        "failed to build market-data task runtime, task will not run"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(make_task());
+        });
+
+    if let Err(error) = spawned {
+        tracing::warn!(
+            ?error,
+            task_name,
+            "failed to spawn market-data task thread, task will not run"
+        );
     }
 }
 

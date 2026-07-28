@@ -9,6 +9,7 @@ apexes-core = { path = "../apexes-core" }
 barter-data = { workspace = true }
 barter-instrument = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 rust_decimal = { workspace = true }

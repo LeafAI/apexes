@@ -116,6 +116,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

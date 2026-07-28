@@ -1,3 +1,4 @@
+use crate::symbol::{split_symbol, symbol_of};
 use apexes_core::{MarketEvent, Tick, Venue};
 use barter_data::{
     exchange::binance::spot::BinanceSpot, streams::Streams, subscription::book::OrderBooksL1,
@@ -5,37 +6,6 @@ use barter_data::{
 use barter_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
-
-/// Splits a Binance spot symbol like "BTCUSDT" into (base, quote) pairs.
-/// Duplicated from `trade_task` deliberately -- see Task 6 self-review note
-/// on whether to extract a shared `symbol.rs` module.
-fn split_symbol(symbol: &str) -> Option<(String, String)> {
-    const KNOWN_QUOTES: [&str; 3] = ["USDT", "USDC", "BUSD"];
-    for quote in KNOWN_QUOTES {
-        if let Some(base) = symbol.strip_suffix(quote)
-            && !base.is_empty()
-        {
-            return Some((base.to_lowercase(), quote.to_lowercase()));
-        }
-    }
-    None
-}
-
-/// Reconstructs the original exchange symbol (e.g. "BTCUSDT") from a
-/// `barter-data` market-data instrument. `MarketDataInstrument`'s `Display`
-/// impl renders "{base}_{quote}_{kind}" (e.g. "btc_usdt_spot"), which is not
-/// the original symbol, so we rebuild it from the (internally lowercased)
-/// base/quote asset names instead. Duplicated from `trade_task` deliberately;
-/// Task 7 consolidates it into a shared module alongside `split_symbol`.
-fn symbol_of(
-    instrument: &barter_instrument::instrument::market_data::MarketDataInstrument,
-) -> String {
-    format!(
-        "{}{}",
-        instrument.base.name().to_uppercase(),
-        instrument.quote.name().to_uppercase()
-    )
-}
 
 /// Subscribes to Binance Spot bookTicker (best bid/ask) for `symbols` and
 /// converts each update into `MarketEvent::Tick`. Updates where either side
@@ -118,18 +88,5 @@ pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
             tracing::warn!("ticker_task: output channel closed, stopping");
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_symbol_handles_usdt_pairs() {
-        assert_eq!(
-            split_symbol("BTCUSDT"),
-            Some(("btc".to_string(), "usdt".to_string()))
-        );
     }
 }
