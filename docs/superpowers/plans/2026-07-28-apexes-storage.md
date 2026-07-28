@@ -19,7 +19,8 @@
 - All ClickHouse Decimal columns use `Decimal(38, 10)`, mapped to `FixedPoint<i128, typenum::U10>` on the Rust side.
 - `write_batch()` requires a homogeneous batch (all elements the same `MarketEvent` variant) — returns `Err(ApexesError::...)` on a mixed batch. No internal buffering; each call is one ClickHouse `INSERT`.
 - All 4 tables use `ENGINE = MergeTree`, `PARTITION BY toYYYYMMDD(<time column>)`, `ORDER BY (venue, symbol, ...)` per the design spec §4.
-- ClickHouse integration tests (anything requiring a live database connection) are marked `#[ignore]` and excluded from default `cargo test`/`cargo test --workspace`; run explicitly via `cargo test -p apexes-storage -- --ignored`, requiring `docker compose up -d` beforehand.
+- ClickHouse integration tests (anything requiring a live database connection) are marked `#[ignore]` and excluded from default `cargo test`/`cargo test --workspace`; run explicitly via `cargo test -p apexes-storage -- --ignored`, requiring ClickHouse running locally beforehand (start via `docker compose up -d` if your Docker installation has the Compose plugin, or `docker-compose up -d` if it only has the standalone binary — check which is available with `docker compose version` vs `docker-compose version` before running).
+- The ClickHouse image tag pinned in `docker-compose.yml` is `25.12` (updated from an initially-planned `24.8` during Task 1 — the `24.8` tag could not be pulled in the verification environment due to a registry connectivity issue specific to that tag, while `25.12` pulled/ran successfully; this is a version-availability adjustment, not a functional change).
 - Crate version floors (verified by compiling against the real crates on 2026-07-28): `clickhouse = "0.15"`, `fixnum = "0.9"` (with `i128` feature — confirmed `FixedPoint<i128, typenum::U10>` compiles and round-trips correctly via `from_decimal(mantissa: i128, exponent: i32)`). Existing workspace deps (`tokio = "1.53"`, `rust_decimal = "1.42"`, `chrono = "0.4"`, `serde = "1.0"`, `tracing = "0.1"`) already pinned in the workspace root `Cargo.toml`.
 - Design spec of record: `docs/superpowers/specs/2026-07-28-apexes-storage-design.md`. If you find a mismatch between this plan and that spec while implementing, the spec wins — stop and flag it rather than improvising.
 
@@ -141,7 +142,7 @@ pub enum EventType { Trade, Tick, Depth, Bar }
 ```yaml
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:25.12
     container_name: apexes-clickhouse
     ports:
       - "8123:8123"
@@ -169,12 +170,12 @@ Expected: `Compiling apexes-storage v0.1.0 (...)` then `Finished` — success, z
 
 - [ ] **Step 6: Verify Docker Compose starts ClickHouse (manual check, not part of automated tests)**
 
-Run: `docker compose up -d`
+Run: `docker compose up -d` (or `docker-compose up -d` if your Docker installation only has the standalone binary, not the Compose plugin — check with `docker compose version` first)
 Expected: the `apexes-clickhouse` container starts and reports healthy. Verify with:
 Run: `curl http://localhost:8123/ping`
 Expected: `Ok.`
 
-Run: `docker compose down` to stop it after verifying (later tasks will start it again as needed for `--ignored` tests).
+Run: `docker compose down` (or `docker-compose down`) to stop it after verifying (later tasks will start it again as needed for `--ignored` tests).
 
 - [ ] **Step 7: Commit**
 
@@ -1672,11 +1673,11 @@ async fn write_batch_rejects_mixed_event_types() {
 Run: `cargo test -p apexes-storage`
 Expected: all 5 new tests in `live_clickhouse.rs` show as ignored (not run), no database connection attempted.
 
-- [ ] **Step 3: Run the live tests manually (requires `docker compose up -d` first)**
+- [ ] **Step 3: Run the live tests manually (requires ClickHouse running locally first)**
 
-Run: `docker compose up -d` then wait ~5 seconds for ClickHouse to be ready, then:
+Run: `docker compose up -d` (or `docker-compose up -d` on machines with only the standalone binary) then wait ~5 seconds for ClickHouse to be ready, then:
 Run: `cargo test -p apexes-storage -- --ignored`
-Expected: all 5 tests pass (`write_and_read_back_trades`, `write_and_read_back_ticks`, `write_and_read_back_depth_with_nested_levels`, `write_and_read_back_bars`, `write_batch_rejects_mixed_event_types`). If ClickHouse isn't running or isn't ready yet, these will fail with a connection error -- if that happens, verify `docker compose ps` shows the container healthy and retry. This is expected to work (not an "environment-dependent, acceptable to fail" situation like sub-project #1's live Binance test) since Docker Compose is checked into this repo and should be startable in any environment with Docker available; if Docker itself is unavailable in your execution environment, report that specific limitation honestly.
+Expected: all 5 tests pass (`write_and_read_back_trades`, `write_and_read_back_ticks`, `write_and_read_back_depth_with_nested_levels`, `write_and_read_back_bars`, `write_batch_rejects_mixed_event_types`). If ClickHouse isn't running or isn't ready yet, these will fail with a connection error -- if that happens, verify `docker compose ps`/`docker-compose ps` shows the container healthy and retry. This is expected to work (not an "environment-dependent, acceptable to fail" situation like sub-project #1's live Binance test) since Docker Compose is checked into this repo and should be startable in any environment with Docker available; if the pinned image tag (`25.12`, see Task 1's note on the `24.8`→`25.12` adjustment) fails to pull due to registry connectivity in your environment, that is the same class of environmental limitation as sub-project #1's Binance network restriction — report it honestly, it does not block task completion.
 
 - [ ] **Step 4: Run clippy**
 
@@ -1723,8 +1724,8 @@ Expected: zero warnings.
 
 - [ ] **Step 5: Run the live ClickHouse integration tests once more with Docker up, as a final end-to-end confirmation**
 
-Run: `docker compose up -d`, wait for readiness, then `cargo test -p apexes-storage -- --ignored`
-Expected: all 5 tests pass. Run `docker compose down` afterward to clean up.
+Run: `docker compose up -d` (or `docker-compose up -d`), wait for readiness, then `cargo test -p apexes-storage -- --ignored`
+Expected: all 5 tests pass. Run `docker compose down` (or `docker-compose down`) afterward to clean up.
 
 - [ ] **Step 6: If any fixes were needed in Steps 2-3, commit them**
 
