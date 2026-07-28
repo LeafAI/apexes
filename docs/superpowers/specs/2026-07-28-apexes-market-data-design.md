@@ -55,15 +55,17 @@ BinanceMarketDataProvider::subscribe(&self, instruments: &[Instrument])
           序列号校验/缺口检测/重新同步均由 barter-data 内部完成）
      每类订阅的重连与指数退避由 barter-data 在 init() 内部自动应用（默认策略，见 §五），
      不需要显式接线
-  3. 为每类订阅（Trade/L1/L2）各 spawn 一个 tokio task，负责把 barter-data 的事件转换为 Apexes MarketEvent：
+  3. 为每类订阅（Trade/L1/L2）各启动一个任务，负责把 barter-data 的事件转换为 Apexes MarketEvent：
        ├─ trade_task  → PublicTrades 流条目 → MarketEvent::Trade，同时喂给 BarAggregator
        │                （见下）产出 MarketEvent::Bar
        ├─ ticker_task → OrderBooksL1 流条目 → MarketEvent::Tick
        └─ depth_task  → OrderBooksL2 流条目 → DepthConverter → MarketEvent::Depth
-  4. 全部 task 将产出的 MarketEvent 推入同一个共享的 tokio::sync::mpsc 通道
-  5. subscribe() 在 spawn 完成后立即返回 Ok(该通道包装为 BoxStream<'static, MarketEvent>)
+  4. 全部任务将产出的 MarketEvent 推入同一个共享的 tokio::sync::mpsc 通道
+  5. subscribe() 在任务启动完成后立即返回 Ok(该通道包装为 BoxStream<'static, MarketEvent>)
      ——不等待任何一个 WebSocket 握手完成（见 §四"初始连接失败处理"）
 ```
+
+**实现修正说明（Task 7 落地时发现，供后续子项目参考）**：上述"任务"最初设计为 `tokio::spawn` 的普通 tokio task，但实现阶段发现 `barter-data 0.11` 的 `StreamBuilder::init()` 内部 await 的 `SubscribeFuture` 类型为 `Pin<Box<dyn Future<Output = Result<(), DataError>>>>`——**不带 `Send` 约束**，导致整个任务 future 无法满足 `tokio::spawn`（多线程运行时）要求的 `Send` bound。最终实现改为：每个任务运行在独立的操作系统线程上，线程内部构建一个仅单线程的 `tokio::runtime::Runtime`（`new_current_thread()`），通过 `Runtime::block_on`（该方法本身不要求 `Send`）驱动任务 future 执行到完成；future 在线程内部构建，从未跨线程移动，因此可以安全持有非 `Send` 类型。三个任务（trade_task/ticker_task/depth_task）均采用此模式，权威实现见 `crates/apexes-market-data/src/provider.rs` 中的 `spawn_task_thread` 函数及其详细代码注释。这一变化不影响本节描述的数据流与语义（订阅编排、事件转换、错误处理均不变），仅改变了任务的执行载体（OS 线程+独立运行时，而非共享 tokio 运行时上的 task）。
 
 **从 tokio 胶水代码中抽取出的纯逻辑、可独立单元测试的类型**：
 - `BarAggregator`（`bar_aggregator.rs`）——每个 symbol 维护 6 个并行的 interval 累积桶，`on_trade(price, qty, time) -> Vec<Bar>`（一次成交可能触发 0 个或多个 bar 关闭，取决于跨越了多少个区间边界）。由 `trade_task` 在收到每笔 `PublicTrade` 时驱动，不再是独立的 task/独立的 barter-data 订阅——因为 Bar 完全从成交流派生，复用 `trade_task` 已经拿到的成交数据即可，无需重复订阅。
@@ -78,13 +80,16 @@ crates/apexes-market-data/
   Cargo.toml
   src/
     lib.rs
-    provider.rs          # BinanceMarketDataProvider、subscribe()、订阅编排
+    provider.rs          # BinanceMarketDataProvider、subscribe()、任务编排（含 spawn_task_thread）
+    symbol.rs             # split_symbol/symbol_of（纯逻辑，单元测试，三个任务共用）
     bar_aggregator.rs     # BarAggregator（纯逻辑，单元测试）
     depth_converter.rs    # DepthConverter（纯逻辑，单元测试）
-    trade_task.rs         # tokio task：barter-data 成交流 -> MarketEvent::Trade + 驱动 BarAggregator -> MarketEvent::Bar
-    ticker_task.rs        # tokio task：barter-data bookTicker -> MarketEvent::Tick
-    depth_task.rs         # tokio task：barter-data L2 -> DepthConverter -> MarketEvent::Depth
+    trade_task.rs         # 独立线程任务：barter-data 成交流 -> MarketEvent::Trade + 驱动 BarAggregator -> MarketEvent::Bar
+    ticker_task.rs        # 独立线程任务：barter-data bookTicker -> MarketEvent::Tick
+    depth_task.rs         # 独立线程任务：barter-data L2 -> DepthConverter -> MarketEvent::Depth
 ```
+
+（"独立线程任务"即上文"实现修正说明"中描述的 OS 线程 + 单线程 tokio 运行时模式，而非普通 `tokio::spawn` task；`symbol.rs` 为实现阶段从 `trade_task.rs`/`ticker_task.rs` 中提取的共享模块，最初设计文档未单独列出。）
 
 ---
 
