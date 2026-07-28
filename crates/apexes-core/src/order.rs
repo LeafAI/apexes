@@ -41,6 +41,42 @@ impl OrderStatus {
     }
 }
 
+use crate::instrument::Venue;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OrderId(pub Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OrderType {
+    Market,
+    Limit,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Order {
+    pub id: OrderId,
+    pub exchange_order_id: Option<String>,
+    pub symbol: String,
+    pub venue: Venue,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub quantity: Decimal,
+    pub price: Option<Decimal>,
+    pub filled_quantity: Decimal,
+    pub status: OrderStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +173,48 @@ mod tests {
         let mut status = OrderStatus::New;
         let result = status.transition_to(OrderStatus::New);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn order_serde_round_trip() {
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId(Uuid::new_v4()),
+            exchange_order_id: None,
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: rust_decimal_macros::dec!(1.5),
+            price: Some(rust_decimal_macros::dec!(65000)),
+            filled_quantity: rust_decimal_macros::dec!(0),
+            status: OrderStatus::New,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&order).unwrap();
+        let round_tripped: Order = serde_json::from_str(&json).unwrap();
+        assert_eq!(order, round_tripped);
+    }
+
+    #[test]
+    fn market_order_has_no_price() {
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId(Uuid::new_v4()),
+            exchange_order_id: None,
+            symbol: "AAPL".to_string(),
+            venue: Venue::Nasdaq,
+            side: Side::Sell,
+            order_type: OrderType::Market,
+            quantity: rust_decimal_macros::dec!(10),
+            price: None,
+            filled_quantity: rust_decimal_macros::dec!(0),
+            status: OrderStatus::New,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(order.price, None);
+        assert_eq!(order.order_type, OrderType::Market);
     }
 }
