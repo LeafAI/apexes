@@ -175,13 +175,15 @@ Apexes 优先复用成熟开源库，而非从零造轮子，但**核心类型�
 
 ## 三、子项目拆解路线图（Roadmap）
 
-> 完整设计范围过大，无法一次性 spec 完成。以下路线图将其拆解为按顺序推进的子项目；每个子项目在真正开始设计前，都会单独走一次 brainstorming → spec → plan → implementation 流程。**排序依据**：优先跑通"数据→回测→模拟→实盘"的完整垂直切片，且优先选择集成成本最低的市场（加密货币：公开 API、无需券商开户）打通全链路后，再横向扩展到 A股/H股/美股（CTP/XTP 开户、IBKR 入驻、合规成本高得多）。基础设施（消息总线、ClickHouse）与 UI 有意后置——等真实数据流跑起来后再引入更有意义。
+> 完整设计范围过大，无法一次性 spec 完成。以下路线图将其拆解为按顺序推进的子项目；每个子项目在真正开始设计前，都会单独走一次 brainstorming → spec → plan → implementation 流程。**排序依据**：优先跑通"数据→回测→模拟→实盘"的完整垂直切片，且优先选择集成成本最低的市场（加密货币：公开 API、无需券商开户）打通全链路后，再横向扩展到 A股/H股/美股（CTP/XTP 开户、IBKR 入驻、合规成本高得多）。UI 有意后置——等真实数据流跑起来后再引入更有意义。
+>
+> **2026-07-28 更新**：子项目 #2（历史数据存储）brainstorming 阶段中，重新评估了"本地文件优先、ClickHouse 后置"的原定排序。本地 Parquet 方案在设计增量写入语义时遇到真实的格式限制（Parquet 是一次性写入、footer 终结的格式，不支持对已关闭文件追加 row group），且 `clickhouse` Rust 客户端已经成熟稳定（官方维护、1000万+下载量）。综合考虑后决定：**将 ClickHouse 引入的时间点从子项目 #12 提前到子项目 #2**，用 ClickHouse 作为历史数据存储的唯一后端，不再经过"本地文件→ClickHouse"的中间迁移阶段。子项目 #12 相应改为"消息总线"（不再包含存储层）。
 
 | # | 子项目 | Crate（预估） | 依赖 | 一句话目标 |
 |---|---|---|---|---|
 | 0 | 基础骨架（Foundation skeleton） | `apexes-core`, `apexes-cli` | — | 共享类型/trait：Instrument、Order、Fill、MarketDataProvider、ApexesError |
 | 1 | 行情接入（单一免费加密货币源） | `apexes-market-data` | 0 | 一个真实的 `MarketDataProvider` 实现（如 Binance 公开 WS，底层可复用 `barter-data`），验证 trait 端到端可用 |
-| 2 | 历史数据存储（最小可用） | `apexes-storage` | 0, 1 | 本地持久化 tick/bar 数据（先用本地文件/Parquet 或 sqlite，暂缓 ClickHouse） |
+| 2 | 历史数据存储（ClickHouse） | `apexes-storage` | 0, 1 | 用 ClickHouse 持久化 tick/bar 数据，作为唯一存储后端（原计划的"本地文件优先"已于 2026-07-28 调整，见上方更新说明） |
 | 3 | 回测引擎 | `apexes-backtest` | 0, 2 | Tick 重放 + 撮合模拟器 + 成本模型 |
 | 4 | 策略 SDK | `apexes-strategy` | 0 | Rust trait 策略 API，可在回测中运行 |
 | 5 | 风控引擎（事前风控） | `apexes-risk` | 0 | 限额检查、黑白名单、自成交防范——回测/模拟/实盘共用 |
@@ -191,12 +193,12 @@ Apexes 优先复用成熟开源库，而非从零造轮子，但**核心类型�
 | 9 | EMS / 执行算法 | `apexes-ems` | 7, 8 | TWAP/VWAP/冰山、智能路由 |
 | 10 | 其他市场网关 | `apexes-gateway-ashare`, `-hshare`, `-usequity` | 7, 8 | 加密货币路径验证后，扩展到 A股/H股/美股 |
 | 11 | 账户与资金管理 | `apexes-account` | 7 | 多市场持仓、盈亏、汇率折算 |
-| 12 | 消息总线与完整存储层 | 基础设施，非独立 crate | 1–8 | 达到规模瓶颈后引入 NATS JetStream + ClickHouse/PostgreSQL |
+| 12 | 消息总线 | 基础设施，非独立 crate | 1–8 | 达到规模瓶颈后引入 NATS JetStream（存储层已于 #2 提前完成，不再包含在本子项目） |
 | 13 | UI | `apexes-ui` | 1, 7, 8 | egui/wgpu 仪表盘，通过消息总线订阅 |
 | 14 | 监控运维 | 横切关注点 | 持续 | tracing/OTel、Prometheus、高可用/故障切换 |
 | 15 | 安全与合规 | 横切关注点 | 持续 | KMS/HSM、RBAC、审计日志、监管报送 |
 
-**当前所处阶段**：子项目 #0（基础骨架）正在设计中，尚未进入 writing-plans 阶段。
+**当前所处阶段**：子项目 #0、#1 已完成；子项目 #2（历史数据存储，ClickHouse）设计中。
 
 ---
 

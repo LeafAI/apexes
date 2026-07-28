@@ -105,7 +105,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 8.1 | Time-series database (ClickHouse/QuestDB — tick & K-line storage) | #12 | 🔲 Not Started | Local file/sqlite used as interim solution in #2 |
+| 8.1 | Time-series database (ClickHouse/QuestDB — tick & K-line storage) | #2 | 🔲 Not Started | ClickHouse introduced in #2 (moved up from #12 on 2026-07-28; #2 is now the sole storage backend, no interim local-file phase) |
 | 8.2 | Relational database (PostgreSQL — config/account/order storage) | #7 / #12 | 🔲 Not Started | Introduced when OMS needs durable order storage |
 | 8.3 | Message bus (NATS JetStream or self-built lock-free ring buffer) | #12 | 🔲 Not Started | |
 | 8.4 | In-memory cache (Redis or self-built shared-memory cache) | #12 | 🔲 Not Started | |
