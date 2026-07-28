@@ -6,5 +6,7 @@
 //! `OrderStatus` state machine.
 
 pub mod error;
+pub mod instrument;
 
 pub use error::ApexesError;
+pub use instrument::{AssetClass, Instrument, MarketType, Venue};
