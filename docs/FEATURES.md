@@ -165,4 +165,4 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
-**Current active work:** Sub-project `#0` (Foundation skeleton) — design phase, not yet at `writing-plans`.
+**Current active work:** Sub-project `#0` (Foundation skeleton) — implementation complete (all 9 plan tasks done, workspace builds/tests/clippy/fmt clean). Next: sub-project `#1` (single-source crypto market data ingestion).
