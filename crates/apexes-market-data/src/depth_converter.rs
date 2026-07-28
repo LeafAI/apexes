@@ -40,8 +40,14 @@ mod tests {
         OrderBook::new(
             sequence,
             Some(Utc::now()),
-            vec![BarterLevel { price: dec!(64999.5), amount: dec!(1.5) }],
-            vec![BarterLevel { price: dec!(65000.5), amount: dec!(2.0) }],
+            vec![BarterLevel {
+                price: dec!(64999.5),
+                amount: dec!(1.5),
+            }],
+            vec![BarterLevel {
+                price: dec!(65000.5),
+                amount: dec!(2.0),
+            }],
         )
     }
 

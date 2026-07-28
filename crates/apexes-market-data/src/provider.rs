@@ -160,6 +160,9 @@ mod tests {
 
         let result = provider.subscribe(&instruments).await;
 
-        assert!(matches!(result, Err(ApexesError::SubscriptionFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(ApexesError::SubscriptionFailed { .. })
+        ));
     }
 }
