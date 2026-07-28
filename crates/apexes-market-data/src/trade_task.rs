@@ -43,7 +43,16 @@ pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
     let subscriptions: Vec<_> = symbols
         .iter()
         .filter_map(|symbol| {
-            let (base, quote) = split_symbol(symbol)?;
+            let (base, quote) = match split_symbol(symbol) {
+                Some(pair) => pair,
+                None => {
+                    tracing::warn!(
+                        %symbol,
+                        "trade_task: skipping symbol with unrecognized quote currency"
+                    );
+                    return None;
+                }
+            };
             Some((
                 BinanceSpot::default(),
                 base,
