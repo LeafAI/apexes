@@ -1,0 +1,20 @@
+[package]
+name = "apexes-market-data"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+barter-data = { workspace = true }
+barter-instrument = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
