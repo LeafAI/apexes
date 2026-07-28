@@ -29,9 +29,12 @@
 
 1. **`barter-data` 已经完整实现了 Binance 官方文档规定的订单簿同步算法**——REST 快照获取 + WebSocket 增量更新的 `U`/`u`/`pu` 序列号校验 + 缺口检测（`BinanceSpotOrderBookL2Sequencer::validate_sequence`，逻辑与 [Binance 官方"如何正确维护本地订单簿"文档](https://binance-docs.github.io/apidocs/spot/en/#how-to-manage-a-local-order-book-correctly) 完全一致），并通过 `OrderBookEvent::Snapshot`/`Update` 变体向外暴露结果。这正是本子项目原本计划自行实现的、风险最高的部分。
 2. `barter_data::books::OrderBook` 提供 `sequence() -> u64`、`bids() -> &OrderBookSide<Bids>`、`asks() -> &OrderBookSide<Asks>`、`time_engine() -> Option<DateTime<Utc>>` 等公开访问器，足以映射到 Apexes 自己的 `DepthUpdate`。
-3. **`barter-data` 的 `Streams<T>::builder()` API 已经内置多交易对订阅与断线重连**：`.subscribe([...])` 支持一次性订阅多个 `(exchange, base, quote, kind, subscription_kind)` 元组；`ReconnectingStream::with_reconnect_backoff(policy, stream_key)` 提供开箱即用的指数退避重连（`ReconnectionBackoffPolicy { backoff_ms_initial, backoff_multiplier, backoff_ms_max }`，均可配置）。这意味着"多交易对支持"和"断线重连"这两项原计划自行实现的能力，`barter-data` 已经提供。
+3. **`barter-data` 的 `Streams<T>::builder()` API 已经内置多交易对订阅与断线重连**：`.subscribe([...])` 支持一次性订阅多个 `(exchange, base, quote, kind, subscription_kind)` 元组；重连与指数退避在 `StreamBuilder::init()` 内部自动应用（通过 `init_market_stream()` 内部调用 `ReconnectingStream::with_reconnect_backoff`），对调用方透明，**不需要**手动接线。这意味着"多交易对支持"和"断线重连"这两项原计划自行实现的能力，`barter-data` 已经提供，且比预想的更"开箱即用"——连显式调用重连 API 都不需要。
 
-**已知限制**：`barter-data` 的 `ReconnectionBackoffPolicy` **不支持抖动（jitter）**——其重连延迟是确定性的 `initial × multiplier^n`（封顶），没有随机化选项。这与本设计文档最初打算的"±25% 抖动，避免多个 symbol 同时掉线时的同步重连风暴"要求冲突。**决策（用户已确认）**：采用 `barter-data` 内置的重连机制（配置为 1 秒初始 / 2x 倍增 / 30 秒封顶，与原计划参数一致），放弃抖动要求——理由是自行包一层抖动逻辑所需的额外复杂度，相对于"避免为一个已经解决的问题重新发明轮子"这一更高优先级的工程原则，不划算；且这一子项目的量级（免费数据源、单一交易所、验证性质）尚不需要应对大规模同步重连风暴的场景。
+**已知限制与决策**：
+- `barter-data` 的重连策略通过 `STREAM_RECONNECTION_POLICY` 常量**硬编码**在 `StreamBuilder` 内部（`backoff_ms_initial: 125, backoff_multiplier: 2, backoff_ms_max: 60_000`），公开的 `Streams::builder().subscribe().init()` API **不支持自定义该策略**——若要自定义，需绕过 builder，直接调用更底层的 `init_market_stream(policy, subscriptions)` 函数（需要手动构造 `Subscription` 对象，放弃 builder 的元组语法糖）。
+- `ReconnectionBackoffPolicy` 本身也**不支持抖动（jitter）**——重连延迟是确定性的 `initial × multiplier^n`（封顶）。
+- **决策（用户已确认）**：接受 `barter-data` 的默认策略（125ms 初始 / 2x 倍增 / 60 秒封顶，无抖动），使用更简单的 `Streams::builder()` API，**不再坚持**本设计文档最初提出的 1 秒初始 / 30 秒封顶 / ±25% 抖动这套自定义参数。理由：125ms/60s 是业界常见的合理重连策略；为了保留一套自定义参数而放弃 builder 的简洁 API、改用底层 API 手动构造 `Subscription`，对这一验证性质、面向免费数据源的子项目而言不划算。
 
 **决策**：`apexes-market-data` 使用 `barter-data` 承担 WebSocket 连接、Binance 消息解析、**订单簿快照/增量同步与缺口检测**、**多交易对订阅编排**、**以及断线重连**的全部工作；`apexes-market-data` 自身只负责把 `barter-data` 的规范化类型（`PublicTrade`、`OrderBookL1`、`OrderBookEvent`）转换为 Apexes 自己的 `MarketEvent`，以及在此之上聚合出 `Bar`（`barter-data` 不提供 K线聚合，且不同交易所的原生 kline 粒度不一致，自行聚合可在未来跨交易所时保持行为一致）。
 
@@ -50,8 +53,8 @@ BinanceMarketDataProvider::subscribe(&self, instruments: &[Instrument])
        ├─ Streams::<OrderBooksL1>::builder().subscribe([...]) → bookTicker 流
        └─ Streams::<OrderBooksL2>::builder().subscribe([...]) → L2 订单簿流（快照+增量，
           序列号校验/缺口检测/重新同步均由 barter-data 内部完成）
-     每类订阅各自应用 barter-data 内置的 with_reconnect_backoff(policy, stream_key)
-     （policy 配置为 1 秒初始 / 2x 倍增 / 30 秒封顶，见 §五）
+     每类订阅的重连与指数退避由 barter-data 在 init() 内部自动应用（默认策略，见 §五），
+     不需要显式接线
   3. 为每类订阅（Trade/L1/L2）各 spawn 一个 tokio task，负责把 barter-data 的事件转换为 Apexes MarketEvent：
        ├─ trade_task  → PublicTrades 流条目 → MarketEvent::Trade，同时喂给 BarAggregator
        │                （见下）产出 MarketEvent::Bar
@@ -93,13 +96,13 @@ crates/apexes-market-data/
 
 ## 五、断线重连
 
-**行为**：复用 `barter-data` 内置的 `ReconnectingStream::with_reconnect_backoff(policy, stream_key)`，不自行实现重连循环。三类订阅（Trade/L1/L2）分别应用该机制；无论是初始连接失败还是运行中断线，都由 `barter-data` 统一处理；重连对下游消费者透明——返回的 `BoxStream` 永远不会因为某个 symbol 掉线而结束，只是暂时停止产出该 symbol 的事件，重连成功后自动恢复。
+**行为**：完全复用 `barter-data` 的 `Streams::builder().subscribe([...]).init()` 内置重连机制，不自行编写任何重连/退避代码，也不需要显式调用 `with_reconnect_backoff`——`StreamBuilder::init()` 内部已经自动应用。三类订阅（Trade/L1/L2）均自动获得该行为；无论是初始连接失败还是运行中断线，都由 `barter-data` 统一处理；重连对下游消费者透明——返回的 `BoxStream` 永远不会因为某个 symbol 掉线而结束，只是暂时停止产出该 symbol 的事件，重连成功后自动恢复。
 
-**退避参数**（通过 `barter_data::streams::reconnect::stream::ReconnectionBackoffPolicy` 配置）：
-- `backoff_ms_initial: 1000`（1 秒）
+**退避参数**（`barter-data` 默认策略，`STREAM_RECONNECTION_POLICY` 常量，不可自定义——见 §二"已知限制与决策"）：
+- `backoff_ms_initial: 125`（125 毫秒）
 - `backoff_multiplier: 2`（每次失败后延迟翻倍）
-- `backoff_ms_max: 30_000`（30 秒封顶）
-- **无抖动**：`barter-data` 的 `ReconnectionBackoffPolicy` 不提供抖动选项，重连延迟是确定性的 `initial × multiplier^n`（封顶）。已确认放弃抖动要求（见 §二"已知限制"），理由是自行包一层抖动逻辑的额外复杂度，相对于复用已验证实现这一更高优先级的原则不划算，且本子项目量级尚不需要应对大规模同步重连风暴。
+- `backoff_ms_max: 60_000`（60 秒封顶）
+- **无抖动**：确定性的 `initial × multiplier^n`（封顶）。已确认接受该默认值（见 §二），不再坚持自定义参数或抖动。
 
 **Depth 重连语义**：`depth_task` 底层的 `barter-data` L2 订阅重连后，会重新获取订单簿快照；这在 Apexes 层面自然表现为下一条 `DepthUpdate` 的 `is_snapshot: true`——下游消费者据此判断"必须丢弃之前维护的本地状态，从此更新重新开始"，无需额外的错误信号或专门的重连事件类型。这一约定同样适用于 `barter-data` 内部检测到序列号缺口（`DataError::InvalidSequence`）而触发的重新同步：无论重连原因是网络中断还是序列号缺口，都统一表现为下一条 `DepthUpdate.is_snapshot == true`。
 
