@@ -1,6 +1,6 @@
 use crate::conversion::{CkDecimal, decimal_to_fixed, fixed_to_decimal};
 use crate::error::StorageError;
-use apexes_core::{Side, Tick, TradeEvent, Venue};
+use apexes_core::{Bar, BarInterval, DepthUpdate, PriceLevel, Side, Tick, TradeEvent, Venue};
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,41 @@ CREATE TABLE IF NOT EXISTS ticks
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (venue, symbol, timestamp)
+";
+
+pub const DEPTH_UPDATES_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS depth_updates
+(
+    symbol      String,
+    venue       String,
+    bids        Array(Tuple(Decimal(38, 10), Decimal(38, 10))),
+    asks        Array(Tuple(Decimal(38, 10), Decimal(38, 10))),
+    sequence    Nullable(UInt64),
+    is_snapshot Bool,
+    timestamp   DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (venue, symbol, timestamp)
+";
+
+pub const BARS_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS bars
+(
+    symbol      String,
+    venue       String,
+    open        Decimal(38, 10),
+    high        Decimal(38, 10),
+    low         Decimal(38, 10),
+    close       Decimal(38, 10),
+    volume      Decimal(38, 10),
+    interval    String,
+    open_time   DateTime64(3, 'UTC'),
+    close_time  DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(open_time)
+ORDER BY (venue, symbol, interval, open_time)
 ";
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -122,6 +157,140 @@ impl TryFrom<TickRow> for Tick {
             ask_size: fixed_to_decimal(row.ask_size),
             timestamp: row.timestamp,
         })
+    }
+}
+
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct DepthRow {
+    pub symbol: String,
+    pub venue: String,
+    pub bids: Vec<(CkDecimal, CkDecimal)>,
+    pub asks: Vec<(CkDecimal, CkDecimal)>,
+    pub sequence: Option<u64>,
+    pub is_snapshot: bool,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl TryFrom<&DepthUpdate> for DepthRow {
+    type Error = StorageError;
+
+    fn try_from(update: &DepthUpdate) -> Result<Self, StorageError> {
+        Ok(DepthRow {
+            symbol: update.symbol.clone(),
+            venue: format!("{:?}", update.venue),
+            bids: levels_to_pairs(&update.bids)?,
+            asks: levels_to_pairs(&update.asks)?,
+            sequence: update.sequence,
+            is_snapshot: update.is_snapshot,
+            timestamp: update.timestamp,
+        })
+    }
+}
+
+impl TryFrom<DepthRow> for DepthUpdate {
+    type Error = StorageError;
+
+    fn try_from(row: DepthRow) -> Result<Self, StorageError> {
+        Ok(DepthUpdate {
+            symbol: row.symbol,
+            venue: parse_venue(&row.venue)?,
+            bids: pairs_to_levels(row.bids),
+            asks: pairs_to_levels(row.asks),
+            sequence: row.sequence,
+            is_snapshot: row.is_snapshot,
+            timestamp: row.timestamp,
+        })
+    }
+}
+
+fn levels_to_pairs(levels: &[PriceLevel]) -> Result<Vec<(CkDecimal, CkDecimal)>, StorageError> {
+    levels
+        .iter()
+        .map(|level| {
+            Ok((
+                decimal_to_fixed(level.price)?,
+                decimal_to_fixed(level.quantity)?,
+            ))
+        })
+        .collect()
+}
+
+fn pairs_to_levels(pairs: Vec<(CkDecimal, CkDecimal)>) -> Vec<PriceLevel> {
+    pairs
+        .into_iter()
+        .map(|(price, quantity)| PriceLevel {
+            price: fixed_to_decimal(price),
+            quantity: fixed_to_decimal(quantity),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct BarRow {
+    pub symbol: String,
+    pub venue: String,
+    pub open: CkDecimal,
+    pub high: CkDecimal,
+    pub low: CkDecimal,
+    pub close: CkDecimal,
+    pub volume: CkDecimal,
+    pub interval: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub open_time: DateTime<Utc>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub close_time: DateTime<Utc>,
+}
+
+impl TryFrom<&Bar> for BarRow {
+    type Error = StorageError;
+
+    fn try_from(bar: &Bar) -> Result<Self, StorageError> {
+        Ok(BarRow {
+            symbol: bar.symbol.clone(),
+            venue: format!("{:?}", bar.venue),
+            open: decimal_to_fixed(bar.open)?,
+            high: decimal_to_fixed(bar.high)?,
+            low: decimal_to_fixed(bar.low)?,
+            close: decimal_to_fixed(bar.close)?,
+            volume: decimal_to_fixed(bar.volume)?,
+            interval: format!("{:?}", bar.interval),
+            open_time: bar.open_time,
+            close_time: bar.close_time,
+        })
+    }
+}
+
+impl TryFrom<BarRow> for Bar {
+    type Error = StorageError;
+
+    fn try_from(row: BarRow) -> Result<Self, StorageError> {
+        Ok(Bar {
+            symbol: row.symbol,
+            venue: parse_venue(&row.venue)?,
+            open: fixed_to_decimal(row.open),
+            high: fixed_to_decimal(row.high),
+            low: fixed_to_decimal(row.low),
+            close: fixed_to_decimal(row.close),
+            volume: fixed_to_decimal(row.volume),
+            interval: parse_bar_interval(&row.interval)?,
+            open_time: row.open_time,
+            close_time: row.close_time,
+        })
+    }
+}
+
+pub(crate) fn parse_bar_interval(value: &str) -> Result<BarInterval, StorageError> {
+    match value {
+        "OneSecond" => Ok(BarInterval::OneSecond),
+        "OneMinute" => Ok(BarInterval::OneMinute),
+        "FiveMinutes" => Ok(BarInterval::FiveMinutes),
+        "FifteenMinutes" => Ok(BarInterval::FifteenMinutes),
+        "OneHour" => Ok(BarInterval::OneHour),
+        "OneDay" => Ok(BarInterval::OneDay),
+        other => Err(StorageError::QueryFailed {
+            reason: format!("unrecognized bar interval string in ClickHouse row: {other}"),
+        }),
     }
 }
 
@@ -230,5 +399,122 @@ mod tests {
     fn parse_venue_rejects_unknown_string() {
         let result = parse_venue("NotARealVenue");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn depth_update_round_trips_through_depth_row() {
+        let update = DepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            bids: vec![
+                PriceLevel {
+                    price: dec!(64999.5),
+                    quantity: dec!(1.5),
+                },
+                PriceLevel {
+                    price: dec!(64998.0),
+                    quantity: dec!(2.0),
+                },
+            ],
+            asks: vec![PriceLevel {
+                price: dec!(65000.5),
+                quantity: dec!(1.0),
+            }],
+            sequence: Some(12345),
+            is_snapshot: true,
+            timestamp: Utc::now(),
+        };
+
+        let row = DepthRow::try_from(&update).unwrap();
+        let back = DepthUpdate::try_from(row).unwrap();
+
+        assert_eq!(back.symbol, update.symbol);
+        assert_eq!(back.venue, update.venue);
+        assert_eq!(back.bids.len(), 2);
+        assert_eq!(back.bids[0].price, dec!(64999.5));
+        assert_eq!(back.bids[0].quantity, dec!(1.5));
+        assert_eq!(back.bids[1].price, dec!(64998.0));
+        assert_eq!(back.asks.len(), 1);
+        assert_eq!(back.asks[0].price, dec!(65000.5));
+        assert_eq!(back.sequence, Some(12345));
+        assert!(back.is_snapshot);
+    }
+
+    #[test]
+    fn depth_update_with_empty_sides_round_trips() {
+        let update = DepthUpdate {
+            symbol: "ETHUSDT".to_string(),
+            venue: Venue::Okx,
+            bids: vec![],
+            asks: vec![],
+            sequence: None,
+            is_snapshot: false,
+            timestamp: Utc::now(),
+        };
+
+        let row = DepthRow::try_from(&update).unwrap();
+        let back = DepthUpdate::try_from(row).unwrap();
+
+        assert!(back.bids.is_empty());
+        assert!(back.asks.is_empty());
+        assert_eq!(back.sequence, None);
+        assert!(!back.is_snapshot);
+    }
+
+    #[test]
+    fn bar_round_trips_through_bar_row() {
+        let now = Utc::now();
+        let bar = Bar {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            open: dec!(65000),
+            high: dec!(65100),
+            low: dec!(64900),
+            close: dec!(65050),
+            volume: dec!(123.456),
+            interval: BarInterval::OneMinute,
+            open_time: now,
+            close_time: now,
+        };
+
+        let row = BarRow::try_from(&bar).unwrap();
+        let back = Bar::try_from(row).unwrap();
+
+        assert_eq!(back.symbol, bar.symbol);
+        assert_eq!(back.venue, bar.venue);
+        assert_eq!(back.open, bar.open);
+        assert_eq!(back.high, bar.high);
+        assert_eq!(back.low, bar.low);
+        assert_eq!(back.close, bar.close);
+        assert_eq!(back.volume, bar.volume);
+        assert_eq!(back.interval, bar.interval);
+    }
+
+    #[test]
+    fn parse_bar_interval_rejects_unknown_string() {
+        let result = parse_bar_interval("NotARealInterval");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_bar_interval_handles_all_six_variants() {
+        assert_eq!(
+            parse_bar_interval("OneSecond").unwrap(),
+            BarInterval::OneSecond
+        );
+        assert_eq!(
+            parse_bar_interval("OneMinute").unwrap(),
+            BarInterval::OneMinute
+        );
+        assert_eq!(
+            parse_bar_interval("FiveMinutes").unwrap(),
+            BarInterval::FiveMinutes
+        );
+        assert_eq!(
+            parse_bar_interval("FifteenMinutes").unwrap(),
+            BarInterval::FifteenMinutes
+        );
+        assert_eq!(parse_bar_interval("OneHour").unwrap(), BarInterval::OneHour);
+        assert_eq!(parse_bar_interval("OneDay").unwrap(), BarInterval::OneDay);
     }
 }
