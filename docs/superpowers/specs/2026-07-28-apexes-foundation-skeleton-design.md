@@ -359,7 +359,7 @@ pub trait MarketDataProvider: Send + Sync {
 **字段命名说明**：字段名为 `source_detail` 而非 `source`——`thiserror` 的 derive 宏会将任何名为 `source` 的字段特殊处理为错误链的 `std::error::Error::source()`，强制要求其类型实现 `std::error::Error`，这与 `Option<String>`（为保持 `Clone` 而选择的类型）冲突，编译期即报错（`E0599`，已用 `thiserror 2.0.19` 独立验证复现）。重命名为 `source_detail` 可在保留 `#[derive(thiserror::Error)]` 的前提下规避此冲突。
 
 ```rust
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ApexesError {
     #[error("invalid instrument: {reason}")]
     InvalidInstrument { reason: String },
