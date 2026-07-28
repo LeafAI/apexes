@@ -1,3 +1,4 @@
+use crate::instrument::Venue;
 use crate::order::OrderStatus;
 use thiserror::Error;
 
@@ -14,6 +15,14 @@ pub enum ApexesError {
 
     #[error("market data connection failed: {reason}")]
     ConnectionFailed {
+        reason: String,
+        source_detail: Option<String>,
+    },
+
+    #[error("subscription failed for {symbol} on {venue:?}: {reason}")]
+    SubscriptionFailed {
+        symbol: String,
+        venue: Venue,
         reason: String,
         source_detail: Option<String>,
     },
@@ -42,5 +51,19 @@ mod tests {
         };
         let cloned = err.clone();
         assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn subscription_failed_display() {
+        let err = ApexesError::SubscriptionFailed {
+            symbol: "BTCUSDT".to_string(),
+            venue: crate::instrument::Venue::Binance,
+            reason: "rate limited".to_string(),
+            source_detail: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "subscription failed for BTCUSDT on Binance: rate limited"
+        );
     }
 }

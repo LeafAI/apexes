@@ -1,6 +1,9 @@
-use crate::instrument::Venue;
+use crate::error::ApexesError;
+use crate::instrument::{Instrument, Venue};
 use crate::order::Side;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +74,19 @@ pub struct TradeEvent {
     pub side: Option<Side>,
     pub trade_id: Option<String>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Streams normalized [`MarketEvent`]s for a set of [`Instrument`]s.
+///
+/// Implementations are expected to be registered behind `Box<dyn
+/// MarketDataProvider>` so data sources can be swapped via configuration
+/// (free vs. paid feeds) without touching strategy or risk code.
+#[async_trait]
+pub trait MarketDataProvider: Send + Sync {
+    async fn subscribe(
+        &self,
+        instruments: &[Instrument],
+    ) -> Result<BoxStream<'static, MarketEvent>, ApexesError>;
 }
 
 #[cfg(test)]
@@ -168,5 +184,12 @@ mod tests {
             timestamp: Utc::now(),
         };
         assert_eq!(event.side, None);
+    }
+
+    #[test]
+    fn market_data_provider_is_object_safe() {
+        // This function only needs to compile — it proves MarketDataProvider
+        // can be used as a trait object, which #[async_trait] enables.
+        fn _assert_object_safe(_providers: Vec<Box<dyn MarketDataProvider>>) {}
     }
 }
