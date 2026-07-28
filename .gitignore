@@ -1,0 +1,12 @@
+# Rust
+/target/
+**/target/
+
+# Local dev-tool skills symlink (machine-specific, points to local plugin cache)
+/.claude/
+
+# Editor/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
