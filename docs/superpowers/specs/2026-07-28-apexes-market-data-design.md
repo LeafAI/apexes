@@ -8,7 +8,7 @@
 
 ### 包含
 - 新增 workspace 成员 crate：`apexes-market-data`
-- `BinanceMarketDataProvider`：`apexes-core::MarketDataProvider` 的真实实现
+- `BinanceMarketDataProvider`：`apexes-core::MarketDataProvider` 的真实实现，仅覆盖 Binance 现货（Spot）市场
 - 同时支持多个交易对（`subscribe(&[Instrument])` 的 slice 语义）
 - 产出全部 4 种 `MarketEvent` variant：`Trade`、`Tick`（bookTicker）、`Depth`（L2 订单簿）、`Bar`（自研 OHLCV 聚合，覆盖全部 6 个 `BarInterval`）
 - 断线自动重连（指数退避，由 `barter-data` 内置机制提供），对下游消费者透明
@@ -89,7 +89,8 @@ crates/apexes-market-data/
 ## 四、`Instrument` 过滤与错误处理
 
 - **venue 不匹配**：`subscribe()` 静默跳过 `venue != Venue::Binance` 的 `Instrument`，通过 `tracing::warn!` 记录，不中断整个调用——允许调用方传入混合 venue 的列表而不需要提前过滤。
-- **过滤后为空**：若所有 instrument 都被跳过（结果为空列表），返回 `Err(ApexesError::SubscriptionFailed { .. })`——因为一个空订阅永远不会产出任何数据，这本身就是一个真实错误，而非可以静默忽略的边界情况。
+- **asset_class 不匹配**：同样的处理方式，`subscribe()` 静默跳过 `asset_class != AssetClass::Spot` 的 `Instrument`（`Perpetual`/`Future`/`Option`/`Equity`），通过 `tracing::warn!` 记录。本子项目只对接 Binance 现货市场数据（对应 `barter_data::exchange::binance::spot::BinanceSpot`）；永续合约/期货/期权需要不同的 `barter-data` 交易所类型（如 `BinanceFuturesUsd`），明确超出本子项目范围。
+- **过滤后为空**：若所有 instrument 都被跳过（因 venue 或 asset_class 不匹配，结果为空列表），返回 `Err(ApexesError::SubscriptionFailed { .. })`——因为一个空订阅永远不会产出任何数据，这本身就是一个真实错误，而非可以静默忽略的边界情况。
 - **初始连接失败处理**：`subscribe()` 在 spawn 完 3 个订阅任务（Trade/L1/L2，每个内部覆盖全部通过过滤的 instrument）后立即返回 `Ok`，**不等待**任何 WebSocket 握手完成。某个 symbol 的初始连接失败与运行中掉线走同一条 `barter-data` 内置重连路径（见 §五），不存在单独的"初始连接错误"分支——这样可以避免 `subscribe()` 因为等待握手而变慢，也避免一个坏 symbol 阻塞整个调用。
 
 ---
