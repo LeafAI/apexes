@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data"]
+members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage"]
 
 [workspace.package]
 edition = "2024"
@@ -21,3 +21,5 @@ serde_json = "1.0"
 barter-data = "0.11"
 barter-instrument = "0.3"
 tracing = "0.1"
+clickhouse = { version = "0.15", features = ["chrono"] }
+fixnum = { version = "0.9", features = ["i128", "serde"] }
