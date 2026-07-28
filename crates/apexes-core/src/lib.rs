@@ -4,3 +4,7 @@
 //! This crate contains only data types and trait definitions — no gateway
 //! implementations, no network I/O, no business logic beyond the
 //! `OrderStatus` state machine.
+
+pub mod error;
+
+pub use error::ApexesError;
