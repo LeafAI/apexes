@@ -5,6 +5,7 @@
 pub mod bar_aggregator;
 pub mod depth_converter;
 pub mod provider;
+pub mod ticker_task;
 pub mod trade_task;
 
 pub use provider::BinanceMarketDataProvider;
