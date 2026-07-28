@@ -181,13 +181,16 @@ fn interval_seconds(interval: BarInterval) -> i64 {
 }
 
 /// The interval-aligned bucket boundaries `[start, end)` for `time` at the given interval.
+///
+/// Computed by subtracting the remainder-into-the-current-bucket directly
+/// from `time` (rather than reconstructing a `DateTime` from epoch seconds),
+/// so this never needs to handle a theoretically-invalid timestamp -- `time`
+/// is already a valid `DateTime<Utc>`, and subtracting a `Duration` from a
+/// valid `DateTime<Utc>` cannot fail.
 fn bucket_bounds(interval: BarInterval, time: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     let secs = interval_seconds(interval);
-    let epoch_secs = time.timestamp();
-    let bucket_start_secs = (epoch_secs / secs) * secs;
-    let start = Utc.timestamp_opt(bucket_start_secs, 0).single().expect(
-        "bucket_start_secs is derived from a valid DateTime<Utc>, so it always represents a valid instant",
-    );
+    let remainder_secs = time.timestamp().rem_euclid(secs);
+    let start = time - chrono::Duration::seconds(remainder_secs);
     let end = start + chrono::Duration::seconds(secs);
     (start, end)
 }
@@ -288,24 +291,31 @@ impl BarAggregator {
 
             let (bucket_start, bucket_end) = bucket_bounds(interval, time);
 
-            match self.open_bars.get_mut(&interval) {
-                Some(open_bar) if open_bar.open_time == bucket_start => {
-                    open_bar.accumulate(price, quantity);
-                }
-                Some(_) => {
-                    // Trade belongs to a later bucket than the currently open one:
-                    // close the open bucket, and skip any empty buckets in between.
-                    let previous = self.open_bars.remove(&interval).expect("checked Some above");
+            let open_bucket_is_stale = self
+                .open_bars
+                .get(&interval)
+                .map(|open_bar| open_bar.open_time != bucket_start)
+                .unwrap_or(false);
+
+            if open_bucket_is_stale {
+                // Trade belongs to a later bucket than the currently open one:
+                // close the open bucket, and skip any empty buckets in between.
+                // `remove` returning `Some` here is guaranteed by
+                // `open_bucket_is_stale` only being true when `get` above
+                // already found an entry -- `if let` (not `.expect()`) still
+                // handles the theoretical `None` case defensively rather
+                // than panicking.
+                if let Some(previous) = self.open_bars.remove(&interval) {
                     closed_bars.push(previous.into_bar(self.symbol.clone(), self.venue, interval));
                     // Everything before the new trade's bucket start is now "passed" --
                     // either closed (like the bucket we just removed) or skipped as
                     // empty -- so any trade landing before it from here on is late.
                     self.last_closed_end.insert(interval, bucket_start);
-                    self.open_bars.insert(
-                        interval,
-                        OpenBar::new(price, quantity, bucket_start, bucket_end),
-                    );
                 }
+            }
+
+            match self.open_bars.get_mut(&interval) {
+                Some(open_bar) => open_bar.accumulate(price, quantity),
                 None => {
                     self.open_bars.insert(
                         interval,
