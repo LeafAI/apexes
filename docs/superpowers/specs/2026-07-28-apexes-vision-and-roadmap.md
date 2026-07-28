@@ -170,7 +170,7 @@ flowchart TB
 
 | # | 子项目 | Crate（预估） | 依赖 | 一句话目标 |
 |---|---|---|---|---|
-| 0 | 基础骨架（Foundation skeleton） | `apexes-core`, `apexes-cli` | — | 共享类型/trait：Instrument、Order、Fill、MarketDataProvider、TalonError |
+| 0 | 基础骨架（Foundation skeleton） | `apexes-core`, `apexes-cli` | — | 共享类型/trait：Instrument、Order、Fill、MarketDataProvider、ApexesError |
 | 1 | 行情接入（单一免费加密货币源） | `apexes-market-data` | 0 | 一个真实的 `MarketDataProvider` 实现（如 Binance 公开 WS），验证 trait 端到端可用 |
 | 2 | 历史数据存储（最小可用） | `apexes-storage` | 0, 1 | 本地持久化 tick/bar 数据（先用本地文件/Parquet 或 sqlite，暂缓 ClickHouse） |
 | 3 | 回测引擎 | `apexes-backtest` | 0, 2 | Tick 重放 + 撮合模拟器 + 成本模型 |
