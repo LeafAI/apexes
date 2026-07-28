@@ -144,12 +144,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
 | 0.1 | Cargo workspace layout (`apexes-core`, `apexes-cli`) | #0 | 📝 Designing | |
-| 0.2 | `Instrument` type (unified identity across crypto/A-share/H-share/US equity) | #0 | 📝 Designing | Flat struct + `Market`/`AssetClass` enums, decided |
+| 0.2 | `Instrument` type (unified identity across crypto/A-share/H-share/US equity) | #0 | 📝 Designing | Two-level `MarketType`/`Venue` + `AssetClass` enums, decided |
 | 0.3 | `Order` / `Fill` types + `OrderStatus` state machine | #0 | 📝 Designing | Full state machine with validated transitions, decided |
 | 0.4 | `MarketDataProvider` trait | #0 | 📝 Designing | Async streaming trait signature, decided |
 | 0.5 | `MarketEvent` model (Tick/Depth/Bar/Trade) | #0 | 📝 Designing | Full enum with real payload fields, decided |
 | 0.6 | `ApexesError` unified error type | #0 | 📝 Designing | Single `thiserror` enum, decided |
-| 0.7 | `talon-cli` → `apexes-cli` skeleton (`--version`/`--help` only) | #0 | 📝 Designing | |
+| 0.7 | `apexes-cli` skeleton (`--version`/`--help` only) | #0 | 📝 Designing | |
 
 ---
 
