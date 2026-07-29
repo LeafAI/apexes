@@ -15,6 +15,12 @@ use std::ops::Range;
 /// Configuration for a single backtest run (design spec §8).
 pub struct BacktestConfig {
     pub instruments: Vec<Instrument>,
+    /// Informational / for-caller-use only: `run_backtest` itself never
+    /// reads this field -- event selection is entirely the
+    /// `HistoricalMarketDataSource`'s responsibility. Kept on the config
+    /// so a caller can, for example, construct a
+    /// `StorageMarketDataSource` using the same range, and for future
+    /// use (e.g. runner-side event filtering).
     pub date_range: Range<NaiveDate>,
     /// Required -- no implicit default (design spec §8).
     pub initial_balances: HashMap<String, Decimal>,
@@ -59,6 +65,15 @@ pub async fn run_backtest(
     let mut last_prices: HashMap<String, Decimal> = HashMap::new();
     let mut all_fills: Vec<Fill> = Vec::new();
 
+    // Record the run's TRUE initial equity point (before any event's
+    // fills are applied) so `PerformanceSummary.total_pnl` -- computed
+    // as last-minus-first of the curve -- includes whatever P&L (e.g.
+    // fees) occurred during the very first processed event.
+    if let Some(first_event) = events.first() {
+        let initial_equity = ledger.equity(&last_prices)?;
+        overall_tracker.record_equity_point(event_timestamp(first_event), initial_equity);
+    }
+
     for event in &events {
         let timestamp = event_timestamp(event);
         clock.wait_for_next_event(timestamp).await;
@@ -82,6 +97,7 @@ pub async fn run_backtest(
                         &mut per_venue_trackers,
                         &mut all_fills,
                         &fills,
+                        config.risk_free_return,
                     )?;
                     if let Some(order) = open_orders.get_mut(&order_id)
                         && let Some(last_fill) = fills.last()
@@ -131,6 +147,7 @@ pub async fn run_backtest(
                             &mut per_venue_trackers,
                             &mut all_fills,
                             &fills,
+                            config.risk_free_return,
                         )?;
                     }
                 }
@@ -165,6 +182,9 @@ pub async fn run_backtest(
 /// the ledger, records each fill into the overall/per-symbol/per-venue
 /// `PerformanceTracker`s, and accumulates every fill into `all_fills`
 /// (the `BacktestReport.trades` source) in occurrence order.
+/// `risk_free_return` is threaded through from `BacktestConfig` so the
+/// per-symbol/per-venue trackers' Sharpe/Sortino/Calmar are computed
+/// with the same risk-free rate as the overall summary.
 fn apply_fills(
     ledger: &mut PortfolioLedger,
     overall_tracker: &mut PerformanceTracker,
@@ -172,17 +192,18 @@ fn apply_fills(
     per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
     all_fills: &mut Vec<Fill>,
     fills: &[Fill],
+    risk_free_return: Decimal,
 ) -> Result<(), ApexesError> {
     for fill in fills {
         ledger.apply_fill(fill)?;
         overall_tracker.record_fill(fill);
         per_symbol_trackers
             .entry(fill.symbol.clone())
-            .or_insert_with(|| PerformanceTracker::new(Decimal::ZERO))
+            .or_insert_with(|| PerformanceTracker::new(risk_free_return))
             .record_fill(fill);
         per_venue_trackers
             .entry(format!("{:?}", fill.venue))
-            .or_insert_with(|| PerformanceTracker::new(Decimal::ZERO))
+            .or_insert_with(|| PerformanceTracker::new(risk_free_return))
             .record_fill(fill);
     }
     all_fills.extend_from_slice(fills);

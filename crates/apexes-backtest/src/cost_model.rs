@@ -91,15 +91,22 @@ impl FeeSchedule for FlatFeeSchedule {
     }
 }
 
-/// The backtest's cost model: fees per fill plus periodic funding for open
-/// perpetual positions. Market-impact/slippage is produced naturally by the
-/// matching engine's book-walk fill logic (Tasks 8-11), not modeled here.
+/// The backtest's cost model: fees per fill, plus a funding-rate field
+/// intended for open perpetual positions (NOT YET WIRED UP -- see
+/// `funding_rate_bps`). Market-impact/slippage is produced naturally by
+/// the matching engine's book-walk fill logic (Tasks 8-11), not modeled
+/// here.
 pub struct CostModel {
     pub fee_schedule: Box<dyn FeeSchedule>,
-    /// Applied periodically (every 8h simulated-time, by the matching
-    /// engine's funding-period tracking in Task 11) to open positions on
-    /// `AssetClass::Perpetual` instruments only; `None` disables funding
-    /// entirely (e.g. for spot-only backtests).
+    /// Funding rate (in basis points) for perpetual positions; `None`
+    /// disables funding entirely (e.g. for spot-only backtests).
+    ///
+    /// NOT YET WIRED UP: `funding_payment` is currently dead code; no
+    /// periodic funding pass exists in `run_backtest` or `MatchingEngine`.
+    /// Set `funding_rate_bps: None` for all current (spot-only)
+    /// backtests. Implementing periodic funding application to open
+    /// `AssetClass::Perpetual` positions is deferred to a future
+    /// iteration (see final-review.md finding I2).
     pub funding_rate_bps: Option<Decimal>,
 }
 

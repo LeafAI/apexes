@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 /// Controls the pacing of backtest replay. Logical time for all
-/// strategy/risk/funding-period calculations always derives from event
+/// strategy/risk calculations always derives from event
 /// timestamps regardless of `ReplaySpeed` (design spec §8) -- this clock
 /// only controls whether/how long to artificially wait between
 /// dispatching events, purely for demo/visual-inspection purposes.

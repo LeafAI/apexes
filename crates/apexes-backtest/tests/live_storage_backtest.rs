@@ -100,8 +100,22 @@ async fn backtest_reads_real_data_from_clickhouse_via_storage_market_data_source
         .unwrap();
 
     // NoOpStrategy places no orders, so no trades -- but the run must
-    // complete without error, proving StorageMarketDataSource correctly
-    // read the real Trade event from ClickHouse and fed it through the
-    // full pipeline.
+    // complete without error, and the equity curve must be non-empty,
+    // proving the written Trade event was actually read from ClickHouse
+    // and flowed through StorageMarketDataSource -> run_backtest (an
+    // empty equity curve would mean zero events were processed).
     assert!(report.trades.is_empty());
+    assert!(
+        !report.equity_curve.is_empty(),
+        "equity curve must be non-empty, proving at least one event flowed through the pipeline"
+    );
+    // NoOpStrategy never trades, so equity stays flat at the initial
+    // 10,000 LIVE balance for every recorded point.
+    assert!(
+        report
+            .equity_curve
+            .iter()
+            .all(|(_, equity)| *equity == dec!(10000)),
+        "with no orders, equity must stay flat at the initial balance"
+    );
 }
