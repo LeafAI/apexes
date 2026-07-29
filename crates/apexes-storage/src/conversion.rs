@@ -23,15 +23,19 @@ pub fn decimal_to_fixed(value: Decimal) -> Result<CkDecimal, StorageError> {
     })
 }
 
-/// Converts a ClickHouse `FixedPoint` value back into `rust_decimal::Decimal`.
-/// Goes through `f64` as an intermediate step (matching the `From<FixedPoint>
-/// for f64` impl `fixnum` provides), then re-parses via `Decimal::try_from`.
-/// This is lossy in theory for values at the extreme edge of f64's 52-bit
-/// mantissa, but is exact in practice for all realistic price/quantity
-/// values (well within f64's ~15-17 significant decimal digits).
+/// Converts a ClickHouse `FixedPoint` value back into `rust_decimal::Decimal`
+/// exactly, with no precision loss. `FixedPoint<i128, U10>::into_bits()`
+/// returns the raw `i128` mantissa at `U10`'s fixed 10-decimal-place scale,
+/// which is passed directly to `Decimal::try_from_i128_with_scale` -- the
+/// inverse of `decimal_to_fixed`'s `from_decimal(mantissa, -scale)`. This
+/// avoids round-tripping through `f64`, which silently loses precision for
+/// any value with more significant digits than f64's ~15-17 digit mantissa
+/// can represent (e.g. large `Decimal(38, 10)` values near the column's
+/// actual range, not just "unrealistic" edge cases).
 pub fn fixed_to_decimal(value: CkDecimal) -> Decimal {
-    let as_f64: f64 = value.into();
-    Decimal::try_from(as_f64).unwrap_or(Decimal::ZERO)
+    let raw_mantissa = value.into_bits();
+    Decimal::try_from_i128_with_scale(raw_mantissa, CkDecimal::PRECISION as u32)
+        .unwrap_or(Decimal::ZERO)
 }
 
 #[cfg(test)]
@@ -75,6 +79,26 @@ mod tests {
     fn round_trips_max_supported_scale() {
         // U10 supports up to 10 decimal places.
         let original = dec!(1.2345678901);
+        let fixed = decimal_to_fixed(original).unwrap();
+        let back = fixed_to_decimal(fixed);
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn round_trips_value_exceeding_f64_significant_digits() {
+        // 25 significant digits -- well beyond f64's ~15-17 digit mantissa,
+        // which a round-trip through f64 (the previous implementation)
+        // would silently truncate. This value is realistic for the
+        // Decimal(38, 10) column type these conversions target.
+        let original = dec!(123456789012345.1234567891);
+        let fixed = decimal_to_fixed(original).unwrap();
+        let back = fixed_to_decimal(fixed);
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn round_trips_large_integer_part_with_full_fractional_scale() {
+        let original = dec!(99999999999.9999999999);
         let fixed = decimal_to_fixed(original).unwrap();
         let back = fixed_to_decimal(fixed);
         assert_eq!(back, original);
