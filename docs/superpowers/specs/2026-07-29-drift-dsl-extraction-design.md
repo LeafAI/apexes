@@ -40,13 +40,25 @@ crate path.
   standard-library functionality, not agent-framework-specific, so it belongs alongside the
   language itself rather than staying `drift`-only.
 
-**Future extensibility (not part of this extraction, noted for context):** `drift-dsl` is
-expected to grow additional general-purpose binding crates over time — e.g. a future
-`drift-script-math` crate for numeric/statistical functions — following the same
-`drift-script-stdlib` pattern (depends only on `drift-script` + generic crates). This
-extraction doesn't need to build that now; it's mentioned here only to confirm the
-repository's intended shape (one core language crate + a growing set of independent,
-general-purpose binding crates) so this extraction's structure doesn't need revisiting later.
+**New scope added to this extraction: a `math` module in `drift-script-stdlib`.** While
+copying `drift-script-stdlib`, add one new binding module, `math`, following the exact same
+pattern as its existing modules (`string.rs`, `os.rs`, etc.: a `pub fn all_bindings() ->
+Vec<(&'static str, NativeFn)>`, registered in `lib.rs` via `self.register_module("math",
+math::all_bindings())`). Scope is deliberately minimal — general-purpose arithmetic helpers
+not already covered by the language's own operators, no statistics, no trading-specific
+functions (those belong to `apexes-strategy`'s own binding, built on top of this):
+`abs`, `min`, `max`, `round`, `floor`, `ceil`, `trunc`, `pow`, `sqrt`, `log` (natural log),
+`exp`, `clamp`, plus the constants `PI` and `E` exposed as `math.PI`/`math.E` (following
+`DriftValue::Number(f64)`, matching every other numeric value in the language — `DriftValue`
+has no separate integer type, per `drift-script`'s `value.rs`).
+
+**Future extensibility (not otherwise part of this extraction, noted for context):**
+`drift-dsl` is expected to grow further general-purpose binding modules/crates over time
+beyond this initial `math` module (e.g. deeper statistics if a genuinely general-purpose need
+arises later) following the same pattern. This extraction doesn't need to build more than the
+minimal `math` module described above; the note exists only to confirm the repository's
+intended shape (one core language crate + a growing set of independent, general-purpose
+binding functionality) so this extraction's structure doesn't need revisiting later.
 
 **Explicitly NOT extracted** (stay in the `drift` monorepo, unchanged in scope):
 - `drift-script-ai` (LLM/MCP/ACP bindings) — has real dependencies on `drift-core`,
