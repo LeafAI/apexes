@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage"]
+members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest"]
 
 [workspace.package]
 edition = "2024"
@@ -23,3 +23,4 @@ barter-instrument = "0.3"
 tracing = "0.1"
 clickhouse = { version = "0.15", features = ["chrono"] }
 fixnum = { version = "0.9", features = ["i128", "serde"] }
+barter = "0.12"
