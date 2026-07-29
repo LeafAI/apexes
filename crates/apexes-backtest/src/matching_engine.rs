@@ -68,9 +68,14 @@ pub fn walk_book(levels: &[PriceLevel], quantity: Decimal) -> Option<BookWalkRes
 
 /// Simulates order matching against locally-reconstructed Level-2 depth:
 /// order book reconstruction (via `ReplayOrderBook`), book-walk fills for
-/// market orders, deterministic depth-consumption fills for limit orders
-/// with an optional probabilistic queue-position adjustment (Task 10), and
+/// market orders, TradeEvent-driven fills for resting limit orders with
+/// an optional queue-position threshold (Task 10, design spec §7.3), and
 /// Stop/StopLimit trigger simulation (Task 11).
+///
+/// Limit-order fills are driven by real `TradeEvent`s arriving via
+/// `on_trade_event` (not by depth-diffing); `DepthUpdate`/order-book
+/// state is used only to seed the INITIAL `volume_ahead_required`
+/// threshold at submission time via `submit_limit_order`.
 pub struct MatchingEngine {
     books: HashMap<String, ReplayOrderBook>,
     cost_model: CostModel,
@@ -90,6 +95,16 @@ struct RestingOrder {
     /// submission time as `visible_volume_at_price_at_submission *
     /// queue_position_factor` (design spec §7.3); 0 if
     /// `queue_position_factor` is 0.0 (always eligible immediately).
+    ///
+    /// KNOWN LIMITATION: each resting order's `volume_ahead_required` is
+    /// computed independently at submission time and does not account
+    /// for OTHER resting orders on the same symbol/side. When multiple
+    /// resting orders share a trade, this can allocate more total fill
+    /// volume across them than the trade actually had available past the
+    /// shared queue -- see task-10-review.md for a worked example.
+    /// Acceptable for single-resting-order-per-symbol backtests; revisit
+    /// with a shared-queue-cursor model if multi-order queue-position
+    /// accuracy becomes a requirement.
     volume_ahead_required: Decimal,
     /// Cumulative volume from `TradeEvent`s at this order's limit price
     /// or better, observed since submission. Once this reaches
@@ -100,6 +115,10 @@ struct RestingOrder {
 
 impl MatchingEngine {
     pub fn new(cost_model: CostModel, queue_position_factor: Decimal) -> Self {
+        debug_assert!(
+            (Decimal::ZERO..=Decimal::ONE).contains(&queue_position_factor),
+            "queue_position_factor should be in [0.0, 1.0], got {queue_position_factor}"
+        );
         Self {
             books: HashMap::new(),
             cost_model,
@@ -233,6 +252,14 @@ impl MatchingEngine {
                 reason: format!(
                     "submit_limit_order called with non-Limit OrderType: {:?}",
                     intent.order_type
+                ),
+            });
+        }
+        if intent.quantity <= Decimal::ZERO {
+            return Err(ApexesError::OrderRejected {
+                reason: format!(
+                    "submit_limit_order requires a positive quantity, got {}",
+                    intent.quantity
                 ),
             });
         }
@@ -885,5 +912,29 @@ mod tests {
             engine.on_trade_event(&trade_event("ETHUSDT", dec!(3000), dec!(10)), Utc::now());
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn submit_limit_order_rejects_non_positive_quantity() {
+        let mut engine = no_fee_engine();
+
+        for quantity in [dec!(0), dec!(-1)] {
+            let intent = OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                quantity,
+                price: Some(dec!(65000)),
+                stop_price: None,
+            };
+
+            let result = engine.submit_limit_order(&intent, Utc::now());
+
+            assert!(
+                matches!(result, Err(ApexesError::OrderRejected { .. })),
+                "quantity {quantity} should be rejected"
+            );
+        }
     }
 }
