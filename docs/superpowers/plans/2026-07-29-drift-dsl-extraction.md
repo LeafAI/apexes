@@ -3,15 +3,19 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extract `crates/drift-script` and `crates/drift-script-stdlib` out of the `drift`
-monorepo into a new standalone repository, `github.com/LeafAI/drift-dsl`, then refactor
-`drift`'s consumer crates to depend on it externally via git, so both `drift` and the future
-`apexes-strategy` sub-project can share the same embedded scripting language.
+monorepo into a new standalone repository, `github.com/LeafAI/drift-dsl`, add a new
+`drift-script-math` crate (general-purpose arithmetic + statistics bindings) alongside them,
+then refactor `drift`'s consumer crates to depend on the relocated crates externally via git,
+so both `drift` and the future `apexes-strategy` sub-project can share the same embedded
+scripting language and its general-purpose bindings.
 
-**Architecture:** A small two-member Cargo workspace in `drift-dsl` (`drift-script` +
-`drift-script-stdlib`, unchanged package names, unchanged source, unchanged tests) replaces
-the same two directories inside `drift`'s `crates/*` workspace. `drift`'s 4 consumer crates
-switch their dependency source from `path = "../..."` to `git = "...", rev = "..."`. No
-language/API changes — this is a pure repository/dependency-graph relocation.
+**Architecture:** A three-member Cargo workspace in `drift-dsl` (`drift-script` +
+`drift-script-stdlib`, both relocated with unchanged package names/source/tests; plus the new
+`drift-script-math`) replaces the two relocated directories inside `drift`'s `crates/*`
+workspace. `drift`'s 4 consumer crates switch their dependency source from `path = "../..."`
+to `git = "...", rev = "..."` for `drift-script`/`drift-script-stdlib` (the only two they
+currently use). No language/API changes to the relocated crates — this is a pure
+repository/dependency-graph relocation for them; `drift-script-math` is genuinely new code.
 
 **Tech Stack:** Rust edition 2024, Cargo workspaces, git (GitHub, `gh` CLI available and
 authenticated with `repo`+`workflow` scopes), GitHub Actions for CI.
@@ -349,44 +353,67 @@ this repo's first "stable" commit that `drift`'s consumers should pin to.
 
 ---
 
-### Task 3: Add a `math` binding module to `drift-script-stdlib`
+### Task 3: Create the new `drift-script-math` crate (arithmetic + statistics bindings)
 
 **Files (in `~/src/oss/drift-dsl`):**
-- Create: `crates/drift-script-stdlib/src/math.rs`
-- Modify: `crates/drift-script-stdlib/src/lib.rs`
+- Create: `crates/drift-script-math/Cargo.toml`
+- Create: `crates/drift-script-math/src/lib.rs`
+- Create: `crates/drift-script-math/src/arithmetic.rs`
+- Create: `crates/drift-script-math/src/statistics.rs`
+- Modify: `Cargo.toml` (workspace root -- add `crates/drift-script-math` to `members`, though
+  the `"crates/*"` glob already covers this automatically; no edit needed if the glob is used,
+  confirm this is the case before skipping the edit)
 
 **Interfaces:**
-- Consumes: `drift_script::{DriftValue, NativeFn}` (from Task 1), the crate-private
-  `error_object`/`require_number` helper pattern already used by sibling modules (e.g.
-  `string.rs`'s `require_usize`).
-- Produces: a new `math` module registered into `BindingRegistry`, exposing `math.abs`,
-  `math.min`, `math.max`, `math.round`, `math.floor`, `math.ceil`, `math.trunc`, `math.pow`,
-  `math.sqrt`, `math.log`, `math.exp`, `math.clamp` (functions) and `math.PI`, `math.E`
-  (constants) to any Drift Script using this stdlib.
+- Consumes: `drift_script::{DriftValue, NativeFn}` (from Task 1).
+- Produces: a new `drift-script-math` crate exposing a `BindingRegistry`-style registration
+  function (`pub fn register_to(interp: &drift_script::Interpreter)` or an equivalent
+  `BindingProvider` impl -- match whichever integration shape `drift-script-stdlib` itself
+  uses, since this crate should follow the same convention, not invent a new one) that
+  installs a `math` global object with: `abs`, `min`, `max`, `round`, `floor`, `ceil`,
+  `trunc`, `pow`, `sqrt`, `log`, `exp`, `clamp` (arithmetic functions), `PI`/`E` (constants),
+  and `mean`, `stddev`, `variance`, `sum`, `product` (statistics functions operating on a
+  `DriftValue::Array` of numbers).
 
-- [ ] **Step 1: Write `math.rs`**
+This crate is NEW code (no existing `drift`-side source to copy) -- write it fresh, following
+`drift-script-stdlib`'s established conventions (its `error_object`/`require_*` helper
+pattern, its `all_bindings() -> Vec<(&'static str, NativeFn)>` per-module shape) as closely as
+possible for consistency across the `drift-dsl` repo's crates, even though this is a separate
+crate and can't literally import `drift-script-stdlib`'s private helpers (`error_object`,
+`require_string`, etc. are not `pub` in that crate) -- redefine equivalent small helpers
+locally in this new crate instead of trying to share them across crates (that kind of shared
+private-helper crate isn't part of this plan's scope; a small amount of duplication between
+`drift-script-stdlib` and `drift-script-math`'s local `error_object`/`require_number` helpers
+is an acceptable, deliberate tradeoff here).
 
-Create `~/src/oss/drift-dsl/crates/drift-script-stdlib/src/math.rs`:
+- [ ] **Step 1: Create the crate's `Cargo.toml`**
+
+Before writing this, check how `drift-script-stdlib`'s `Cargo.toml` (already copied in Task
+2) declares its dependency on `drift-script` and its `edition`/`license` fields, and mirror
+the same shape exactly. Create `~/src/oss/drift-dsl/crates/drift-script-math/Cargo.toml`:
+
+```toml
+[package]
+name = "drift-script-math"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drift-script = { path = "../drift-script" }
+```
+
+- [ ] **Step 2: Write `arithmetic.rs`**
+
+Create `~/src/oss/drift-dsl/crates/drift-script-math/src/arithmetic.rs`:
 
 ```rust
-//! Math module bindings for Drift Script.
-//!
-//! Provides general-purpose numeric helpers not already covered by the
-//! language's own arithmetic operators: `abs`, `min`, `max`, `round`,
-//! `floor`, `ceil`, `trunc`, `pow`, `sqrt`, `log` (natural log), `exp`,
-//! `clamp`. Constants `PI`/`E` are exposed separately (see
-//! `math_constants()`), not as zero-argument functions, since Drift
-//! Script has no distinct "constant" binding kind beyond a plain value.
-//!
-//! Deliberately minimal: no statistics, no domain-specific (e.g.
-//! trading/financial) functions -- those belong in a downstream binding
-//! built on top of this crate.
+//! General-purpose arithmetic bindings for Drift Script: helpers not
+//! already covered by the language's own operators.
 
 use std::sync::Arc;
 
 use drift_script::{DriftValue, NativeFn};
-
-use crate::error_object;
 
 pub fn all_bindings() -> Vec<(&'static str, NativeFn)> {
     vec![
@@ -405,14 +432,25 @@ pub fn all_bindings() -> Vec<(&'static str, NativeFn)> {
     ]
 }
 
-/// `math.PI` / `math.E` constants, registered separately from the function
-/// bindings above (see `lib.rs`'s `register_math`) since they are plain
-/// `DriftValue::Number` values, not `NativeFunction`s.
+/// `math.PI` / `math.E` constants -- plain `DriftValue::Number` values,
+/// not `NativeFunction`s, so they're registered separately (see this
+/// crate's `lib.rs`).
 pub fn constants() -> Vec<(&'static str, f64)> {
     vec![("PI", std::f64::consts::PI), ("E", std::f64::consts::E)]
 }
 
-fn require_number(args: &[DriftValue], index: usize, name: &str) -> Result<f64, DriftValue> {
+pub(crate) fn error_object(message: &str) -> DriftValue {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    map.insert("error".to_string(), DriftValue::String(Arc::new(message.to_string())));
+    DriftValue::Object(map)
+}
+
+pub(crate) fn require_number(
+    args: &[DriftValue],
+    index: usize,
+    name: &str,
+) -> Result<f64, DriftValue> {
     match args.get(index) {
         Some(DriftValue::Number(n)) => Ok(*n),
         Some(other) => Err(error_object(&format!(
@@ -594,255 +632,420 @@ mod tests {
         f(args).await
     }
 
+    fn assert_is_error(value: &DriftValue) {
+        match value {
+            DriftValue::Object(map) => assert!(map.contains_key("error")),
+            other => panic!("expected an error object, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn abs_returns_absolute_value() {
-        let result = call(&native_abs(), vec![DriftValue::Number(-5.0)]).await;
-        assert_eq!(result, DriftValue::Number(5.0));
+        assert_eq!(call(&native_abs(), vec![DriftValue::Number(-5.0)]).await, DriftValue::Number(5.0));
     }
 
     #[tokio::test]
     async fn min_returns_smaller_value() {
-        let result =
-            call(&native_min(), vec![DriftValue::Number(3.0), DriftValue::Number(7.0)]).await;
+        let result = call(&native_min(), vec![DriftValue::Number(3.0), DriftValue::Number(7.0)]).await;
         assert_eq!(result, DriftValue::Number(3.0));
     }
 
     #[tokio::test]
     async fn max_returns_larger_value() {
-        let result =
-            call(&native_max(), vec![DriftValue::Number(3.0), DriftValue::Number(7.0)]).await;
+        let result = call(&native_max(), vec![DriftValue::Number(3.0), DriftValue::Number(7.0)]).await;
         assert_eq!(result, DriftValue::Number(7.0));
     }
 
     #[tokio::test]
     async fn round_rounds_to_nearest_integer() {
-        let result = call(&native_round(), vec![DriftValue::Number(2.6)]).await;
-        assert_eq!(result, DriftValue::Number(3.0));
+        assert_eq!(call(&native_round(), vec![DriftValue::Number(2.6)]).await, DriftValue::Number(3.0));
     }
 
     #[tokio::test]
     async fn floor_rounds_down() {
-        let result = call(&native_floor(), vec![DriftValue::Number(2.9)]).await;
-        assert_eq!(result, DriftValue::Number(2.0));
+        assert_eq!(call(&native_floor(), vec![DriftValue::Number(2.9)]).await, DriftValue::Number(2.0));
     }
 
     #[tokio::test]
     async fn ceil_rounds_up() {
-        let result = call(&native_ceil(), vec![DriftValue::Number(2.1)]).await;
-        assert_eq!(result, DriftValue::Number(3.0));
+        assert_eq!(call(&native_ceil(), vec![DriftValue::Number(2.1)]).await, DriftValue::Number(3.0));
     }
 
     #[tokio::test]
     async fn trunc_drops_fractional_part() {
-        let result = call(&native_trunc(), vec![DriftValue::Number(-2.9)]).await;
-        assert_eq!(result, DriftValue::Number(-2.0));
+        assert_eq!(call(&native_trunc(), vec![DriftValue::Number(-2.9)]).await, DriftValue::Number(-2.0));
     }
 
     #[tokio::test]
     async fn pow_raises_to_exponent() {
-        let result =
-            call(&native_pow(), vec![DriftValue::Number(2.0), DriftValue::Number(10.0)]).await;
+        let result = call(&native_pow(), vec![DriftValue::Number(2.0), DriftValue::Number(10.0)]).await;
         assert_eq!(result, DriftValue::Number(1024.0));
     }
 
     #[tokio::test]
     async fn sqrt_of_negative_number_returns_error_object() {
-        let result = call(&native_sqrt(), vec![DriftValue::Number(-1.0)]).await;
-        match result {
-            DriftValue::Object(map) => assert!(map.contains_key("error")),
-            other => panic!("expected an error object, got {other:?}"),
-        }
+        assert_is_error(&call(&native_sqrt(), vec![DriftValue::Number(-1.0)]).await);
     }
 
     #[tokio::test]
     async fn sqrt_of_positive_number_returns_root() {
-        let result = call(&native_sqrt(), vec![DriftValue::Number(16.0)]).await;
-        assert_eq!(result, DriftValue::Number(4.0));
+        assert_eq!(call(&native_sqrt(), vec![DriftValue::Number(16.0)]).await, DriftValue::Number(4.0));
     }
 
     #[tokio::test]
     async fn log_of_non_positive_number_returns_error_object() {
-        let result = call(&native_log(), vec![DriftValue::Number(0.0)]).await;
-        match result {
-            DriftValue::Object(map) => assert!(map.contains_key("error")),
-            other => panic!("expected an error object, got {other:?}"),
-        }
+        assert_is_error(&call(&native_log(), vec![DriftValue::Number(0.0)]).await);
     }
 
     #[tokio::test]
     async fn exp_of_zero_is_one() {
-        let result = call(&native_exp(), vec![DriftValue::Number(0.0)]).await;
-        assert_eq!(result, DriftValue::Number(1.0));
+        assert_eq!(call(&native_exp(), vec![DriftValue::Number(0.0)]).await, DriftValue::Number(1.0));
     }
 
     #[tokio::test]
     async fn clamp_restricts_value_to_range() {
-        let below =
-            call(&native_clamp(), vec![DriftValue::Number(-5.0), DriftValue::Number(0.0), DriftValue::Number(10.0)])
-                .await;
+        let below = call(
+            &native_clamp(),
+            vec![DriftValue::Number(-5.0), DriftValue::Number(0.0), DriftValue::Number(10.0)],
+        )
+        .await;
         assert_eq!(below, DriftValue::Number(0.0));
 
-        let above =
-            call(&native_clamp(), vec![DriftValue::Number(15.0), DriftValue::Number(0.0), DriftValue::Number(10.0)])
-                .await;
+        let above = call(
+            &native_clamp(),
+            vec![DriftValue::Number(15.0), DriftValue::Number(0.0), DriftValue::Number(10.0)],
+        )
+        .await;
         assert_eq!(above, DriftValue::Number(10.0));
-
-        let within =
-            call(&native_clamp(), vec![DriftValue::Number(5.0), DriftValue::Number(0.0), DriftValue::Number(10.0)])
-                .await;
-        assert_eq!(within, DriftValue::Number(5.0));
     }
 
     #[tokio::test]
     async fn clamp_rejects_inverted_range() {
-        let result =
-            call(&native_clamp(), vec![DriftValue::Number(5.0), DriftValue::Number(10.0), DriftValue::Number(0.0)])
-                .await;
-        match result {
-            DriftValue::Object(map) => assert!(map.contains_key("error")),
-            other => panic!("expected an error object, got {other:?}"),
-        }
+        let result = call(
+            &native_clamp(),
+            vec![DriftValue::Number(5.0), DriftValue::Number(10.0), DriftValue::Number(0.0)],
+        )
+        .await;
+        assert_is_error(&result);
     }
 }
 ```
 
-Before finalizing, check `drift_script::DriftValue`'s actual `Debug`/`PartialEq` derives
-(read `~/src/oss/drift-dsl/crates/drift-script/src/value.rs`, copied in Task 1) to confirm
-`assert_eq!(result, DriftValue::Number(...))` and `{other:?}` formatting both compile as
-written above -- `value.rs`'s `DriftValue` enum derives (or manually implements) `Debug` and
-has a custom `PartialEq` impl per the file's own `impl PartialEq for DriftValue` block (seen
-during planning); if the real derives differ from this assumption, adjust the test assertions
-to use whatever comparison mechanism the type actually supports (e.g. pattern-matching
-`DriftValue::Number(n)` and asserting on `n` directly if `PartialEq`/`Debug` aren't derived
-the way assumed here).
+Before finalizing, read `~/src/oss/drift-dsl/crates/drift-script/src/value.rs` (copied in
+Task 1) directly to confirm `DriftValue` derives/implements `Debug` and `PartialEq` as the
+tests above assume (`assert_eq!`, `{other:?}` formatting) -- if the real implementation
+differs, adjust the test assertions to whatever comparison mechanism the type actually
+supports.
 
-- [ ] **Step 2: Register the `math` module in `lib.rs`**
+- [ ] **Step 3: Write `statistics.rs`**
 
-Modify `~/src/oss/drift-dsl/crates/drift-script-stdlib/src/lib.rs`. Add `pub mod math;` to the
-module declarations at the top (alongside the existing `pub mod console;`, `pub mod fs;`,
-etc.).
+Create `~/src/oss/drift-dsl/crates/drift-script-math/src/statistics.rs`:
 
-Find:
 ```rust
-        registry.register_fs();
-        registry.register_shell();
-        registry.register_http();
-        registry.register_json();
-        registry.register_log();
-        registry.register_module("os", os_bindings);
-        registry.register_process();
-        registry.register_object();
-        registry.register_string();
-        registry.register_console();
-        registry
+//! General-purpose statistics bindings for Drift Script, operating on a
+//! `DriftValue::Array` of numbers. No trading-specific indicators here
+//! (SMA/EMA/RSI/etc. belong to a downstream, domain-specific binding
+//! crate) -- just general array statistics any script might need.
+
+use std::sync::Arc;
+
+use drift_script::{DriftValue, NativeFn};
+
+use crate::arithmetic::error_object;
+
+pub fn all_bindings() -> Vec<(&'static str, NativeFn)> {
+    vec![
+        ("mean", native_mean()),
+        ("stddev", native_stddev()),
+        ("variance", native_variance()),
+        ("sum", native_sum()),
+        ("product", native_product()),
+    ]
+}
+
+/// Extracts a `Vec<f64>` from a `DriftValue::Array` argument, returning an
+/// error object if the argument isn't an array or contains a non-number
+/// element.
+fn require_number_array(
+    args: &[DriftValue],
+    index: usize,
+    name: &str,
+) -> Result<Vec<f64>, DriftValue> {
+    match args.get(index) {
+        Some(DriftValue::Array(items)) => {
+            let mut numbers = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    DriftValue::Number(n) => numbers.push(*n),
+                    other => {
+                        return Err(error_object(&format!(
+                            "{}: array element at index {} must be a number, got {}",
+                            name,
+                            i,
+                            other.type_name()
+                        )));
+                    }
+                }
+            }
+            Ok(numbers)
+        }
+        Some(other) => Err(error_object(&format!(
+            "{}: expected array argument at position {}, got {}",
+            name,
+            index,
+            other.type_name()
+        ))),
+        None => Err(error_object(&format!("{}: missing argument at position {}", name, index))),
     }
-```
-Replace with (adds `register_math()` to the chain):
-```rust
-        registry.register_fs();
-        registry.register_shell();
-        registry.register_http();
-        registry.register_json();
-        registry.register_log();
-        registry.register_module("os", os_bindings);
-        registry.register_process();
-        registry.register_object();
-        registry.register_string();
-        registry.register_console();
-        registry.register_math();
-        registry
-    }
-```
+}
 
-Add a new `register_math` method to the `impl BindingRegistry` block (alongside
-`register_string`, `register_process`, etc.):
-```rust
-    fn register_math(&mut self) {
-        self.register_module("math", math::all_bindings());
-        for (name, value) in math::constants() {
-            self.globals.insert(format!("math.{name}"), DriftValue::Number(value));
+fn mean_of(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn variance_of(values: &[f64]) -> f64 {
+    let mean = mean_of(values);
+    values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+}
+
+fn native_mean() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            match require_number_array(&args, 0, "math.mean") {
+                Ok(values) if values.is_empty() => {
+                    error_object("math.mean: array must not be empty")
+                }
+                Ok(values) => DriftValue::Number(mean_of(&values)),
+                Err(e) => e,
+            }
+        })
+    })
+}
+
+fn native_variance() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            match require_number_array(&args, 0, "math.variance") {
+                Ok(values) if values.is_empty() => {
+                    error_object("math.variance: array must not be empty")
+                }
+                Ok(values) => DriftValue::Number(variance_of(&values)),
+                Err(e) => e,
+            }
+        })
+    })
+}
+
+fn native_stddev() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            match require_number_array(&args, 0, "math.stddev") {
+                Ok(values) if values.is_empty() => {
+                    error_object("math.stddev: array must not be empty")
+                }
+                Ok(values) => DriftValue::Number(variance_of(&values).sqrt()),
+                Err(e) => e,
+            }
+        })
+    })
+}
+
+fn native_sum() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            match require_number_array(&args, 0, "math.sum") {
+                Ok(values) => DriftValue::Number(values.iter().sum()),
+                Err(e) => e,
+            }
+        })
+    })
+}
+
+fn native_product() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            match require_number_array(&args, 0, "math.product") {
+                Ok(values) => DriftValue::Number(values.iter().product()),
+                Err(e) => e,
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn call(f: &NativeFn, args: Vec<DriftValue>) -> DriftValue {
+        f(args).await
+    }
+
+    fn number_array(values: &[f64]) -> DriftValue {
+        DriftValue::Array(values.iter().map(|v| DriftValue::Number(*v)).collect())
+    }
+
+    fn assert_is_error(value: &DriftValue) {
+        match value {
+            DriftValue::Object(map) => assert!(map.contains_key("error")),
+            other => panic!("expected an error object, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn mean_computes_average() {
+        let result = call(&native_mean(), vec![number_array(&[2.0, 4.0, 6.0])]).await;
+        assert_eq!(result, DriftValue::Number(4.0));
+    }
+
+    #[tokio::test]
+    async fn mean_of_empty_array_returns_error() {
+        assert_is_error(&call(&native_mean(), vec![number_array(&[])]).await);
+    }
+
+    #[tokio::test]
+    async fn variance_computes_population_variance() {
+        // [2, 4, 6]: mean=4, deviations=[-2,0,2], squared=[4,0,4], variance=8/3
+        let result = call(&native_variance(), vec![number_array(&[2.0, 4.0, 6.0])]).await;
+        match result {
+            DriftValue::Number(n) => assert!((n - 8.0 / 3.0).abs() < 1e-9),
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stddev_is_sqrt_of_variance() {
+        let result = call(&native_stddev(), vec![number_array(&[2.0, 4.0, 6.0])]).await;
+        match result {
+            DriftValue::Number(n) => assert!((n - (8.0_f64 / 3.0).sqrt()).abs() < 1e-9),
+            other => panic!("expected a number, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sum_adds_all_elements() {
+        let result = call(&native_sum(), vec![number_array(&[1.0, 2.0, 3.0])]).await;
+        assert_eq!(result, DriftValue::Number(6.0));
+    }
+
+    #[tokio::test]
+    async fn sum_of_empty_array_is_zero() {
+        let result = call(&native_sum(), vec![number_array(&[])]).await;
+        assert_eq!(result, DriftValue::Number(0.0));
+    }
+
+    #[tokio::test]
+    async fn product_multiplies_all_elements() {
+        let result = call(&native_product(), vec![number_array(&[2.0, 3.0, 4.0])]).await;
+        assert_eq!(result, DriftValue::Number(24.0));
+    }
+
+    #[tokio::test]
+    async fn array_with_non_number_element_returns_error() {
+        let mixed = DriftValue::Array(vec![
+            DriftValue::Number(1.0),
+            DriftValue::String(std::sync::Arc::new("not a number".to_string())),
+        ]);
+        assert_is_error(&call(&native_mean(), vec![mixed]).await);
+    }
+
+    #[tokio::test]
+    async fn non_array_argument_returns_error() {
+        assert_is_error(&call(&native_mean(), vec![DriftValue::Number(5.0)]).await);
+    }
+}
 ```
 
-Wait -- inserting flat `"math.PI"`/`"math.E"` keys into `self.globals` would make them
-top-level globals named literally `math.PI` (an identifier Drift Script's parser cannot
-reference as `math.PI`, a property access, since `self.globals` populates top-level bindings,
-not nested object properties). Instead, the constants must be merged INTO the same `math`
-object that `register_module("math", ...)` creates, so `math.PI` works as a real property
-access on the `math` object at the script level. Fix `register_math` to build the module map
-manually instead of relying on `register_module`'s function-only signature:
+- [ ] **Step 4: Write `lib.rs` to register both modules as a combined `math` global**
+
+Before writing this, read `drift-script-stdlib`'s `lib.rs` (copied in Task 2) once more,
+specifically its `register_console`/`register_math`-style pattern for building a combined
+`DriftValue::Object` (functions + constants) as a single global -- this crate follows the
+identical pattern, just as its own standalone `register_to` entry point instead of being
+folded into `drift-script-stdlib`'s `BindingRegistry`.
+
+Create `~/src/oss/drift-dsl/crates/drift-script-math/src/lib.rs`:
 
 ```rust
-    fn register_math(&mut self) {
-        let mut math_map: HashMap<String, NativeFn> =
-            math::all_bindings().into_iter().map(|(name, f)| (name.to_string(), f)).collect();
-        // Constants (PI, E) are plain numbers, not NativeFunctions, so they
-        // can't go through `math_map` (which is NativeFn-only) or through
-        // `register_module` (function-only) -- register the whole `math`
-        // object as a single combined DriftValue::Object global instead,
-        // mixing NativeFunction and Number entries directly.
-        let mut combined = HashMap::new();
-        for (name, f) in math_map.drain() {
-            combined.insert(name, DriftValue::NativeFunction(f));
-        }
-        for (name, value) in math::constants() {
-            combined.insert(name.to_string(), DriftValue::Number(value));
-        }
-        self.register_global("math", DriftValue::Object(combined));
+//! Drift Script Math Bindings
+//!
+//! General-purpose arithmetic and statistics functions for the Drift
+//! Script interpreter, exposed as a single `math` global object. No
+//! trading-specific indicators here -- see `apexes-strategy` (a separate,
+//! downstream crate) for those.
+
+pub mod arithmetic;
+pub mod statistics;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use drift_script::{DriftValue, Interpreter, NativeFn};
+
+/// Installs the `math` global object (arithmetic functions, statistics
+/// functions, and the `PI`/`E` constants) into `interp`'s environment.
+pub fn register_to(interp: &Interpreter) {
+    let mut math_map: HashMap<String, DriftValue> = HashMap::new();
+
+    for (name, f) in arithmetic::all_bindings() {
+        math_map.insert(name.to_string(), DriftValue::NativeFunction(f));
     }
+    for (name, f) in statistics::all_bindings() {
+        math_map.insert(name.to_string(), DriftValue::NativeFunction(f));
+    }
+    for (name, value) in arithmetic::constants() {
+        math_map.insert(name.to_string(), DriftValue::Number(value));
+    }
+
+    interp.env().define_const("math".to_string(), DriftValue::Object(math_map));
+}
 ```
 
-This mirrors `register_console`'s existing pattern (which also builds a combined object map
-manually rather than using `register_module`, for the same reason: `register_module` only
-handles `NativeFn` entries, and `console`/`math` both need a plain `DriftValue::Object` with
-mixed content). Re-read `register_console`'s exact existing code in `lib.rs` (already shown
-above during planning) to confirm this new `register_math` follows the identical structural
-pattern before finalizing.
+Before finalizing this file, verify `drift_script::Interpreter`'s actual public API for
+accessing/mutating its environment (`interp.env().define_const(...)` is the pattern used by
+`drift-script-stdlib`'s `register_to`, confirmed during planning by reading that crate's
+`lib.rs` directly -- re-confirm this exact method chain compiles against the real
+`drift-script` crate copied in Task 1; if the real signature differs, adjust to match it,
+don't guess).
 
-- [ ] **Step 3: Write a script-level integration test**
+Also note: `NativeFn` here needs an unused import removed if `Arc` isn't otherwise used
+directly in this file after the above -- run `cargo clippy` in Step 6 and fix any such unused
+import warning.
 
-Add to `~/src/oss/drift-dsl/crates/drift-script-stdlib/src/lib.rs`'s existing test module (if
-one exists at the crate root -- check first; if not, create `#[cfg(test)] mod tests` at the
-bottom of `lib.rs`) a test that exercises `math` end-to-end through a real `Interpreter`,
-mirroring however the existing crate-level tests (if any) verify other modules end-to-end. If
-no such crate-level integration test pattern already exists in `drift-script-stdlib` (i.e.
-all existing tests are per-module unit tests calling `NativeFn`s directly, like the ones
-written in Step 1), it's acceptable to skip a separate script-level integration test for
-`math` and rely on `math.rs`'s own unit tests (Step 1) as sufficient coverage -- match
-whatever the codebase's existing convention actually is, don't invent a new testing pattern
-for just this one module.
-
-- [ ] **Step 4: Run tests**
+- [ ] **Step 5: Run tests**
 
 Run:
 ```bash
 cd ~/src/oss/drift-dsl
-cargo test -p drift-script-stdlib math
+cargo test -p drift-script-math
 ```
-Expected: all `math`-module tests pass (count depends on exactly how many you wrote in Step
-1 -- report the real number).
+Expected: all tests from both `arithmetic.rs` and `statistics.rs` pass. Report the exact
+total count.
 
-- [ ] **Step 5: Run clippy and fmt**
+- [ ] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/drift-dsl
+cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
-Expected: no warnings, no formatting diffs.
+Expected: no warnings, no formatting diffs, across the now-three-crate workspace.
 
-- [ ] **Step 6: Commit and push**
+- [ ] **Step 7: Commit and push**
 
 ```bash
 cd ~/src/oss/drift-dsl
-git add crates/drift-script-stdlib/src/math.rs crates/drift-script-stdlib/src/lib.rs
-git commit -S -s -m "feat: add math binding module to drift-script-stdlib"
+git add crates/drift-script-math Cargo.toml
+git commit -S -s -m "feat: add drift-script-math crate with arithmetic and statistics bindings"
 git push origin master
 ```
 
 Record the commit SHA of this push (`git rev-parse HEAD`) -- this is the `rev` value Task 4
-will pin `drift`'s consumer crates to.
+will pin `drift`'s consumer crates to (`drift`'s existing consumers only need `drift-script`
+and `drift-script-stdlib`, per the design spec's consumer table -- `drift-script-math` has no
+`drift`-side consumer yet, but pinning the same final commit SHA for `drift-script`/
+`drift-script-stdlib` in Task 4 is still correct and simplest, since all three crates live in
+the same repo at the same commit).
 
 ---
 
@@ -853,8 +1056,8 @@ will pin `drift`'s consumer crates to.
 - Modify: `crates/drift-script-ai/Cargo.toml`
 
 **Interfaces:**
-- Consumes: the `drift-dsl` repo pushed in Task 2 (specifically the commit SHA recorded at
-  the end of Task 2's Step 4).
+- Consumes: the `drift-dsl` repo pushed in Tasks 1-3 (specifically the commit SHA recorded at
+  the end of Task 3's Step 7, the final push before any consumer pins a rev).
 - Produces: `drift-lsp` and `drift-script-ai` building successfully against the external
   `drift-script` crate, with zero source-code changes (only the dependency source line
   changes).
@@ -865,7 +1068,7 @@ Find the line:
 ```toml
 drift-script = { path = "../drift-script" }
 ```
-Replace with (using the ACTUAL commit SHA recorded at the end of Task 2's Step 4, not a
+Replace with (using the ACTUAL commit SHA recorded at the end of Task 3's Step 7, not a
 placeholder):
 ```toml
 drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "<commit-sha>" }
@@ -1053,23 +1256,26 @@ verification-only task.
 
 ## Plan Self-Review Notes
 
-**Spec coverage:** §2 (scope: extract `drift-script` + `drift-script-stdlib` plus the new
-`math` module, not `drift-script-ai`/`drift-script-signing`) → Tasks 1-2 (the copy), Task 3
-(the new `math` module), and Task 5 (deletion from `drift`, confirming nothing else was
-extracted); §3 (target repo, branch rename, CI) → Task 1 Steps 1-2, Task 2 Step 4; §4
-(migration mechanics: version pinning, consumer table, workspace glob behavior) → Task 1 Step
-3/7 (versions), Tasks 4-5 (the 4 consumers exactly per the design spec's table:
-`drift-lsp`+`drift-script-ai` in Task 4, `drift-tools`+`drift` in Task 5); §5 (testing
-strategy: behavioral identity, fresh-clone verification) → Task 1 Step 8, Task 2 Step 2, Task
-6 Step 1; §6 (error handling: fix forward, don't revert to path deps) → called out explicitly
-in Global Constraints and Task 4 Step 3's guidance; §7 (non-goals: no apexes work, no
-language changes, no touching pre-existing unrelated `drift` changes) → enforced throughout
-via Global Constraints and Task 5 Step 5's explicit `git status` check.
+**Spec coverage:** §2 (scope: extract `drift-script` + `drift-script-stdlib`, plus the new
+`drift-script-math` crate with arithmetic + statistics, not `drift-script-ai`/
+`drift-script-signing`) → Tasks 1-2 (the copy), Task 3 (the new `drift-script-math` crate),
+and Task 5 (deletion from `drift`, confirming nothing else was extracted); §3 (target repo,
+branch rename, CI) → Task 1 Steps 1-2, Task 2 Step 4; §4 (migration mechanics: version
+pinning, consumer table, workspace glob behavior) → Task 1 Step 3/7 (versions), Tasks 4-5
+(the 4 consumers exactly per the design spec's table: `drift-lsp`+`drift-script-ai` in Task
+4, `drift-tools`+`drift` in Task 5); §5 (testing strategy: behavioral identity, fresh-clone
+verification, `drift-script-math`'s from-scratch test suite) → Task 1 Step 8, Task 2 Step 2,
+Task 3 Steps 5-6, Task 6 Step 1; §6 (error handling: fix forward, don't revert to path deps)
+→ called out explicitly in Global Constraints and Task 4 Step 3's guidance; §7 (non-goals: no
+apexes work, no language changes, no trading-specific indicators in `drift-script-math`, no
+touching pre-existing unrelated `drift` changes) → enforced throughout via Global Constraints,
+Task 3's scope note, and Task 5 Step 5's explicit `git status` check.
 
 **Placeholder scan:** No TBD/TODO/"implement later" strings. The one genuine
 runtime-dependent value (`<commit-sha>`) is explicitly flagged at every occurrence as "the
-ACTUAL commit SHA recorded at the end of Task 2's Step 4" -- not a placeholder to leave
-unfilled, but a real value each task must look up from the prior task's actual output.
+ACTUAL commit SHA recorded at the end of Task 3's Step 7" (the final `drift-dsl` push before
+any `drift`-side consumer pins a rev) -- not a placeholder to leave unfilled, but a real
+value each task must look up from the prior task's actual output.
 
 **Type consistency:** Crate names (`drift-script`, `drift-script-stdlib`), the git URL
 (`https://github.com/LeafAI/drift-dsl.git`), and the consumer-crate list (`drift-lsp`,
