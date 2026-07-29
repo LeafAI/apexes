@@ -18,7 +18,10 @@ impl PortfolioLedger {
     /// debit/credit). `initial_balances` is required explicit starting
     /// capital per asset symbol (e.g. "USDT" -> 10000) -- no implicit
     /// default, per design spec §8.
-    pub fn new(instruments: HashMap<String, Instrument>, initial_balances: HashMap<String, Decimal>) -> Self {
+    pub fn new(
+        instruments: HashMap<String, Instrument>,
+        initial_balances: HashMap<String, Decimal>,
+    ) -> Self {
         Self {
             instruments,
             balances: initial_balances,
@@ -50,11 +53,13 @@ impl PortfolioLedger {
             }
         })?;
 
-        let base = instrument.base_currency.clone().ok_or_else(|| {
-            ApexesError::InvalidBacktestConfig {
-                reason: format!("Instrument {} has no base_currency", fill.symbol),
-            }
-        })?;
+        let base =
+            instrument
+                .base_currency
+                .clone()
+                .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                    reason: format!("Instrument {} has no base_currency", fill.symbol),
+                })?;
         let quote = instrument.quote_currency.clone().ok_or_else(|| {
             ApexesError::InvalidBacktestConfig {
                 reason: format!("Instrument {} has no quote_currency", fill.symbol),
@@ -71,13 +76,17 @@ impl PortfolioLedger {
         let mut required_debits: HashMap<String, Decimal> = HashMap::new();
         match fill.side {
             Side::Buy => {
-                *required_debits.entry(quote.clone()).or_insert(Decimal::ZERO) += notional;
+                *required_debits
+                    .entry(quote.clone())
+                    .or_insert(Decimal::ZERO) += notional;
             }
             Side::Sell => {
                 *required_debits.entry(base.clone()).or_insert(Decimal::ZERO) += fill.quantity;
             }
         }
-        *required_debits.entry(fee_currency.clone()).or_insert(Decimal::ZERO) += fill.fee;
+        *required_debits
+            .entry(fee_currency.clone())
+            .or_insert(Decimal::ZERO) += fill.fee;
 
         // Phase 2: validate every required debit against current balances
         // before mutating anything.
@@ -130,7 +139,10 @@ impl PortfolioLedger {
     /// phase 2/3 split) -- this method itself performs no validation, by
     /// design, so it can be used for both directions uniformly.
     fn credit(&mut self, asset: &str, amount: Decimal) {
-        let balance = self.balances.entry(asset.to_string()).or_insert(Decimal::ZERO);
+        let balance = self
+            .balances
+            .entry(asset.to_string())
+            .or_insert(Decimal::ZERO);
         *balance += amount;
     }
 
@@ -140,11 +152,14 @@ impl PortfolioLedger {
             Side::Sell => -fill.quantity,
         };
 
-        let position = self.positions.entry(fill.symbol.clone()).or_insert(Position {
-            symbol: fill.symbol.clone(),
-            quantity: Decimal::ZERO,
-            average_entry_price: Decimal::ZERO,
-        });
+        let position = self
+            .positions
+            .entry(fill.symbol.clone())
+            .or_insert(Position {
+                symbol: fill.symbol.clone(),
+                quantity: Decimal::ZERO,
+                average_entry_price: Decimal::ZERO,
+            });
 
         let same_direction = position.quantity.is_zero()
             || (position.quantity.is_sign_positive() == signed_quantity.is_sign_positive());
@@ -235,7 +250,9 @@ mod tests {
     fn sell_fill_credits_quote_debits_base() {
         let mut ledger = ledger_with_10k_usdt();
         // First buy some BTC to have a base balance to sell (0.1 * 60000 = 6000 USDT, within the 10000 starting balance).
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
         // USDT: 10000 - 6000 = 4000; BTC: 0.1
 
         let sell_fill = sample_fill(Side::Sell, dec!(65000), dec!(0.04), dec!(2.6));
@@ -250,14 +267,19 @@ mod tests {
     #[test]
     fn sell_fill_fails_with_insufficient_base_balance_and_leaves_ledger_unchanged() {
         let mut ledger = ledger_with_10k_usdt();
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
         let usdt_before = *ledger.balances().get("USDT").unwrap();
         let btc_before = *ledger.balances().get("BTC").unwrap();
 
         // Try to sell more BTC than we have.
         let result = ledger.apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(5), dec!(0)));
 
-        assert!(matches!(result, Err(ApexesError::InsufficientBalance { .. })));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
         // Ledger must be completely unchanged after a failed apply_fill (atomicity).
         assert_eq!(*ledger.balances().get("USDT").unwrap(), usdt_before);
         assert_eq!(*ledger.balances().get("BTC").unwrap(), btc_before);
@@ -270,14 +292,21 @@ mod tests {
 
         let result = ledger.apply_fill(&fill);
 
-        assert!(matches!(result, Err(ApexesError::InsufficientBalance { .. })));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
     }
 
     #[test]
     fn position_average_entry_price_is_volume_weighted() {
         let mut ledger = ledger_with_10k_usdt();
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.05), dec!(0))).unwrap();
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(70000), dec!(0.05), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.05), dec!(0)))
+            .unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(70000), dec!(0.05), dec!(0)))
+            .unwrap();
 
         let position = ledger.positions().get("BTCUSDT").unwrap();
         assert_eq!(position.quantity, dec!(0.1));
@@ -298,9 +327,13 @@ mod tests {
         initial_balances.insert("USDT".to_string(), dec!(10000));
         initial_balances.insert("BTC".to_string(), dec!(0.5));
         let mut ledger = PortfolioLedger::new(instruments, initial_balances);
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
         // Sell more than the current long position: flips to short.
-        ledger.apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.3), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.3), dec!(0)))
+            .unwrap();
 
         let position = ledger.positions().get("BTCUSDT").unwrap();
         assert_eq!(position.quantity, dec!(-0.2));
@@ -315,13 +348,18 @@ mod tests {
 
         let result = ledger.apply_fill(&fill);
 
-        assert!(matches!(result, Err(ApexesError::InvalidBacktestConfig { .. })));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InvalidBacktestConfig { .. })
+        ));
     }
 
     #[test]
     fn equity_sums_balances_with_mark_prices() {
         let mut ledger = ledger_with_10k_usdt();
-        ledger.apply_fill(&sample_fill(Side::Buy, dec!(65000), dec!(0.1), dec!(0))).unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(65000), dec!(0.1), dec!(0)))
+            .unwrap();
 
         let mut mark_prices = HashMap::new();
         mark_prices.insert("BTC".to_string(), dec!(65000));
