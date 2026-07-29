@@ -26,6 +26,13 @@ pub struct StrategyContext<'a> {
     pub balances: &'a HashMap<String, Decimal>,
     /// Currently-open (unfilled or partially-filled) orders, keyed by
     /// `OrderId`.
+    ///
+    /// Known limitation: a Stop/StopLimit order that triggers internally
+    /// during matching is tracked under a NEW OrderId once converted to a
+    /// Market/Limit order; the original OrderId's entry in this map will
+    /// not reflect the resulting fill. See
+    /// docs/superpowers/plans/2026-07-28-apexes-backtest.md Task 14 for
+    /// full rationale.
     pub open_orders: &'a HashMap<OrderId, Order>,
     /// Current simulated (backtest) or real (live) time.
     pub now: DateTime<Utc>,
