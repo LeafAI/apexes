@@ -236,12 +236,25 @@ pub trait FeeSchedule: Send + Sync {
     fn taker_fee_bps(&self, venue: Venue) -> Decimal;
 }
 
-/// Binance Spot's real VIP tier fee table (VIP0..VIP9).
+/// Binance Spot's real VIP tier fee table (VIP0/Regular..VIP9), standard
+/// (non-BNB-discounted) rates, confirmed by the user directly from
+/// binance.com/en/fee/schedule on 2026-07-28:
 ///
-/// NOTE: exact basis-point values pending confirmation from the user against
-/// Binance's live fee schedule page (automated fetches were blocked during
-/// spec-writing). MUST be verified/updated before this schedule is used for
-/// any real-money-adjacent calculation.
+/// | Tier | Maker (bps) | Taker (bps) |
+/// |------|-------------|-------------|
+/// | 0 (Regular) | 10.0 | 10.0 |
+/// | 1    | 9.0  | 10.0 |
+/// | 2    | 8.0  | 10.0 |
+/// | 3    | 4.0  | 6.0  |
+/// | 4    | 4.0  | 5.2  |
+/// | 5    | 2.5  | 3.1  |
+/// | 6    | 2.0  | 2.9  |
+/// | 7    | 1.9  | 2.8  |
+/// | 8    | 1.6  | 2.5  |
+/// | 9    | 1.1  | 2.3  |
+///
+/// BNB-fee-discount (25% off) and USDC-pair-specific rates are out of scope
+/// for this sub-project; only standard spot rates are modeled.
 pub struct BinanceSpotVipFeeSchedule {
     pub tier: u8,  // 0..=9
 }
@@ -370,11 +383,10 @@ propagated as `Err`.
   data via `StorageMarketDataSource`, following the exact `docker-compose up -d` /
   `cargo test -- --ignored` convention established in sub-project #2.
 
-## 11. Open item — must resolve before/during implementation
+## 11. Resolved: Binance fee schedule
 
-The exact Binance Spot VIP0–VIP9 maker/taker basis-point fee table (§7.5,
-`BinanceSpotVipFeeSchedule`) needs to be confirmed by the user against Binance's official,
-current fee schedule before being hardcoded — automated fetches of Binance's fee-schedule
-pages were blocked during spec-writing (empty/bot-detected responses). The plan will include
-an explicit task step for this; implementation must not proceed with guessed/unverified
-numbers presented as authoritative.
+The Binance Spot VIP0–VIP9 maker/taker fee table (§7.5) was confirmed by the user directly
+from `binance.com/en/fee/schedule` on 2026-07-28 (automated fetches of that page were blocked
+during spec-writing — bot-detected/empty responses — so the user supplied the authoritative
+values directly). The exact table is embedded in §7.5's `BinanceSpotVipFeeSchedule` doc
+comment above. No open items remain.
