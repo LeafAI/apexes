@@ -79,7 +79,7 @@ authenticated with `repo`+`workflow` scopes), GitHub Actions for CI.
   that `cargo build`/`cargo test`/`cargo clippy -- -D warnings`/`cargo fmt --check` all pass
   on, with zero behavioral change from the original.
 
-- [ ] **Step 1: Clone the empty `drift-dsl` repo locally**
+- [x] **Step 1: Clone the empty `drift-dsl` repo locally**
 
 Run:
 ```bash
@@ -92,7 +92,7 @@ Expected: an empty repository (no commits yet, or possibly an auto-generated def
 with no files — check `git log` and `ls -la` to confirm the actual empty state before
 proceeding).
 
-- [ ] **Step 2: Rename the default branch to `master`**
+- [x] **Step 2: Rename the default branch to `master`**
 
 Run:
 ```bash
@@ -106,7 +106,7 @@ if so, create a minimal placeholder commit first, push it, run the rename, then 
 the real content in Step 3 onward (this placeholder commit is fine to have in history, it's
 not something to avoid).
 
-- [ ] **Step 3: Create the workspace root `Cargo.toml`**
+- [x] **Step 3: Create the workspace root `Cargo.toml`**
 
 Create `~/src/oss/drift-dsl/Cargo.toml`:
 
@@ -132,13 +132,13 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ```
 
-- [ ] **Step 4: Create `LICENSE`**
+- [x] **Step 4: Create `LICENSE`**
 
 Create `~/src/oss/drift-dsl/LICENSE` with the exact content of `~/src/oss/drift/LICENSE`
 (copy it verbatim -- read the source file first, then write the identical content; do not
 alter the copyright line).
 
-- [ ] **Step 5: Create `README.md`**
+- [x] **Step 5: Create `README.md`**
 
 Create `~/src/oss/drift-dsl/README.md`:
 
@@ -164,7 +164,7 @@ still powers workflow scripting, tool-call automation, and MCP/ACP integrations 
 MIT
 ```
 
-- [ ] **Step 6: Create `.gitignore`**
+- [x] **Step 6: Create `.gitignore`** (also created `rustfmt.toml` here, a file this plan step never mentioned — see the note after Step 9 below)
 
 `drift`'s own `.gitignore` (already checked during planning) does NOT ignore `Cargo.lock` --
 it's committed at `drift`'s workspace root. Follow the same convention here. Create
@@ -178,7 +178,7 @@ it's committed at `drift`'s workspace root. Follow the same convention here. Cre
 Do NOT add `Cargo.lock` to this file -- it will be committed (see Step 9, which explicitly
 includes it via `git add .`).
 
-- [ ] **Step 7: Copy `drift-script`'s source files verbatim**
+- [x] **Step 7: Copy `drift-script`'s source files verbatim**
 
 Copy every file from `~/src/oss/drift/crates/drift-script/src/` (12 files: `chunk.rs`,
 `compiler.rs`, `environment.rs`, `error.rs`, `hir.rs`, `interpreter.rs`, `lib.rs`, `module.rs`,
@@ -217,7 +217,7 @@ re-read that file directly before finalizing this one, to make sure no dependenc
 or a version mismatched; the block above is expected to match but treat the real source file
 as authoritative if there's any discrepancy.)
 
-- [ ] **Step 8: Verify `drift-script` builds and tests standalone**
+- [x] **Step 8: Verify `drift-script` builds and tests standalone**
 
 Run:
 ```bash
@@ -232,7 +232,7 @@ what `cargo test -p drift-script` reports when run inside the ORIGINAL `~/src/os
 repo, to confirm identical test count -- run that comparison command too and report both
 numbers).
 
-- [ ] **Step 9: Commit and push**
+- [x] **Step 9: Commit and push**
 
 ```bash
 cd ~/src/oss/drift-dsl
@@ -240,6 +240,25 @@ git add .
 git commit -S -s -m "feat: extract drift-script from the drift monorepo"
 git push -u origin master
 ```
+
+**Task 1 completion notes (actual execution):**
+- Commit: `e50d08db40c80adcdc8d2f16ac753e5dae4d7416` on `origin/master` (root commit, 19
+  files, 7804 insertions), default branch confirmed set to `master` via `gh repo view`.
+- Test counts: `drift-dsl`'s standalone `drift-script` — **142 passed, 0 failed**; the
+  original `~/src/oss/drift`'s `drift-script` — **142 passed, 0 failed**. Identical, as
+  expected for a byte-for-byte copy (`diff -rq` on both `src/` directories showed zero
+  differences).
+- **Plan gap found and fixed**: this plan's Task 1 never mentions `drift`'s root-level
+  `rustfmt.toml` (`edition = "2024"`, `max_width = 100`, `use_small_heuristics = "Max"`).
+  Without copying it into `drift-dsl`, `cargo fmt -p drift-script -- --check` fails with
+  ~2000 lines of diff (default rustfmt settings reformat struct-literal patterns like
+  `Stmt::If { cond, then_branch, else_branch, .. }` onto multiple lines, since
+  `use_small_heuristics` defaults to `"Default"`, not `"Max"`). Copied
+  `~/src/oss/drift/rustfmt.toml` to `~/src/oss/drift-dsl/rustfmt.toml` verbatim (added to
+  Step 6's commit) and confirmed `cargo fmt --check` then passes cleanly. Future
+  extractions (Task 2's `drift-script-stdlib`) don't need to repeat this since the
+  workspace-root `rustfmt.toml` already covers every crate in the `drift-dsl` workspace.
+- Clippy: `cargo clippy -p drift-script -- -D warnings` — zero warnings.
 
 ---
 
