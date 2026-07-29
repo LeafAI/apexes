@@ -26,6 +26,19 @@ pub enum ApexesError {
         reason: String,
         source_detail: Option<String>,
     },
+
+    #[error("insufficient balance: required {required} {asset}, available {available}")]
+    InsufficientBalance {
+        asset: String,
+        required: rust_decimal::Decimal,
+        available: rust_decimal::Decimal,
+    },
+
+    #[error("invalid backtest config: {reason}")]
+    InvalidBacktestConfig { reason: String },
+
+    #[error("order rejected: {reason}")]
+    OrderRejected { reason: String },
 }
 
 #[cfg(test)]
@@ -65,5 +78,48 @@ mod tests {
             err.to_string(),
             "subscription failed for BTCUSDT on Binance: rate limited"
         );
+    }
+
+    #[test]
+    fn insufficient_balance_display() {
+        let err = ApexesError::InsufficientBalance {
+            asset: "USDT".to_string(),
+            required: rust_decimal_macros::dec!(1000),
+            available: rust_decimal_macros::dec!(500),
+        };
+        assert_eq!(
+            err.to_string(),
+            "insufficient balance: required 1000 USDT, available 500"
+        );
+    }
+
+    #[test]
+    fn invalid_backtest_config_display() {
+        let err = ApexesError::InvalidBacktestConfig {
+            reason: "missing initial balance for traded asset BTC".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid backtest config: missing initial balance for traded asset BTC"
+        );
+    }
+
+    #[test]
+    fn order_rejected_display() {
+        let err = ApexesError::OrderRejected {
+            reason: "unsupported order kind".to_string(),
+        };
+        assert_eq!(err.to_string(), "order rejected: unsupported order kind");
+    }
+
+    #[test]
+    fn insufficient_balance_is_cloneable() {
+        let err = ApexesError::InsufficientBalance {
+            asset: "BTC".to_string(),
+            required: rust_decimal_macros::dec!(1),
+            available: rust_decimal_macros::dec!(0.5),
+        };
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
     }
 }

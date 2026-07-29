@@ -58,6 +58,10 @@ pub enum Side {
 pub enum OrderType {
     Market,
     Limit,
+    /// Triggers a Market order once `Order.stop_price` is touched.
+    Stop,
+    /// Triggers a Limit order (at `Order.price`) once `Order.stop_price` is touched.
+    StopLimit,
 }
 
 /// An order to buy or sell a quantity of an instrument at a venue.
@@ -70,8 +74,10 @@ pub struct Order {
     pub side: Side,
     pub order_type: OrderType,
     pub quantity: Decimal,
-    /// `None` for Market orders; `Some` for Limit orders.
+    /// Limit price. `None` for Market/Stop orders; `Some` for Limit/StopLimit orders.
     pub price: Option<Decimal>,
+    /// Trigger price. `None` for Market/Limit orders; `Some` for Stop/StopLimit orders.
+    pub stop_price: Option<Decimal>,
     pub filled_quantity: Decimal,
     pub status: OrderStatus,
     pub created_at: DateTime<Utc>,
@@ -188,6 +194,7 @@ mod tests {
             order_type: OrderType::Limit,
             quantity: rust_decimal_macros::dec!(1.5),
             price: Some(rust_decimal_macros::dec!(65000)),
+            stop_price: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -210,6 +217,7 @@ mod tests {
             order_type: OrderType::Market,
             quantity: rust_decimal_macros::dec!(10),
             price: None,
+            stop_price: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -217,5 +225,55 @@ mod tests {
         };
         assert_eq!(order.price, None);
         assert_eq!(order.order_type, OrderType::Market);
+    }
+
+    #[test]
+    fn stop_order_serde_round_trip() {
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId(Uuid::new_v4()),
+            exchange_order_id: None,
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Sell,
+            order_type: OrderType::Stop,
+            quantity: rust_decimal_macros::dec!(1.0),
+            price: None,
+            stop_price: Some(rust_decimal_macros::dec!(60000)),
+            filled_quantity: rust_decimal_macros::dec!(0),
+            status: OrderStatus::New,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&order).unwrap();
+        let round_tripped: Order = serde_json::from_str(&json).unwrap();
+        assert_eq!(order, round_tripped);
+        assert_eq!(order.price, None);
+        assert_eq!(order.stop_price, Some(rust_decimal_macros::dec!(60000)));
+    }
+
+    #[test]
+    fn stop_limit_order_serde_round_trip() {
+        let now = Utc::now();
+        let order = Order {
+            id: OrderId(Uuid::new_v4()),
+            exchange_order_id: None,
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::StopLimit,
+            quantity: rust_decimal_macros::dec!(1.0),
+            price: Some(rust_decimal_macros::dec!(65500)),
+            stop_price: Some(rust_decimal_macros::dec!(65450)),
+            filled_quantity: rust_decimal_macros::dec!(0),
+            status: OrderStatus::New,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&order).unwrap();
+        let round_tripped: Order = serde_json::from_str(&json).unwrap();
+        assert_eq!(order, round_tripped);
+        assert_eq!(order.price, Some(rust_decimal_macros::dec!(65500)));
+        assert_eq!(order.stop_price, Some(rust_decimal_macros::dec!(65450)));
     }
 }
