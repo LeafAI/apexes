@@ -367,19 +367,6 @@ git commit -S -s -m "ci: add GitHub Actions workflow for build/test/clippy/fmt"
 git push origin master
 ```
 
-**Task 2 completion notes (actual execution):**
-- Commits: `d8ab2d5` (extraction, 13 files, 5101 insertions) and `39db62e` (CI workflow, 1
-  file, 18 insertions), both on `origin/master`.
-- Test counts: `drift-dsl` workspace (`drift-script` + `drift-script-stdlib` combined) —
-  **257 passed, 0 failed** (142 + 115); `drift-script-stdlib` alone in the original
-  `~/src/oss/drift` repo — **115 passed, 0 failed**. Exact match, as expected for a
-  byte-for-byte copy (`diff -rq` on both `src/` directories showed zero differences).
-- Clippy: `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings.
-- Fmt: `cargo fmt --check` — clean (no diff), confirming Task 1's workspace-root
-  `rustfmt.toml` covers this crate too, with no additional per-crate config needed.
-- No new plan gaps found for this task (the `rustfmt.toml` gap from Task 1 already
-  resolved this at the workspace level).
-
 Do NOT record a commit SHA yet for consumer pinning -- Task 3 adds one more module before
 this repo's first "stable" commit that `drift`'s consumers should pin to.
 
@@ -387,51 +374,20 @@ this repo's first "stable" commit that `drift`'s consumers should pin to.
 - Commits: `d8ab2d5` ("feat: extract drift-script-stdlib from the drift monorepo", 13 files,
   5101 insertions) and `39db62e` ("ci: add GitHub Actions workflow for build/test/clippy/fmt",
   1 file, 18 insertions), both pushed to `origin/master`.
-- Test counts: `drift-dsl`'s full workspace — **257 passed, 0 failed** (142 from `drift-script`
-  + 115 from `drift-script-stdlib`). The original `~/src/oss/drift`'s `drift-script-stdlib` —
-  **115 passed, 0 failed**, run twice independently, both times matching exactly. Source files
+- Test counts: `drift-dsl`'s full workspace — **257 passed, 0 failed** (142 from
+  `drift-script` + 115 from `drift-script-stdlib`). The original `~/src/oss/drift`'s
+  `drift-script-stdlib` alone — **115 passed, 0 failed**, matching exactly. Source files
   verified byte-for-byte identical via `diff -rq` before running any tests.
-- No new plan gaps found this time -- the workspace-root `rustfmt.toml` added during Task 1
-  already covered `drift-script-stdlib` with no extra work, exactly as predicted in Task 1's
-  completion notes. `cargo fmt --check` passed cleanly (exit 0) on the first attempt.
-- Clippy: `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings across both
-  crates together.
-- One environmental note (not a plan defect): this machine was under heavy, unrelated
-  concurrent load from other cargo processes during this task (background jobs from prior,
-  unrelated work in the `drift` repo), which occasionally suspended backgrounded `cargo`
-  invocations mid-compile. Running cargo commands synchronously (foreground, one at a time,
-  checking `ps aux | grep cargo` first) avoided the issue reliably.
-
-**Task 2 completion notes (actual execution):**
-- Commits: `d8ab2d5` (extraction, 13 files changed, 5101 insertions) and `39db62e` (CI
-  workflow, 1 file changed) on `origin/master`.
-- Test counts: `drift-dsl`'s `drift-script-stdlib` — **115 passed, 0 failed**; the original
-  `~/src/oss/drift`'s `drift-script-stdlib` — **115 passed, 0 failed**. Identical, matching
-  the byte-for-byte source copy. Combined workspace total (`drift-script` +
-  `drift-script-stdlib`): **257 passed, 0 failed**.
-- `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings (no
-  `rustfmt.toml`-style gap this time; the workspace-root config from Task 1 already covers
-  this crate, confirmed by `cargo fmt --check` passing with zero diff on the first attempt).
-- `tokio` dependency note: `drift`'s original `drift-script-stdlib/Cargo.toml` pins
-  `tokio = { workspace = true, features = ["full"] }` explicitly (redundant here since
-  `drift-dsl`'s workspace-level `tokio` dependency already specifies `features = ["full"]`,
-  but kept explicit to match the source exactly per this task's own instruction to treat the
-  real source file as authoritative over the plan's template).
-
-**Task 2 completion notes (actual execution):**
-- Commits: `d8ab2d5` ("feat: extract drift-script-stdlib...", 13 files, 5101 insertions) and
-  `39db62e` ("ci: add GitHub Actions workflow...", 1 file, 18 insertions), both pushed to
-  `origin/master`.
-- Test counts: `drift-dsl` workspace (`drift-script` + `drift-script-stdlib` together) —
-  **257 passed, 0 failed** (142 + 115), matching **115 passed, 0 failed** when
-  `cargo test -p drift-script-stdlib` was re-run inside the original `~/src/oss/drift` repo
-  on the unmodified source. Source files verified byte-for-byte identical via `diff -rq`
-  before running any test.
 - Clippy (`cargo clippy --workspace --all-targets -- -D warnings`) and fmt
   (`cargo fmt --check`) both passed cleanly with zero issues -- the workspace-root
-  `rustfmt.toml` added during Task 1 already covers this crate too, no additional fmt-gap
-  found this time.
-- No plan gaps found for this task (Task 1's `rustfmt.toml` fix already covered it).
+  `rustfmt.toml` added during Task 1 already covers this crate too, exactly as predicted in
+  Task 1's completion notes.
+- `tokio` dependency note: `drift`'s original `drift-script-stdlib/Cargo.toml` pins
+  `tokio = { workspace = true, features = ["full"] }` explicitly (redundant given
+  `drift-dsl`'s workspace-level `tokio` dependency already specifies `features = ["full"]`,
+  but kept explicit to match the real source exactly).
+- No plan gaps found for this task (Task 1's `rustfmt.toml` fix already covered the whole
+  workspace).
 
 ---
 
