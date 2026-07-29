@@ -34,5 +34,5 @@ pub mod clock;
 pub mod performance;
 
 // Populated in Task 14.
-pub mod runner;
 pub mod report;
+pub mod runner;
