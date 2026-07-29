@@ -12,6 +12,17 @@ use rust_decimal_macros::dec;
 
 const CLICKHOUSE_URL: &str = "http://localhost:8123";
 
+/// Builds a symbol unique to this test invocation so re-running the suite
+/// against a persistent (non-wiped) ClickHouse instance doesn't accumulate
+/// rows from prior runs under the same symbol -- each test's exact-row-count
+/// assertions require this for repeatability.
+fn unique_symbol(prefix: &str, now: chrono::DateTime<Utc>) -> String {
+    format!(
+        "{prefix}{}",
+        now.timestamp_nanos_opt().unwrap_or(now.timestamp())
+    )
+}
+
 #[tokio::test]
 #[ignore]
 async fn write_and_read_back_trades() {
@@ -23,9 +34,9 @@ async fn write_and_read_back_trades() {
         .expect("StorageReader::new should succeed");
 
     let now = Utc::now();
-    let symbol = "TESTTRADE";
+    let symbol = unique_symbol("TESTTRADE", now);
     let events = vec![MarketEvent::Trade(TradeEvent {
-        symbol: symbol.to_string(),
+        symbol: symbol.clone(),
         venue: Venue::Binance,
         price: dec!(65000.12345),
         quantity: dec!(0.5),
@@ -42,7 +53,7 @@ async fn write_and_read_back_trades() {
     let date = now.date_naive();
     let read_back = reader
         .read_batch(
-            symbol,
+            &symbol,
             Venue::Binance,
             date..(date.succ_opt().unwrap()),
             EventType::Trade,
@@ -67,9 +78,9 @@ async fn write_and_read_back_ticks() {
     let reader = StorageReader::new(CLICKHOUSE_URL).await.unwrap();
 
     let now = Utc::now();
-    let symbol = "TESTTICK";
+    let symbol = unique_symbol("TESTTICK", now);
     let events = vec![MarketEvent::Tick(Tick {
-        symbol: symbol.to_string(),
+        symbol: symbol.clone(),
         venue: Venue::Binance,
         bid_price: dec!(64999.5),
         bid_size: dec!(1.5),
@@ -83,7 +94,7 @@ async fn write_and_read_back_ticks() {
     let date = now.date_naive();
     let read_back = reader
         .read_batch(
-            symbol,
+            &symbol,
             Venue::Binance,
             date..(date.succ_opt().unwrap()),
             EventType::Tick,
@@ -106,9 +117,9 @@ async fn write_and_read_back_depth_with_nested_levels() {
     let reader = StorageReader::new(CLICKHOUSE_URL).await.unwrap();
 
     let now = Utc::now();
-    let symbol = "TESTDEPTH";
+    let symbol = unique_symbol("TESTDEPTH", now);
     let events = vec![MarketEvent::Depth(DepthUpdate {
-        symbol: symbol.to_string(),
+        symbol: symbol.clone(),
         venue: Venue::Binance,
         bids: vec![
             PriceLevel {
@@ -134,7 +145,7 @@ async fn write_and_read_back_depth_with_nested_levels() {
     let date = now.date_naive();
     let read_back = reader
         .read_batch(
-            symbol,
+            &symbol,
             Venue::Binance,
             date..(date.succ_opt().unwrap()),
             EventType::Depth,
@@ -162,9 +173,9 @@ async fn write_and_read_back_bars() {
     let reader = StorageReader::new(CLICKHOUSE_URL).await.unwrap();
 
     let now = Utc::now();
-    let symbol = "TESTBAR";
+    let symbol = unique_symbol("TESTBAR", now);
     let events = vec![MarketEvent::Bar(Bar {
-        symbol: symbol.to_string(),
+        symbol: symbol.clone(),
         venue: Venue::Binance,
         open: dec!(65000),
         high: dec!(65200),
@@ -181,7 +192,7 @@ async fn write_and_read_back_bars() {
     let date = now.date_naive();
     let read_back = reader
         .read_batch(
-            symbol,
+            &symbol,
             Venue::Binance,
             date..(date.succ_opt().unwrap()),
             EventType::Bar,
