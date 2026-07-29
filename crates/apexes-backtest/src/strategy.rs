@@ -27,10 +27,16 @@ pub struct StrategyContext<'a> {
     /// Currently-open (unfilled or partially-filled) orders, keyed by
     /// `OrderId`.
     ///
-    /// Known limitation: a Stop/StopLimit order that triggers internally
-    /// during matching is tracked under a NEW OrderId once converted to a
-    /// Market/Limit order; the original OrderId's entry in this map will
-    /// not reflect the resulting fill. See
+    /// Triggered Stop orders: a Stop order that triggers converts
+    /// internally to a Market order, and its fills are reported under the
+    /// ORIGINAL `OrderId` this map already holds -- the runner's
+    /// `open_orders.get_mut(&order_id)` lookup finds the same entry, so
+    /// the strategy observes the fill on the order it placed.
+    ///
+    /// Known limitation (StopLimit only): a triggered StopLimit converts
+    /// to a NEW resting Limit order tracked under a NEW `OrderId`; the
+    /// original OrderId's entry in this map will not reflect fills of
+    /// the converted order. See
     /// docs/superpowers/plans/2026-07-28-apexes-backtest.md Task 14 for
     /// full rationale.
     pub open_orders: &'a HashMap<OrderId, Order>,

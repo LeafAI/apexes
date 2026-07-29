@@ -94,6 +94,25 @@ struct PendingTrigger {
     stop_price: Decimal,
 }
 
+/// The outcome of `MatchingEngine::check_pending_triggers`: fills from
+/// triggered Stop orders (keyed by the ORIGINAL Stop order's `OrderId`,
+/// so they flow through `on_trade_event`'s results exactly like
+/// resting-order fills), plus triggered StopLimit orders awaiting
+/// deferred conversion into resting Limit orders.
+struct TriggerCheckResult {
+    stop_fills: Vec<(OrderId, Vec<Fill>)>,
+    stop_limit_conversions: Vec<(OrderId, OrderIntent)>,
+}
+
+impl TriggerCheckResult {
+    fn empty() -> Self {
+        Self {
+            stop_fills: Vec::new(),
+            stop_limit_conversions: Vec::new(),
+        }
+    }
+}
+
 struct RestingOrder {
     order_id: OrderId,
     order: Order,
@@ -164,6 +183,14 @@ impl MatchingEngine {
                 reason: format!(
                     "submit_market_order called with non-Market OrderType: {:?}",
                     intent.order_type
+                ),
+            });
+        }
+        if intent.quantity <= Decimal::ZERO {
+            return Err(ApexesError::OrderRejected {
+                reason: format!(
+                    "submit_market_order requires a positive quantity, got {}",
+                    intent.quantity
                 ),
             });
         }
@@ -394,37 +421,48 @@ impl MatchingEngine {
         Ok(order)
     }
 
-    /// Processes a real executed `TradeEvent`, filling any eligible
-    /// resting limit orders at `trade.symbol`. A resting Buy limit order
-    /// is triggered by trades at or below its limit price; a resting Sell
-    /// limit order is triggered by trades at or above its limit price.
+    /// Processes a real executed `TradeEvent`: triggers any pending
+    /// Stop/StopLimit orders at `trade.symbol` whose stop price was
+    /// crossed, then fills any eligible resting limit orders. A resting
+    /// Buy limit order is triggered by trades at or below its limit
+    /// price; a resting Sell limit order is triggered by trades at or
+    /// above its limit price.
     /// Once `volume_ahead_required` (see `RestingOrder`) has been observed
     /// via cumulative trade volume, further trade volume at/through the
     /// order's price fills the order itself, up to `trade.quantity` or the
     /// order's `remaining_quantity`, whichever is smaller. Returns
     /// `(OrderId, Vec<Fill>)` for every order that received a fill from
-    /// this trade; fully filled orders are removed from `resting_orders`.
+    /// this trade -- including triggered Stop orders (whose Market-order
+    /// fills are keyed by the ORIGINAL Stop order's ID) -- and fully
+    /// filled resting orders are removed from `resting_orders`.
     pub fn on_trade_event(
         &mut self,
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
         // Check pending triggers FIRST: triggered Stop orders convert to
-        // Market orders and fill immediately; triggered StopLimit orders
-        // are returned as Limit intents and submitted AFTER this call's
-        // resting-order pass below, so the trade that triggered a
-        // StopLimit can never also fill it in the same call (the order was
-        // not yet resting when that trade occurred).
-        let stop_limit_conversions = self.check_pending_triggers(trade, now);
+        // Market orders and fill immediately (their fills are returned
+        // through `results` below, keyed by the ORIGINAL Stop order's ID);
+        // triggered StopLimit orders are returned as Limit intents and
+        // submitted AFTER this call's resting-order pass below, so the
+        // trade that triggered a StopLimit can never also fill it in the
+        // same call (the order was not yet resting when that trade
+        // occurred).
+        let trigger_result = self.check_pending_triggers(trade, now);
 
-        let mut results = Vec::new();
+        let mut results = trigger_result.stop_fills;
         if let Some(orders) = self.resting_orders.get_mut(&trade.symbol)
             && !orders.is_empty()
         {
-            results = Self::fill_resting_orders(orders, trade, now, &self.cost_model);
+            results.extend(Self::fill_resting_orders(
+                orders,
+                trade,
+                now,
+                &self.cost_model,
+            ));
         }
 
-        for (original_order_id, limit_intent) in stop_limit_conversions {
+        for (original_order_id, limit_intent) in trigger_result.stop_limit_conversions {
             match self.submit_limit_order(&limit_intent, now) {
                 Ok(_) => tracing::info!(
                     symbol = %trade.symbol,
@@ -535,10 +573,11 @@ impl MatchingEngine {
     /// through `stop_price`. Triggered orders are removed from
     /// `pending_triggers`. A triggered `Stop` is immediately submitted as
     /// a Market order (filled synchronously via `submit_market_order`'s
-    /// book-walk logic against the CURRENT order book state -- its fills
-    /// are not returned to `on_trade_event`'s caller in this call; the
-    /// runner (Task 14) tracks each `Order`'s status independently and
-    /// observes the transition on its own next check). A triggered
+    /// book-walk logic against the CURRENT order book state) and its
+    /// fills are returned as `(original OrderId, Vec<Fill>)` pairs so
+    /// `on_trade_event` can merge them into its own results -- they flow
+    /// through the exact same downstream mechanism as resting-order
+    /// fills (ledger, equity curve, `BacktestReport.trades`). A triggered
     /// `StopLimit` is returned as an `(OrderId, Limit OrderIntent)` pair
     /// (the original order's ID alongside the converted intent) for the
     /// caller (`on_trade_event`) to submit via `submit_limit_order` AFTER the
@@ -547,16 +586,20 @@ impl MatchingEngine {
     /// order was not yet resting when that trade occurred. The converted
     /// Limit order is eligible for fills from the NEXT `on_trade_event`
     /// call onward, exactly like any other resting limit order.
+    ///
+    /// Returns a `TriggerCheckResult`: triggered-Stop
+    /// fills keyed by the ORIGINAL `OrderId` `submit_stop_order` returned,
+    /// and triggered-StopLimit conversions awaiting submission.
     fn check_pending_triggers(
         &mut self,
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
-    ) -> Vec<(OrderId, OrderIntent)> {
+    ) -> TriggerCheckResult {
         let Some(pending) = self.pending_triggers.get_mut(&trade.symbol) else {
-            return Vec::new();
+            return TriggerCheckResult::empty();
         };
         if pending.is_empty() {
-            return Vec::new();
+            return TriggerCheckResult::empty();
         }
 
         let mut still_pending = Vec::new();
@@ -575,18 +618,42 @@ impl MatchingEngine {
         }
         *pending = still_pending;
 
+        let mut stop_fills = Vec::new();
         let mut stop_limit_conversions = Vec::new();
         for trigger in triggered {
             match trigger.intent.order_type {
                 OrderType::Stop => {
                     let mut market_intent = trigger.intent.clone();
                     market_intent.order_type = OrderType::Market;
-                    if self.submit_market_order(&market_intent, now).is_ok() {
-                        tracing::info!(
-                            symbol = %trade.symbol,
-                            order_id = ?trigger.order_id,
-                            "Stop order triggered and converted to Market order"
-                        );
+                    match self.submit_market_order(&market_intent, now) {
+                        Ok((_order, fills)) if !fills.is_empty() => {
+                            tracing::info!(
+                                symbol = %trade.symbol,
+                                order_id = ?trigger.order_id,
+                                "Stop order triggered and converted to Market order"
+                            );
+                            // Key the fills by the ORIGINAL Stop order's ID
+                            // (not the throwaway Market order's freshly-minted
+                            // ID), so the runner's `open_orders` bookkeeping
+                            // and `BacktestReport.trades` attribute them to
+                            // the order the strategy actually placed.
+                            stop_fills.push((trigger.order_id, fills));
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                symbol = %trade.symbol,
+                                order_id = ?trigger.order_id,
+                                "Stop order triggered but produced no fills (no visible liquidity)"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                symbol = %trade.symbol,
+                                order_id = ?trigger.order_id,
+                                ?error,
+                                "Stop order triggered but failed to submit as a Market order"
+                            );
+                        }
                     }
                 }
                 OrderType::StopLimit => {
@@ -603,7 +670,10 @@ impl MatchingEngine {
                 ),
             }
         }
-        stop_limit_conversions
+        TriggerCheckResult {
+            stop_fills,
+            stop_limit_conversions,
+        }
     }
 }
 
@@ -1127,6 +1197,30 @@ mod tests {
     }
 
     #[test]
+    fn submit_market_order_rejects_non_positive_quantity() {
+        let mut engine = no_fee_engine();
+
+        for quantity in [dec!(0), dec!(-1)] {
+            let intent = OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity,
+                price: None,
+                stop_price: None,
+            };
+
+            let result = engine.submit_market_order(&intent, Utc::now());
+
+            assert!(
+                matches!(result, Err(ApexesError::OrderRejected { .. })),
+                "quantity {quantity} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn submit_stop_order_rests_as_pending_trigger() {
         let mut engine = no_fee_engine();
         let intent = OrderIntent {
@@ -1236,14 +1330,27 @@ mod tests {
             price: None,
             stop_price: Some(dec!(66000)),
         };
-        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+        let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
-        // A trade at/above the stop price triggers it.
-        engine.on_trade_event(&trade_event("BTCUSDT", dec!(66050), dec!(1)), Utc::now());
+        // A trade at/above the stop price triggers it; the resulting
+        // Market-order fill MUST be returned through on_trade_event's
+        // results (keyed by the ORIGINAL Stop order's ID) so the runner's
+        // ledger/equity/trades bookkeeping actually observes it --
+        // regression guard for the final-review finding that these fills
+        // were previously computed and then silently discarded.
+        let results =
+            engine.on_trade_event(&trade_event("BTCUSDT", dec!(66050), dec!(1)), Utc::now());
 
-        // Verify the order actually filled by submitting a NEW market order and
-        // confirming the book was consumed by the triggered Stop's market fill
-        // (the ask level's 5 quantity should now be reduced by 1, to 4).
+        assert_eq!(results.len(), 1);
+        let (result_order_id, fills) = &results[0];
+        assert_eq!(*result_order_id, order.id);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, dec!(1));
+        assert_eq!(fills[0].price, dec!(66100)); // walked the ask level
+        assert_eq!(fills[0].side, Side::Buy);
+
+        // The ask level's 5 quantity should also have been consumed by
+        // the triggered Stop's market fill (reduced by 1, to 4).
         let (_order, fills) = engine
             .submit_market_order(
                 &OrderIntent {
@@ -1318,10 +1425,21 @@ mod tests {
             price: None,
             stop_price: Some(dec!(64000)),
         };
-        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+        let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
-        // A trade at/below the stop price triggers a sell stop.
-        engine.on_trade_event(&trade_event("BTCUSDT", dec!(63950), dec!(1)), Utc::now());
+        // A trade at/below the stop price triggers a sell stop; the fill
+        // flows back through on_trade_event's results (same regression
+        // guard as the Buy-stop test above).
+        let results =
+            engine.on_trade_event(&trade_event("BTCUSDT", dec!(63950), dec!(1)), Utc::now());
+
+        assert_eq!(results.len(), 1);
+        let (result_order_id, fills) = &results[0];
+        assert_eq!(*result_order_id, order.id);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, dec!(1));
+        assert_eq!(fills[0].price, dec!(63900)); // walked the bid level
+        assert_eq!(fills[0].side, Side::Sell);
 
         let (_order, fills) = engine
             .submit_market_order(
