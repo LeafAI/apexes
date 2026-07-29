@@ -36,3 +36,18 @@ pub mod performance;
 // Populated in Task 14.
 pub mod report;
 pub mod runner;
+
+pub use clock::ReplaySpeed;
+pub use cost_model::{
+    BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
+};
+pub use error::ApexesError;
+pub use ledger::PortfolioLedger;
+pub use market_data_source::{
+    HistoricalMarketDataSource, InMemoryMarketDataSource, StorageMarketDataSource,
+};
+pub use matching_engine::MatchingEngine;
+pub use performance::{PerformanceSummary, PerformanceTracker};
+pub use report::BacktestReport;
+pub use runner::{BacktestConfig, run_backtest};
+pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
