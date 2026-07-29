@@ -1777,7 +1777,17 @@ mod tests {
 
     #[test]
     fn position_flips_sign_and_resets_entry_price_on_full_reversal() {
-        let mut ledger = ledger_with_10k_usdt();
+        // NOTE: this ledger starts with an extra 0.5 BTC pre-funded so the
+        // direction-flipping sell below passes apply_fill's atomic balance
+        // check (a 10k-USDT-only setup would hold just 0.1 BTC at flip
+        // time and could never execute the 0.3 BTC sell -- caught during
+        // Task 7 implementation).
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+        initial_balances.insert("BTC".to_string(), dec!(0.5));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
         ledger.apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0))).unwrap();
         // Sell more than the current long position: flips to short.
         ledger.apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.3), dec!(0))).unwrap();
