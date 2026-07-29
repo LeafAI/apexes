@@ -83,6 +83,15 @@ pub struct MatchingEngine {
     queue_position_factor: Decimal,
     /// Resting limit orders, keyed by symbol -> list of `RestingOrder`.
     resting_orders: HashMap<String, Vec<RestingOrder>>,
+    /// Pending Stop/StopLimit orders awaiting their trigger price, keyed
+    /// by symbol -> list of `PendingTrigger`.
+    pending_triggers: HashMap<String, Vec<PendingTrigger>>,
+}
+
+struct PendingTrigger {
+    order_id: OrderId,
+    intent: OrderIntent,
+    stop_price: Decimal,
 }
 
 struct RestingOrder {
@@ -124,6 +133,7 @@ impl MatchingEngine {
             cost_model,
             queue_position_factor,
             resting_orders: HashMap::new(),
+            pending_triggers: HashMap::new(),
         }
     }
 
@@ -317,6 +327,65 @@ impl MatchingEngine {
         Ok(order)
     }
 
+    /// Submits a Stop or StopLimit `OrderIntent`. The order does not rest
+    /// in the order book -- it waits as a pending trigger until a
+    /// `TradeEvent` at or through `intent.stop_price` is observed (via
+    /// `on_trade_event`), at which point it converts to a Market order
+    /// (`Stop`) or is submitted as a Limit order (`StopLimit`), per design
+    /// spec §7.4.
+    pub fn submit_stop_order(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Order, ApexesError> {
+        if intent.order_type != OrderType::Stop && intent.order_type != OrderType::StopLimit {
+            return Err(ApexesError::OrderRejected {
+                reason: format!(
+                    "submit_stop_order called with non-Stop/StopLimit OrderType: {:?}",
+                    intent.order_type
+                ),
+            });
+        }
+        let stop_price = intent
+            .stop_price
+            .ok_or_else(|| ApexesError::OrderRejected {
+                reason: "Stop/StopLimit order requires a stop_price".to_string(),
+            })?;
+        if intent.order_type == OrderType::StopLimit && intent.price.is_none() {
+            return Err(ApexesError::OrderRejected {
+                reason: "StopLimit order requires both stop_price and price".to_string(),
+            });
+        }
+
+        let order_id = OrderId(Uuid::new_v4());
+        let order = Order {
+            id: order_id,
+            exchange_order_id: None,
+            symbol: intent.symbol.clone(),
+            venue: intent.venue,
+            side: intent.side,
+            order_type: intent.order_type,
+            quantity: intent.quantity,
+            price: intent.price,
+            stop_price: Some(stop_price),
+            filled_quantity: Decimal::ZERO,
+            status: OrderStatus::New,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.pending_triggers
+            .entry(intent.symbol.clone())
+            .or_default()
+            .push(PendingTrigger {
+                order_id,
+                intent: intent.clone(),
+                stop_price,
+            });
+
+        Ok(order)
+    }
+
     /// Processes a real executed `TradeEvent`, filling any eligible
     /// resting limit orders at `trade.symbol`. A resting Buy limit order
     /// is triggered by trades at or below its limit price; a resting Sell
@@ -332,13 +401,42 @@ impl MatchingEngine {
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
-        let Some(orders) = self.resting_orders.get_mut(&trade.symbol) else {
-            return Vec::new();
-        };
-        if orders.is_empty() {
-            return Vec::new();
+        // Check pending triggers FIRST: triggered Stop orders convert to
+        // Market orders and fill immediately; triggered StopLimit orders
+        // are returned as Limit intents and submitted AFTER this call's
+        // resting-order pass below, so the trade that triggered a
+        // StopLimit can never also fill it in the same call (the order was
+        // not yet resting when that trade occurred).
+        let stop_limit_conversions = self.check_pending_triggers(trade, now);
+
+        let mut results = Vec::new();
+        if let Some(orders) = self.resting_orders.get_mut(&trade.symbol)
+            && !orders.is_empty()
+        {
+            results = Self::fill_resting_orders(orders, trade, now, &self.cost_model);
         }
 
+        for limit_intent in stop_limit_conversions {
+            if self.submit_limit_order(&limit_intent, now).is_ok() {
+                tracing::info!(
+                    symbol = %trade.symbol,
+                    "StopLimit order triggered and converted to resting Limit order"
+                );
+            }
+        }
+
+        results
+    }
+
+    /// The resting-limit-order fill pass of `on_trade_event`, extracted so
+    /// the early-return cases above don't skip the StopLimit conversion
+    /// submissions. Operates directly on the symbol's resting-order list.
+    fn fill_resting_orders(
+        orders: &mut Vec<RestingOrder>,
+        trade: &apexes_core::TradeEvent,
+        now: DateTime<Utc>,
+        cost_model: &CostModel,
+    ) -> Vec<(OrderId, Vec<Fill>)> {
         let mut results = Vec::new();
         let mut still_resting = Vec::new();
         let mut remaining_trade_quantity = trade.quantity;
@@ -383,9 +481,7 @@ impl MatchingEngine {
             }
 
             let notional = price * fill_quantity;
-            let fee =
-                self.cost_model
-                    .fee_for_fill(resting.order.venue, FillLiquidity::Maker, notional);
+            let fee = cost_model.fee_for_fill(resting.order.venue, FillLiquidity::Maker, notional);
             let fill = Fill {
                 id: FillId(Uuid::new_v4()),
                 order_id: resting.order_id,
@@ -416,6 +512,82 @@ impl MatchingEngine {
 
         *orders = still_resting;
         results
+    }
+
+    /// Checks every pending Stop/StopLimit trigger at `trade.symbol`
+    /// against `trade.price`: a Buy stop triggers when price rises to or
+    /// through `stop_price`; a Sell stop triggers when price falls to or
+    /// through `stop_price`. Triggered orders are removed from
+    /// `pending_triggers`. A triggered `Stop` is immediately submitted as
+    /// a Market order (filled synchronously via `submit_market_order`'s
+    /// book-walk logic against the CURRENT order book state -- its fills
+    /// are not returned to `on_trade_event`'s caller in this call; the
+    /// runner (Task 14) tracks each `Order`'s status independently and
+    /// observes the transition on its own next check). A triggered
+    /// `StopLimit` is returned as a Limit `OrderIntent` for the caller
+    /// (`on_trade_event`) to submit via `submit_limit_order` AFTER the
+    /// current call's resting-order pass -- the trade that triggered the
+    /// StopLimit must not also fill it in the same call, because the
+    /// order was not yet resting when that trade occurred. The converted
+    /// Limit order is eligible for fills from the NEXT `on_trade_event`
+    /// call onward, exactly like any other resting limit order.
+    fn check_pending_triggers(
+        &mut self,
+        trade: &apexes_core::TradeEvent,
+        now: DateTime<Utc>,
+    ) -> Vec<OrderIntent> {
+        let Some(pending) = self.pending_triggers.get_mut(&trade.symbol) else {
+            return Vec::new();
+        };
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let mut still_pending = Vec::new();
+        let mut triggered = Vec::new();
+
+        for trigger in pending.drain(..) {
+            let is_triggered = match trigger.intent.side {
+                Side::Buy => trade.price >= trigger.stop_price,
+                Side::Sell => trade.price <= trigger.stop_price,
+            };
+            if is_triggered {
+                triggered.push(trigger);
+            } else {
+                still_pending.push(trigger);
+            }
+        }
+        *pending = still_pending;
+
+        let mut stop_limit_conversions = Vec::new();
+        for trigger in triggered {
+            match trigger.intent.order_type {
+                OrderType::Stop => {
+                    let mut market_intent = trigger.intent.clone();
+                    market_intent.order_type = OrderType::Market;
+                    if self.submit_market_order(&market_intent, now).is_ok() {
+                        tracing::info!(
+                            symbol = %trade.symbol,
+                            order_id = ?trigger.order_id,
+                            "Stop order triggered and converted to Market order"
+                        );
+                    }
+                }
+                OrderType::StopLimit => {
+                    // submit_limit_order rejects non-Limit order types, so
+                    // convert the intent to Limit (same pattern as the
+                    // Stop -> Market arm above) and defer submission to
+                    // the caller -- see this method's doc comment.
+                    let mut limit_intent = trigger.intent.clone();
+                    limit_intent.order_type = OrderType::Limit;
+                    stop_limit_conversions.push(limit_intent);
+                }
+                _ => unreachable!(
+                    "PendingTrigger only ever holds Stop/StopLimit intents, enforced by submit_stop_order"
+                ),
+            }
+        }
+        stop_limit_conversions
     }
 }
 
@@ -936,5 +1108,236 @@ mod tests {
                 "quantity {quantity} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn submit_stop_order_rests_as_pending_trigger() {
+        let mut engine = no_fee_engine();
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Stop,
+            quantity: dec!(1),
+            price: None,
+            stop_price: Some(dec!(66000)),
+        };
+
+        let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
+
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(order.stop_price, Some(dec!(66000)));
+    }
+
+    #[test]
+    fn submit_stop_order_rejects_stop_limit_without_price() {
+        let mut engine = no_fee_engine();
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::StopLimit,
+            quantity: dec!(1),
+            price: None, // missing -- should be rejected
+            stop_price: Some(dec!(66000)),
+        };
+
+        let result = engine.submit_stop_order(&intent, Utc::now());
+
+        assert!(matches!(result, Err(ApexesError::OrderRejected { .. })));
+    }
+
+    #[test]
+    fn submit_stop_order_rejects_missing_stop_price() {
+        let mut engine = no_fee_engine();
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Stop,
+            quantity: dec!(1),
+            price: None,
+            stop_price: None,
+        };
+
+        let result = engine.submit_stop_order(&intent, Utc::now());
+
+        assert!(matches!(result, Err(ApexesError::OrderRejected { .. })));
+    }
+
+    #[test]
+    fn submit_stop_order_rejects_non_stop_intent() {
+        let mut engine = no_fee_engine();
+        let intent = buy_intent("BTCUSDT", dec!(1)); // OrderType::Market
+
+        let result = engine.submit_stop_order(&intent, Utc::now());
+
+        assert!(matches!(result, Err(ApexesError::OrderRejected { .. })));
+    }
+
+    #[test]
+    fn buy_stop_triggers_and_fills_as_market_order_when_price_rises_through_stop() {
+        let mut engine = no_fee_engine();
+        engine.on_depth_update(&snapshot(
+            "BTCUSDT",
+            vec![],
+            vec![PriceLevel {
+                price: dec!(66100),
+                quantity: dec!(5),
+            }],
+        ));
+
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Stop,
+            quantity: dec!(1),
+            price: None,
+            stop_price: Some(dec!(66000)),
+        };
+        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+
+        // A trade at/above the stop price triggers it.
+        engine.on_trade_event(&trade_event("BTCUSDT", dec!(66050), dec!(1)), Utc::now());
+
+        // Verify the order actually filled by submitting a NEW market order and
+        // confirming the book was consumed by the triggered Stop's market fill
+        // (the ask level's 5 quantity should now be reduced by 1, to 4).
+        let (_order, fills) = engine
+            .submit_market_order(
+                &OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: Venue::Binance,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(4),
+                    price: None,
+                    stop_price: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(fills[0].quantity, dec!(4)); // exactly the remaining depth after the triggered Stop consumed 1
+    }
+
+    #[test]
+    fn buy_stop_does_not_trigger_when_price_stays_below_stop() {
+        let mut engine = no_fee_engine();
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Stop,
+            quantity: dec!(1),
+            price: None,
+            stop_price: Some(dec!(66000)),
+        };
+        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+
+        // Trade stays below the stop price -- not triggered.
+        engine.on_trade_event(&trade_event("BTCUSDT", dec!(65000), dec!(1)), Utc::now());
+
+        // No liquidity was consumed by a phantom fill: submitting a fresh
+        // market order against an untouched (empty) book should find zero fills.
+        let (_order, fills) = engine
+            .submit_market_order(
+                &OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: Venue::Binance,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn sell_stop_triggers_when_price_falls_through_stop() {
+        let mut engine = no_fee_engine();
+        engine.on_depth_update(&snapshot(
+            "BTCUSDT",
+            vec![PriceLevel {
+                price: dec!(63900),
+                quantity: dec!(5),
+            }],
+            vec![],
+        ));
+
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Sell,
+            order_type: OrderType::Stop,
+            quantity: dec!(1),
+            price: None,
+            stop_price: Some(dec!(64000)),
+        };
+        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+
+        // A trade at/below the stop price triggers a sell stop.
+        engine.on_trade_event(&trade_event("BTCUSDT", dec!(63950), dec!(1)), Utc::now());
+
+        let (_order, fills) = engine
+            .submit_market_order(
+                &OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: Venue::Binance,
+                    side: Side::Sell,
+                    order_type: OrderType::Market,
+                    quantity: dec!(4),
+                    price: None,
+                    stop_price: None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(fills[0].quantity, dec!(4));
+    }
+
+    #[test]
+    fn stop_limit_triggers_and_rests_as_limit_order_not_immediate_fill() {
+        let mut engine = no_fee_engine();
+        engine.on_depth_update(&snapshot(
+            "BTCUSDT",
+            vec![],
+            vec![PriceLevel {
+                price: dec!(66100),
+                quantity: dec!(5),
+            }],
+        ));
+
+        let intent = OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::StopLimit,
+            quantity: dec!(1),
+            price: Some(dec!(66050)), // limit price once triggered
+            stop_price: Some(dec!(66000)),
+        };
+        engine.submit_stop_order(&intent, Utc::now()).unwrap();
+
+        // Trigger: a trade at/above the stop price, but BELOW the StopLimit's
+        // own limit price (66020 < 66050), so the newly-resting Buy limit
+        // order (which fills on trades AT/BELOW its price) is not yet
+        // triggered by this same trade.
+        let results =
+            engine.on_trade_event(&trade_event("BTCUSDT", dec!(66020), dec!(1)), Utc::now());
+        assert!(
+            results.is_empty(),
+            "StopLimit becomes a resting Limit order on trigger, not an immediate fill"
+        );
+
+        // A subsequent trade at/below the limit price fills the now-resting Limit order.
+        let results =
+            engine.on_trade_event(&trade_event("BTCUSDT", dec!(66040), dec!(1)), Utc::now());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1[0].price, dec!(66050)); // fills at the StopLimit's own limit price
     }
 }

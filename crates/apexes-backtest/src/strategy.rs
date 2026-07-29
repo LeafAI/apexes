@@ -37,6 +37,7 @@ pub struct StrategyContext<'a> {
 /// and lifecycle state) -- `OrderIntent` is the strategy's *request*,
 /// before the matching engine (backtest) or OMS (live) assigns it an
 /// identity and begins tracking its status.
+#[derive(Debug, Clone)]
 pub struct OrderIntent {
     pub symbol: String,
     pub venue: Venue,
