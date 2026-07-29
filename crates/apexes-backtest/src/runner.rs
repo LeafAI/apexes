@@ -68,7 +68,11 @@ pub async fn run_backtest(
                 matching_engine.on_depth_update(update);
             }
             MarketEvent::Trade(trade) => {
-                last_prices.insert(trade.symbol.clone(), trade.price);
+                if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
+                    && let Some(base) = &instrument.base_currency
+                {
+                    last_prices.insert(base.clone(), trade.price);
+                }
                 let fill_results = matching_engine.on_trade_event(trade, timestamp);
                 for (order_id, fills) in fill_results {
                     apply_fills(
@@ -191,5 +195,149 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Depth(depth) => depth.timestamp,
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ReplaySpeed;
+    use crate::market_data_source::InMemoryMarketDataSource;
+    use crate::strategy::OrderIntent;
+    use apexes_core::{AssetClass, DepthUpdate, MarketType, PriceLevel, Side, TradeEvent, Venue};
+    use chrono::{Duration, TimeZone, Utc};
+    use rust_decimal_macros::dec;
+
+    struct BuyOnceStrategy {
+        bought: bool,
+    }
+
+    impl Strategy for BuyOnceStrategy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if !self.bought && matches!(event, MarketEvent::Trade(_)) {
+                self.bought = true;
+                return vec![OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: Venue::Binance,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                }];
+            }
+            Vec::new()
+        }
+    }
+
+    fn btcusdt_instrument() -> Instrument {
+        Instrument {
+            symbol: "BTCUSDT".to_string(),
+            market_type: MarketType::Crypto,
+            venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.00001),
+            multiplier: dec!(1),
+        }
+    }
+
+    fn zero_cost_model() -> CostModel {
+        CostModel {
+            fee_schedule: Box::new(crate::cost_model::FlatFeeSchedule {
+                maker_bps: Decimal::ZERO,
+                taker_bps: Decimal::ZERO,
+            }),
+            funding_rate_bps: None,
+        }
+    }
+
+    /// Regression test for the Task 14 fix: `run_backtest` must key
+    /// `last_prices` by BASE ASSET (e.g. "BTC"), not by trading-pair symbol
+    /// (e.g. "BTCUSDT"), because `PortfolioLedger::equity()` looks up mark
+    /// prices by asset symbol. With the old (buggy) keying, a held BTC
+    /// balance silently fell back to a price of 1.0, so buying 1 BTC at
+    /// 100 USDT from 10,000 USDT would report final equity of 9,901
+    /// (9,900 USDT + 1 BTC * 1.0) instead of the correct 10,010
+    /// (9,900 USDT + 1 BTC * 110 mark).
+    #[tokio::test]
+    async fn equity_curve_marks_held_base_asset_at_real_trade_price() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            MarketEvent::Depth(DepthUpdate {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                bids: vec![PriceLevel {
+                    price: dec!(99),
+                    quantity: dec!(10),
+                }],
+                asks: vec![PriceLevel {
+                    price: dec!(100),
+                    quantity: dec!(10),
+                }],
+                sequence: None,
+                is_snapshot: true,
+                timestamp: t0,
+            }),
+            MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                price: dec!(100),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: t0 + Duration::seconds(1),
+            }),
+            MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                price: dec!(110),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: t0 + Duration::seconds(2),
+            }),
+        ];
+
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+
+        let config = BacktestConfig {
+            instruments: vec![btcusdt_instrument()],
+            date_range: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+                ..chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            initial_balances,
+            cost_model: zero_cost_model(),
+            speed: ReplaySpeed::AsFastAsPossible,
+            queue_position_factor: dec!(0.5),
+            risk_free_return: Decimal::ZERO,
+        };
+
+        let report = run_backtest(
+            config,
+            InMemoryMarketDataSource::new(events),
+            BuyOnceStrategy { bought: false },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.trades.len(), 1);
+        let final_equity = report
+            .equity_curve
+            .last()
+            .map(|(_, equity)| *equity)
+            .unwrap();
+        // Correct mark-to-market: 9,900 USDT + 1 BTC * 110 = 10,010.
+        assert_eq!(final_equity, dec!(10010));
+        // Guard against the regression's exact wrong value: with
+        // symbol-keyed mark prices the held BTC fell back to price 1.0,
+        // giving 9,900 + 1 = 9,901.
+        assert_ne!(final_equity, dec!(9901));
     }
 }
