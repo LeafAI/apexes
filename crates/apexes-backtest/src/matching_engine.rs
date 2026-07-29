@@ -356,6 +356,14 @@ impl MatchingEngine {
                 reason: "StopLimit order requires both stop_price and price".to_string(),
             });
         }
+        if intent.quantity <= Decimal::ZERO {
+            return Err(ApexesError::OrderRejected {
+                reason: format!(
+                    "submit_stop_order requires a positive quantity, got {}",
+                    intent.quantity
+                ),
+            });
+        }
 
         let order_id = OrderId(Uuid::new_v4());
         let order = Order {
@@ -416,12 +424,19 @@ impl MatchingEngine {
             results = Self::fill_resting_orders(orders, trade, now, &self.cost_model);
         }
 
-        for limit_intent in stop_limit_conversions {
-            if self.submit_limit_order(&limit_intent, now).is_ok() {
-                tracing::info!(
+        for (original_order_id, limit_intent) in stop_limit_conversions {
+            match self.submit_limit_order(&limit_intent, now) {
+                Ok(_) => tracing::info!(
                     symbol = %trade.symbol,
+                    order_id = ?original_order_id,
                     "StopLimit order triggered and converted to resting Limit order"
-                );
+                ),
+                Err(error) => tracing::warn!(
+                    symbol = %trade.symbol,
+                    order_id = ?original_order_id,
+                    ?error,
+                    "StopLimit order triggered but failed to convert to a resting Limit order"
+                ),
             }
         }
 
@@ -524,8 +539,9 @@ impl MatchingEngine {
     /// are not returned to `on_trade_event`'s caller in this call; the
     /// runner (Task 14) tracks each `Order`'s status independently and
     /// observes the transition on its own next check). A triggered
-    /// `StopLimit` is returned as a Limit `OrderIntent` for the caller
-    /// (`on_trade_event`) to submit via `submit_limit_order` AFTER the
+    /// `StopLimit` is returned as an `(OrderId, Limit OrderIntent)` pair
+    /// (the original order's ID alongside the converted intent) for the
+    /// caller (`on_trade_event`) to submit via `submit_limit_order` AFTER the
     /// current call's resting-order pass -- the trade that triggered the
     /// StopLimit must not also fill it in the same call, because the
     /// order was not yet resting when that trade occurred. The converted
@@ -535,7 +551,7 @@ impl MatchingEngine {
         &mut self,
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
-    ) -> Vec<OrderIntent> {
+    ) -> Vec<(OrderId, OrderIntent)> {
         let Some(pending) = self.pending_triggers.get_mut(&trade.symbol) else {
             return Vec::new();
         };
@@ -580,7 +596,7 @@ impl MatchingEngine {
                     // the caller -- see this method's doc comment.
                     let mut limit_intent = trigger.intent.clone();
                     limit_intent.order_type = OrderType::Limit;
-                    stop_limit_conversions.push(limit_intent);
+                    stop_limit_conversions.push((trigger.order_id, limit_intent));
                 }
                 _ => unreachable!(
                     "PendingTrigger only ever holds Stop/StopLimit intents, enforced by submit_stop_order"
@@ -1173,6 +1189,30 @@ mod tests {
         let result = engine.submit_stop_order(&intent, Utc::now());
 
         assert!(matches!(result, Err(ApexesError::OrderRejected { .. })));
+    }
+
+    #[test]
+    fn submit_stop_order_rejects_non_positive_quantity() {
+        let mut engine = no_fee_engine();
+
+        for quantity in [dec!(0), dec!(-1)] {
+            let intent = OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                side: Side::Buy,
+                order_type: OrderType::Stop,
+                quantity,
+                price: None,
+                stop_price: Some(dec!(66000)),
+            };
+
+            let result = engine.submit_stop_order(&intent, Utc::now());
+
+            assert!(
+                matches!(result, Err(ApexesError::OrderRejected { .. })),
+                "quantity {quantity} should be rejected"
+            );
+        }
     }
 
     #[test]
