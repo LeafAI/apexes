@@ -54,11 +54,11 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 3.1 | Historical data replay engine (tick-level exact replay, variable speed) | #3 | 🔲 Not Started | |
-| 3.2 | Matching simulator (order book reconstruction, probabilistic fill model, Level-2 depth consumption) | #3 | 🔲 Not Started | |
-| 3.3 | Cost model (slippage, fees, market impact, funding rate) | #3 | 🔲 Not Started | |
-| 3.4 | Performance attribution & risk metrics (Sharpe, max drawdown, turnover, etc.) | #3 | 🔲 Not Started | |
-| 3.5 | Backtest report generation & visualization | #3 | 🔲 Not Started | |
+| 3.1 | Historical data replay engine (tick-level exact replay, variable speed) | #3 | ✅ Done | Implemented in apexes-backtest via HistoricalMarketDataSource + BacktestClock (AsFastAsPossible/Multiplier/RealTime) |
+| 3.2 | Matching simulator (order book reconstruction, probabilistic fill model, Level-2 depth consumption) | #3 | ✅ Done | MatchingEngine: ReplayOrderBook (reuses barter-data's OrderBook), book-walk VWAP fills, TradeEvent-driven limit-order fills with configurable queue_position_factor, Stop/StopLimit trigger simulation |
+| 3.3 | Cost model (slippage, fees, market impact, funding rate) | #3 | ✅ Done | CostModel: venue-aware FeeSchedule trait (BinanceSpotVipFeeSchedule with real confirmed VIP0-9 rates, FlatFeeSchedule fallback), funding_rate_bps for perpetuals; slippage/market-impact emerges from book-walk fills |
+| 3.4 | Performance attribution & risk metrics (Sharpe, max drawdown, turnover, etc.) | #3 | ✅ Done | PerformanceTracker via barter::statistic::metric (Sharpe/Sortino/Calmar/drawdown/win-rate/profit-factor), overall + per-symbol + per-venue breakdown |
+| 3.5 | Backtest report generation & visualization | #3 | ✅ Done | BacktestReport: structured, JSON-serializable data only; no rendering/charting (deferred to sub-project #13 per design spec §8) |
 
 ## 4. Paper Trading System
 
@@ -157,12 +157,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 56 |
+| 🔲 Not Started | 51 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 13 |
+| ✅ Done | 18 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
-**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), and `#2` (historical data storage — ClickHouse via `apexes-storage`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Next: sub-project `#3` (backtest engine), per roadmap.
+**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Next: sub-project `#4` (strategy SDK) or `#5` (risk engine) — both depend only on `#0` and are unblocked; `#6` Paper Trading needs `#1`+`#3`+`#4`+`#5`, so `#4`/`#5` come first.
