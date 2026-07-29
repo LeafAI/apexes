@@ -68,7 +68,8 @@ mod tests {
     use std::time::Instant;
 
     fn time_at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, second).unwrap()
+        Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, second)
+            .unwrap()
     }
 
     #[tokio::test]
@@ -104,8 +105,14 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Should be roughly 10ms (1000ms / 100), allow generous scheduling slack.
-        assert!(elapsed.as_millis() >= 5, "expected some sleep to occur, got {elapsed:?}");
-        assert!(elapsed.as_millis() < 200, "expected a short sleep, got {elapsed:?}");
+        assert!(
+            elapsed.as_millis() >= 5,
+            "expected some sleep to occur, got {elapsed:?}"
+        );
+        assert!(
+            elapsed.as_millis() < 200,
+            "expected a short sleep, got {elapsed:?}"
+        );
     }
 
     #[tokio::test]
