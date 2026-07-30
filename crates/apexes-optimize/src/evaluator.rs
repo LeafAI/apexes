@@ -16,7 +16,7 @@ use std::collections::HashMap;
 /// -- this trait only fixes the input (`params`, `market_data`) and
 /// output (`Decimal` score) shape, not any of that internal wiring.
 #[async_trait]
-pub trait Evaluator {
+pub trait Evaluator: Send {
     /// Returns `Err(message)` if constructing the strategy or running
     /// the backtest failed for this parameter combination (e.g. a
     /// malformed `.drift` script, or a backtest configuration error).
