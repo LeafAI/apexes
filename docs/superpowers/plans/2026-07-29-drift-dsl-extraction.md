@@ -1049,7 +1049,7 @@ Also note: `NativeFn` here needs an unused import removed if `Arc` isn't otherwi
 directly in this file after the above -- run `cargo clippy` in Step 6 and fix any such unused
 import warning.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run:
 ```bash
@@ -1059,7 +1059,7 @@ cargo test -p drift-script-math
 Expected: all tests from both `arithmetic.rs` and `statistics.rs` pass. Report the exact
 total count.
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/drift-dsl
@@ -1069,7 +1069,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs, across the now-three-crate workspace.
 
-- [ ] **Step 7: Commit and push**
+- [x] **Step 7: Commit and push**
 
 ```bash
 cd ~/src/oss/drift-dsl
@@ -1077,6 +1077,8 @@ git add crates/drift-script-math Cargo.toml
 git commit -S -s -m "feat: add drift-script-math crate with arithmetic and statistics bindings"
 git push origin master
 ```
+
+Done. Pushed commit SHA: `679d149130ca0f014b0386aff00863baec6141c8`.
 
 Record the commit SHA of this push (`git rev-parse HEAD`) -- this is the `rev` value Task 4
 will pin `drift`'s consumer crates to (`drift`'s existing consumers only need `drift-script`
@@ -1100,7 +1102,7 @@ the same repo at the same commit).
   `drift-script` crate, with zero source-code changes (only the dependency source line
   changes).
 
-- [ ] **Step 1: Update `crates/drift-lsp/Cargo.toml`**
+- [x] **Step 1: Update `crates/drift-lsp/Cargo.toml`**
 
 Find the line:
 ```toml
@@ -1112,13 +1114,13 @@ placeholder):
 drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "<commit-sha>" }
 ```
 
-- [ ] **Step 2: Update `crates/drift-script-ai/Cargo.toml`**
+- [x] **Step 2: Update `crates/drift-script-ai/Cargo.toml`**
 
 Apply the identical change: find `drift-script = { path = "../drift-script" }`, replace with
 the same `git = "...", rev = "<commit-sha>"` line (same SHA as Step 1 -- both crates must
 pin the exact same `drift-dsl` commit).
 
-- [ ] **Step 3: Verify these two crates still build**
+- [x] **Step 3: Verify these two crates still build**
 
 Run (from `~/src/oss/drift`):
 ```bash
@@ -1131,7 +1133,7 @@ in the plan; do not attempt to fix that here, it's Task 5's job. If `cargo build
 -p drift-script-ai` itself fails for a reason unrelated to the other still-local-path crates,
 investigate and report the exact error.
 
-- [ ] **Step 4: Run each crate's own tests**
+- [x] **Step 4: Run each crate's own tests**
 
 Run:
 ```bash
@@ -1142,7 +1144,7 @@ Expected: both pass, with identical results to before this change (this is a pur
 dependency-source change, not a logic change -- any test failure here must be investigated,
 not worked around).
 
-- [ ] **Step 5: Commit (do NOT push yet -- wait until Task 5 completes so `drift`'s workspace is in a consistently buildable state for each pushed commit)**
+- [x] **Step 5: Commit (do NOT push yet -- wait until Task 5 completes so `drift`'s workspace is in a consistently buildable state for each pushed commit)**
 
 ```bash
 cd ~/src/oss/drift
@@ -1175,7 +1177,7 @@ diff you're seeing rather than guessing.
 - Produces: `drift`'s entire workspace building and testing cleanly with `drift-script`/
   `drift-script-stdlib` no longer present locally at all.
 
-- [ ] **Step 1: Update `crates/drift-tools/Cargo.toml`**
+- [x] **Step 1: Update `crates/drift-tools/Cargo.toml`**
 
 Find both lines:
 ```toml
@@ -1188,18 +1190,18 @@ drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "<commit
 drift-script-stdlib = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "<commit-sha>" }
 ```
 
-- [ ] **Step 2: Update `crates/drift/Cargo.toml`**
+- [x] **Step 2: Update `crates/drift/Cargo.toml`**
 
 Apply the identical change to its `drift-script`/`drift-script-stdlib` lines (same SHA).
 
-- [ ] **Step 3: Delete the old local crate directories**
+- [x] **Step 3: Delete the old local crate directories**
 
 ```bash
 cd ~/src/oss/drift
 rm -rf crates/drift-script crates/drift-script-stdlib
 ```
 
-- [ ] **Step 4: Verify the full workspace builds and tests clean**
+- [x] **Step 4: Verify the full workspace builds and tests clean**
 
 Run:
 ```bash
@@ -1215,7 +1217,7 @@ BEFORE this whole extraction started, e.g. from git history or your own memory o
 `cargo test --workspace` at the very start of this task, note that comparison -- otherwise
 just report the current totals clearly broken down by crate).
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 cd ~/src/oss/drift
@@ -1224,6 +1226,8 @@ git add -u crates/drift-script crates/drift-script-stdlib
 git commit -S -s -m "chore: point drift-tools and drift CLI at the external drift-dsl repo; remove local drift-script(-stdlib)"
 git push origin master
 ```
+
+Done. Commit SHA: `02b4dbe54dbdf24ea76828b1a81a1944312dc3bf`, pushed alongside Task 4's `9331f25` to `origin/master`.
 
 Note: `git add -u` on the now-deleted directories stages their removal. Double-check with
 `git status` before committing that ONLY the expected files are staged (the 2 Cargo.toml
@@ -1245,7 +1249,7 @@ repos and confirms the extraction's end state.
 - Produces: confirmation that both repos are independently healthy and the extraction is
   complete.
 
-- [ ] **Step 1: Re-verify `drift-dsl` standalone (fresh clone, to rule out any local-state contamination)**
+- [x] **Step 1: Re-verify `drift-dsl` standalone (fresh clone, to rule out any local-state contamination)**
 
 ```bash
 cd /tmp
@@ -1260,7 +1264,7 @@ cargo fmt --check
 Expected: all succeed on a completely fresh clone (proves the repo is self-contained and has
 no hidden dependency on the original `drift` monorepo's workspace settings).
 
-- [ ] **Step 2: Re-verify `drift`'s full workspace one more time**
+- [x] **Step 2: Re-verify `drift`'s full workspace one more time**
 
 ```bash
 cd ~/src/oss/drift
@@ -1274,7 +1278,7 @@ Expected: all succeed. `git status` should show ONLY the pre-existing unrelated 
 changes (never touched by this plan) -- confirm this explicitly by listing what `git status`
 shows and comparing against the Global Constraints' list of pre-existing files.
 
-- [ ] **Step 3: Confirm no stray local crate references remain**
+- [x] **Step 3: Confirm no stray local crate references remain**
 
 ```bash
 cd ~/src/oss/drift
@@ -1283,7 +1287,7 @@ grep -rn "path = \"\.\./drift-script" crates/*/Cargo.toml
 Expected: no output (zero matches) -- confirms every consumer now uses the external git
 dependency, not a stale local path.
 
-- [ ] **Step 4: Report final summary**
+- [x] **Step 4: Report final summary**
 
 Summarize: `drift-dsl` repo URL, default branch, final commit SHA, test counts;
 `drift` repo's final commit SHA for this extraction, test counts, confirmation that
