@@ -1,0 +1,13 @@
+[package]
+name = "apexes-indicators"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
