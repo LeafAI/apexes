@@ -61,7 +61,7 @@ binding layer only, in `apexes-strategy`), `thiserror`.
   Output = Option<Decimal>>` with `pub fn new(period: usize) -> Self`. Both re-exported from
   `apexes_indicators::{Indicator, Sma}` for later tasks and for `apexes-strategy`.
 
-- [ ] **Step 1: Add the new crate to the workspace**
+- [x] **Step 1: Add the new crate to the workspace**
 
 Read the current workspace root `Cargo.toml`:
 
@@ -79,7 +79,7 @@ resolver = "3"
 members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators"]
 ```
 
-- [ ] **Step 2: Create `crates/apexes-indicators/Cargo.toml`**
+- [x] **Step 2: Create `crates/apexes-indicators/Cargo.toml`**
 
 ```toml
 [package]
@@ -97,7 +97,7 @@ thiserror = { workspace = true }
 rust_decimal_macros = "1.40"
 ```
 
-- [ ] **Step 3: Create `crates/apexes-indicators/src/indicator.rs`**
+- [x] **Step 3: Create `crates/apexes-indicators/src/indicator.rs`**
 
 ```rust
 //! The shared streaming indicator interface implemented by every
@@ -134,7 +134,7 @@ pub trait Indicator {
 }
 ```
 
-- [ ] **Step 4: Write `Sma`'s failing tests**
+- [x] **Step 4: Write `Sma`'s failing tests**
 
 Create `crates/apexes-indicators/src/sma.rs`:
 
@@ -224,7 +224,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Create `crates/apexes-indicators/src/lib.rs`**
+- [x] **Step 5: Create `crates/apexes-indicators/src/lib.rs`**
 
 ```rust
 //! Apexes technical indicator library: a shared streaming `Indicator`
@@ -241,7 +241,7 @@ pub use indicator::Indicator;
 pub use sma::Sma;
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -249,7 +249,7 @@ cargo test -p apexes-indicators
 ```
 Expected: `4 passed` (3 behavior tests + 1 `#[should_panic]` test).
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -259,7 +259,7 @@ cargo fmt --check
 Expected: no warnings, no formatting diffs. If `cargo fmt --check` reports diffs, run `cargo
 fmt` (auto-fix) and re-run both commands to confirm clean.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -284,7 +284,7 @@ git push origin master
   `Indicator<Input = Decimal, Output = Option<Decimal>>` with `pub fn new(period: usize) ->
   Self`. Both consumed by `Bollinger` in Task 4 and by the Drift Script binding layer in Task 6.
 
-- [ ] **Step 1: Write `Ema`**
+- [x] **Step 1: Write `Ema`**
 
 Create `crates/apexes-indicators/src/ema.rs`:
 
@@ -365,7 +365,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Write `RollingStdDev`**
+- [x] **Step 2: Write `RollingStdDev`**
 
 Create `crates/apexes-indicators/src/stddev.rs`:
 
@@ -455,7 +455,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Update `lib.rs` re-exports**
+- [x] **Step 3: Update `lib.rs` re-exports**
 
 ```rust
 pub mod ema;
@@ -469,7 +469,7 @@ pub use sma::Sma;
 pub use stddev::RollingStdDev;
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -477,7 +477,7 @@ cargo test -p apexes-indicators
 ```
 Expected: `10 passed` (4 from Task 1 + 3 `Ema` + 3 `RollingStdDev`).
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -486,7 +486,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -508,7 +508,7 @@ git push origin master
 - Produces: `pub struct Rsi` implementing `Indicator<Input = Decimal, Output = Option<Decimal>>`
   with `pub fn new(period: usize) -> Self`.
 
-- [ ] **Step 1: Write `Rsi`**
+- [x] **Step 1: Write `Rsi`**
 
 Create `crates/apexes-indicators/src/rsi.rs`:
 
@@ -639,7 +639,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `lib.rs`**
+- [x] **Step 2: Update `lib.rs`**
 
 ```rust
 pub mod ema;
@@ -655,7 +655,7 @@ pub use sma::Sma;
 pub use stddev::RollingStdDev;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -668,7 +668,7 @@ temporarily) and widen the tolerance constant if the discrepancy is within expec
 floating/decimal rounding noise (sub-0.001 magnitude) — do not change the RSI algorithm itself
 without re-deriving the golden values by hand first.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -677,7 +677,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -703,7 +703,7 @@ git push origin master
   Option<BollingerOutput>>`, `pub struct BollingerOutput { pub upper: Decimal, pub middle:
   Decimal, pub lower: Decimal }`. Both consumed by the Drift Script binding layer in Task 6.
 
-- [ ] **Step 1: Write `Macd`**
+- [x] **Step 1: Write `Macd`**
 
 Create `crates/apexes-indicators/src/macd.rs`:
 
@@ -803,7 +803,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Write `Bollinger`**
+- [x] **Step 2: Write `Bollinger`**
 
 Create `crates/apexes-indicators/src/bollinger.rs`:
 
@@ -886,7 +886,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Update `lib.rs`**
+- [x] **Step 3: Update `lib.rs`**
 
 ```rust
 pub mod bollinger;
@@ -906,7 +906,7 @@ pub use sma::Sma;
 pub use stddev::RollingStdDev;
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -914,7 +914,7 @@ cargo test -p apexes-indicators
 ```
 Expected: `20 passed` (14 from Tasks 1-3 + 3 `Macd` + 3 `Bollinger`).
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -923,7 +923,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -948,7 +948,7 @@ git push origin master
   Self`. `AtrInput` consumed directly by the Drift Script binding layer in Task 6 (constructed
   from three validated `Decimal` fields, not via the `Bar` conversion).
 
-- [ ] **Step 1: Write `Atr`**
+- [x] **Step 1: Write `Atr`**
 
 Create `crates/apexes-indicators/src/atr.rs`:
 
@@ -1102,7 +1102,7 @@ confirmed by reading `crates/apexes-core/src/market_data.rs` directly (`symbol`,
 `cargo doc` or `crates/apexes-core/src/lib.rs` if the import path differs; adjust the `use`/path
 prefix to match, the field values themselves do not change).
 
-- [ ] **Step 2: Update `lib.rs`**
+- [x] **Step 2: Update `lib.rs`**
 
 ```rust
 pub mod atr;
@@ -1124,7 +1124,7 @@ pub use sma::Sma;
 pub use stddev::RollingStdDev;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1136,7 +1136,7 @@ root, check `crates/apexes-core/src/lib.rs` for the actual re-export path (e.g.
 `apexes_core::instrument::Venue`) and fix the `use`/inline path accordingly — the field values
 and assertions themselves are unaffected.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1145,7 +1145,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1172,7 +1172,7 @@ git push origin master
 - Produces: `pub fn register_to(interp: &Interpreter)` in `drift_dsl::indicators`, called from
   `DriftScriptStrategy::from_file` alongside the existing `drift_script_math::register_to` call.
 
-- [ ] **Step 1: Add the `apexes-indicators` dependency**
+- [x] **Step 1: Add the `apexes-indicators` dependency**
 
 Edit `crates/apexes-strategy/Cargo.toml`, adding one line to `[dependencies]` (after
 `apexes-core`):
@@ -1190,7 +1190,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 ```
 
-- [ ] **Step 2: Write `crates/apexes-strategy/src/drift_dsl/indicators.rs`**
+- [x] **Step 2: Write `crates/apexes-strategy/src/drift_dsl/indicators.rs`**
 
 ```rust
 //! `indicators.*` bindings exposed to Drift Script strategy scripts:
@@ -1578,7 +1578,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the new module's tests**
+- [x] **Step 3: Run the new module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1588,7 +1588,7 @@ Expected: this will FAIL TO COMPILE at this point, because `mod.rs` doesn't yet 
 `indicators` as a submodule and `strategy.rs` doesn't register it. That's expected — proceed to
 Step 4.
 
-- [ ] **Step 4: Wire the new module into `mod.rs`**
+- [x] **Step 4: Wire the new module into `mod.rs`**
 
 Read `crates/apexes-strategy/src/drift_dsl/mod.rs` (current content from the prior plan):
 
@@ -1612,7 +1612,7 @@ mod strategy;
 pub use strategy::DriftScriptStrategy;
 ```
 
-- [ ] **Step 5: Register `indicators::register_to` in `DriftScriptStrategy::from_file`**
+- [x] **Step 5: Register `indicators::register_to` in `DriftScriptStrategy::from_file`**
 
 In `crates/apexes-strategy/src/drift_dsl/strategy.rs`, find this existing line:
 
@@ -1629,7 +1629,7 @@ Replace it with:
         crate::drift_dsl::indicators::register_to(&interpreter);
 ```
 
-- [ ] **Step 6: Run the new module's tests again**
+- [x] **Step 6: Run the new module's tests again**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1641,7 +1641,7 @@ Expected: `5 passed` (`sma_factory_rejects_zero_period`,
 `atr_update_reads_high_low_close_from_object_argument`,
 `atr_update_rejects_non_object_argument`).
 
-- [ ] **Step 7: Run the full `apexes-strategy` test suite**
+- [x] **Step 7: Run the full `apexes-strategy` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1651,7 +1651,7 @@ Expected: all prior tests (25 unit + 7 integration from the previous plan) plus 
 `indicators` tests = `30 passed` in the unit-test binary, `7 passed` in the integration-test
 binary, 0 failed.
 
-- [ ] **Step 8: Run clippy and fmt**
+- [x] **Step 8: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1663,7 +1663,7 @@ arms/nested closures in `indicators.rs`), run `cargo fmt` and re-run `cargo test
 apexes-strategy` + both clippy/fmt commands again to confirm nothing regressed and formatting is
 clean.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1686,7 +1686,7 @@ git push origin master
 - Produces: nothing new consumed by later tasks — this is the plan's final behavioral proof
   point.
 
-- [ ] **Step 1: Create the fixture script**
+- [x] **Step 1: Create the fixture script**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-strategy/tests/fixtures
@@ -1730,7 +1730,7 @@ script top level is the SAME instance mutated across all three `on_market_event`
 (proving the `Arc<Mutex<_>>`-backed top-level-script-state design from decision 1 actually
 works end to end, not just at the unit-test level).
 
-- [ ] **Step 2: Add the driver tests**
+- [x] **Step 2: Add the driver tests**
 
 Read `crates/apexes-strategy/tests/drift_script_strategy.rs` (from the prior plan) to confirm
 its existing `with_runtime`/`fixture_path`/`sample_trade_event` helpers are still present, then
@@ -1828,7 +1828,7 @@ fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
 }
 ```
 
-- [ ] **Step 3: Run the new tests**
+- [x] **Step 3: Run the new tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1842,7 +1842,7 @@ a `TradeEvent` (which has `type: "trade"` and a `price` field, not `close` -- co
 the object's `"type"` field is exactly the string `"trade"`, so the ternary's condition is
 `false` and it correctly evaluates to `event.price`) before changing the fixture script.
 
-- [ ] **Step 4: Run the full `apexes-strategy` test suite one more time**
+- [x] **Step 4: Run the full `apexes-strategy` test suite one more time**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1850,7 +1850,7 @@ cargo test -p apexes-strategy
 ```
 Expected: `30 passed` (unit tests) + `9 passed` (integration tests), 0 failed.
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1859,7 +1859,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1875,7 +1875,7 @@ git push origin master
 **Files:** None created/modified — this task only runs verification commands, updates
 `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1883,7 +1883,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1894,7 +1894,7 @@ unit tests, and `apexes-strategy`'s now-30 unit + 9 integration tests. Report th
 test count broken down by crate, and explicitly confirm `apexes-backtest`'s pre-existing tests
 are unaffected (they don't touch `apexes-indicators` at all in this plan).
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1902,7 +1902,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 4: Full workspace fmt check**
+- [x] **Step 4: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1910,7 +1910,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 5: Update `docs/FEATURES.md`**
+- [x] **Step 5: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find row `2.2` (`Factor library & technical indicator library`,
 currently `🔲 Not Started`). Update its Status to `✅ Done` and its Notes column to:
@@ -1925,7 +1925,7 @@ prior plan; leave the "what's next" decision unstated (per PyO3 bindings being e
 deferred to the end of `#4`, and `2.3`/`2.4`/`2.5`/`#5` all still open — don't guess which one
 the user picks next).
 
-- [ ] **Step 6: Commit the FEATURES.md update**
+- [x] **Step 6: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1934,7 +1934,7 @@ git commit -S -s -m "docs: mark factor/technical-indicator library complete in F
 git push origin master
 ```
 
-- [ ] **Step 7: Report final summary**
+- [x] **Step 7: Report final summary**
 
 Summarize: `apexes-indicators` crate's file list and line counts, total test count (broken
 down: unit tests per indicator file), `apexes-strategy`'s updated test count (unit +
