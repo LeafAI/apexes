@@ -916,7 +916,7 @@ git push origin master
 - Produces: `pub struct GridSearchOptimizer` with `pub fn new(events: Vec<MarketEvent>) ->
   Self`, implementing `ParameterOptimizer`. Consumed by Task 7's end-to-end test.
 
-- [ ] **Step 1: Write `crates/apexes-optimize/src/grid_search.rs`**
+- [x] **Step 1: Write `crates/apexes-optimize/src/grid_search.rs`**
 
 ```rust
 //! [`GridSearchOptimizer`]: exhaustively evaluates every combination in
@@ -1086,7 +1086,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `lib.rs`**
+- [x] **Step 2: Update `lib.rs`**
 
 ```rust
 pub mod evaluator;
@@ -1100,7 +1100,7 @@ pub use optimizer::{EvaluatedCombination, OptimizationResult, ParameterOptimizer
 pub use search_space::SearchSpace;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1111,7 +1111,7 @@ Expected: `10 passed` (5 from Task 3's `search_space` tests + 5 new `grid_search
 `a_failed_combination_is_excluded_from_best_but_recorded`,
 `best_is_none_when_every_combination_fails`, `empty_search_space_produces_empty_result`).
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1120,7 +1120,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
