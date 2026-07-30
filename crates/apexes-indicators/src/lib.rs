@@ -7,10 +7,12 @@
 
 pub mod ema;
 pub mod indicator;
+pub mod rsi;
 pub mod sma;
 pub mod stddev;
 
 pub use ema::Ema;
 pub use indicator::Indicator;
+pub use rsi::Rsi;
 pub use sma::Sma;
 pub use stddev::RollingStdDev;
