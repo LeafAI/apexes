@@ -10,4 +10,5 @@ rust_decimal = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 rust_decimal_macros = "1.40"
