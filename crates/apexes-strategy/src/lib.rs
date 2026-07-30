@@ -5,6 +5,9 @@
 //! that runs a user-authored Drift Script (`.drift`) file as the strategy's
 //! decision logic.
 
+pub mod drift_dsl;
+pub mod error;
 pub mod strategy;
 
+pub use error::StrategyError;
 pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
