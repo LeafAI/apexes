@@ -190,3 +190,94 @@ fn runtime_error_script_returns_empty_vec_not_panic() {
         );
     });
 }
+
+#[test]
+fn uses_indicators_sma_stays_flat_during_warmup_then_buys() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            now,
+        };
+
+        // SMA(3) warm-up: first two calls, regardless of price, must
+        // return no orders (sma.update returns null on the script side).
+        let first_event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(10),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(strategy.on_market_event(&first_event, &ctx).len(), 0);
+
+        let second_event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(11),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(strategy.on_market_event(&second_event, &ctx).len(), 0);
+
+        // Third call: SMA(3) over [10, 11, 12] = 11; price 12 > 11 -> buy.
+        let third_event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(12),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        let intents = strategy.on_market_event(&third_event, &ctx);
+        assert_eq!(
+            intents.len(),
+            1,
+            "SMA should be warm by the 3rd tick and trigger a buy"
+        );
+        assert_eq!(intents[0].side, Side::Buy);
+    });
+}
+
+#[test]
+fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
+    with_runtime(|| {
+        // A second, freshly-constructed DriftScriptStrategy must start
+        // its own SMA warm-up from scratch -- proving indicator state is
+        // NOT accidentally shared across separate script instances (e.g.
+        // via a process-global registry), only within one instance's
+        // persistent top-level environment.
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            now,
+        };
+        let event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(999),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(
+            strategy.on_market_event(&event, &ctx).len(),
+            0,
+            "a brand-new strategy instance must start its own warm-up, not inherit state"
+        );
+    });
+}

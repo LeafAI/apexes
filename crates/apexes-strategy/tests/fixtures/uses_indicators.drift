@@ -1,0 +1,29 @@
+let sma = indicators.sma(3);
+
+function on_market_event(event, ctx) {
+  // drift-script does not support `??` (nullish coalescing) -- its parser
+  // accepts the syntax but the lowering pass explicitly rejects it with
+  // "nullish coalescing not supported" (confirmed by reading
+  // `lower_logical_expression` in drift-dsl's `crates/drift-script/src/parser.rs`).
+  // Use a ternary keyed off the `event.type` tag field that
+  // `convert.rs`'s `market_event_to_drift_value` always sets instead.
+  let price = event.type == "bar" ? event.close : event.price;
+  let sma_value = sma.update(price);
+
+  if (sma_value == null) {
+    // Still warming up -- not enough data points yet.
+    return [];
+  }
+
+  if (price > sma_value) {
+    return [{
+      symbol: event.symbol,
+      venue: event.venue,
+      side: "buy",
+      order_type: "market",
+      quantity: 1,
+    }];
+  }
+
+  return [];
+}
