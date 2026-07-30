@@ -4,6 +4,7 @@
 
 mod bindings;
 mod convert;
+mod indicators;
 mod strategy;
 
 pub use strategy::DriftScriptStrategy;

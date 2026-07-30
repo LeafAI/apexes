@@ -42,6 +42,7 @@ impl DriftScriptStrategy {
 
         let mut interpreter = Interpreter::new();
         drift_script_math::register_to(&interpreter);
+        crate::drift_dsl::indicators::register_to(&interpreter);
 
         let handle = tokio::runtime::Handle::current();
         handle

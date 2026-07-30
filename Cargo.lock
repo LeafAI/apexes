@@ -186,6 +186,7 @@ name = "apexes-strategy"
 version = "0.1.0"
 dependencies = [
  "apexes-core",
+ "apexes-indicators",
  "chrono",
  "drift-script",
  "drift-script-math",
