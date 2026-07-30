@@ -5,6 +5,7 @@
 mod bindings;
 mod convert;
 mod indicators;
+mod params;
 mod signals;
 mod strategy;
 

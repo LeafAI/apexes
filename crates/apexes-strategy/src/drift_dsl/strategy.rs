@@ -31,6 +31,26 @@ impl DriftScriptStrategy {
     /// level -- construction fails closed, never producing a
     /// partially-usable instance.
     pub fn from_file(path: &Path) -> Result<Self, StrategyError> {
+        Self::from_file_inner(path, std::collections::HashMap::new())
+    }
+
+    /// Like `from_file`, but registers a `param(name, default)` native
+    /// function (see `crate::drift_dsl::params::register_to`) that
+    /// returns `overrides.get(name)` when present, otherwise `default`.
+    /// Intended for parameter-optimization callers (`apexes-optimize`)
+    /// that need to re-construct the same script with different
+    /// parameter values across many backtest runs.
+    pub fn from_file_with_params(
+        path: &Path,
+        overrides: std::collections::HashMap<String, rust_decimal::Decimal>,
+    ) -> Result<Self, StrategyError> {
+        Self::from_file_inner(path, overrides)
+    }
+
+    fn from_file_inner(
+        path: &Path,
+        overrides: std::collections::HashMap<String, rust_decimal::Decimal>,
+    ) -> Result<Self, StrategyError> {
         let source = std::fs::read_to_string(path).map_err(|source| StrategyError::Io {
             path: PathBuf::from(path),
             source,
@@ -44,6 +64,7 @@ impl DriftScriptStrategy {
         drift_script_math::register_to(&interpreter);
         crate::drift_dsl::indicators::register_to(&interpreter);
         crate::drift_dsl::signals::register_to(&interpreter);
+        crate::drift_dsl::params::register_to(&interpreter, overrides);
 
         let handle = tokio::runtime::Handle::current();
         handle
