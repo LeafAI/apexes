@@ -5,8 +5,12 @@
 //! recompute-from-scratch over history), matching the project's
 //! backtest/live logic-parity requirement.
 
+pub mod ema;
 pub mod indicator;
 pub mod sma;
+pub mod stddev;
 
+pub use ema::Ema;
 pub use indicator::Indicator;
 pub use sma::Sma;
+pub use stddev::RollingStdDev;
