@@ -29,6 +29,10 @@ pub fn register_to(interp: &Interpreter) {
         "target_position".to_string(),
         DriftValue::NativeFunction(target_position_fn()),
     );
+    signals_map.insert(
+        "rebalance_order".to_string(),
+        DriftValue::NativeFunction(rebalance_order_fn()),
+    );
     interp
         .env()
         .define_const("signals".to_string(), DriftValue::Object(signals_map));
@@ -77,6 +81,29 @@ fn require_arg_number(args: &[DriftValue], index: usize, fn_name: &str) -> Resul
         Some(DriftValue::Number(n)) => Ok(*n),
         Some(other) => Err(error_object(format!(
             "{fn_name}: argument at position {index} must be a number, got {}",
+            other.type_name()
+        ))),
+        None => Err(error_object(format!(
+            "{fn_name}: missing argument at position {index}"
+        ))),
+    }
+}
+
+/// Reads a required non-empty string positional argument, returning a
+/// `DriftValue` error object on any failure (wrong type, or an empty
+/// string, which is never a valid symbol/venue).
+fn require_arg_string(
+    args: &[DriftValue],
+    index: usize,
+    fn_name: &str,
+) -> Result<String, DriftValue> {
+    match args.get(index) {
+        Some(DriftValue::String(s)) if !s.is_empty() => Ok(s.as_str().to_string()),
+        Some(DriftValue::String(_)) => Err(error_object(format!(
+            "{fn_name}: argument at position {index} must be a non-empty string"
+        ))),
+        Some(other) => Err(error_object(format!(
+            "{fn_name}: argument at position {index} must be a string, got {}",
             other.type_name()
         ))),
         None => Err(error_object(format!(
@@ -168,6 +195,70 @@ fn target_position_fn() -> NativeFn {
                 -max_position_size * (-score - threshold) / (1.0 - threshold)
             };
             DriftValue::Number(target)
+        })
+    })
+}
+
+/// `signals.rebalance_order(target_qty, current_qty, symbol, venue,
+/// min_order_size) -> array`. Diffs `target_qty` against `current_qty`;
+/// if the absolute difference is below `min_order_size`, returns an empty
+/// array (nothing to trade); otherwise returns a single-element array
+/// containing a Market `OrderIntent`-shaped object, directly usable as
+/// `on_market_event`'s return value (design spec §五). `venue`'s
+/// legality is NOT checked here -- that is `order_intents_from_drift_value`'s
+/// job downstream in `convert.rs`.
+fn rebalance_order_fn() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            const FN: &str = "signals.rebalance_order";
+            let target_qty = match require_arg_number(&args, 0, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let current_qty = match require_arg_number(&args, 1, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let symbol = match require_arg_string(&args, 2, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let venue = match require_arg_string(&args, 3, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let min_order_size = match require_arg_number(&args, 4, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+
+            if min_order_size < 0.0 {
+                return error_object(format!(
+                    "{FN}: min_order_size must be non-negative, got {min_order_size}"
+                ));
+            }
+
+            let diff = target_qty - current_qty;
+            if diff.abs() < min_order_size {
+                return DriftValue::Array(vec![]);
+            }
+
+            let mut order = HashMap::new();
+            order.insert("symbol".to_string(), DriftValue::String(Arc::new(symbol)));
+            order.insert("venue".to_string(), DriftValue::String(Arc::new(venue)));
+            order.insert(
+                "side".to_string(),
+                DriftValue::String(Arc::new(
+                    if diff > 0.0 { "buy" } else { "sell" }.to_string(),
+                )),
+            );
+            order.insert(
+                "order_type".to_string(),
+                DriftValue::String(Arc::new("market".to_string())),
+            );
+            order.insert("quantity".to_string(), DriftValue::Number(diff.abs()));
+
+            DriftValue::Array(vec![DriftValue::Object(order)])
         })
     })
 }
@@ -388,6 +479,137 @@ mod tests {
                 DriftValue::Number(-0.1),
             ],
         );
+        assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
+    }
+
+    #[test]
+    fn rebalance_order_produces_buy_when_target_above_current() {
+        let f = rebalance_order_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(5.0),
+                DriftValue::Number(2.0),
+                DriftValue::String(Arc::new("BTCUSDT".to_string())),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(0.1),
+            ],
+        );
+        let DriftValue::Array(items) = result else {
+            panic!("expected Array")
+        };
+        assert_eq!(items.len(), 1);
+        let DriftValue::Object(obj) = &items[0] else {
+            panic!("expected Object")
+        };
+        assert!(matches!(obj.get("side"), Some(DriftValue::String(s)) if s.as_str() == "buy"));
+        assert!(
+            matches!(obj.get("quantity"), Some(DriftValue::Number(n)) if (*n - 3.0).abs() < 1e-9)
+        );
+        assert!(
+            matches!(obj.get("order_type"), Some(DriftValue::String(s)) if s.as_str() == "market")
+        );
+        assert!(
+            matches!(obj.get("symbol"), Some(DriftValue::String(s)) if s.as_str() == "BTCUSDT")
+        );
+        assert!(matches!(obj.get("venue"), Some(DriftValue::String(s)) if s.as_str() == "binance"));
+    }
+
+    #[test]
+    fn rebalance_order_produces_sell_when_target_below_current() {
+        let f = rebalance_order_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(1.0),
+                DriftValue::Number(4.0),
+                DriftValue::String(Arc::new("BTCUSDT".to_string())),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(0.1),
+            ],
+        );
+        let DriftValue::Array(items) = result else {
+            panic!("expected Array")
+        };
+        assert_eq!(items.len(), 1);
+        let DriftValue::Object(obj) = &items[0] else {
+            panic!("expected Object")
+        };
+        assert!(matches!(obj.get("side"), Some(DriftValue::String(s)) if s.as_str() == "sell"));
+        assert!(
+            matches!(obj.get("quantity"), Some(DriftValue::Number(n)) if (*n - 3.0).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn rebalance_order_returns_empty_array_when_diff_below_min_order_size() {
+        let f = rebalance_order_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(5.001),
+                DriftValue::Number(5.0),
+                DriftValue::String(Arc::new("BTCUSDT".to_string())),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(0.01),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Array(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn rebalance_order_returns_empty_array_when_diff_exactly_equals_min_order_size() {
+        let f = rebalance_order_fn();
+        // |diff| == min_order_size exactly -> still not traded (strict "<").
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(5.1),
+                DriftValue::Number(5.0),
+                DriftValue::String(Arc::new("BTCUSDT".to_string())),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(0.1),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Array(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn rebalance_order_rejects_negative_min_order_size() {
+        let f = rebalance_order_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(5.0),
+                DriftValue::Number(2.0),
+                DriftValue::String(Arc::new("BTCUSDT".to_string())),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(-0.1),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
+    }
+
+    #[test]
+    fn rebalance_order_rejects_non_string_symbol() {
+        let f = rebalance_order_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(5.0),
+                DriftValue::Number(2.0),
+                DriftValue::Number(1.0),
+                DriftValue::String(Arc::new("binance".to_string())),
+                DriftValue::Number(0.1),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
+    }
+
+    #[test]
+    fn rebalance_order_rejects_missing_argument() {
+        let f = rebalance_order_fn();
+        let result = call(&f, vec![DriftValue::Number(5.0)]);
         assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
     }
 }
