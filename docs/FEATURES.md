@@ -44,7 +44,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | ID | Feature | Sub-project | Status | Notes |
 |---|---|---|---|---|
-| 2.1 | Strategy development SDK (Rust native trait API + PyO3 bindings for research) | #4 | 🔲 Not Started | |
+| 2.1 | Strategy development SDK (Rust native trait API + PyO3 bindings for research) | #4 | ✅ Done | Strategy trait/StrategyContext/OrderIntent/Position migrated to new apexes-strategy crate (was in apexes-backtest); DriftScriptStrategy runs .drift scripts via drift-dsl. PyO3 bindings deferred to a future pass. |
 | 2.2 | Factor library & technical indicator library | #4 | 🔲 Not Started | |
 | 2.3 | Multi-signal combination & position generation engine | #4 | 🔲 Not Started | |
 | 2.4 | Parameter optimization interface (grid/Bayesian, pluggable external ML service) | #4 | 🔲 Not Started | |
@@ -157,12 +157,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 51 |
+| 🔲 Not Started | 50 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 18 |
+| ✅ Done | 19 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
-**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Next: sub-project `#4` (strategy SDK) or `#5` (risk engine) — both depend only on `#0` and are unblocked; `#6` Paper Trading needs `#1`+`#3`+`#4`+`#5`, so `#4`/`#5` come first.
+**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Sub-project `#4`'s first phase (Rust-native strategy trait API + Drift Script integration, row `2.1`) is now also complete via the new `apexes-strategy` crate. Remaining `#4` work (`2.2` factor/indicator library, `2.3` multi-signal combination, `2.4` parameter optimization, `2.5` strategy versioning, plus PyO3 bindings) and sub-project `#5` (risk engine) are both unblocked and available next; which to pursue is not yet decided.
