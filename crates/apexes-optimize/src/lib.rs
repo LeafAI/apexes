@@ -8,11 +8,13 @@
 //! stable ABI and that approach would require `unsafe` code).
 
 pub mod evaluator;
+pub mod external_process;
 pub mod grid_search;
 pub mod optimizer;
 pub mod search_space;
 
 pub use evaluator::Evaluator;
+pub use external_process::ExternalProcessOptimizer;
 pub use grid_search::GridSearchOptimizer;
 pub use optimizer::{EvaluatedCombination, OptimizationResult, ParameterOptimizer};
 pub use search_space::SearchSpace;
