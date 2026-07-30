@@ -5,8 +5,8 @@ use crate::market_data_source::HistoricalMarketDataSource;
 use crate::matching_engine::MatchingEngine;
 use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
-use crate::strategy::{Strategy, StrategyContext};
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Order, OrderId, OrderType};
+use apexes_strategy::{Strategy, StrategyContext};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -224,8 +224,8 @@ mod tests {
     use super::*;
     use crate::clock::ReplaySpeed;
     use crate::market_data_source::InMemoryMarketDataSource;
-    use crate::strategy::OrderIntent;
     use apexes_core::{AssetClass, DepthUpdate, MarketType, PriceLevel, Side, TradeEvent, Venue};
+    use apexes_strategy::OrderIntent;
     use chrono::{Duration, TimeZone, Utc};
     use rust_decimal_macros::dec;
 

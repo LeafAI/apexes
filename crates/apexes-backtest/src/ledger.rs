@@ -1,5 +1,5 @@
-use crate::strategy::Position;
 use apexes_core::{ApexesError, Fill, Instrument, Side};
+use apexes_strategy::Position;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 

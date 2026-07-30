@@ -3,11 +3,12 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
-/// The shared strategy interface implemented by both this backtest engine
-/// and all future live-trading sub-projects (#6 Paper Trading, #7 OMS, #8
-/// live crypto gateway), per the project's non-negotiable backtest/live
-/// logic-parity requirement (design spec §2). A `Strategy` implementation
-/// never needs to know whether it is running in backtest or live mode.
+/// The shared strategy interface implemented by both the backtest engine
+/// (`apexes-backtest`) and all future live-trading sub-projects (#6 Paper
+/// Trading, #7 OMS, #8 live crypto gateway), per the project's
+/// non-negotiable backtest/live logic-parity requirement. A `Strategy`
+/// implementation never needs to know whether it is running in backtest
+/// or live mode.
 pub trait Strategy: Send {
     /// Called once per incoming `MarketEvent`, in timestamp order.
     fn on_market_event(

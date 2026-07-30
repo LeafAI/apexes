@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 apexes-core = { path = "../apexes-core" }
 apexes-storage = { path = "../apexes-storage" }
+apexes-strategy = { path = "../apexes-strategy" }
 uuid = { workspace = true }
 barter-data = { workspace = true }
 barter = { workspace = true }

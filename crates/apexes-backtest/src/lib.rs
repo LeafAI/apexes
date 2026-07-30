@@ -18,9 +18,6 @@ pub mod order_book;
 // Populated in Task 5.
 pub mod cost_model;
 
-// Populated in Task 6.
-pub mod strategy;
-
 // Populated in Task 7.
 pub mod ledger;
 
@@ -37,6 +34,7 @@ pub mod performance;
 pub mod report;
 pub mod runner;
 
+pub use apexes_strategy::{OrderIntent, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
 pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
@@ -50,4 +48,3 @@ pub use matching_engine::MatchingEngine;
 pub use performance::{PerformanceSummary, PerformanceTracker};
 pub use report::BacktestReport;
 pub use runner::{BacktestConfig, run_backtest};
-pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};

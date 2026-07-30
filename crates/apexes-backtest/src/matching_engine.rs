@@ -1,10 +1,10 @@
 use crate::cost_model::{CostModel, FillLiquidity};
 use crate::order_book::ReplayOrderBook;
-use crate::strategy::OrderIntent;
 use apexes_core::{
     ApexesError, DepthUpdate, Fill, FillId, Order, OrderId, OrderStatus, OrderType, PriceLevel,
     Side,
 };
+use apexes_strategy::OrderIntent;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;

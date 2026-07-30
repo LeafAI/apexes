@@ -1,0 +1,21 @@
+[package]
+name = "apexes-strategy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
+drift-script-math = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+uuid = { workspace = true }
+futures = { workspace = true }
