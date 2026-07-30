@@ -253,14 +253,20 @@ let atr = indicators.atr(14);
 let macd = indicators.macd(12, 26, 9);
 
 function on_market_event(event, ctx) {
-  // 价格类指标：显式传入价格（不是整个 event），脚本自己决定用哪个价格字段
-  let sma_value = sma.update(event.close ?? event.price);
+  // 价格类指标：显式传入价格（不是整个 event），脚本自己决定用哪个价格字段。
+  // 注意：drift-script 目前不支持 `??`（nullish coalescing，parser 层面能解析，
+  // 但 lowering 阶段显式报 "nullish coalescing not supported" 错误，见
+  // drift-dsl `crates/drift-script/src/parser.rs` 的 `lower_logical_expression`），
+  // 所以用三元表达式 + `event.type` 标签字段（`convert.rs` 对每种 MarketEvent
+  // variant 都会写入这个字段）判断走哪个价格字段：
+  let price = event.type == "bar" ? event.close : event.price;
+  let sma_value = sma.update(price);
 
   // ATR：唯一需要完整 Bar 的指标，直接传整个 event（须是 bar 类型事件；
   // 结构上要求 event.high/low/close 都存在，与 apexes_core::Bar 的字段一一对应）
   let atr_value = atr.update(event);
 
-  let macd_value = macd.update(event.close ?? event.price);
+  let macd_value = macd.update(price);
   if (macd_value != null) {
     // macd_value.macd / macd_value.signal / macd_value.histogram
   }
