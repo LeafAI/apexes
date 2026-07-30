@@ -25,6 +25,10 @@ pub fn register_to(interp: &Interpreter) {
         "combine".to_string(),
         DriftValue::NativeFunction(combine_fn()),
     );
+    signals_map.insert(
+        "target_position".to_string(),
+        DriftValue::NativeFunction(target_position_fn()),
+    );
     interp
         .env()
         .define_const("signals".to_string(), DriftValue::Object(signals_map));
@@ -60,6 +64,24 @@ fn require_object_field_number(obj: &DriftValue, key: &str, fn_name: &str) -> Re
             other.type_name()
         )),
         None => Err(format!("{fn_name}: missing required field {key:?}")),
+    }
+}
+
+/// Reads a required `f64` positional argument, returning a `DriftValue`
+/// error object (unlike `require_object_field_number`, which returns a
+/// plain `String` for the caller to wrap) since `target_position` and
+/// `rebalance_order` read top-level positional args directly, with no
+/// enclosing object to describe in the error message.
+fn require_arg_number(args: &[DriftValue], index: usize, fn_name: &str) -> Result<f64, DriftValue> {
+    match args.get(index) {
+        Some(DriftValue::Number(n)) => Ok(*n),
+        Some(other) => Err(error_object(format!(
+            "{fn_name}: argument at position {index} must be a number, got {}",
+            other.type_name()
+        ))),
+        None => Err(error_object(format!(
+            "{fn_name}: missing argument at position {index}"
+        ))),
     }
 }
 
@@ -101,6 +123,51 @@ fn combine_fn() -> NativeFn {
                 return DriftValue::Number(0.0);
             }
             DriftValue::Number(weighted_sum / weight_sum)
+        })
+    })
+}
+
+/// `signals.target_position(score, max_position_size, threshold) -> number`.
+/// Dead-zone + linear scaling: `|score| <= threshold` maps to `0`;
+/// outside the dead zone, scales linearly from `0` at `threshold` to
+/// `max_position_size` at `score == 1.0` (design spec §四).
+fn target_position_fn() -> NativeFn {
+    Arc::new(|args| {
+        Box::pin(async move {
+            const FN: &str = "signals.target_position";
+            let score = match require_arg_number(&args, 0, FN) {
+                Ok(v) => clamp_score(v),
+                Err(e) => return e,
+            };
+            let max_position_size = match require_arg_number(&args, 1, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let threshold = match require_arg_number(&args, 2, FN) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+
+            if max_position_size < 0.0 {
+                return error_object(format!(
+                    "{FN}: max_position_size must be non-negative, got {max_position_size}"
+                ));
+            }
+            if threshold < 0.0 {
+                return error_object(format!(
+                    "{FN}: threshold must be in [0, 1], got {threshold}"
+                ));
+            }
+
+            if score.abs() <= threshold {
+                return DriftValue::Number(0.0);
+            }
+            let target = if score > threshold {
+                max_position_size * (score - threshold) / (1.0 - threshold)
+            } else {
+                -max_position_size * (-score - threshold) / (1.0 - threshold)
+            };
+            DriftValue::Number(target)
         })
     })
 }
@@ -192,6 +259,135 @@ mod tests {
     fn combine_rejects_negative_weight() {
         let f = combine_fn();
         let result = call(&f, vec![DriftValue::Array(vec![score_weight(0.5, -1.0)])]);
+        assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
+    }
+
+    #[test]
+    fn target_position_returns_zero_within_dead_zone() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(0.15),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if n == 0.0));
+    }
+
+    #[test]
+    fn target_position_returns_zero_at_dead_zone_boundary() {
+        let f = target_position_fn();
+        // |score| == threshold exactly -> still zero (spec: "<=").
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(0.2),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if n == 0.0));
+    }
+
+    #[test]
+    fn target_position_scales_linearly_above_threshold() {
+        let f = target_position_fn();
+        // max=10, threshold=0.2, score=0.6 -> 10*(0.6-0.2)/(1-0.2) = 5.0
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(0.6),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if (n - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn target_position_scales_linearly_below_negative_threshold() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(-0.6),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if (n - (-5.0)).abs() < 1e-9));
+    }
+
+    #[test]
+    fn target_position_at_score_one_equals_max_position_size() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(1.0),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if (n - 10.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn target_position_threshold_at_or_above_one_always_zero() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(1.0),
+                DriftValue::Number(10.0),
+                DriftValue::Number(1.0),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Number(n) if n == 0.0));
+    }
+
+    #[test]
+    fn target_position_clamps_out_of_range_score() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(1.5),
+                DriftValue::Number(10.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        // 1.5 clamped to 1.0 -> same as target_position_at_score_one_equals_max_position_size.
+        assert!(matches!(result, DriftValue::Number(n) if (n - 10.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn target_position_rejects_negative_max_position_size() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(0.5),
+                DriftValue::Number(-1.0),
+                DriftValue::Number(0.2),
+            ],
+        );
+        assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
+    }
+
+    #[test]
+    fn target_position_rejects_negative_threshold() {
+        let f = target_position_fn();
+        let result = call(
+            &f,
+            vec![
+                DriftValue::Number(0.5),
+                DriftValue::Number(10.0),
+                DriftValue::Number(-0.1),
+            ],
+        );
         assert!(matches!(result, DriftValue::Object(obj) if obj.contains_key("error")));
     }
 }
