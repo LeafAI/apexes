@@ -762,7 +762,7 @@ git push origin master
   &mut dyn Evaluator) -> OptimizationResult`). Consumed by Task 5's `GridSearchOptimizer` and
   Task 6's `ExternalProcessOptimizer`.
 
-- [ ] **Step 1: Write `crates/apexes-optimize/src/evaluator.rs`**
+- [x] **Step 1: Write `crates/apexes-optimize/src/evaluator.rs`**
 
 ```rust
 //! [`Evaluator`]: the caller-supplied "run one backtest with these
@@ -799,7 +799,7 @@ pub trait Evaluator {
 }
 ```
 
-- [ ] **Step 2: Write `crates/apexes-optimize/src/optimizer.rs`**
+- [x] **Step 2: Write `crates/apexes-optimize/src/optimizer.rs`**
 
 ```rust
 //! [`ParameterOptimizer`]: the pluggable parameter-search algorithm
@@ -862,7 +862,7 @@ pub trait ParameterOptimizer {
 }
 ```
 
-- [ ] **Step 3: Update `lib.rs` re-exports**
+- [x] **Step 3: Update `lib.rs` re-exports**
 
 ```rust
 pub mod evaluator;
@@ -874,7 +874,7 @@ pub use optimizer::{EvaluatedCombination, OptimizationResult, ParameterOptimizer
 pub use search_space::SearchSpace;
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -883,7 +883,7 @@ cargo build -p apexes-optimize
 Expected: succeeds, 0 errors. (No new tests in this task -- `Evaluator`/`ParameterOptimizer` are
 pure trait definitions with no implementation to unit test yet; Tasks 5-6 exercise them.)
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -892,7 +892,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
