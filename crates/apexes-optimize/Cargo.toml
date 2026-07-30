@@ -16,4 +16,6 @@ tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-mult
 tracing = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
+futures = { workspace = true }
 rust_decimal_macros = "1.40"

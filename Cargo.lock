@@ -173,6 +173,8 @@ dependencies = [
  "apexes-core",
  "apexes-strategy",
  "async-trait",
+ "chrono",
+ "futures",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
