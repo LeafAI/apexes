@@ -161,7 +161,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 19 |
+| ✅ Done | 20 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
