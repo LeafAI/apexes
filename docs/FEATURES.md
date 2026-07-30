@@ -46,7 +46,7 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 |---|---|---|---|---|
 | 2.1 | Strategy development SDK (Rust native trait API + PyO3 bindings for research) | #4 | ✅ Done | Strategy trait/StrategyContext/OrderIntent/Position migrated to new apexes-strategy crate (was in apexes-backtest); DriftScriptStrategy runs .drift scripts via drift-dsl. PyO3 bindings deferred to a future pass. |
 | 2.2 | Factor library & technical indicator library | #4 | ✅ Done | apexes-indicators crate: streaming Indicator trait (SMA/EMA/RSI/MACD/Bollinger/ATR/rolling stddev, all O(1) amortized per update); wired into DriftScriptStrategy as the indicators.* Drift Script binding (indicators.sma(period).update(price) etc.), with cross-tick state persistence proven end to end. |
-| 2.3 | Multi-signal combination & position generation engine | #4 | 🔲 Not Started | |
+| 2.3 | Multi-signal combination & position generation engine | #4 | ✅ Done | Pure Drift Script binding (no new Rust trait/crate, per explicit scope decision): signals.combine (weighted-average signal scores), signals.target_position (dead-zone + linear scaling to a target position size), signals.rebalance_order (diffs target vs current position into a ready-to-return order array) -- all stateless, callable inline in on_market_event. |
 | 2.4 | Parameter optimization interface (grid/Bayesian, pluggable external ML service) | #4 | 🔲 Not Started | |
 | 2.5 | Strategy version management & canary release | #4 | 🔲 Not Started | |
 
@@ -157,12 +157,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 49 |
+| 🔲 Not Started | 48 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
 | 🚧 In Progress | 0 |
-| ✅ Done | 20 |
+| ✅ Done | 21 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |
 
-**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Sub-project `#4`'s first two phases are now both complete: the strategy SDK (Rust-native strategy trait API + Drift Script integration, row `2.1`) via the `apexes-strategy` crate, and the factor/technical indicator library (row `2.2`) via the new `apexes-indicators` crate wired into `DriftScriptStrategy` as the `indicators.*` Drift Script binding. Remaining `#4` work (`2.3` multi-signal combination, `2.4` parameter optimization, `2.5` strategy versioning, plus PyO3 bindings deferred to the end of `#4`) and sub-project `#5` (risk engine) are both unblocked and available next; which to pursue is not yet decided.
+**Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Sub-project `#4`'s first three phases are now all complete: the strategy SDK (Rust-native strategy trait API + Drift Script integration, row `2.1`) via the `apexes-strategy` crate, the factor/technical indicator library (row `2.2`) via the `apexes-indicators` crate wired into `DriftScriptStrategy` as the `indicators.*` Drift Script binding, and the multi-signal combination & position generation engine (row `2.3`) via the `signals.*` Drift Script binding (`signals.combine`/`signals.target_position`/`signals.rebalance_order`). Remaining `#4` work (`2.4` parameter optimization, `2.5` strategy versioning, plus PyO3 bindings deferred to the end of `#4`) and sub-project `#5` (risk engine) are both unblocked and available next; which to pursue is not yet decided.
