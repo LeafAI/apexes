@@ -57,7 +57,7 @@ evaluation logic.
   Result<Self, StrategyError>` in `drift_dsl::strategy`. Consumed by Task 6's end-to-end test and
   by `apexes-optimize`'s `Evaluator` implementations (Task 5).
 
-- [ ] **Step 1: Write `crates/apexes-strategy/src/drift_dsl/params.rs`**
+- [x] **Step 1: Write `crates/apexes-strategy/src/drift_dsl/params.rs`**
 
 ```rust
 //! `param(name, default)` binding exposed to Drift Script strategy
@@ -228,7 +228,7 @@ already used in `crates/apexes-strategy/src/drift_dsl/strategy.rs`'s `from_file`
 core assertions (override present -> override value; override absent -> default value; wrong
 argument types -> error object) must hold regardless of exact setup mechanics.
 
-- [ ] **Step 2: Wire the new module into `mod.rs`**
+- [x] **Step 2: Wire the new module into `mod.rs`**
 
 Read `crates/apexes-strategy/src/drift_dsl/mod.rs` (current content):
 
@@ -251,7 +251,7 @@ mod signals;
 mod strategy;
 ```
 
-- [ ] **Step 3: Add `DriftScriptStrategy::from_file_with_params`**
+- [x] **Step 3: Add `DriftScriptStrategy::from_file_with_params`**
 
 In `crates/apexes-strategy/src/drift_dsl/strategy.rs`, the existing `from_file` method reads:
 
@@ -361,7 +361,7 @@ new public entry point:
     }
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -369,7 +369,7 @@ cargo build -p apexes-strategy
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 5: Run the new module's tests**
+- [x] **Step 5: Run the new module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -378,7 +378,7 @@ cargo test -p apexes-strategy drift_dsl::params:: -- --nocapture
 Expected: `5 passed` (`returns_override_value_when_present`, `returns_default_when_override_absent`,
 `rejects_non_string_name`, `rejects_non_number_default`, `works_end_to_end_via_a_real_script`).
 
-- [ ] **Step 6: Run the full `apexes-strategy` test suite**
+- [x] **Step 6: Run the full `apexes-strategy` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -387,7 +387,7 @@ cargo test -p apexes-strategy
 Expected: all prior tests (54 unit + 11 integration, per the prior `apexes-signals` plan) plus the
 5 new `params` tests = `59 passed` (unit) + `11 passed` (integration), 0 failed.
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -397,7 +397,7 @@ cargo fmt --check
 Expected: no warnings, no formatting diffs. If `cargo fmt --check` reports diffs, run `cargo fmt`
 (auto-fix) and re-run both commands to confirm clean.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -418,7 +418,7 @@ git push origin master
   consumed by Task 5's `GridSearchOptimizer`/`ExternalProcessOptimizer` (both pass
   `&InMemoryMarketDataSource` directly to `apexes_backtest::run_backtest`).
 
-- [ ] **Step 1: Read the existing `HistoricalMarketDataSource` trait definition**
+- [x] **Step 1: Read the existing `HistoricalMarketDataSource` trait definition**
 
 Read `crates/apexes-backtest/src/market_data_source.rs`'s current top of file to confirm the
 exact trait signature (as of the prior `apexes-indicators`/`apexes-signals` plans, unchanged by
@@ -430,7 +430,7 @@ pub trait HistoricalMarketDataSource {
 }
 ```
 
-- [ ] **Step 2: Add the blanket `&T` impl**
+- [x] **Step 2: Add the blanket `&T` impl**
 
 Add this immediately after the trait definition (before `InMemoryMarketDataSource`'s own impl
 block):
@@ -443,7 +443,7 @@ impl<T: HistoricalMarketDataSource + Sync> HistoricalMarketDataSource for &T {
 }
 ```
 
-- [ ] **Step 3: Write a test proving a `&InMemoryMarketDataSource` can be passed to `run_backtest`**
+- [x] **Step 3: Write a test proving a `&InMemoryMarketDataSource` can be passed to `run_backtest`**
 
 Append this test to the existing `#[cfg(test)] mod tests` block at the bottom of
 `crates/apexes-backtest/src/market_data_source.rs`:
@@ -463,7 +463,7 @@ Append this test to the existing `#[cfg(test)] mod tests` block at the bottom of
     }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -473,7 +473,7 @@ Expected: `4 passed` (`in_memory_source_sorts_events_chronologically`,
 `in_memory_source_handles_empty_input`, `event_timestamp_extracts_bar_open_time_not_close_time`,
 `reference_to_in_memory_source_implements_the_trait`).
 
-- [ ] **Step 5: Run the full `apexes-backtest` test suite**
+- [x] **Step 5: Run the full `apexes-backtest` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -482,7 +482,7 @@ cargo test -p apexes-backtest
 Expected: all prior tests (69 unit + 3 integration) plus the 1 new test = `70 passed` (unit) + `3
 passed` (integration), 0 failed.
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -491,7 +491,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -516,7 +516,7 @@ git push origin master
   Vec<HashMap<String, Decimal>>`. Re-exported from `apexes_optimize::SearchSpace`. Consumed by
   Task 4's `ParameterOptimizer` trait and Task 5's optimizer implementations.
 
-- [ ] **Step 1: Add the new crate to the workspace**
+- [x] **Step 1: Add the new crate to the workspace**
 
 ```bash
 cd ~/src/oss/apexes
@@ -531,7 +531,7 @@ resolver = "3"
 members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize"]
 ```
 
-- [ ] **Step 2: Create `crates/apexes-optimize/Cargo.toml`**
+- [x] **Step 2: Create `crates/apexes-optimize/Cargo.toml`**
 
 ```toml
 [package]
@@ -555,7 +555,7 @@ tracing = { workspace = true }
 rust_decimal_macros = "1.40"
 ```
 
-- [ ] **Step 3: Write `SearchSpace`'s failing tests**
+- [x] **Step 3: Write `SearchSpace`'s failing tests**
 
 Create `crates/apexes-optimize/src/search_space.rs`:
 
@@ -695,7 +695,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Create `crates/apexes-optimize/src/lib.rs`**
+- [x] **Step 4: Create `crates/apexes-optimize/src/lib.rs`**
 
 ```rust
 //! Apexes parameter optimization interface: `SearchSpace` (parameter
@@ -712,7 +712,7 @@ pub mod search_space;
 pub use search_space::SearchSpace;
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -723,7 +723,7 @@ Expected: `5 passed` (`single_parameter_produces_one_combination_per_value`,
 `parameter_with_empty_candidate_list_produces_no_combinations`,
 `with_parameter_called_twice_for_same_name_replaces_candidates`).
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -732,7 +732,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs (auto-fix with `cargo fmt` if needed, then re-verify).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1147,7 +1147,7 @@ git push origin master
   this task's own tests exercise `ExternalProcessOptimizer` directly against the mock Python
   script).
 
-- [ ] **Step 1: Check that `python3` is available for the mock external optimizer**
+- [x] **Step 1: Check that `python3` is available for the mock external optimizer**
 
 ```bash
 which python3
@@ -1161,7 +1161,7 @@ speaks the identical protocol (same JSON message shapes, same newline-delimited 
 adjust Step 2's fixture file and Step 6's spawn command accordingly -- the test assertions in
 Step 7 do not depend on which language the mock is written in.
 
-- [ ] **Step 2: Write the mock external optimizer fixture**
+- [x] **Step 2: Write the mock external optimizer fixture**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-optimize/tests/fixtures
@@ -1219,7 +1219,7 @@ EOF
 chmod +x ~/src/oss/apexes/crates/apexes-optimize/tests/fixtures/mock_optimizer.py
 ```
 
-- [ ] **Step 3: Write `crates/apexes-optimize/src/external_process.rs`**
+- [x] **Step 3: Write `crates/apexes-optimize/src/external_process.rs`**
 
 ```rust
 //! [`ExternalProcessOptimizer`]: delegates parameter search to an
@@ -1520,7 +1520,7 @@ change adds a field type that COULD fail to serialize, replace this `.expect` wi
 propagation into the `OptimizationResult.error` field, matching this task's other failure-path
 patterns.
 
-- [ ] **Step 4: Update `lib.rs`**
+- [x] **Step 4: Update `lib.rs`**
 
 ```rust
 pub mod evaluator;
@@ -1536,7 +1536,7 @@ pub use optimizer::{EvaluatedCombination, OptimizationResult, ParameterOptimizer
 pub use search_space::SearchSpace;
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1551,7 +1551,7 @@ that `mock_optimizer.py` was created with executable permissions (Step 2's `chmo
 here means the subprocess never wrote its first line, most likely because it isn't running at
 all.
 
-- [ ] **Step 6: Run the full `apexes-optimize` test suite**
+- [x] **Step 6: Run the full `apexes-optimize` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1560,7 +1560,7 @@ cargo test -p apexes-optimize
 Expected: all prior tests (5 `search_space` + 5 `grid_search`) plus the 3 new `external_process`
 tests = `13 passed`, 0 failed.
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1570,7 +1570,7 @@ cargo fmt --check
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run `cargo test -p apexes-optimize` +
 both clippy/fmt commands once more to confirm nothing regressed).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1594,7 +1594,7 @@ git push origin master
 - Produces: nothing new consumed by later tasks -- this is the plan's final behavioral proof
   point before Task 8's whole-effort verification.
 
-- [ ] **Step 1: Create the fixture script**
+- [x] **Step 1: Create the fixture script**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-optimize/tests/fixtures
@@ -1622,7 +1622,7 @@ prices, a lower `threshold` produces more trades (and thus a higher `report.over
 than a higher `threshold` -- the grid search's job is to find the `threshold` value that
 maximizes `trade_count` given a known, hand-constructed price sequence.
 
-- [ ] **Step 2: Write the end-to-end test**
+- [x] **Step 2: Write the end-to-end test**
 
 Create `crates/apexes-optimize/tests/grid_search_end_to_end.rs`:
 
@@ -1777,7 +1777,7 @@ async fn grid_search_finds_the_threshold_that_maximizes_trade_count() {
 }
 ```
 
-- [ ] **Step 3: Run the test**
+- [x] **Step 3: Run the test**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1797,7 +1797,7 @@ fixture's math is wrong without first confirming the Depth snapshot is present a
 Trade event chronologically (`sample_events()`'s `+1` second offset on trade timestamps exists
 specifically to guarantee this ordering).
 
-- [ ] **Step 4: Run the full `apexes-optimize` test suite**
+- [x] **Step 4: Run the full `apexes-optimize` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1806,7 +1806,7 @@ cargo test -p apexes-optimize
 Expected: `13 passed` (unit tests from Tasks 3, 5, 6) + `1 passed` (this task's integration test),
 0 failed.
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1816,7 +1816,7 @@ cargo fmt --check
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run the full test suite + both
 clippy/fmt commands once more to confirm nothing regressed).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1832,7 +1832,7 @@ git push origin master
 **Files:** None created/modified -- this task only runs verification commands, updates
 `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1840,7 +1840,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1852,7 +1852,7 @@ completely unaffected by this plan (they were never touched); `apexes-backtest` 
 new test (Task 2); `apexes-strategy` gains exactly 5 new tests (Task 1); `apexes-optimize` is
 brand new with 14 tests (13 unit/integration from Tasks 3/5/6 + 1 end-to-end from Task 7).
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1860,7 +1860,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 4: Full workspace fmt check**
+- [x] **Step 4: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1868,7 +1868,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 5: Update `docs/FEATURES.md`**
+- [x] **Step 5: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find row `2.4` (`Parameter optimization interface (grid/Bayesian,
 pluggable external ML service)`, currently `🔲 Not Started`). Update its Status to `✅ Done` and
@@ -1886,7 +1886,7 @@ sub-project `#4`'s fourth phase (`2.4`) is now also complete alongside `2.1`/`2.
 "what's next" unstated since `2.5`/PyO3/`#5` are all still open options -- don't guess which one
 the user picks next.
 
-- [ ] **Step 6: Commit the FEATURES.md update**
+- [x] **Step 6: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1895,7 +1895,7 @@ git commit -S -s -m "docs: mark parameter optimization interface complete in FEA
 git push origin master
 ```
 
-- [ ] **Step 7: Mark this plan's checkboxes complete**
+- [x] **Step 7: Mark this plan's checkboxes complete**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1915,7 +1915,7 @@ git commit -S -s -m "docs: mark apexes-optimize plan complete"
 git push origin master
 ```
 
-- [ ] **Step 8: Report final summary**
+- [x] **Step 8: Report final summary**
 
 Summarize: `apexes-optimize` crate's file list and line counts, total test count (broken down:
 unit tests per module, the end-to-end integration test), confirmation that
