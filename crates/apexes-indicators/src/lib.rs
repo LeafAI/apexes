@@ -5,14 +5,18 @@
 //! recompute-from-scratch over history), matching the project's
 //! backtest/live logic-parity requirement.
 
+pub mod bollinger;
 pub mod ema;
 pub mod indicator;
+pub mod macd;
 pub mod rsi;
 pub mod sma;
 pub mod stddev;
 
+pub use bollinger::{Bollinger, BollingerOutput};
 pub use ema::Ema;
 pub use indicator::Indicator;
+pub use macd::{Macd, MacdOutput};
 pub use rsi::Rsi;
 pub use sma::Sma;
 pub use stddev::RollingStdDev;
