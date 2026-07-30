@@ -55,7 +55,7 @@ dependency), `tokio` (for `block_on` bridging sync `Strategy` trait to async `In
 - Produces: `pub async fn Interpreter::call(&mut self, func: DriftValue, args: Vec<DriftValue>) -> InterpretResult`,
   consumed by `apexes-strategy`'s `DriftScriptStrategy` in Task 5.
 
-- [ ] **Step 1: Locate the existing private `call_function` method**
+- [x] **Step 1: Locate the existing private `call_function` method**
 
 Read `~/src/oss/drift-dsl/crates/drift-script/src/interpreter.rs` around line 992-993 to confirm
 the exact current signature:
@@ -68,7 +68,7 @@ the exact current signature:
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InterpretResult> + Send + 'a>> {
 ```
 
-- [ ] **Step 2: Add the public `call()` wrapper immediately before `call_function`**
+- [x] **Step 2: Add the public `call()` wrapper immediately before `call_function`**
 
 Insert this method into the `impl Interpreter` block, directly above the existing
 `fn call_function<'a>(` line:
@@ -86,7 +86,7 @@ Insert this method into the `impl Interpreter` block, directly above the existin
 
 ```
 
-- [ ] **Step 3: Verify it compiles**
+- [x] **Step 3: Verify it compiles**
 
 Run:
 ```bash
@@ -95,7 +95,7 @@ cargo build -p drift-script
 ```
 Expected: succeeds with no warnings.
 
-- [ ] **Step 4: Run drift-script's existing test suite to confirm no regression**
+- [x] **Step 4: Run drift-script's existing test suite to confirm no regression**
 
 Run:
 ```bash
@@ -105,7 +105,7 @@ cargo test -p drift-script
 Expected: all existing tests still pass (this is a pure additive change, no existing behavior
 touched).
 
-- [ ] **Step 5: Run clippy and fmt across the whole drift-dsl workspace**
+- [x] **Step 5: Run clippy and fmt across the whole drift-dsl workspace**
 
 ```bash
 cd ~/src/oss/drift-dsl
@@ -114,7 +114,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs.
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
 ```bash
 cd ~/src/oss/drift-dsl
@@ -145,7 +145,7 @@ same repo at the same commit, so one SHA covers both).
 - Produces: `apexes_strategy::{Strategy, StrategyContext, OrderIntent, Position}`, consumed by
   `apexes-backtest` (this task) and by `DriftScriptStrategy` (Task 5).
 
-- [ ] **Step 1: Create `crates/apexes-strategy/Cargo.toml`**
+- [x] **Step 1: Create `crates/apexes-strategy/Cargo.toml`**
 
 Use the exact SHA recorded at the end of Task 1's Step 6 in place of `<SHA>` below:
 
@@ -173,7 +173,7 @@ uuid = { workspace = true }
 futures = { workspace = true }
 ```
 
-- [ ] **Step 2: Add `apexes-strategy` to the workspace members list**
+- [x] **Step 2: Add `apexes-strategy` to the workspace members list**
 
 Read `~/src/oss/apexes/Cargo.toml`. It currently reads:
 
@@ -191,13 +191,13 @@ resolver = "3"
 members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy"]
 ```
 
-- [ ] **Step 3: Read the current `apexes-backtest/src/strategy.rs` in full**
+- [x] **Step 3: Read the current `apexes-backtest/src/strategy.rs` in full**
 
 Read `~/src/oss/apexes/crates/apexes-backtest/src/strategy.rs` (166 lines) to have its exact
 content in front of you for the next step — every field, doc comment, and existing test must
 be preserved verbatim.
 
-- [ ] **Step 4: Create `crates/apexes-strategy/src/strategy.rs` with the migrated content**
+- [x] **Step 4: Create `crates/apexes-strategy/src/strategy.rs` with the migrated content**
 
 Copy the full content of `apexes-backtest/src/strategy.rs` verbatim into this new file, with
 ONLY the module-level doc comment's crate-name references updated (the trait/struct
@@ -374,7 +374,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Create `crates/apexes-strategy/src/lib.rs`**
+- [x] **Step 5: Create `crates/apexes-strategy/src/lib.rs`**
 
 ```rust
 //! Apexes strategy SDK: the shared `Strategy` trait interface (implemented
@@ -389,14 +389,14 @@ pub mod strategy;
 pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
 ```
 
-- [ ] **Step 6: Delete the old `apexes-backtest/src/strategy.rs`**
+- [x] **Step 6: Delete the old `apexes-backtest/src/strategy.rs`**
 
 ```bash
 cd ~/src/oss/apexes
 rm crates/apexes-backtest/src/strategy.rs
 ```
 
-- [ ] **Step 7: Update `crates/apexes-backtest/Cargo.toml`**
+- [x] **Step 7: Update `crates/apexes-backtest/Cargo.toml`**
 
 Read the current file, then add `apexes-strategy` as a dependency (alongside the existing
 `apexes-core = { path = "../apexes-core" }` line):
@@ -405,7 +405,7 @@ Read the current file, then add `apexes-strategy` as a dependency (alongside the
 apexes-strategy = { path = "../apexes-strategy" }
 ```
 
-- [ ] **Step 8: Update `crates/apexes-backtest/src/lib.rs`**
+- [x] **Step 8: Update `crates/apexes-backtest/src/lib.rs`**
 
 Find:
 ```rust
@@ -424,7 +424,7 @@ pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
 Delete this line (the new `pub use apexes_strategy::{...}` above replaces it — having both
 would be a duplicate re-export of the same names and fail to compile).
 
-- [ ] **Step 9: Verify the whole workspace still builds**
+- [x] **Step 9: Verify the whole workspace still builds**
 
 ```bash
 cd ~/src/oss/apexes
@@ -434,7 +434,7 @@ Expected: succeeds. This is the first real network access to the `drift-dsl` git
 if it fails to resolve the git dependency, verify the SHA from Task 1 Step 6 is correct and the
 `drift-dsl` push actually succeeded.
 
-- [ ] **Step 10: Run the full test suite**
+- [x] **Step 10: Run the full test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -446,7 +446,7 @@ now running from `apexes-strategy` instead of `apexes-backtest`, and all of `ape
 own existing tests (which reference `Strategy`/`OrderIntent`/etc. via the crate's public API,
 now backed by the re-export) continuing to pass unchanged.
 
-- [ ] **Step 11: Run clippy and fmt**
+- [x] **Step 11: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -455,7 +455,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -478,7 +478,7 @@ git push origin master
 - Produces: `apexes_strategy::StrategyError` (consumed by `DriftScriptStrategy::from_file` in
   Task 5); `apexes_strategy::drift_dsl` module namespace (populated by Tasks 4-5).
 
-- [ ] **Step 1: Create `crates/apexes-strategy/src/error.rs`**
+- [x] **Step 1: Create `crates/apexes-strategy/src/error.rs`**
 
 ```rust
 //! Error type for `apexes-strategy`'s Drift Script integration.
@@ -514,7 +514,7 @@ pub enum StrategyError {
 }
 ```
 
-- [ ] **Step 2: Create `crates/apexes-strategy/src/drift_dsl/mod.rs`**
+- [x] **Step 2: Create `crates/apexes-strategy/src/drift_dsl/mod.rs`**
 
 ```rust
 //! Drift Script integration: [`DriftScriptStrategy`] runs a user-authored
@@ -528,7 +528,7 @@ mod strategy;
 pub use strategy::DriftScriptStrategy;
 ```
 
-- [ ] **Step 3: Add placeholder `bindings.rs` and `convert.rs` (populated in Task 4)**
+- [x] **Step 3: Add placeholder `bindings.rs` and `convert.rs` (populated in Task 4)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -542,7 +542,7 @@ cat > crates/apexes-strategy/src/drift_dsl/bindings.rs << 'EOF'
 EOF
 ```
 
-- [ ] **Step 4: Add the `drift_dsl` and `error` modules to `lib.rs`**
+- [x] **Step 4: Add the `drift_dsl` and `error` modules to `lib.rs`**
 
 Update `crates/apexes-strategy/src/lib.rs` to:
 
@@ -562,7 +562,7 @@ pub use error::StrategyError;
 pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
 ```
 
-- [ ] **Step 5: Verify it compiles**
+- [x] **Step 5: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -582,7 +582,7 @@ Re-run `cargo build -p apexes-strategy` after adding this stub file; expected: s
 (with an unused-import warning for the empty `bindings`/`convert` modules being fine at this
 checkpoint since they only contain doc comments, not unused imports).
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -591,7 +591,7 @@ cargo fmt --check
 ```
 Expected: no warnings, no formatting diffs.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -619,7 +619,7 @@ git push origin master
   All four consumed by `bindings.rs` (Task 5, for the first three) and `strategy.rs` (Task 5,
   for `market_event_to_drift_value` and `order_intents_from_drift_value`).
 
-- [ ] **Step 1: Write the failing tests for `market_event_to_drift_value`**
+- [x] **Step 1: Write the failing tests for `market_event_to_drift_value`**
 
 Replace the content of `crates/apexes-strategy/src/drift_dsl/convert.rs` with:
 
@@ -859,7 +859,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to see them pass (implementation is inline with test-writing above; confirm it compiles and passes)**
+- [x] **Step 2: Run the tests to see them pass (implementation is inline with test-writing above; confirm it compiles and passes)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -867,7 +867,7 @@ cargo test -p apexes-strategy convert:: -- --nocapture
 ```
 Expected: `4 passed` (the four tests just added). Note: this crate has a genuine `use apexes_core::{Instrument as _, ...}` import that is not actually needed for these functions — remove it now if `cargo build` warns about an unused import; the venue/side/order-type conversions do not require the `Instrument` trait. Fix immediately if `cargo clippy` (Step 6) flags it.
 
-- [ ] **Step 3: Add `position_to_drift_value` and `default_position_drift_value`**
+- [x] **Step 3: Add `position_to_drift_value` and `default_position_drift_value`**
 
 Append to `crates/apexes-strategy/src/drift_dsl/convert.rs`, just above the `#[cfg(test)]`
 module:
@@ -899,7 +899,7 @@ pub fn default_position_drift_value(symbol: &str) -> DriftValue {
 }
 ```
 
-- [ ] **Step 4: Write tests for the two new functions**
+- [x] **Step 4: Write tests for the two new functions**
 
 Add to the `mod tests` block in the same file:
 
@@ -930,7 +930,7 @@ Add to the `mod tests` block in the same file:
     }
 ```
 
-- [ ] **Step 5: Run tests to confirm they pass**
+- [x] **Step 5: Run tests to confirm they pass**
 
 ```bash
 cd ~/src/oss/apexes
@@ -938,7 +938,7 @@ cargo test -p apexes-strategy convert:: -- --nocapture
 ```
 Expected: `6 passed`.
 
-- [ ] **Step 6: Add `order_intents_from_drift_value`**
+- [x] **Step 6: Add `order_intents_from_drift_value`**
 
 Append to `crates/apexes-strategy/src/drift_dsl/convert.rs`, just above the `#[cfg(test)]`
 module:
@@ -1087,7 +1087,7 @@ pub fn order_intents_from_drift_value(value: DriftValue) -> Result<Vec<OrderInte
 }
 ```
 
-- [ ] **Step 7: Write tests covering valid input and every validation failure mode**
+- [x] **Step 7: Write tests covering valid input and every validation failure mode**
 
 Add to the `mod tests` block:
 
@@ -1239,7 +1239,7 @@ Add to the `mod tests` block:
     }
 ```
 
-- [ ] **Step 8: Run all convert.rs tests to confirm they pass**
+- [x] **Step 8: Run all convert.rs tests to confirm they pass**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1248,7 +1248,7 @@ cargo test -p apexes-strategy convert:: -- --nocapture
 Expected: `17 passed` (6 from Steps 1-5 + 11 from Step 7 — recount exact number against your
 actual test list before treating a mismatch as a failure; the important thing is 0 failed).
 
-- [ ] **Step 9: Remove the unused `Instrument` import if clippy flags it**
+- [x] **Step 9: Remove the unused `Instrument` import if clippy flags it**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1261,7 +1261,7 @@ use apexes_core::{MarketEvent, OrderType, Side, Venue};
 ```
 Re-run clippy to confirm clean.
 
-- [ ] **Step 10: Run fmt**
+- [x] **Step 10: Run fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1270,7 +1270,7 @@ cargo fmt --check
 If it reports diffs, run `cargo fmt` (not `--check`) to apply them, then re-run `--check` to
 confirm clean.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1299,7 +1299,7 @@ git push origin master
 - Produces: `pub struct DriftScriptStrategy` implementing `Strategy`, with
   `pub fn from_file(path: &std::path::Path) -> Result<Self, StrategyError>`.
 
-- [ ] **Step 1: Implement the `ctx.*` native function bindings in `bindings.rs`**
+- [x] **Step 1: Implement the `ctx.*` native function bindings in `bindings.rs`**
 
 Replace the content of `crates/apexes-strategy/src/drift_dsl/bindings.rs` with:
 
@@ -1484,7 +1484,7 @@ mod tests {
 `crates/apexes-core/src/order.rs` directly. If a future refactor changes `Order`'s fields
 before this task runs, update the literal to match.
 
-- [ ] **Step 2: Run the bindings tests**
+- [x] **Step 2: Run the bindings tests**
 
 (`futures` and `uuid` dev-dependencies were already added to `crates/apexes-strategy/Cargo.toml`
 in Task 2 Step 1, so no `Cargo.toml` change is needed here.)
@@ -1497,7 +1497,7 @@ Expected: `6 passed`. If the `Order` literal in the last test doesn't compile be
 struct has different/additional fields, fix the literal to match (per the note in Step 1) and
 re-run.
 
-- [ ] **Step 3: Implement `DriftScriptStrategy` in `strategy.rs`**
+- [x] **Step 3: Implement `DriftScriptStrategy` in `strategy.rs`**
 
 Replace the content of `crates/apexes-strategy/src/drift_dsl/strategy.rs` with:
 
@@ -1605,7 +1605,7 @@ migrated code), `Decimal` and `OrderId` are `Copy`, and `Order` derives `Clone` 
 `apexes-core` (confirmed by its existing `#[derive(Debug, Clone, PartialEq, ...)]` in
 `crates/apexes-core/src/order.rs`) — no additional derives needed.
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1615,7 +1615,7 @@ Expected: succeeds. `drift_script_math` needs to be added as a direct dependency
 present from Task 2's `Cargo.toml` (it is — confirm the `drift-script-math = { git = ... }` line
 is present).
 
-- [ ] **Step 5: Create the five `.drift` test fixture scripts**
+- [x] **Step 5: Create the five `.drift` test fixture scripts**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-strategy/tests/fixtures
@@ -1677,7 +1677,7 @@ function on_market_event(event, ctx) {
 EOF
 ```
 
-- [ ] **Step 6: Write the end-to-end driver test**
+- [x] **Step 6: Write the end-to-end driver test**
 
 Create `crates/apexes-strategy/tests/drift_script_strategy.rs`:
 
@@ -1801,14 +1801,14 @@ async fn runtime_error_script_returns_empty_vec_not_panic() {
 which requires an active tokio runtime on the calling thread — hence every test above is
 `#[tokio::test]`, matching the design's documented constraint (design spec §七, last paragraph).
 
-- [ ] **Step 7: Add `apexes-strategy`'s `lib.rs` re-export for the integration test to use `drift_dsl::DriftScriptStrategy` and `StrategyError`**
+- [x] **Step 7: Add `apexes-strategy`'s `lib.rs` re-export for the integration test to use `drift_dsl::DriftScriptStrategy` and `StrategyError`**
 
 Confirm `crates/apexes-strategy/src/lib.rs` (from Task 3 Step 4) already has `pub mod drift_dsl;`
 and `pub use error::StrategyError;` — the integration test references
 `apexes_strategy::drift_dsl::DriftScriptStrategy` and `apexes_strategy::StrategyError` directly,
 both already public from Task 3. No further `lib.rs` change needed.
 
-- [ ] **Step 8: Run the end-to-end tests**
+- [x] **Step 8: Run the end-to-end tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1821,7 +1821,7 @@ unchanged — that's consistent, since `parse_venue` is case-insensitive), re-ch
 failure message before assuming a bug; the case-insensitive matching in `convert.rs` should
 handle whatever casing the script produces.
 
-- [ ] **Step 9: Run the full `apexes-strategy` test suite**
+- [x] **Step 9: Run the full `apexes-strategy` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1830,7 +1830,7 @@ cargo test -p apexes-strategy
 Expected: all unit tests (`strategy.rs`, `convert.rs`, `bindings.rs`) plus the integration test
 file all pass, 0 failed.
 
-- [ ] **Step 10: Run clippy and fmt**
+- [x] **Step 10: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1840,7 +1840,7 @@ cargo fmt --check
 Expected: no warnings, no formatting diffs. Fix any issues (most likely: unused imports in
 `strategy.rs` if a helper wasn't actually needed, or minor formatting) and re-run until clean.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1856,7 +1856,7 @@ git push origin master
 **Files:** None created/modified — this task only runs verification commands and confirms the
 end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1864,7 +1864,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1876,7 +1876,7 @@ Expected: all tests across all crates pass, including `apexes-core`, `apexes-mar
 `Strategy`/`OrderIntent`), and the new `apexes-strategy` crate's unit + integration tests.
 Report the exact total test count broken down by crate.
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1884,7 +1884,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 4: Full workspace fmt check**
+- [x] **Step 4: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1892,7 +1892,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 5: Confirm no lingering references to the deleted `apexes-backtest::strategy` module**
+- [x] **Step 5: Confirm no lingering references to the deleted `apexes-backtest::strategy` module**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1902,7 +1902,7 @@ Expected: no output (zero matches) — confirms `apexes-backtest` no longer has 
 `strategy` module and every internal reference goes through the `apexes_strategy::*`
 re-export at the crate root.
 
-- [ ] **Step 6: Update `docs/FEATURES.md`**
+- [x] **Step 6: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find row `2.1` (`Strategy development SDK (Rust native trait API +
 PyO3 bindings for research)`, currently `🔲 Not Started`). Update its Status to `✅ Done` and
@@ -1919,7 +1919,7 @@ first phase is complete and name what's next (`#4.2` factor library, or `#5` ris
 PyO3 bindings — whichever the user directs at that point; don't guess, just note the milestone
 and leave the "what's next" decision unstated if unsure).
 
-- [ ] **Step 7: Commit the FEATURES.md update**
+- [x] **Step 7: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1928,7 +1928,7 @@ git commit -S -s -m "docs: mark strategy SDK Rust trait API + Drift Script integ
 git push origin master
 ```
 
-- [ ] **Step 8: Report final summary**
+- [x] **Step 8: Report final summary**
 
 Summarize: `apexes-strategy` crate's file list and line counts, total test count (broken down:
 unit tests in `strategy.rs`/`convert.rs`/`bindings.rs`, integration tests in
