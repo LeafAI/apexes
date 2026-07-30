@@ -1,6 +1,6 @@
 # Apexes-Signals: Multi-Signal Combination & Position Generation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add a new `signals.*` Drift Script binding module to `apexes-strategy` — three pure,
 stateless functions (`combine`, `target_position`, `rebalance_order`) that let `.drift` scripts
@@ -52,7 +52,7 @@ are stateless and callable directly inline inside `on_market_event` — no top-l
   registering a `signals` global object with (initially, this task) one function: `combine`.
   Consumed by Task 4's `strategy.rs` wiring.
 
-- [ ] **Step 1: Create `crates/apexes-strategy/src/drift_dsl/signals.rs`**
+- [x] **Step 1: Create `crates/apexes-strategy/src/drift_dsl/signals.rs`**
 
 ```rust
 //! `signals.*` bindings exposed to Drift Script strategy scripts:
@@ -247,7 +247,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Wire the new module into `mod.rs`**
+- [x] **Step 2: Wire the new module into `mod.rs`**
 
 Read `crates/apexes-strategy/src/drift_dsl/mod.rs` (current content):
 
@@ -273,7 +273,7 @@ mod strategy;
 pub use strategy::DriftScriptStrategy;
 ```
 
-- [ ] **Step 3: Run the new module's tests**
+- [x] **Step 3: Run the new module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -284,7 +284,7 @@ Expected: `8 passed` (`combine_computes_weighted_average`, `combine_returns_zero
 `combine_rejects_non_array_argument`, `combine_rejects_non_object_element`,
 `combine_rejects_missing_field`, `combine_rejects_negative_weight`).
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -294,7 +294,7 @@ cargo fmt --check
 Expected: no warnings, no formatting diffs. If `cargo fmt --check` reports diffs, run `cargo
 fmt` (auto-fix) and re-run both commands to confirm clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -315,7 +315,7 @@ git push origin master
 - Produces: `target_position` registered in the `signals` object, consumed by Task 4's
   end-to-end fixture test.
 
-- [ ] **Step 1: Add a `require_number` argument-position helper**
+- [x] **Step 1: Add a `require_number` argument-position helper**
 
 Add this helper function to `crates/apexes-strategy/src/drift_dsl/signals.rs`, right after
 `require_object_field_number`:
@@ -340,7 +340,7 @@ fn require_arg_number(args: &[DriftValue], index: usize, fn_name: &str) -> Resul
 }
 ```
 
-- [ ] **Step 2: Add `target_position_fn`**
+- [x] **Step 2: Add `target_position_fn`**
 
 Add this function after `combine_fn`:
 
@@ -391,7 +391,7 @@ fn target_position_fn() -> NativeFn {
 }
 ```
 
-- [ ] **Step 3: Register it in `register_to`**
+- [x] **Step 3: Register it in `register_to`**
 
 ```rust
 pub fn register_to(interp: &Interpreter) {
@@ -410,7 +410,7 @@ pub fn register_to(interp: &Interpreter) {
 }
 ```
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Append these tests inside the existing `#[cfg(test)] mod tests` block in `signals.rs`:
 
@@ -509,7 +509,7 @@ Append these tests inside the existing `#[cfg(test)] mod tests` block in `signal
     }
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -517,7 +517,7 @@ cargo test -p apexes-strategy drift_dsl::signals:: -- --nocapture
 ```
 Expected: `17 passed` (8 from Task 1 + 9 new `target_position` tests).
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -526,7 +526,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -547,7 +547,7 @@ git push origin master
 - Produces: `rebalance_order` registered in the `signals` object, consumed by Task 4's
   end-to-end fixture test.
 
-- [ ] **Step 1: Add a `require_arg_string` helper**
+- [x] **Step 1: Add a `require_arg_string` helper**
 
 Add this helper function right after `require_arg_number`:
 
@@ -572,7 +572,7 @@ fn require_arg_string(args: &[DriftValue], index: usize, fn_name: &str) -> Resul
 }
 ```
 
-- [ ] **Step 2: Add `rebalance_order_fn`**
+- [x] **Step 2: Add `rebalance_order_fn`**
 
 Add this function after `target_position_fn`:
 
@@ -642,7 +642,7 @@ fn rebalance_order_fn() -> NativeFn {
 }
 ```
 
-- [ ] **Step 3: Register it in `register_to`**
+- [x] **Step 3: Register it in `register_to`**
 
 ```rust
 pub fn register_to(interp: &Interpreter) {
@@ -665,7 +665,7 @@ pub fn register_to(interp: &Interpreter) {
 }
 ```
 
-- [ ] **Step 4: Add tests**
+- [x] **Step 4: Add tests**
 
 Append these tests inside the existing `#[cfg(test)] mod tests` block:
 
@@ -786,7 +786,7 @@ Append these tests inside the existing `#[cfg(test)] mod tests` block:
     }
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -794,7 +794,7 @@ cargo test -p apexes-strategy drift_dsl::signals:: -- --nocapture
 ```
 Expected: `24 passed` (17 from Tasks 1-2 + 7 new `rebalance_order` tests).
 
-- [ ] **Step 6: Run the full `apexes-strategy` unit test suite**
+- [x] **Step 6: Run the full `apexes-strategy` unit test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -803,7 +803,7 @@ cargo test -p apexes-strategy --lib
 Expected: all prior unit tests (30 from before this plan) plus the 24 new `signals` tests = `54
 passed`, 0 failed.
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -812,7 +812,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-verify both commands).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -836,7 +836,7 @@ git push origin master
 - Produces: nothing new consumed by later tasks — this is the plan's final behavioral proof
   point.
 
-- [ ] **Step 1: Register `signals::register_to` in `DriftScriptStrategy::from_file`**
+- [x] **Step 1: Register `signals::register_to` in `DriftScriptStrategy::from_file`**
 
 In `crates/apexes-strategy/src/drift_dsl/strategy.rs`, find this existing line block:
 
@@ -855,7 +855,7 @@ Replace it with:
         crate::drift_dsl::signals::register_to(&interpreter);
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [x] **Step 2: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -863,7 +863,7 @@ cargo build -p apexes-strategy
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 3: Create the fixture script**
+- [x] **Step 3: Create the fixture script**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-strategy/tests/fixtures
@@ -895,7 +895,7 @@ nullish coalescing — confirmed unsupported in a prior plan, see
 `docs/superpowers/plans/2026-07-30-apexes-indicators.md` Task 7's fixture for the identical
 pattern and rationale).
 
-- [ ] **Step 4: Add the driver tests**
+- [x] **Step 4: Add the driver tests**
 
 Read `crates/apexes-strategy/tests/drift_script_strategy.rs` to confirm its existing
 `with_runtime`/`fixture_path`/`empty_ctx`/`sample_trade_event` helpers are still present (they
@@ -986,7 +986,7 @@ fn uses_signals_produces_rebalance_order_once_warm() {
 }
 ```
 
-- [ ] **Step 5: Run the new tests**
+- [x] **Step 5: Run the new tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1001,7 +1001,7 @@ computed independently in this plan (`10*(0.8-0.2)/(1-0.2) = 7.5`) and cross-che
 Task 2's `target_position_scales_linearly_above_threshold` unit test's identical formula
 pattern.
 
-- [ ] **Step 6: Run the full `apexes-strategy` test suite**
+- [x] **Step 6: Run the full `apexes-strategy` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1010,7 +1010,7 @@ cargo test -p apexes-strategy
 Expected: `54 passed` (unit tests: 30 pre-existing + 24 new `signals` tests) + `11 passed`
 (integration tests), 0 failed.
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1020,7 +1020,7 @@ cargo fmt --check
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run `cargo test -p apexes-strategy`
 + both clippy/fmt commands once more to confirm nothing regressed).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1036,7 +1036,7 @@ git push origin master
 **Files:** None created/modified — this task only runs verification commands, updates
 `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1044,7 +1044,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1055,7 +1055,7 @@ explicitly confirming `apexes-core`/`apexes-market-data`/`apexes-storage`/`apexe
 `apexes-indicators` are completely unaffected by this plan (this plan only touches
 `apexes-strategy`).
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1063,7 +1063,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 4: Full workspace fmt check**
+- [x] **Step 4: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1071,7 +1071,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 5: Update `docs/FEATURES.md`**
+- [x] **Step 5: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find row `2.3` (`Multi-signal combination & position generation
 engine`, currently `🔲 Not Started`). Update its Status to `✅ Done` and its Notes column to:
@@ -1085,7 +1085,7 @@ Update the Summary counts table (increment `✅ Done` by 1 to `21`, decrement `�
 unstated since `2.4`/`2.5`/PyO3/`#5` are all still open options — don't guess which one the user
 picks next.
 
-- [ ] **Step 6: Commit the FEATURES.md update**
+- [x] **Step 6: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1094,7 +1094,7 @@ git commit -S -s -m "docs: mark multi-signal combination & position generation e
 git push origin master
 ```
 
-- [ ] **Step 7: Report final summary**
+- [x] **Step 7: Report final summary**
 
 Summarize: `signals.rs`'s final line count and function list, total test count (24 unit tests
 in `signals.rs` + 2 new integration tests in `drift_script_strategy.rs`), confirmation that
