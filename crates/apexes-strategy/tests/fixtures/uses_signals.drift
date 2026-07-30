@@ -1,0 +1,18 @@
+let sma = indicators.sma(3);
+
+function on_market_event(event, ctx) {
+  let price = event.type == "bar" ? event.close : event.price;
+  let sma_value = sma.update(price);
+
+  if (sma_value == null) {
+    // Still warming up -- treat as neutral, produce no orders this tick.
+    return [];
+  }
+
+  let raw_score = price > sma_value ? 0.8 : -0.8;
+  let composite = signals.combine([{ score: raw_score, weight: 1 }]);
+  let target_qty = signals.target_position(composite, 10, 0.2);
+  let position = ctx.get_position(event.symbol);
+
+  return signals.rebalance_order(target_qty, position.quantity, event.symbol, event.venue, 0.01);
+}

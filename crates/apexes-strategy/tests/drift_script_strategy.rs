@@ -281,3 +281,91 @@ fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
         );
     });
 }
+
+#[test]
+fn uses_signals_produces_no_order_during_indicator_warmup() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            now,
+        };
+        let event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(10),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+
+        // SMA(3) warm-up: first call must produce no orders.
+        let intents = strategy.on_market_event(&event, &ctx);
+        assert_eq!(
+            intents.len(),
+            0,
+            "should produce no orders while the SMA is still warming up"
+        );
+    });
+}
+
+#[test]
+fn uses_signals_produces_rebalance_order_once_warm() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            now,
+        };
+
+        // Prices [10, 11, 12]: SMA(3) becomes warm on the 3rd call
+        // (average of [10,11,12] = 11), and price (12) > sma (11), so
+        // raw_score = 0.8 -> composite = 0.8 -> target_position(0.8, 10,
+        // 0.2) = 10*(0.8-0.2)/(1-0.2) = 7.5 -> rebalance_order(7.5, 0,
+        // ..., 0.01) -> a single Buy order for quantity 7.5.
+        for price in [dec!(10), dec!(11)] {
+            let event = MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                price,
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: Utc::now(),
+            });
+            let intents = strategy.on_market_event(&event, &ctx);
+            assert_eq!(intents.len(), 0, "still warming up at price {price}");
+        }
+
+        let third_event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(12),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        let intents = strategy.on_market_event(&third_event, &ctx);
+        assert_eq!(
+            intents.len(),
+            1,
+            "SMA should be warm by the 3rd tick and trigger a rebalance"
+        );
+        assert_eq!(intents[0].side, Side::Buy);
+        assert!(
+            (intents[0].quantity - dec!(7.5)).abs() < dec!(0.0001),
+            "expected quantity ~7.5, got {}",
+            intents[0].quantity
+        );
+    });
+}
