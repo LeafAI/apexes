@@ -7,6 +7,10 @@
 //! deliberately NOT a native dynamic-library plugin, since Rust has no
 //! stable ABI and that approach would require `unsafe` code).
 
+pub mod evaluator;
+pub mod optimizer;
 pub mod search_space;
 
+pub use evaluator::Evaluator;
+pub use optimizer::{EvaluatedCombination, OptimizationResult, ParameterOptimizer};
 pub use search_space::SearchSpace;
