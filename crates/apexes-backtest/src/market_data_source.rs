@@ -17,6 +17,12 @@ pub trait HistoricalMarketDataSource {
     fn events(&self) -> impl Future<Output = Result<Vec<MarketEvent>, ApexesError>> + Send;
 }
 
+impl<T: HistoricalMarketDataSource + Sync> HistoricalMarketDataSource for &T {
+    async fn events(&self) -> Result<Vec<MarketEvent>, ApexesError> {
+        (**self).events().await
+    }
+}
+
 /// An in-memory `HistoricalMarketDataSource` backed by a pre-supplied
 /// `Vec<MarketEvent>`. Used for fast, network-free unit/integration tests
 /// that don't require a live ClickHouse instance.
@@ -152,6 +158,22 @@ mod tests {
         let source = InMemoryMarketDataSource::new(vec![]);
         let result = source.events().await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    // The `&source` borrow below is intentional, not needless: this test's
+    // entire purpose is to prove `&InMemoryMarketDataSource` itself (not
+    // just `InMemoryMarketDataSource`) implements `HistoricalMarketDataSource`
+    // via this task's blanket `&T` impl. Clippy can't tell the difference
+    // since owned `source` isn't used again either way.
+    #[allow(clippy::needless_borrow)]
+    async fn reference_to_in_memory_source_implements_the_trait() {
+        let events = vec![trade_at("A", 1)];
+        let source = InMemoryMarketDataSource::new(events);
+
+        let result = (&source).events().await.unwrap();
+
+        assert_eq!(result.len(), 1);
     }
 
     #[test]
