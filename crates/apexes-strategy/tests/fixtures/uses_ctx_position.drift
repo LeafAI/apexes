@@ -1,0 +1,20 @@
+function on_market_event(event, ctx) {
+  let position = ctx.get_position(event.symbol);
+  let balance = ctx.get_balance("USDT");
+  let has_open = ctx.has_open_order(event.symbol);
+
+  if (position.quantity > 0) {
+    return [];
+  }
+  if (has_open) {
+    return [];
+  }
+
+  return [{
+    symbol: event.symbol,
+    venue: event.venue,
+    side: "buy",
+    order_type: "market",
+    quantity: 1,
+  }];
+}

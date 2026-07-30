@@ -1,0 +1,11 @@
+function on_market_event(event, ctx) {
+  let prices = [event.price, event.price, event.price];
+  let avg = math.mean(prices);
+  return [{
+    symbol: event.symbol,
+    venue: event.venue,
+    side: "buy",
+    order_type: "market",
+    quantity: avg > 0 ? 1 : 0,
+  }];
+}

@@ -1,0 +1,3 @@
+function on_market_event(event, ctx) {
+  return [ {{{ this is not valid syntax
+}
