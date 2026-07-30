@@ -166,6 +166,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-optimize"
+version = "0.1.0"
+dependencies = [
+ "apexes-backtest",
+ "apexes-core",
+ "apexes-strategy",
+ "async-trait",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "apexes-storage"
 version = "0.1.0"
 dependencies = [
