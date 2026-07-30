@@ -1,0 +1,25 @@
+[package]
+name = "apexes-strategy-registry"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-storage = { path = "../apexes-storage" }
+apexes-optimize = { path = "../apexes-optimize" }
+apexes-backtest = { path = "../apexes-backtest" }
+clickhouse = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros"] }
