@@ -1,0 +1,23 @@
+[package]
+name = "apexes-live-trading"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-oms = { path = "../apexes-oms" }
+apexes-backtest = { path = "../apexes-backtest" }
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-risk = { path = "../apexes-risk" }
+tokio = { workspace = true, features = ["time", "sync"] }
+futures = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
