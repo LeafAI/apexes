@@ -146,8 +146,8 @@ impl ExecutionGateway for BinanceExecutionGateway {
         // orders: Spot's `STOP_LOSS`/`STOP_LOSS_LIMIT` don't exist on
         // Futures, which instead uses `STOP_MARKET`/`STOP`. Sending the
         // Spot names to Futures (or vice versa) would be rejected by
-        // Binance. Futures' `STOP` (unlike Spot's `STOP_LOSS_LIMIT`)
-        // also doesn't accept `timeInForce`.
+        // Binance. Unlike Spot's `STOP_LOSS_LIMIT`, Futures' `STOP`
+        // does not require `timeInForce` (Binance defaults to GTC).
         let order_type = match (family, order.order_type) {
             (_, apexes_core::OrderType::Market) => "MARKET",
             (_, apexes_core::OrderType::Limit) => "LIMIT",

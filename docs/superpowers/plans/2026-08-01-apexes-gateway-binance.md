@@ -2938,11 +2938,19 @@ impl ExecutionGateway for BinanceExecutionGateway {
             apexes_core::Side::Buy => "BUY",
             apexes_core::Side::Sell => "SELL",
         };
-        let order_type = match order.order_type {
-            apexes_core::OrderType::Market => "MARKET",
-            apexes_core::OrderType::Limit => "LIMIT",
-            apexes_core::OrderType::Stop => "STOP_LOSS",
-            apexes_core::OrderType::StopLimit => "STOP_LOSS_LIMIT",
+        // Spot and Futures use different order-type strings for stop
+        // orders: Spot's `STOP_LOSS`/`STOP_LOSS_LIMIT` don't exist on
+        // Futures, which instead uses `STOP_MARKET`/`STOP`. Sending the
+        // Spot names to Futures (or vice versa) would be rejected by
+        // Binance. Unlike Spot's `STOP_LOSS_LIMIT`, Futures' `STOP`
+        // does not require `timeInForce` (Binance defaults to GTC).
+        let order_type = match (family, order.order_type) {
+            (_, apexes_core::OrderType::Market) => "MARKET",
+            (_, apexes_core::OrderType::Limit) => "LIMIT",
+            (ApiFamily::Spot, apexes_core::OrderType::Stop) => "STOP_LOSS",
+            (ApiFamily::Futures, apexes_core::OrderType::Stop) => "STOP_MARKET",
+            (ApiFamily::Spot, apexes_core::OrderType::StopLimit) => "STOP_LOSS_LIMIT",
+            (ApiFamily::Futures, apexes_core::OrderType::StopLimit) => "STOP",
         };
 
         let mut params = format!(
@@ -2951,7 +2959,12 @@ impl ExecutionGateway for BinanceExecutionGateway {
         );
         if let Some(price) = order.price {
             params.push_str(&format!("&price={price}"));
-            if order.order_type == apexes_core::OrderType::Limit {
+            let needs_time_in_force = matches!(
+                (family, order.order_type),
+                (_, apexes_core::OrderType::Limit)
+                    | (ApiFamily::Spot, apexes_core::OrderType::StopLimit)
+            );
+            if needs_time_in_force {
                 params.push_str("&timeInForce=GTC");
             }
         }
