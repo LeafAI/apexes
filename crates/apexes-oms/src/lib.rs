@@ -14,6 +14,8 @@
 
 pub mod error;
 pub mod gateway;
+pub mod mock_gateway;
 
 pub use error::OmsError;
 pub use gateway::{ExecutionGateway, GatewayOutcome};
+pub use mock_gateway::MockExecutionGateway;
