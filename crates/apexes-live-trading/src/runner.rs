@@ -60,10 +60,30 @@ pub async fn run_live_trading(
     mut strategy: impl Strategy,
     mut order_manager: OrderManager,
     mut risk_checker: Option<CompositeRiskChecker>,
-    mut exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin,
     mut stop_signal: oneshot::Receiver<()>,
 ) -> Result<LiveTradingReport, ApexesError> {
+    if config.reconcile_interval.is_zero() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "reconcile_interval must be non-zero".to_string(),
+        });
+    }
+
     let mut market_events = market_data_provider.subscribe(&config.instruments).await?;
+
+    // Once `exchange_updates` ends (returns `None`), chain in a
+    // `pending()` stream that never resolves, so this branch stops
+    // being re-polled every loop iteration -- treating "the stream
+    // permanently ended" as "this branch is now permanently inert"
+    // rather than "nothing ready yet, try again immediately", which
+    // would otherwise busy-loop (verified empirically to spin tens of
+    // millions of iterations per second) for as long as
+    // `market_events` keeps the outer loop alive afterward. The real
+    // Binance User Data Stream never ends on its own (its socket task
+    // retries forever), so this only matters for a finite/synthetic
+    // stream (e.g. a test's `futures::stream::empty()`), but the fix
+    // costs nothing in the common case.
+    let mut exchange_updates = exchange_updates.chain(futures::stream::pending());
 
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
