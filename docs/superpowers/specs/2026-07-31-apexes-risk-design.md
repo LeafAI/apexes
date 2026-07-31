@@ -449,7 +449,7 @@ use crate::error::RiskViolation;
 use crate::pre_trade::PreTradeCheck;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListMode<T> {
+pub enum ListMode<T: std::hash::Hash + Eq> {
     Disabled,
     Blacklist(HashSet<T>),
     Whitelist(HashSet<T>),
