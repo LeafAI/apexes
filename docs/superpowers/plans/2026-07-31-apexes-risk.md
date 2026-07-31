@@ -885,7 +885,7 @@ pub use pre_trade::PreTradeCheck;
 cd ~/src/oss/apexes
 cargo test -p apexes-risk limits:: -- --nocapture
 ```
-Expected: 13 passed, 0 failed.
+Expected: 12 passed, 0 failed.
 
 - [ ] **Step 4: Run clippy and fmt**
 
@@ -1956,7 +1956,7 @@ Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands p
 cd ~/src/oss/apexes
 cargo test -p apexes-risk
 ```
-Expected: all tests from Tasks 1-6 pass (5 error + 13 limits + 8 lists + 8 self_trade + 5 circuit_breaker = 39 tests), 0 failed.
+Expected: all tests from Tasks 1-6 pass (5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker = 38 tests), 0 failed.
 
 - [ ] **Step 6: Full workspace build check**
 
@@ -2340,7 +2340,7 @@ cargo test -p apexes-risk
 cargo clippy -p apexes-risk --all-targets -- -D warnings
 cargo fmt --check
 ```
-Expected: 45 tests passed (5 error + 13 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite), 0 failed; clippy and fmt clean (auto-fix with `cargo fmt` if needed and re-run all three commands).
+Expected: 44 tests passed (5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite), 0 failed; clippy and fmt clean (auto-fix with `cargo fmt` if needed and re-run all three commands).
 
 - [ ] **Step 5: Full workspace build check**
 
@@ -3105,7 +3105,7 @@ Expected: succeeds, 0 errors.
 cd ~/src/oss/apexes
 cargo test --workspace
 ```
-Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-strategy`/`apexes-storage`/`apexes-strategy-registry` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-optimize` unaffected except its one updated `BacktestConfig` literal (test count unchanged); `apexes-backtest` gains exactly 3 new tests (Task 8's `risk_integration.rs`); `apexes-risk` is brand new with 45 tests (Tasks 1-7: 5 error + 13 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite).
+Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-strategy`/`apexes-storage`/`apexes-strategy-registry` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-optimize` unaffected except its one updated `BacktestConfig` literal (test count unchanged); `apexes-backtest` gains exactly 3 new tests (Task 8's `risk_integration.rs`); `apexes-risk` is brand new with 44 tests (Tasks 1-7: 5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite).
 
 - [ ] **Step 3: Full workspace clippy**
 
