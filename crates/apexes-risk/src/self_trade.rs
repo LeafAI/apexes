@@ -76,7 +76,7 @@ impl PreTradeCheck for SelfTradePreventer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{OrderStatus, Venue};
+    use apexes_core::{AssetClass, OrderStatus, Venue};
     use chrono::TimeZone;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
@@ -97,6 +97,7 @@ mod tests {
         OrderIntent {
             symbol: symbol.to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -109,6 +110,7 @@ mod tests {
         OrderIntent {
             symbol: symbol.to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side,
             order_type: OrderType::Market,
             quantity: dec!(1),
@@ -124,6 +126,7 @@ mod tests {
             exchange_order_id: None,
             symbol: symbol.to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side,
             order_type: OrderType::Limit,
             quantity: dec!(1),

@@ -208,7 +208,7 @@ impl PreTradeCheck for LimitChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::Venue;
+    use apexes_core::{AssetClass, Venue};
     use rust_decimal_macros::dec;
 
     fn sample_intent(
@@ -220,6 +220,7 @@ mod tests {
         OrderIntent {
             symbol: symbol.to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side,
             order_type: if price.is_some() {
                 apexes_core::OrderType::Limit

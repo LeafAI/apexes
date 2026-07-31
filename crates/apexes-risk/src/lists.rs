@@ -86,6 +86,7 @@ impl PreTradeCheck for SymbolVenueList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apexes_core::AssetClass;
     use apexes_core::{OrderType, Side};
     use chrono::TimeZone;
 
@@ -93,6 +94,7 @@ mod tests {
         OrderIntent {
             symbol: symbol.to_string(),
             venue,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: rust_decimal_macros::dec!(1),

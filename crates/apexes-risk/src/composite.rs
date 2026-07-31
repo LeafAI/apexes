@@ -91,7 +91,7 @@ impl CompositeRiskChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{OrderType, Side, Venue};
+    use apexes_core::{AssetClass, OrderType, Side, Venue};
     use chrono::TimeZone;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
@@ -147,6 +147,7 @@ mod tests {
         OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: dec!(1),
