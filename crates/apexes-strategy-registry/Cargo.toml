@@ -23,3 +23,7 @@ async-trait = { workspace = true }
 [dev-dependencies]
 rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros"] }
+chrono = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+apexes-core = { path = "../apexes-core" }

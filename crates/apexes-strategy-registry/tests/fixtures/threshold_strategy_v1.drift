@@ -1,0 +1,15 @@
+let threshold = param("threshold", 100000);
+
+function on_market_event(event, ctx) {
+  let price = event.type == "bar" ? event.close : event.price;
+  if (price > threshold) {
+    return [{
+      symbol: event.symbol,
+      venue: event.venue,
+      side: "buy",
+      order_type: "market",
+      quantity: 0.01,
+    }];
+  }
+  return [];
+}
