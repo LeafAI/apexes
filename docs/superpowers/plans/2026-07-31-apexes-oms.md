@@ -38,7 +38,7 @@
 **Interfaces:**
 - Produces: `pub enum OmsError`. Consumed by every later task in this plan.
 
-- [ ] **Step 1: Add the PostgreSQL service to `docker-compose.yml`**
+- [x] **Step 1: Add the PostgreSQL service to `docker-compose.yml`**
 
 The current file looks like this:
 
@@ -105,7 +105,7 @@ volumes:
   apexes-postgres-data:
 ```
 
-- [ ] **Step 2: Add `sqlx` to the workspace and register the new crate**
+- [x] **Step 2: Add `sqlx` to the workspace and register the new crate**
 
 Edit `Cargo.toml`:
 
@@ -143,7 +143,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "ru
 
 Note: `"crates/apexes-risk"` and `"crates/apexes-paper"` and `rand` should already be present in your actual `Cargo.toml` from prior plans -- the block above shows the full expected end state; if any of those are missing, add them back, but do not remove anything else.
 
-- [ ] **Step 3: Create `crates/apexes-oms/Cargo.toml`**
+- [x] **Step 3: Create `crates/apexes-oms/Cargo.toml`**
 
 ```toml
 [package]
@@ -172,7 +172,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 
 Note: `uuid` is listed under `[dependencies]`, not `[dev-dependencies]` -- non-test code (`OrderManager::submit_order` in Task 6, `MockExecutionGateway` in Task 3) constructs `OrderId(Uuid::new_v4())` outside any `#[cfg(test)]` block, so `uuid` must be a normal dependency, not a dev-only one.
 
-- [ ] **Step 4: Write `crates/apexes-oms/src/error.rs`**
+- [x] **Step 4: Write `crates/apexes-oms/src/error.rs`**
 
 ```rust
 //! Error type for `apexes-oms`.
@@ -256,7 +256,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Write `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 5: Write `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -278,7 +278,7 @@ pub mod error;
 pub use error::OmsError;
 ```
 
-- [ ] **Step 6: Run the error module's tests**
+- [x] **Step 6: Run the error module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -286,7 +286,7 @@ cargo test -p apexes-oms error:: -- --nocapture
 ```
 Expected: 3 passed, 0 failed.
 
-- [ ] **Step 7: Run clippy and fmt**
+- [x] **Step 7: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -295,7 +295,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands).
 
-- [ ] **Step 8: Full workspace build check**
+- [x] **Step 8: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -303,7 +303,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -324,7 +324,7 @@ git push origin master
 - Consumes: `apexes_core::{Order, OrderId, OrderStatus}` (existing).
 - Produces: `pub enum GatewayOutcome`, `pub trait ExecutionGateway`. Consumed by Task 3's `MockExecutionGateway` and Task 5's `OrderManager`.
 
-- [ ] **Step 1: Write `crates/apexes-oms/src/gateway.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/src/gateway.rs`**
 
 ```rust
 //! [`ExecutionGateway`]: the abstraction `OrderManager` submits/cancels/
@@ -395,7 +395,7 @@ pub trait ExecutionGateway: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -419,7 +419,7 @@ pub use error::OmsError;
 pub use gateway::{ExecutionGateway, GatewayOutcome};
 ```
 
-- [ ] **Step 3: Verify it compiles**
+- [x] **Step 3: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -427,7 +427,7 @@ cargo check -p apexes-oms
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -436,7 +436,7 @@ cargo fmt --check
 ```
 Expected clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -457,7 +457,7 @@ git push origin master
 - Consumes: `crate::gateway::{ExecutionGateway, GatewayOutcome}` (Task 2), `apexes_core::{Order, OrderId, OrderStatus}` (existing).
 - Produces: `pub struct MockExecutionGateway` with `new`/`program_next_submit_outcome`/`program_next_cancel_outcome`/`set_exchange_state`. Consumed by Task 6's `OrderManager` unit tests.
 
-- [ ] **Step 1: Write `crates/apexes-oms/src/mock_gateway.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/src/mock_gateway.rs`**
 
 ```rust
 //! [`MockExecutionGateway`]: an in-memory `ExecutionGateway` for tests.
@@ -708,7 +708,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -734,7 +734,7 @@ pub use gateway::{ExecutionGateway, GatewayOutcome};
 pub use mock_gateway::MockExecutionGateway;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -742,7 +742,7 @@ cargo test -p apexes-oms mock_gateway:: -- --nocapture
 ```
 Expected: 6 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -751,7 +751,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus the test command).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -759,7 +759,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -780,7 +780,7 @@ git push origin master
 - Consumes: `crate::error::OmsError` (Task 1), `apexes_core::{Order, OrderId, OrderStatus, OrderType, Side, Fill, FillId, Venue}` (existing).
 - Produces: `ORDERS_TABLE_DDL`/`ORDERS_EXCHANGE_ID_INDEX_DDL`/`FILLS_TABLE_DDL`/`FILLS_ORDER_ID_INDEX_DDL` constants, `pub struct OrderRow`/`pub struct FillRow` with `TryFrom` conversions both ways. Consumed by Task 5's `OrderStore`.
 
-- [ ] **Step 1: Write `crates/apexes-oms/src/schema.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/src/schema.rs`**
 
 ```rust
 //! PostgreSQL table schemas for `apexes-oms`. Mirrors
@@ -1093,7 +1093,7 @@ mod tests {
 
 Note: `AssetClass`/`MarketType` are imported in the test module for consistency with other test files in this codebase but are not directly used by these particular tests -- if `cargo clippy` flags them as unused imports, remove them from the `use` line (they were included defensively in case earlier drafts of this test needed `Instrument` construction; this task's tests only need `Order`/`Fill` construction, which does not require an `Instrument`).
 
-- [ ] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -1120,7 +1120,7 @@ pub use gateway::{ExecutionGateway, GatewayOutcome};
 pub use mock_gateway::MockExecutionGateway;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1128,7 +1128,7 @@ cargo test -p apexes-oms schema:: -- --nocapture
 ```
 Expected: 6 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1137,7 +1137,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed; if clippy flags the unused `AssetClass`/`MarketType` imports noted above, remove them and re-run). Re-run the test command afterward to confirm nothing regressed.
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1145,7 +1145,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1166,7 +1166,7 @@ git push origin master
 - Consumes: `crate::schema::{ORDERS_TABLE_DDL, ORDERS_EXCHANGE_ID_INDEX_DDL, FILLS_TABLE_DDL, FILLS_ORDER_ID_INDEX_DDL, OrderRow, FillRow}` (Task 4), `crate::error::OmsError` (Task 1), `apexes_core::{Order, OrderId, Fill}` (existing).
 - Produces: `pub struct OrderStore` with `new`/`upsert_order`/`get_order`/`get_open_orders`/`insert_fill`/`get_fills_for_order`. Consumed by Task 6's `OrderManager` and Task 8's end-to-end test.
 
-- [ ] **Step 1: Write `crates/apexes-oms/src/store.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/src/store.rs`**
 
 ```rust
 //! [`OrderStore`]: pure PostgreSQL read/write for `Order`/`Fill` -- no
@@ -1292,7 +1292,7 @@ impl OrderStore {
 
 Note: no unit tests in this file -- `OrderStore` has no in-memory mode (it always talks to a real PostgreSQL connection), so all of its behavior is exercised by Task 6's `OrderManager` tests and Task 8's end-to-end test, both of which are `#[ignore]`d and require a live database. This mirrors `apexes_storage::StorageWriter`/`StorageReader`, which also carry no unit tests of their own for the same reason.
 
-- [ ] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -1321,7 +1321,7 @@ pub use mock_gateway::MockExecutionGateway;
 pub use store::OrderStore;
 ```
 
-- [ ] **Step 3: Verify it compiles**
+- [x] **Step 3: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1329,7 +1329,7 @@ cargo check -p apexes-oms
 ```
 Expected: succeeds, 0 errors. Note: `sqlx::query`/`query_as` (the runtime-checked, non-macro API) do NOT require a live database connection at compile time -- only at actual runtime execution -- so this check succeeds without PostgreSQL running.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1338,7 +1338,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1346,7 +1346,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1369,7 +1369,7 @@ git push origin master
 
 **IMPORTANT:** This is the core business-logic task and the most safety-critical code in this plan (per the design spec's "non-negotiable quality bar" framing). Read the design spec's §六 in full before writing this file -- pay particular attention to: (a) persist-before-submit ordering, (b) the three-way `GatewayOutcome` handling for both `submit_order` and `cancel_order`, (c) `reconcile()` matching by client order ID (`OrderId`) not `exchange_order_id`, and (d) `reconcile()` bypassing `OrderStatus::can_transition_to` entirely (the exchange is authoritative).
 
-- [ ] **Step 1: Write `crates/apexes-oms/src/manager.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/src/manager.rs`**
 
 ```rust
 //! [`OrderManager`]: the business-logic layer -- risk checks, gateway
@@ -1650,7 +1650,7 @@ impl OrderManager {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-oms/src/lib.rs`**
 
 ```rust
 //! Apexes order management system (OMS): gateway-agnostic order
@@ -1681,7 +1681,7 @@ pub use mock_gateway::MockExecutionGateway;
 pub use store::OrderStore;
 ```
 
-- [ ] **Step 3: Verify it compiles**
+- [x] **Step 3: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1689,7 +1689,7 @@ cargo check -p apexes-oms
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1698,7 +1698,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1706,7 +1706,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors. `manager.rs` has no unit tests in this task -- those are Task 7's job (they require a live PostgreSQL connection since `OrderManager` owns a real `OrderStore`, so they are written as a separate, clearly `#[ignore]`d task rather than bundled into this one, matching this plan's Global Constraints on network/database-dependent tests).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1729,7 +1729,7 @@ git push origin master
 - Consumes: `crate::manager::OrderManager` (Task 6), `crate::store::OrderStore` (Task 5), `crate::mock_gateway::MockExecutionGateway` (Task 3), `apexes_risk::{PreTradeCheck, RiskViolation}` (existing). Requires a live PostgreSQL connection -- all tests here are `#[ignore]`, matching `apexes-storage`'s established pattern.
 - Produces: a corrected `OrderManager::reconcile()`. Consumed by Task 8's end-to-end test.
 
-- [ ] **Step 1: Fix `OrderManager::reconcile()` to add a second pass using `query_order_status`**
+- [x] **Step 1: Fix `OrderManager::reconcile()` to add a second pass using `query_order_status`**
 
 In `crates/apexes-oms/src/manager.rs`, find the current `reconcile` method (it ends with the `open_orders.retain(...)` call and `Ok(changed)`). Replace its ENTIRE body with:
 
@@ -1885,7 +1885,7 @@ Also update this method's doc comment (immediately above `pub async fn reconcile
     /// list of `OrderId`s whose status actually changed.
 ```
 
-- [ ] **Step 2: Verify the fix compiles**
+- [x] **Step 2: Verify the fix compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1893,7 +1893,7 @@ cargo check -p apexes-oms
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 3: Add `force_register_exchange_order` to `MockExecutionGateway`**
+- [x] **Step 3: Add `force_register_exchange_order` to `MockExecutionGateway`**
 
 Edit `crates/apexes-oms/src/mock_gateway.rs`, adding this method inside the existing `impl MockExecutionGateway` block (after `set_exchange_state`):
 
@@ -1918,7 +1918,7 @@ Edit `crates/apexes-oms/src/mock_gateway.rs`, adding this method inside the exis
     }
 ```
 
-- [ ] **Step 4: Append the test module to `crates/apexes-oms/src/manager.rs`**
+- [x] **Step 4: Append the test module to `crates/apexes-oms/src/manager.rs`**
 
 ```rust
 
@@ -2208,7 +2208,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Start PostgreSQL and run the tests**
+- [x] **Step 5: Start PostgreSQL and run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2218,7 +2218,7 @@ cargo test -p apexes-oms --lib -- --ignored --nocapture
 ```
 Expected: all 11 `#[ignore]`d tests in `manager.rs` pass (4 `submit_order`-focused + 3 `cancel_order`-focused + 4 `reconcile`-focused), plus `mock_gateway.rs`'s existing non-ignored tests remain unaffected (run separately, not `#[ignore]`d). Note: these tests share one live PostgreSQL database via `clean_db()`, so run them with `--test-threads=1` if you see occasional cross-test interference under default parallel execution -- this is a known limitation of the shared-database test-isolation approach, not a code defect.
 
-- [ ] **Step 6: Run the full non-ignored suite, clippy, and fmt**
+- [x] **Step 6: Run the full non-ignored suite, clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2228,7 +2228,7 @@ cargo fmt --check
 ```
 Expected: non-ignored tests unchanged from before this task (3 error + 6 mock_gateway + 6 schema = 15), clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all three commands plus Step 5's ignored-test command to confirm nothing regressed).
 
-- [ ] **Step 7: Full workspace verification**
+- [x] **Step 7: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2239,7 +2239,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2259,7 +2259,7 @@ git push origin master
 - Consumes: `apexes_oms::{OrderManager, OrderStore, MockExecutionGateway, ExecutionGateway}` (Tasks 2-6), `apexes_strategy::OrderIntent` (existing). Requires a live PostgreSQL connection -- marked `#[ignore]`.
 - Produces: nothing new consumed by later tasks -- this is the plan's final behavioral proof point before Task 9's whole-effort verification.
 
-- [ ] **Step 1: Write `crates/apexes-oms/tests/live_postgres.rs`**
+- [x] **Step 1: Write `crates/apexes-oms/tests/live_postgres.rs`**
 
 ```rust
 //! End-to-end integration test proving `OrderManager` correctly
@@ -2344,7 +2344,7 @@ async fn order_manager_recovers_open_orders_after_simulated_restart_and_reconcil
 }
 ```
 
-- [ ] **Step 2: Run the end-to-end test**
+- [x] **Step 2: Run the end-to-end test**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2354,7 +2354,7 @@ cargo test -p apexes-oms --test live_postgres -- --ignored --nocapture
 ```
 Expected: `1 passed`.
 
-- [ ] **Step 3: Run the full `apexes-oms` test suite (ignored + non-ignored), clippy, and fmt**
+- [x] **Step 3: Run the full `apexes-oms` test suite (ignored + non-ignored), clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2365,7 +2365,7 @@ cargo fmt --check
 ```
 Expected: non-ignored: 15 passed (3 error + 6 mock_gateway + 6 schema). Ignored: 12 passed (11 from Task 7's `manager.rs` tests + 1 from this task's `live_postgres.rs`) -- run with `--test-threads=1` if you see cross-test interference (these tests share one live PostgreSQL database). Clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all four commands).
 
-- [ ] **Step 4: Full workspace verification**
+- [x] **Step 4: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2376,7 +2376,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2391,7 +2391,7 @@ git push origin master
 
 **Files:** None created/modified -- this task only runs verification commands, updates `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2399,7 +2399,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite (non-ignored)**
+- [x] **Step 2: Full workspace test suite (non-ignored)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2407,7 +2407,7 @@ cargo test --workspace
 ```
 Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-strategy`/`apexes-storage`/`apexes-strategy-registry`/`apexes-optimize`/`apexes-risk`/`apexes-backtest`/`apexes-paper` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-oms` is brand new with 15 non-ignored tests (3 error + 6 mock_gateway + 6 schema).
 
-- [ ] **Step 3: Full workspace test suite (ignored/live-network)**
+- [x] **Step 3: Full workspace test suite (ignored/live-network)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2421,7 +2421,7 @@ cargo test -p apexes-oms -- --ignored
 ```
 Expected: `apexes-market-data`/`apexes-storage`/`apexes-strategy-registry`/`apexes-paper`'s pre-existing ignored tests behave exactly as they did before this plan started (unchanged -- note `apexes-market-data`'s and `apexes-paper`'s live Binance tests may be affected by this sandbox's known pre-existing network limitations documented in the prior `apexes-paper` plan; that is unrelated to this plan's work). `apexes-oms` contributes 12 new ignored tests (11 `manager.rs` + 1 `live_postgres.rs`), all passing against the live PostgreSQL container started above (run `manager.rs`'s tests with `--test-threads=1` if cross-test interference occurs, since they share one live database).
 
-- [ ] **Step 4: Full workspace clippy**
+- [x] **Step 4: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2429,7 +2429,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 5: Full workspace fmt check**
+- [x] **Step 5: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2437,7 +2437,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 6: Update `docs/FEATURES.md`**
+- [x] **Step 6: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find rows `5.1.1` (Order generation & pre-trade validation, currently `🔲 Not Started`) and `5.1.3` (Persistence & reconnect state recovery/reconciliation, currently `🔲 Not Started`, flagged as a non-negotiable quality bar). Update BOTH rows' Status to `✅ Done`.
 
@@ -2453,7 +2453,7 @@ apexes-oms crate: introduces PostgreSQL (via sqlx) as the project's first relati
 
 **Important:** before finalizing, do not just increment counts by 2/2 -- actually count the current `✅ Done` / `🔲 Not Started` / `⏸️ Deferred` (and any other status symbols present) rows in the file (e.g. `grep -cE "^\| [0-9].*<symbol>"` against each status marker, restricted to actual data rows -- NOT the legend rows near the top of the file and NOT the Summary table's own rows, which is exactly the distinction a prior plan's Task 6 got wrong and had to be corrected for) and confirm your new numbers match Done+2, Not Started-2, Total unchanged, against the real counts. Update the Summary counts table accordingly and the "Current active work" paragraph to note sub-project `#7`'s rows `5.1.1`/`5.1.3` are complete via the new `apexes-oms` crate (alongside the already-`Done` row `5.1.2`); leave "what's next" unstated since sub-project `#8` (first live gateway, now unlocked since it depends on `#7`), `#9`/`#11` (EMS, account management), the PyO3 bindings evaluation, and `apexes-risk`'s `6.4`/`6.5` are all still open/deferred options -- don't guess which one the user picks next.
 
-- [ ] **Step 7: Commit the FEATURES.md update**
+- [x] **Step 7: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2462,7 +2462,7 @@ git commit -S -s -m "docs: mark order generation and persistence/reconciliation 
 git push origin master
 ```
 
-- [ ] **Step 8: Mark this plan's checkboxes complete**
+- [x] **Step 8: Mark this plan's checkboxes complete**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2476,7 +2476,7 @@ git commit -S -s -m "docs: mark apexes-oms plan complete"
 git push origin master
 ```
 
-- [ ] **Step 9: Report final summary**
+- [x] **Step 9: Report final summary**
 
 Summarize: `apexes-oms` crate's file list and line counts, total test count (broken down: unit tests per module, ignored/live-PostgreSQL tests, the end-to-end restart-recovery test), confirmation that every other crate's pre-existing tests still pass unchanged, and the `apexes` commit SHAs for Tasks 1-9. No further commit needed for this verification-only task.
 
