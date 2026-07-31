@@ -91,14 +91,30 @@ impl OrderStore {
         rows.into_iter().map(Order::try_from).collect()
     }
 
-    pub async fn insert_fill(&self, fill: &Fill) -> Result<(), OmsError> {
-        let row = FillRow::from(fill);
-        sqlx::query(
-            "INSERT INTO fills (id, order_id, symbol, venue, side, price, quantity, fee, fee_currency, filled_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    /// Inserts a fill, keyed for deduplication on `(order_id,
+    /// exchange_trade_id)` -- a real exchange's "my trades" endpoint
+    /// returns the full trade history for an order every call, so this
+    /// must be safely callable multiple times with the same
+    /// `exchange_trade_id` without creating duplicate rows. Returns
+    /// `Ok(true)` if a new row was inserted, `Ok(false)` if it already
+    /// existed (the `ON CONFLICT DO NOTHING` path) -- callers (see
+    /// `OrderManager::apply_exchange_update`, Task 10) use this to know
+    /// whether to propagate the fill onward (e.g. into a
+    /// `PortfolioLedger`).
+    pub async fn insert_fill(
+        &self,
+        fill: &Fill,
+        exchange_trade_id: &str,
+    ) -> Result<bool, OmsError> {
+        let row = FillRow::from_fill(fill, exchange_trade_id);
+        let result = sqlx::query(
+            "INSERT INTO fills (id, order_id, exchange_trade_id, symbol, venue, side, price, quantity, fee, fee_currency, filled_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (order_id, exchange_trade_id) DO NOTHING",
         )
         .bind(row.id)
         .bind(row.order_id)
+        .bind(&row.exchange_trade_id)
         .bind(&row.symbol)
         .bind(&row.venue)
         .bind(&row.side)
@@ -109,7 +125,7 @@ impl OrderStore {
         .bind(row.filled_at)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_fills_for_order(&self, order_id: OrderId) -> Result<Vec<Fill>, OmsError> {

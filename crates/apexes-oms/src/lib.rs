@@ -13,6 +13,7 @@
 //! for testing.
 
 pub mod error;
+pub mod exchange_update;
 pub mod gateway;
 pub mod manager;
 pub mod mock_gateway;
@@ -20,7 +21,8 @@ pub mod schema;
 pub mod store;
 
 pub use error::OmsError;
-pub use gateway::{ExecutionGateway, GatewayOutcome};
+pub use exchange_update::ExchangeUpdate;
+pub use gateway::{ExchangeFill, ExecutionGateway, GatewayOutcome};
 pub use manager::OrderManager;
 pub use mock_gateway::MockExecutionGateway;
 pub use store::OrderStore;

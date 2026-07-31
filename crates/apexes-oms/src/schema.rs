@@ -39,16 +39,18 @@ CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id
 pub const FILLS_TABLE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS fills
 (
-    id              UUID PRIMARY KEY,
-    order_id        UUID NOT NULL REFERENCES orders(id),
-    symbol          TEXT NOT NULL,
-    venue           TEXT NOT NULL,
-    side            TEXT NOT NULL,
-    price           NUMERIC(38, 10) NOT NULL,
-    quantity        NUMERIC(38, 10) NOT NULL,
-    fee             NUMERIC(38, 10) NOT NULL,
-    fee_currency    TEXT,
-    filled_at       TIMESTAMPTZ NOT NULL
+    id                  UUID PRIMARY KEY,
+    order_id            UUID NOT NULL REFERENCES orders(id),
+    exchange_trade_id   TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    venue               TEXT NOT NULL,
+    side                TEXT NOT NULL,
+    price               NUMERIC(38, 10) NOT NULL,
+    quantity            NUMERIC(38, 10) NOT NULL,
+    fee                 NUMERIC(38, 10) NOT NULL,
+    fee_currency        TEXT,
+    filled_at           TIMESTAMPTZ NOT NULL,
+    UNIQUE (order_id, exchange_trade_id)
 )
 ";
 
@@ -122,6 +124,7 @@ impl TryFrom<OrderRow> for Order {
 pub struct FillRow {
     pub id: Uuid,
     pub order_id: Uuid,
+    pub exchange_trade_id: String,
     pub symbol: String,
     pub venue: String,
     pub side: String,
@@ -132,11 +135,12 @@ pub struct FillRow {
     pub filled_at: DateTime<Utc>,
 }
 
-impl From<&Fill> for FillRow {
-    fn from(fill: &Fill) -> Self {
+impl FillRow {
+    pub fn from_fill(fill: &Fill, exchange_trade_id: &str) -> Self {
         FillRow {
             id: fill.id.0,
             order_id: fill.order_id.0,
+            exchange_trade_id: exchange_trade_id.to_string(),
             symbol: fill.symbol.clone(),
             venue: format!("{:?}", fill.venue),
             side: format!("{:?}", fill.side),
@@ -307,7 +311,7 @@ mod tests {
     #[test]
     fn fill_round_trips_through_fill_row() {
         let fill = sample_fill();
-        let row = FillRow::from(&fill);
+        let row = FillRow::from_fill(&fill, "T1");
         let back = Fill::try_from(row).unwrap();
         assert_eq!(back, fill);
     }
@@ -316,8 +320,15 @@ mod tests {
     fn fill_with_none_fee_currency_round_trips() {
         let mut fill = sample_fill();
         fill.fee_currency = None;
-        let row = FillRow::from(&fill);
+        let row = FillRow::from_fill(&fill, "T1");
         let back = Fill::try_from(row).unwrap();
         assert_eq!(back.fee_currency, None);
+    }
+
+    #[test]
+    fn from_fill_stores_the_given_exchange_trade_id() {
+        let fill = sample_fill();
+        let row = FillRow::from_fill(&fill, "T-UNIQUE-42");
+        assert_eq!(row.exchange_trade_id, "T-UNIQUE-42");
     }
 }
