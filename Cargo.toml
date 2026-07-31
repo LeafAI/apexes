@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms"]
+members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms", "crates/apexes-gateway-binance"]
 
 [workspace.package]
 edition = "2024"
@@ -27,3 +27,7 @@ barter = "0.12"
 sha2 = "0.10"
 rand = "0.10"
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "rust_decimal", "uuid"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+hmac = "0.13"
+hex = "0.4"
