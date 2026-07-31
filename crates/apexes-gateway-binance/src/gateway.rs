@@ -138,6 +138,30 @@ fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {
     }
 }
 
+/// Parses one `query_all_open_orders` response entry into the
+/// `(client_order_id, exchange_order_id, status)` triple the trait
+/// contract requires. Factored out of `query_all_open_orders` so a
+/// single unparseable entry can be skipped-and-logged by the caller
+/// rather than failing the entire batch (see that method's doc
+/// comment for why: `reconcile()`'s safety-net purpose depends on
+/// one bad entry never hiding every other order in the same response).
+fn parse_open_order_entry(
+    entry: &OpenOrderEntry,
+) -> Result<(OrderId, Option<String>, OrderStatus), String> {
+    let client_order_id = entry.client_order_id.parse::<uuid::Uuid>().map_err(|error| {
+        format!(
+            "clientOrderId {:?} is not a valid UUID (was it set by something other than this gateway?): {error}",
+            entry.client_order_id
+        )
+    })?;
+    let status = parse_binance_status(&entry.status)?;
+    Ok((
+        OrderId(client_order_id),
+        Some(entry.order_id.to_string()),
+        status,
+    ))
+}
+
 fn parse_decimal_field(value: &str, field: &str) -> Result<Decimal, String> {
     value
         .parse::<Decimal>()
@@ -276,26 +300,33 @@ impl ExecutionGateway for BinanceExecutionGateway {
         let entries: Vec<OpenOrderEntry> = serde_json::from_str(&body)
             .map_err(|error| format!("parse error: {error}; body={body}"))?;
 
-        entries
+        // A single entry this gateway can't parse (a non-UUID
+        // clientOrderId from an order placed by something other than
+        // this gateway -- e.g. manually via Binance's web/app UI on the
+        // same account -- or a Binance order-status string outside our
+        // 5-variant mapping, e.g. PENDING_CANCEL) must not poison every
+        // OTHER entry in this response: reconcile() is the safety-net
+        // poll specifically meant to catch what a WS disconnect missed,
+        // and losing visibility into every other open order in this
+        // asset class over one unrelated/unmapped entry would defeat
+        // that purpose exactly when it matters most. Skip and log the
+        // offending entry instead of failing the whole batch, matching
+        // `user_data_stream::parse_binance_status`'s existing
+        // skip-and-log behavior for the same class of problem.
+        Ok(entries
             .into_iter()
-            .map(|entry| {
-                let client_order_id = entry
-                    .client_order_id
-                    .parse::<uuid::Uuid>()
-                    .map_err(|error| {
-                        format!(
-                            "clientOrderId {:?} is not a valid UUID (was it set by something other than this gateway?): {error}",
-                            entry.client_order_id
-                        )
-                    })?;
-                let status = parse_binance_status(&entry.status)?;
-                Ok((
-                    OrderId(client_order_id),
-                    Some(entry.order_id.to_string()),
-                    status,
-                ))
+            .filter_map(|entry| match parse_open_order_entry(&entry) {
+                Ok(parsed) => Some(parsed),
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        client_order_id = entry.client_order_id,
+                        "skipping unparseable open-order entry"
+                    );
+                    None
+                }
             })
-            .collect()
+            .collect())
     }
 
     async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {

@@ -302,6 +302,24 @@ impl OrderManager {
             }
         }
 
+        // Keep `filled_quantity` in sync with the fills actually
+        // recorded for this transition, mirroring
+        // `apexes_backtest::event_loop::run_event_loop`'s equivalent
+        // increment -- without this, `filled_quantity` would stay at
+        // its `submit_order`-time value of zero for the entire life of
+        // every live-traded order, even after Binance reports
+        // PartiallyFilled/Filled, silently misrepresenting the
+        // persisted `orders` row to any future consumer of this field.
+        if !new_fills.is_empty()
+            && let Some(order) = self.open_orders.get_mut(&client_order_id)
+        {
+            order.filled_quantity += new_fills.iter().map(|fill| fill.quantity).sum::<Decimal>();
+            order.updated_at = Utc::now();
+            self.store
+                .upsert_order(self.open_orders.get(&client_order_id).unwrap())
+                .await?;
+        }
+
         if matches!(
             status,
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
@@ -783,6 +801,14 @@ mod tests {
 
         let persisted_fills = manager.store.get_fills_for_order(order_id).await.unwrap();
         assert_eq!(persisted_fills.len(), 1);
+
+        // Regression check for the final whole-branch review's Important
+        // finding: filled_quantity must reflect the fill that just
+        // transitioned this order to Filled, both in the persisted row
+        // and in the in-memory snapshot (the order is removed from
+        // open_orders once Filled, so check the persisted row).
+        let persisted_order = manager.store.get_order(order_id).await.unwrap().unwrap();
+        assert_eq!(persisted_order.filled_quantity, dec!(1));
 
         gateway.set_exchange_state(order_id, OrderStatus::Filled);
         let changed_again = manager.reconcile().await.unwrap();

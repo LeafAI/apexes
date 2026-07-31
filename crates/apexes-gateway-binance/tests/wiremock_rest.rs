@@ -212,6 +212,56 @@ async fn query_all_open_orders_parses_client_order_id_back_into_order_id() {
     assert_eq!(open_orders[0].2, OrderStatus::PartiallyFilled);
 }
 
+// Regression test for the final whole-branch review's Critical finding:
+// query_all_open_orders used to fail its entire batch if a single entry
+// had a non-UUID clientOrderId (e.g. an order placed manually via
+// Binance's web/app UI on the same account) or an unmapped status
+// string -- losing visibility into every OTHER order in the response,
+// exactly when reconcile()'s safety-net poll needs it most.
+#[tokio::test]
+async fn query_all_open_orders_skips_unparseable_entries_without_losing_the_rest() {
+    let mock_server = MockServer::start().await;
+    let good_order_id = Uuid::new_v4();
+
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "orderId": 555,
+                "clientOrderId": good_order_id.to_string(),
+                "status": "NEW"
+            },
+            {
+                "orderId": 556,
+                "clientOrderId": "android_not_a_uuid",
+                "status": "NEW"
+            },
+            {
+                "orderId": 557,
+                "clientOrderId": Uuid::new_v4().to_string(),
+                "status": "PENDING_CANCEL"
+            }
+        ])))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    let open_orders = gateway
+        .query_all_open_orders(AssetClass::Spot)
+        .await
+        .unwrap();
+
+    // Both the non-UUID clientOrderId entry and the unmapped-status
+    // entry are skipped, but the one valid entry still comes through --
+    // the whole call must not fail just because two of three entries
+    // couldn't be parsed.
+    assert_eq!(open_orders.len(), 1);
+    assert_eq!(open_orders[0].0, OrderId(good_order_id));
+    assert_eq!(open_orders[0].1, Some("555".to_string()));
+    assert_eq!(open_orders[0].2, OrderStatus::New);
+}
+
 #[tokio::test]
 async fn query_fills_for_order_parses_trade_list() {
     let mock_server = MockServer::start().await;
