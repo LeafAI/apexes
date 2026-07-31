@@ -33,7 +33,7 @@
 **Interfaces:**
 - Produces: `pub enum RiskViolation`, `pub enum CircuitBreakerScope` (both in `crate::error`). Consumed by every later task in this plan.
 
-- [ ] **Step 1: Register the new crate in the workspace**
+- [x] **Step 1: Register the new crate in the workspace**
 
 ```bash
 cd ~/src/oss/apexes
@@ -48,7 +48,7 @@ resolver = "3"
 members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk"]
 ```
 
-- [ ] **Step 2: Create `crates/apexes-risk/Cargo.toml`**
+- [x] **Step 2: Create `crates/apexes-risk/Cargo.toml`**
 
 ```toml
 [package]
@@ -69,7 +69,7 @@ rust_decimal_macros = "1.40"
 uuid = { workspace = true, features = ["v4"] }
 ```
 
-- [ ] **Step 3: Write `crates/apexes-risk/src/error.rs`**
+- [x] **Step 3: Write `crates/apexes-risk/src/error.rs`**
 
 ```rust
 //! [`RiskViolation`]: describes exactly which risk rule was violated and
@@ -200,7 +200,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Write `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 4: Write `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -215,7 +215,7 @@ pub mod error;
 pub use error::{CircuitBreakerScope, RiskViolation};
 ```
 
-- [ ] **Step 5: Run the error module's tests**
+- [x] **Step 5: Run the error module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -223,7 +223,7 @@ cargo test -p apexes-risk error:: -- --nocapture
 ```
 Expected: 5 passed, 0 failed.
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -232,7 +232,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands).
 
-- [ ] **Step 7: Full workspace build check**
+- [x] **Step 7: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -240,7 +240,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -262,7 +262,7 @@ git push origin master
 - Consumes: `crate::error::RiskViolation` (Task 1), `apexes_core::{Order, OrderId, Fill}`, `apexes_strategy::{OrderIntent, Position}` (existing).
 - Produces: `pub trait PreTradeCheck`, `pub trait InTradeMonitor`. Consumed by Tasks 3-6's concrete implementations and Task 7's `CompositeRiskChecker`/backtest integration.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/pre_trade.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/pre_trade.rs`**
 
 ```rust
 //! [`PreTradeCheck`]: called after a `Strategy::on_market_event` call
@@ -299,7 +299,7 @@ pub trait PreTradeCheck: Send {
 }
 ```
 
-- [ ] **Step 2: Write `crates/apexes-risk/src/in_trade.rs`**
+- [x] **Step 2: Write `crates/apexes-risk/src/in_trade.rs`**
 
 ```rust
 //! [`InTradeMonitor`]: called after a `Fill` is applied to the ledger,
@@ -331,7 +331,7 @@ pub trait InTradeMonitor: Send {
 }
 ```
 
-- [ ] **Step 3: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 3: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -350,7 +350,7 @@ pub use in_trade::InTradeMonitor;
 pub use pre_trade::PreTradeCheck;
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -358,7 +358,7 @@ cargo check -p apexes-risk
 ```
 Expected: succeeds, 0 errors. Traits with no implementations yet compile fine on their own.
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -367,7 +367,7 @@ cargo fmt --check
 ```
 Expected clean.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -388,7 +388,7 @@ git push origin master
 - Consumes: `crate::pre_trade::PreTradeCheck`, `crate::error::RiskViolation` (Tasks 1-2), `apexes_strategy::{OrderIntent, Position}`, `apexes_core::{Order, OrderId, Side}` (existing).
 - Produces: `pub struct RiskLimits`, `pub struct LimitChecker` with `new`/`update_limits`. Consumed by Task 6's `CircuitBreaker` (shares the `RiskLimits` type) and Task 7's `CompositeRiskChecker`/backtest integration tests.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/limits.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/limits.rs`**
 
 ```rust
 //! [`RiskLimits`]: the configurable threshold values [`LimitChecker`]
@@ -858,7 +858,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -879,7 +879,7 @@ pub use limits::{LimitChecker, RiskLimits};
 pub use pre_trade::PreTradeCheck;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -887,7 +887,7 @@ cargo test -p apexes-risk limits:: -- --nocapture
 ```
 Expected: 12 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -896,7 +896,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus the test command to confirm nothing regressed).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -904,7 +904,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -925,7 +925,7 @@ git push origin master
 - Consumes: `crate::pre_trade::PreTradeCheck`, `crate::error::RiskViolation` (Tasks 1-2), `apexes_core::Venue` (existing, already derives `Hash`/`Eq`).
 - Produces: `pub enum ListMode<T>`, `pub struct SymbolVenueList`. Consumed by Task 7's `CompositeRiskChecker`/backtest integration tests.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/lists.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/lists.rs`**
 
 ```rust
 //! [`SymbolVenueList`]: symbol-level and venue-level allow/deny lists.
@@ -1153,7 +1153,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -1176,7 +1176,7 @@ pub use lists::{ListMode, SymbolVenueList};
 pub use pre_trade::PreTradeCheck;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1184,7 +1184,7 @@ cargo test -p apexes-risk lists:: -- --nocapture
 ```
 Expected: 8 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1193,7 +1193,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus the test command).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1201,7 +1201,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1222,7 +1222,7 @@ git push origin master
 - Consumes: `crate::pre_trade::PreTradeCheck`, `crate::error::RiskViolation` (Tasks 1-2), `apexes_core::{Order, OrderId, OrderType, Side}` (existing).
 - Produces: `pub struct SelfTradePreventer`. Consumed by Task 7's `CompositeRiskChecker`/backtest integration tests.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/self_trade.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/self_trade.rs`**
 
 ```rust
 //! [`SelfTradePreventer`]: rejects an `OrderIntent` that would risk
@@ -1448,7 +1448,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -1473,7 +1473,7 @@ pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1481,7 +1481,7 @@ cargo test -p apexes-risk self_trade:: -- --nocapture
 ```
 Expected: 8 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1490,7 +1490,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus the test command).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1498,7 +1498,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1519,7 +1519,7 @@ git push origin master
 - Consumes: `crate::pre_trade::PreTradeCheck`, `crate::in_trade::InTradeMonitor`, `crate::error::{RiskViolation, CircuitBreakerScope}`, `crate::limits::RiskLimits` (Tasks 1-3), `apexes_core::Fill`, `apexes_strategy::Position` (existing).
 - Produces: `pub struct CircuitBreaker` with `new`/`reset`/`is_tripped`, plus two adapter structs `pub struct CircuitBreakerPreTradeAdapter` and `pub struct CircuitBreakerInTradeAdapter` (both wrapping `Arc<Mutex<CircuitBreaker>>`) and a `CircuitBreaker::split()` constructor helper. Consumed by Task 7's `CompositeRiskChecker`/backtest integration.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/circuit_breaker.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/circuit_breaker.rs`**
 
 ```rust
 //! [`CircuitBreaker`]: trips (opens) when a fill causes a position-type
@@ -1906,7 +1906,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -1933,7 +1933,7 @@ pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1941,7 +1941,7 @@ cargo test -p apexes-risk circuit_breaker:: -- --nocapture
 ```
 Expected: 5 passed, 0 failed.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1950,7 +1950,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus the test command). If clippy flags the `unwrap_or_else(|poisoned| poisoned.into_inner())` pattern, keep it as-is -- it is the standard idiomatic way to recover from a poisoned `Mutex` without panicking, and is intentional here (a panic inside one risk-check call must not poison the mutex for all future calls).
 
-- [ ] **Step 5: Run the full `apexes-risk` test suite**
+- [x] **Step 5: Run the full `apexes-risk` test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1958,7 +1958,7 @@ cargo test -p apexes-risk
 ```
 Expected: all tests from Tasks 1-6 pass (5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker = 38 tests), 0 failed.
 
-- [ ] **Step 6: Full workspace build check**
+- [x] **Step 6: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1966,7 +1966,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1987,7 +1987,7 @@ git push origin master
 - Consumes: `crate::pre_trade::PreTradeCheck`, `crate::in_trade::InTradeMonitor`, `crate::error::RiskViolation` (Tasks 1-2). Consumed by Task 8's `apexes-backtest` integration.
 - Produces: `pub struct CompositeRiskChecker` with `new`/`with_pre_trade_check`/`with_in_trade_monitor`/`check`/`on_fill`.
 
-- [ ] **Step 1: Write `crates/apexes-risk/src/composite.rs`**
+- [x] **Step 1: Write `crates/apexes-risk/src/composite.rs`**
 
 ```rust
 //! [`CompositeRiskChecker`]: runs multiple `PreTradeCheck`/
@@ -2295,7 +2295,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
+- [x] **Step 2: Update `crates/apexes-risk/src/lib.rs`**
 
 ```rust
 //! Apexes risk engine: pluggable pre-trade (`PreTradeCheck`) and
@@ -2324,7 +2324,7 @@ pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2332,7 +2332,7 @@ cargo test -p apexes-risk composite:: -- --nocapture
 ```
 Expected: 6 passed, 0 failed.
 
-- [ ] **Step 4: Run the full `apexes-risk` test suite, clippy, and fmt**
+- [x] **Step 4: Run the full `apexes-risk` test suite, clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2342,7 +2342,7 @@ cargo fmt --check
 ```
 Expected: 44 tests passed (5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite), 0 failed; clippy and fmt clean (auto-fix with `cargo fmt` if needed and re-run all three commands).
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2350,7 +2350,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2378,7 +2378,7 @@ git push origin master
 
 **IMPORTANT -- read before starting:** `BacktestConfig` has NO `Default` impl and is constructed via exhaustive struct literals at **7 locations** across 3 crates. Adding the new `risk_checker` field breaks compilation everywhere until every single one of these 7 call sites is updated with `risk_checker: None,`. This task's steps are ordered so that you add the field FIRST (Step 2), confirm the resulting compile errors match exactly these 7 locations (Step 3), then fix each one in turn (Steps 4-10). Do not skip the verification in Step 3 -- if `cargo build --workspace` reports a compile error anywhere NOT in this list of 7, stop and investigate before proceeding (it means either this plan's file list is stale or something else changed).
 
-- [ ] **Step 1: Add `apexes-risk` as a dependency of `apexes-backtest`**
+- [x] **Step 1: Add `apexes-risk` as a dependency of `apexes-backtest`**
 
 Edit `crates/apexes-backtest/Cargo.toml`:
 
@@ -2410,7 +2410,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 uuid = { workspace = true, features = ["v4"] }
 ```
 
-- [ ] **Step 2: Add the `risk_checker` field to `BacktestConfig` and thread it through `run_backtest`**
+- [x] **Step 2: Add the `risk_checker` field to `BacktestConfig` and thread it through `run_backtest`**
 
 In `crates/apexes-backtest/src/runner.rs`, find this exact block near the top of the file:
 
@@ -2524,7 +2524,7 @@ pub async fn run_backtest(
 ) -> Result<BacktestReport, ApexesError> {
 ```
 
-- [ ] **Step 3: Confirm the resulting compile errors are exactly the 7 known call sites**
+- [x] **Step 3: Confirm the resulting compile errors are exactly the 7 known call sites**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2540,7 +2540,7 @@ Expected: multiple `error[E0063]: missing field \`risk_checker\` in initializer 
 
 If any error appears at a location NOT in this list, STOP and investigate before proceeding -- do not fix call sites this plan doesn't know about without first understanding why they exist.
 
-- [ ] **Step 4: Insert the pre-trade check and in-trade monitor calls into the event loop**
+- [x] **Step 4: Insert the pre-trade check and in-trade monitor calls into the event loop**
 
 In `crates/apexes-backtest/src/runner.rs`, find this exact block (the order-intent submission loop):
 
@@ -2644,7 +2644,7 @@ Replace it with:
         }
 ```
 
-- [ ] **Step 5: Insert the in-trade monitor call into the Trade-event fill path**
+- [x] **Step 5: Insert the in-trade monitor call into the Trade-event fill path**
 
 In `crates/apexes-backtest/src/runner.rs`, find this exact block (inside the `MarketEvent::Trade(trade) => { ... }` arm, where resting-order fills from a `TradeEvent` are applied):
 
@@ -2717,7 +2717,7 @@ Replace it with:
 
 This is the resting-limit-order fill path (fills that happen when a `TradeEvent` arrives and matches an existing resting order) -- distinct from Step 4's immediate-fill path (Market orders filled at submission time). Both paths produce `Fill`s that must reach `InTradeMonitor::on_fill`.
 
-- [ ] **Step 6: Fix `crates/apexes-backtest/src/runner.rs`'s own internal test**
+- [x] **Step 6: Fix `crates/apexes-backtest/src/runner.rs`'s own internal test**
 
 Find this exact block in `runner.rs`'s `#[cfg(test)] mod tests`:
 
@@ -2750,7 +2750,7 @@ Replace it with:
         };
 ```
 
-- [ ] **Step 7: Fix `crates/apexes-backtest/tests/end_to_end.rs`'s three call sites**
+- [x] **Step 7: Fix `crates/apexes-backtest/tests/end_to_end.rs`'s three call sites**
 
 This file has three separate `BacktestConfig { ... risk_free_return: dec!(0), };` literals (around lines 92-106, 127-141, and 235-249 as of this plan's writing -- use `grep -n "risk_free_return: dec!(0),"` to find their current exact line numbers, since earlier edits in this same file may have shifted line numbers). Each one ends with exactly:
 
@@ -2773,7 +2773,7 @@ Replace **each of the three occurrences** with:
 
 Run `grep -c "risk_checker: None," crates/apexes-backtest/tests/end_to_end.rs` after editing -- expect `3`.
 
-- [ ] **Step 8: Fix `crates/apexes-backtest/tests/live_storage_backtest.rs`**
+- [x] **Step 8: Fix `crates/apexes-backtest/tests/live_storage_backtest.rs`**
 
 Find this exact block:
 
@@ -2816,7 +2816,7 @@ Replace it with:
     };
 ```
 
-- [ ] **Step 9: Fix `crates/apexes-optimize/tests/grid_search_end_to_end.rs`**
+- [x] **Step 9: Fix `crates/apexes-optimize/tests/grid_search_end_to_end.rs`**
 
 Find this exact block:
 
@@ -2861,11 +2861,11 @@ Replace it with:
         };
 ```
 
-- [ ] **Step 10: Fix `crates/apexes-strategy-registry/tests/registry_end_to_end.rs`**
+- [x] **Step 10: Fix `crates/apexes-strategy-registry/tests/registry_end_to_end.rs`**
 
 Find the equivalent `BacktestConfig { ... risk_free_return: dec!(0), };` block in this file (same shape as Step 9's, ending the same way) and apply the identical fix: add `risk_checker: None,` immediately after the `risk_free_return: dec!(0),` line, before the closing `};`.
 
-- [ ] **Step 11: Verify the whole workspace compiles**
+- [x] **Step 11: Verify the whole workspace compiles**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2873,7 +2873,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors. If any `E0063` errors remain, they indicate a missed call site -- find it with `grep -rn "risk_free_return:" crates/*/tests crates/*/src` and fix it following the same pattern (add `risk_checker: None,` right after the `risk_free_return` line).
 
-- [ ] **Step 12: Run the full existing `apexes-backtest`/`apexes-optimize`/`apexes-strategy-registry` test suites to confirm zero regressions**
+- [x] **Step 12: Run the full existing `apexes-backtest`/`apexes-optimize`/`apexes-strategy-registry` test suites to confirm zero regressions**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2883,7 +2883,7 @@ cargo test -p apexes-strategy-registry
 ```
 Expected: every test that passed before this task still passes (same counts as recorded in this plan's Global Constraints / prior plans' final summaries) -- `risk_checker: None` must produce byte-for-byte identical behavior to the pre-existing code path, since `None` short-circuits both new `if let Some(risk_checker) = ...` blocks entirely.
 
-- [ ] **Step 13: Write the risk integration test**
+- [x] **Step 13: Write the risk integration test**
 
 Create `crates/apexes-backtest/tests/risk_integration.rs`:
 
@@ -3046,7 +3046,7 @@ async fn non_blacklisted_symbol_still_trades_normally_through_a_configured_risk_
 }
 ```
 
-- [ ] **Step 14: Run the new integration test**
+- [x] **Step 14: Run the new integration test**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3054,7 +3054,7 @@ cargo test -p apexes-backtest --test risk_integration -- --nocapture
 ```
 Expected: 3 passed, 0 failed.
 
-- [ ] **Step 15: Run clippy and fmt on every touched crate**
+- [x] **Step 15: Run clippy and fmt on every touched crate**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3065,7 +3065,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run all four commands plus Step 12's three test commands and Step 14's test command to confirm nothing regressed).
 
-- [ ] **Step 16: Full workspace verification**
+- [x] **Step 16: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3076,7 +3076,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures across every crate.
 
-- [ ] **Step 17: Commit**
+- [x] **Step 17: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3091,7 +3091,7 @@ git push origin master
 
 **Files:** None created/modified -- this task only runs verification commands, updates `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3099,7 +3099,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3107,7 +3107,7 @@ cargo test --workspace
 ```
 Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-strategy`/`apexes-storage`/`apexes-strategy-registry` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-optimize` unaffected except its one updated `BacktestConfig` literal (test count unchanged); `apexes-backtest` gains exactly 3 new tests (Task 8's `risk_integration.rs`); `apexes-risk` is brand new with 44 tests (Tasks 1-7: 5 error + 12 limits + 8 lists + 8 self_trade + 5 circuit_breaker + 6 composite).
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3115,7 +3115,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 4: Full workspace fmt check**
+- [x] **Step 4: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3123,7 +3123,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 5: Update `docs/FEATURES.md`**
+- [x] **Step 5: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find rows `6.1` (Pre-trade risk controls, currently `🔲 Not Started`) and `6.2` (In-trade risk controls, currently `🔲 Not Started`). Update BOTH rows' Status to `✅ Done`.
 
@@ -3139,7 +3139,7 @@ apexes-risk crate: CircuitBreaker implements both PreTradeCheck and InTradeMonit
 
 **Important:** before finalizing, do not just increment counts by 2/2 -- actually count the current `✅ Done` / `🔲 Not Started` / `⏸️ Deferred` rows in the file (e.g. `grep -c` against the row-level status markers, excluding the legend rows and the Summary table's own rows) and confirm your new numbers match Done+2, Not Started-2, Total unchanged, against the real counts. Update the Summary counts table accordingly and the "Current active work" paragraph to note sub-project `#5`'s first phase (pre-trade + in-trade risk controls, rows `6.1`/`6.2`) is now complete via the `apexes-risk` crate; leave rows `6.4`/`6.5` and sub-project `#15`'s row `6.3` explicitly unstarted in the prose (don't imply they're done); leave "what's next" unstated since PyO3 bindings evaluation, `6.4`/`6.5`, and the next major sub-project (`#6` Paper Trading, `#7` OMS, etc.) are all still open options -- don't guess which one the user picks next.
 
-- [ ] **Step 6: Commit the FEATURES.md update**
+- [x] **Step 6: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3148,7 +3148,7 @@ git commit -S -s -m "docs: mark pre-trade and in-trade risk controls complete in
 git push origin master
 ```
 
-- [ ] **Step 7: Mark this plan's checkboxes complete**
+- [x] **Step 7: Mark this plan's checkboxes complete**
 
 ```bash
 cd ~/src/oss/apexes
@@ -3162,7 +3162,7 @@ git commit -S -s -m "docs: mark apexes-risk plan complete"
 git push origin master
 ```
 
-- [ ] **Step 8: Report final summary**
+- [x] **Step 8: Report final summary**
 
 Summarize: `apexes-risk` crate's file list and line counts, total test count (broken down: unit tests per module), confirmation that `apexes-backtest`'s/`apexes-optimize`'s/`apexes-strategy-registry`'s pre-existing tests still pass unchanged after their small `BacktestConfig` additions, and the `apexes` commit SHAs for Tasks 1-9. No further commit needed for this verification-only task.
 
