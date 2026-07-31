@@ -62,6 +62,25 @@ impl MockExecutionGateway {
             .expect("set_exchange_state called for an order never submitted through this mock");
         entry.1 = status;
     }
+
+    /// Directly registers exchange-side state for `client_order_id`
+    /// WITHOUT requiring a prior `submit_order` call to have gone
+    /// through this mock -- needed because a programmed `Uncertain`
+    /// `submit_order` outcome does NOT itself populate `exchange_state`.
+    /// Used to simulate an order whose `submit_order` returned
+    /// `Uncertain` later being confirmed by the exchange -- the exact
+    /// scenario `OrderManager::reconcile` exists to resolve.
+    pub fn force_register_exchange_order(
+        &self,
+        client_order_id: OrderId,
+        exchange_order_id: &str,
+        status: OrderStatus,
+    ) {
+        self.exchange_state
+            .lock()
+            .unwrap()
+            .insert(client_order_id, (exchange_order_id.to_string(), status));
+    }
 }
 
 #[async_trait]

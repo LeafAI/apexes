@@ -193,23 +193,35 @@ impl OrderManager {
         }
     }
 
-    /// Reconnect reconciliation: calls
-    /// `gateway.query_all_open_orders()`, and for every
-    /// `(client_order_id, exchange_order_id, exchange_status)` triple
-    /// returned, looks up the matching local order BY `client_order_id`
-    /// (our own `OrderId` -- NOT `exchange_order_id`, which may still be
-    /// unknown locally for `Uncertain`-outcome orders). If found: sets
-    /// `order.exchange_order_id` (populating it if it was `None`) and
-    /// OVERWRITES the local status with the exchange's reported status
-    /// UNCONDITIONALLY -- bypassing `OrderStatus::can_transition_to`'s
-    /// validation entirely, per this design's explicit decision that
-    /// the exchange is authoritative during reconciliation. If NOT
-    /// found (a `client_order_id` the exchange reports that we have no
-    /// local record of at all), logs a `tracing::error!` and skips it.
-    /// Local orders NOT present in the exchange's open-order list are
-    /// left unchanged if already terminal, or logged as a discrepancy
-    /// (`tracing::warn!`) if the local status is still `New`/
-    /// `PartiallyFilled`. Every status change is persisted via
+    /// Reconnect reconciliation, in two passes:
+    ///
+    /// **Pass 1** -- calls `gateway.query_all_open_orders()`, and for
+    /// every `(client_order_id, exchange_order_id, exchange_status)`
+    /// triple returned, looks up the matching local order BY
+    /// `client_order_id` (our own `OrderId` -- NOT `exchange_order_id`,
+    /// which may still be unknown locally for `Uncertain`-outcome
+    /// orders). If found: sets `order.exchange_order_id` (populating it
+    /// if it was `None`) and OVERWRITES the local status with the
+    /// exchange's reported status UNCONDITIONALLY -- bypassing
+    /// `OrderStatus::can_transition_to`'s validation entirely, per this
+    /// design's explicit decision that the exchange is authoritative
+    /// during reconciliation. If NOT found (a `client_order_id` the
+    /// exchange reports that we have no local record of at all), logs a
+    /// `tracing::error!` and skips it.
+    ///
+    /// **Pass 2** -- `query_all_open_orders` is documented to report
+    /// ONLY non-terminal orders, so it can never surface a `Filled`/
+    /// `Cancelled`/`Rejected` transition on its own. For every local
+    /// order still `New`/`PartiallyFilled` that pass 1 did NOT see
+    /// (and that has a known `exchange_order_id`), this pass calls
+    /// `gateway.query_order_status` individually (which DOES report
+    /// terminal statuses) and applies the same unconditional-overwrite
+    /// treatment. A local order with no `exchange_order_id` yet (an
+    /// unresolved `Uncertain` submission) and not reported by pass 1
+    /// either cannot be resolved via the current `ExecutionGateway`
+    /// interface -- logged via `tracing::warn!`, left unchanged.
+    ///
+    /// Every status change (either pass) is persisted via
     /// `store.upsert_order` and reflected in `open_orders`. Returns the
     /// list of `OrderId`s whose status actually changed.
     pub async fn reconcile(&mut self) -> Result<Vec<OrderId>, OmsError> {
@@ -220,9 +232,13 @@ impl OrderManager {
             .map_err(|reason| OmsError::QueryFailed { reason })?;
 
         let mut changed = Vec::new();
-        let exchange_order_ids: std::collections::HashSet<OrderId> =
+        let reported_client_ids: std::collections::HashSet<OrderId> =
             exchange_orders.iter().map(|(id, _, _)| *id).collect();
 
+        // First pass: orders the exchange still considers open (or has
+        // just transitioned between non-terminal states). Matched by
+        // OUR client order ID, never by exchange_order_id -- see
+        // ExecutionGateway::query_all_open_orders's docs for why.
         for (client_order_id, exchange_order_id, exchange_status) in exchange_orders {
             match self.open_orders.get_mut(&client_order_id) {
                 Some(order) => {
@@ -246,17 +262,72 @@ impl OrderManager {
             }
         }
 
-        for (local_id, local_order) in self.open_orders.iter() {
-            if !exchange_order_ids.contains(local_id)
-                && matches!(
-                    local_order.status,
-                    OrderStatus::New | OrderStatus::PartiallyFilled
-                )
-            {
+        // Second pass: local orders still New/PartiallyFilled that the
+        // exchange did NOT report as open in the first pass. This is
+        // NOT an edge case -- it is the primary way a Filled/Cancelled/
+        // Rejected transition is ever discovered, since
+        // query_all_open_orders structurally never reports terminal
+        // orders. For each such local order that HAS an
+        // exchange_order_id, query it individually (query_order_status
+        // DOES return terminal statuses).
+        let still_locally_open: Vec<OrderId> = self
+            .open_orders
+            .iter()
+            .filter(|(id, order)| {
+                !reported_client_ids.contains(*id)
+                    && matches!(
+                        order.status,
+                        OrderStatus::New | OrderStatus::PartiallyFilled
+                    )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for client_order_id in still_locally_open {
+            let exchange_order_id = self
+                .open_orders
+                .get(&client_order_id)
+                .and_then(|order| order.exchange_order_id.clone());
+
+            let Some(exchange_order_id) = exchange_order_id else {
+                // Uncertain submission that was never accepted into the
+                // exchange's open-order list either -- nothing to query
+                // by yet. Log and move on; this specific combination
+                // (Uncertain + never became visible as open + went
+                // straight to a terminal state) cannot be resolved with
+                // the current ExecutionGateway interface.
                 tracing::warn!(
-                    order_id = ?local_id,
-                    "reconcile: local order still open but exchange no longer reports it as open"
+                    order_id = ?client_order_id,
+                    "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
                 );
+                continue;
+            };
+
+            match self.gateway.query_order_status(&exchange_order_id).await {
+                Ok(Some(status)) => {
+                    if let Some(order) = self.open_orders.get_mut(&client_order_id)
+                        && order.status != status
+                    {
+                        order.status = status;
+                        order.updated_at = Utc::now();
+                        self.store.upsert_order(order).await?;
+                        changed.push(client_order_id);
+                    }
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        order_id = ?client_order_id,
+                        exchange_order_id,
+                        "reconcile: exchange has no record at all of an order we believe is open"
+                    );
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        order_id = ?client_order_id,
+                        reason,
+                        "reconcile: query_order_status failed for this order; will retry on next reconcile() call"
+                    );
+                }
             }
         }
 
@@ -275,5 +346,297 @@ impl OrderManager {
 
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {
         &self.open_orders
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock_gateway::MockExecutionGateway;
+    use apexes_core::{OrderType, Side, Venue};
+    use apexes_risk::RiskViolation;
+    use chrono::DateTime;
+    use rust_decimal_macros::dec;
+    use std::collections::HashMap;
+
+    const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
+
+    /// Wraps a `PreTradeCheck` that always rejects, for testing
+    /// `submit_order`'s risk-check-failure path without depending on
+    /// `apexes-risk`'s concrete checkers.
+    struct AlwaysRejectCheck;
+
+    impl PreTradeCheck for AlwaysRejectCheck {
+        fn check(
+            &self,
+            intent: &OrderIntent,
+            _positions: &HashMap<String, Position>,
+            _balances: &HashMap<String, Decimal>,
+            _open_orders: &HashMap<OrderId, Order>,
+            _now: DateTime<Utc>,
+        ) -> Result<(), Vec<RiskViolation>> {
+            Err(vec![RiskViolation::SymbolBlacklisted {
+                symbol: intent.symbol.clone(),
+            }])
+        }
+    }
+
+    fn sample_intent() -> OrderIntent {
+        OrderIntent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            quantity: dec!(1),
+            price: None,
+            stop_price: None,
+        }
+    }
+
+    /// Deletes all rows from both tables before a test runs, so tests
+    /// sharing one live PostgreSQL database don't see leftover state
+    /// from earlier tests (e.g. `OrderManager::new`'s
+    /// `get_open_orders()` recovery would otherwise pick up unrelated
+    /// New-status orders from a previous test run).
+    async fn clean_db(store: &OrderStore) {
+        // OrderStore has no public "delete everything" method (by
+        // design -- production code should never truncate order
+        // history). Test-only cleanup goes directly through sqlx.
+        // OrderStore does not expose its pool, so this helper
+        // reconnects independently for the sole purpose of clearing
+        // state; production code never does this.
+        let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+        sqlx::query("TRUNCATE fills, orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = store; // parameter kept for call-site symmetry/clarity
+    }
+
+    async fn fresh_manager(gateway: Arc<dyn ExecutionGateway>) -> OrderManager {
+        let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        clean_db(&store).await;
+        OrderManager::new(store, gateway, None).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn submit_order_with_failing_risk_check_creates_no_order() {
+        let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        clean_db(&store).await;
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = OrderManager::new(store, gateway, Some(Box::new(AlwaysRejectCheck)))
+            .await
+            .unwrap();
+
+        let result = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await;
+
+        assert!(matches!(result, Err(OmsError::RiskCheckFailed { .. })));
+        assert!(manager.open_orders().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn submit_order_accepted_by_gateway_appears_in_open_orders_with_exchange_id() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        let order = manager.open_orders().get(&order_id).unwrap();
+        assert!(order.exchange_order_id.is_some());
+        assert_eq!(order.status, OrderStatus::New);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn submit_order_rejected_by_gateway_is_not_in_open_orders() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        gateway.program_next_submit_outcome(GatewayOutcome::Rejected {
+            reason: "insufficient balance".to_string(),
+        });
+        let mut manager = fresh_manager(gateway).await;
+
+        let result = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await;
+
+        assert!(matches!(result, Err(OmsError::OrderRejected { .. })));
+        assert!(manager.open_orders().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn submit_order_uncertain_outcome_stays_open_with_no_exchange_id() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
+            reason: "connection reset".to_string(),
+        });
+        let mut manager = fresh_manager(gateway).await;
+
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        let order = manager.open_orders().get(&order_id).unwrap();
+        assert_eq!(order.exchange_order_id, None);
+        assert_eq!(order.status, OrderStatus::New);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cancel_order_not_found_returns_error() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+
+        let result = manager.cancel_order(OrderId(Uuid::new_v4())).await;
+        assert!(matches!(result, Err(OmsError::OrderNotFound { .. })));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cancel_order_with_unknown_exchange_id_is_rejected_without_calling_gateway() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
+            reason: "timeout".to_string(),
+        });
+        let mut manager = fresh_manager(gateway).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        let result = manager.cancel_order(order_id).await;
+        assert!(matches!(
+            result,
+            Err(OmsError::ExchangeOrderIdUnknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cancel_order_accepted_removes_it_from_open_orders() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        manager.cancel_order(order_id).await.unwrap();
+
+        assert!(manager.open_orders().get(&order_id).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_pass_one_overwrites_local_status_for_a_reported_open_order() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.open_orders().get(&order_id).unwrap().status,
+            OrderStatus::New
+        );
+
+        // PartiallyFilled is NON-terminal, so it still appears in
+        // query_all_open_orders -- this exercises pass 1.
+        gateway.set_exchange_state(order_id, OrderStatus::PartiallyFilled);
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed, vec![order_id]);
+        assert_eq!(
+            manager.open_orders().get(&order_id).unwrap().status,
+            OrderStatus::PartiallyFilled
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_pass_two_discovers_a_terminal_status_via_query_order_status() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        // Filled is TERMINAL -- query_all_open_orders will no longer
+        // report this order (by MockExecutionGateway's own filtering,
+        // matching the real ExecutionGateway contract), so pass 1 alone
+        // cannot see this. Only pass 2's query_order_status call can.
+        gateway.set_exchange_state(order_id, OrderStatus::Filled);
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed, vec![order_id]);
+        assert!(manager.open_orders().get(&order_id).is_none());
+
+        let persisted = manager.store.get_order(order_id).await.unwrap().unwrap();
+        assert_eq!(persisted.status, OrderStatus::Filled);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_resolves_a_previously_uncertain_order_via_pass_one() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
+            reason: "timeout".to_string(),
+        });
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .open_orders()
+                .get(&order_id)
+                .unwrap()
+                .exchange_order_id,
+            None
+        );
+
+        // The exchange actually accepted the order despite our local
+        // Uncertain result, and it is still open (non-terminal) --
+        // this is reported via query_all_open_orders (pass 1), which
+        // is why force_register_exchange_order (not set_exchange_state,
+        // which requires a prior submit_order through this mock) is
+        // used here.
+        gateway.force_register_exchange_order(order_id, "EX-999", OrderStatus::PartiallyFilled);
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed, vec![order_id]);
+        let order = manager.open_orders().get(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.exchange_order_id, Some("EX-999".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_leaves_terminal_orders_unaffected_when_not_reported_by_exchange() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        manager.cancel_order(order_id).await.unwrap();
+
+        // Cancelled order is terminal and no longer in open_orders;
+        // reconcile should not error or resurrect it.
+        let changed = manager.reconcile().await.unwrap();
+        assert!(!changed.contains(&order_id));
     }
 }
