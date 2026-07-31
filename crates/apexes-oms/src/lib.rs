@@ -13,5 +13,7 @@
 //! for testing.
 
 pub mod error;
+pub mod gateway;
 
 pub use error::OmsError;
+pub use gateway::{ExecutionGateway, GatewayOutcome};
