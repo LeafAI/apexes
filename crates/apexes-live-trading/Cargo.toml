@@ -21,3 +21,4 @@ rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 async-trait = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+sqlx = { workspace = true }
