@@ -293,3 +293,94 @@ async fn cancel_order_with_no_exchange_order_id_is_rejected_without_a_network_ca
 
     assert!(matches!(outcome, GatewayOutcome::Rejected { .. }));
 }
+
+#[tokio::test]
+async fn submit_order_uses_spot_stop_loss_type_names_on_spot() {
+    let mock_server = MockServer::start().await;
+    let order_id = Uuid::new_v4();
+    let mut order = sample_order(order_id);
+    order.order_type = OrderType::StopLimit;
+    order.price = Some(dec!(100));
+    order.stop_price = Some(dec!(99));
+
+    Mock::given(method("POST"))
+        .and(path("/api/v3/order"))
+        .and(query_param("type", "STOP_LOSS_LIMIT"))
+        .and(query_param("timeInForce", "GTC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId": 1
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    let outcome = gateway.submit_order(&order).await;
+
+    assert!(matches!(outcome, GatewayOutcome::Accepted { .. }));
+}
+
+#[tokio::test]
+async fn submit_order_uses_futures_stop_market_type_names_on_perpetual() {
+    let mock_server = MockServer::start().await;
+    let order_id = Uuid::new_v4();
+    let mut order = sample_order(order_id);
+    order.asset_class = AssetClass::Perpetual;
+    order.order_type = OrderType::Stop;
+    order.stop_price = Some(dec!(99));
+
+    // Futures has no `STOP_LOSS` order type -- it's `STOP_MARKET`.
+    // Sending the Spot name here would be rejected by real Binance.
+    Mock::given(method("POST"))
+        .and(path("/fapi/v1/order"))
+        .and(query_param("type", "STOP_MARKET"))
+        .respond_with(move |request: &wiremock::Request| {
+            let query = request.url.query().unwrap_or_default();
+            assert!(
+                !query.contains("timeInForce="),
+                "STOP_MARKET must not send timeInForce, got: {query}"
+            );
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "orderId": 2 }))
+        })
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    let outcome = gateway.submit_order(&order).await;
+
+    assert!(matches!(outcome, GatewayOutcome::Accepted { .. }));
+}
+
+#[tokio::test]
+async fn submit_order_uses_futures_stop_limit_type_name_on_perpetual() {
+    let mock_server = MockServer::start().await;
+    let order_id = Uuid::new_v4();
+    let mut order = sample_order(order_id);
+    order.asset_class = AssetClass::Perpetual;
+    order.order_type = OrderType::StopLimit;
+    order.price = Some(dec!(100));
+    order.stop_price = Some(dec!(99));
+
+    // Futures' limit-triggered stop order is `STOP`, not Spot's
+    // `STOP_LOSS_LIMIT`, and (unlike Spot) does not take timeInForce.
+    Mock::given(method("POST"))
+        .and(path("/fapi/v1/order"))
+        .and(query_param("type", "STOP"))
+        .respond_with(move |request: &wiremock::Request| {
+            let query = request.url.query().unwrap_or_default();
+            assert!(
+                !query.contains("timeInForce="),
+                "futures STOP must not send timeInForce, got: {query}"
+            );
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "orderId": 3 }))
+        })
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    let outcome = gateway.submit_order(&order).await;
+
+    assert!(matches!(outcome, GatewayOutcome::Accepted { .. }));
+}
