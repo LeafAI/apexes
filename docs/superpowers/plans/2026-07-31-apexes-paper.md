@@ -36,7 +36,7 @@
 
 **IMPORTANT:** This task is a pure refactor. The event-loop body below is the EXACT SAME LOGIC currently in `crates/apexes-backtest/src/runner.rs`'s `run_backtest` function, merely restructured to (a) live in a new file, (b) accept a generic `Stream` instead of a `Vec`, (c) accept optional `stop_signal`/`latency_model` parameters that are inert (`None`) for `run_backtest`'s call path. Do not change any business logic, fee calculation, fill application, or risk-check behavior.
 
-- [ ] **Step 1: Read the current `run_backtest` implementation in full**
+- [x] **Step 1: Read the current `run_backtest` implementation in full**
 
 ```bash
 cd ~/src/oss/apexes
@@ -45,7 +45,7 @@ cat crates/apexes-backtest/src/runner.rs
 
 Confirm your local copy matches what this plan's Step 3 shows below exactly (if there is any discrepancy, STOP and report it -- the plan's code assumes this exact starting state).
 
-- [ ] **Step 2: Add `rand` to the workspace dependencies**
+- [x] **Step 2: Add `rand` to the workspace dependencies**
 
 Edit `Cargo.toml`:
 
@@ -82,7 +82,7 @@ rand = "0.10"
 
 Note: `"crates/apexes-risk"` is missing from the `members` list shown above in the current repo state -- if you find it missing when you read the actual file, add it back (it should already be there from the prior `apexes-risk` plan; this is just showing the `rand` addition in context). Do NOT remove any existing member.
 
-- [ ] **Step 3: Create `crates/apexes-backtest/src/event_loop.rs` with the extracted core**
+- [x] **Step 3: Create `crates/apexes-backtest/src/event_loop.rs` with the extracted core**
 
 ```rust
 //! Shared event-loop core driving both `run_backtest` (historical
@@ -378,7 +378,7 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
 }
 ```
 
-- [ ] **Step 4: Create `crates/apexes-backtest/src/latency.rs`**
+- [x] **Step 4: Create `crates/apexes-backtest/src/latency.rs`**
 
 ```rust
 //! [`LatencyModel`]: simulates network round-trip latency between a
@@ -498,7 +498,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Replace `crates/apexes-backtest/src/runner.rs` with the thin wrapper**
+- [x] **Step 5: Replace `crates/apexes-backtest/src/runner.rs` with the thin wrapper**
 
 Replace the entire file's contents with:
 
@@ -724,7 +724,7 @@ mod tests {
 
 **Note on the test module**: the plan's Step 5 code above reconstructs the single pre-existing test from `runner.rs` (`run_backtest` producing a trade with correct mark-to-market equity) plus a trivial smoke test. If you find the actual pre-refactor `runner.rs` file (read in Step 1) has additional or differently-named tests beyond what's shown here, preserve ALL of them with identical assertions -- do not delete any existing test coverage. This plan's code block is a representative reconstruction, not necessarily a byte-for-byte copy of every test that may exist; treat "zero test regressions" (Global Constraints) as the authoritative requirement over this code block's literal test count.
 
-- [ ] **Step 6: Update `crates/apexes-backtest/src/lib.rs`**
+- [x] **Step 6: Update `crates/apexes-backtest/src/lib.rs`**
 
 Find the current `pub mod`/`pub use` declarations and add the two new modules. The existing file looks like this:
 
@@ -814,7 +814,7 @@ pub use runner::{BacktestConfig, run_backtest};
 
 Note: `LatencyModel` IS re-exported at the top level (unlike `event_loop`) since it's a small, self-contained, useful-on-its-own type that both `run_backtest`-adjacent tooling and `apexes-paper` benefit from reaching directly as `apexes_backtest::LatencyModel`.
 
-- [ ] **Step 7: Add `apexes-risk` to workspace members if missing, add `rand` dependency to `apexes-backtest`**
+- [x] **Step 7: Add `apexes-risk` to workspace members if missing, add `rand` dependency to `apexes-backtest`**
 
 ```bash
 cd ~/src/oss/apexes
@@ -853,7 +853,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 uuid = { workspace = true, features = ["v4"] }
 ```
 
-- [ ] **Step 8: Build and run the crate's own tests**
+- [x] **Step 8: Build and run the crate's own tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -862,7 +862,7 @@ cargo test -p apexes-backtest --lib
 ```
 Expected: builds clean; the lib's own unit tests (in `runner.rs` and `latency.rs`) all pass. `latency.rs` contributes 6 new tests.
 
-- [ ] **Step 9: Run the crate's full test suite (lib + integration tests) and confirm zero regressions**
+- [x] **Step 9: Run the crate's full test suite (lib + integration tests) and confirm zero regressions**
 
 ```bash
 cd ~/src/oss/apexes
@@ -870,7 +870,7 @@ cargo test -p apexes-backtest
 ```
 Expected: EVERY test that passed before this refactor (70 lib unit tests + 3 `end_to_end.rs` + 1 ignored `live_storage_backtest.rs` + 3 `risk_integration.rs`, per the state recorded at the end of the prior `apexes-risk` plan) still passes, with the exact same counts, PLUS the 6 new `latency.rs` tests. If any pre-existing test fails or a count differs, this is a regression -- do not proceed, find and fix the discrepancy first (the refactor must be behavior-preserving).
 
-- [ ] **Step 10: Run clippy and fmt**
+- [x] **Step 10: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -879,7 +879,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus Step 9's full test command to confirm nothing regressed).
 
-- [ ] **Step 11: Verify downstream crates that depend on `apexes-backtest` still compile and pass**
+- [x] **Step 11: Verify downstream crates that depend on `apexes-backtest` still compile and pass**
 
 ```bash
 cd ~/src/oss/apexes
@@ -888,7 +888,7 @@ cargo test -p apexes-strategy-registry
 ```
 Expected: both unchanged from their state at the end of the prior `apexes-risk` plan (13 unit + 1 integration for `apexes-optimize`; 10 unit/6 ignored + 1 ignored integration for `apexes-strategy-registry`) -- this refactor must not break any consumer of `apexes-backtest`'s public API, since that API (`run_backtest`, `BacktestConfig`, etc.) is unchanged.
 
-- [ ] **Step 12: Full workspace build check**
+- [x] **Step 12: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -896,7 +896,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 13: Commit**
+- [x] **Step 13: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -919,7 +919,7 @@ git push origin master
 - Consumes: `apexes_backtest::PortfolioLedger` (existing, unchanged), `apexes_core::ApexesError` (existing), `apexes_strategy::Position` (existing).
 - Produces: `pub struct AccountSnapshot`, `pub struct PaperAccount<'a>` with `new`/`balances_snapshot`/`positions_snapshot`/`equity_snapshot`/`full_snapshot`. Consumed by Task 5's `run_paper_trading` integration tests (as an example of how a caller might inspect state, though `run_paper_trading` itself does not need to call it internally).
 
-- [ ] **Step 1: Register the new crate in the workspace**
+- [x] **Step 1: Register the new crate in the workspace**
 
 ```bash
 cd ~/src/oss/apexes
@@ -934,7 +934,7 @@ resolver = "3"
 members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper"]
 ```
 
-- [ ] **Step 2: Create `crates/apexes-paper/Cargo.toml`**
+- [x] **Step 2: Create `crates/apexes-paper/Cargo.toml`**
 
 ```toml
 [package]
@@ -963,7 +963,7 @@ async-trait = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 ```
 
-- [ ] **Step 3: Write `crates/apexes-paper/src/account.rs`**
+- [x] **Step 3: Write `crates/apexes-paper/src/account.rs`**
 
 ```rust
 //! [`PaperAccount`]: a thin read-only query layer over `PortfolioLedger`,
@@ -1078,7 +1078,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Write `crates/apexes-paper/src/lib.rs`**
+- [x] **Step 4: Write `crates/apexes-paper/src/lib.rs`**
 
 ```rust
 //! Apexes paper trading: drives `apexes-backtest`'s shared event-loop
@@ -1099,7 +1099,7 @@ pub use apexes_backtest::LatencyModel;
 pub use runner::{PaperTradingConfig, run_paper_trading};
 ```
 
-- [ ] **Step 5: Run the tests written so far**
+- [x] **Step 5: Run the tests written so far**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1107,7 +1107,7 @@ cargo test -p apexes-paper account:: -- --nocapture
 ```
 Expected: still a compile error, because `lib.rs` declares `pub mod runner;` which doesn't exist yet -- confirm the ONLY compile error mentions `runner`, not `account`. This is expected and resolved by Task 3.
 
-- [ ] **Step 6: Commit is deferred to Task 3**
+- [x] **Step 6: Commit is deferred to Task 3**
 
 Do not commit yet -- the crate does not compile as a whole until `runner.rs` exists (Task 3). Proceed directly to Task 3.
 
@@ -1122,7 +1122,7 @@ Do not commit yet -- the crate does not compile as a whole until `runner.rs` exi
 - Consumes: `apexes_backtest::event_loop::{EventLoopConfig, run_event_loop}`, `apexes_backtest::{LatencyModel, BacktestReport, CostModel}`, `apexes_backtest::clock::BacktestClock`, `apexes_backtest::clock::ReplaySpeed` (from Task 1), `apexes_core::{ApexesError, Instrument, MarketDataProvider}`, `apexes_risk::CompositeRiskChecker`, `apexes_strategy::Strategy` (all existing).
 - Produces: `pub struct PaperTradingConfig`, `pub async fn run_paper_trading`. Consumed by Task 4's mock-provider tests and Task 5's live Binance integration test.
 
-- [ ] **Step 1: Confirm `apexes_backtest::clock::BacktestClock`/`ReplaySpeed` are reachable at that path**
+- [x] **Step 1: Confirm `apexes_backtest::clock::BacktestClock`/`ReplaySpeed` are reachable at that path**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1130,7 +1130,7 @@ grep -n "pub mod clock" crates/apexes-backtest/src/lib.rs
 ```
 Expected: `pub mod clock;` is present (it already is, unchanged by Task 1) -- confirming `apexes_backtest::clock::BacktestClock` and `apexes_backtest::clock::ReplaySpeed` (equivalently reachable via the re-exported `apexes_backtest::ReplaySpeed`) are both valid paths for this task's imports.
 
-- [ ] **Step 2: Write `crates/apexes-paper/src/runner.rs`**
+- [x] **Step 2: Write `crates/apexes-paper/src/runner.rs`**
 
 ```rust
 //! [`run_paper_trading`]: the `apexes-paper` counterpart to
@@ -1196,7 +1196,7 @@ pub async fn run_paper_trading(
 }
 ```
 
-- [ ] **Step 3: Verify the crate compiles as a whole**
+- [x] **Step 3: Verify the crate compiles as a whole**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1204,7 +1204,7 @@ cargo check -p apexes-paper
 ```
 Expected: succeeds, 0 errors (all three source files -- `account.rs`, `runner.rs`, `lib.rs` -- now exist and compile together).
 
-- [ ] **Step 4: Run all tests written so far**
+- [x] **Step 4: Run all tests written so far**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1212,7 +1212,7 @@ cargo test -p apexes-paper
 ```
 Expected: the 4 `account.rs` tests from Task 2 pass, 0 failed. `runner.rs` has no unit tests yet -- those come in Task 4.
 
-- [ ] **Step 5: Run clippy and fmt**
+- [x] **Step 5: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1221,7 +1221,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands).
 
-- [ ] **Step 6: Full workspace build check**
+- [x] **Step 6: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1229,7 +1229,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors -- first point in this plan where `apexes-paper` compiles as part of the whole workspace.
 
-- [ ] **Step 7: Commit Tasks 2-3 together**
+- [x] **Step 7: Commit Tasks 2-3 together**
 
 Tasks 2-3 are committed as one unit because `lib.rs`'s `pub mod runner;` declaration means the crate does not compile until both `account.rs` and `runner.rs` exist (per Global Constraints: every task that touches compiled code must leave `cargo build --workspace` passing before committing).
 
@@ -1251,7 +1251,7 @@ git push origin master
 - Consumes: `crate::runner::{PaperTradingConfig, run_paper_trading}` (Task 3), `apexes_core::MarketDataProvider` (existing), `apexes_risk::{CompositeRiskChecker, ListMode, SymbolVenueList}` (existing). Requires no network access -- the mock provider returns an in-memory `Stream` built with `futures::stream::iter`.
 - Produces: nothing new consumed by later tasks -- this task only adds test coverage.
 
-- [ ] **Step 1: Append the test module to `crates/apexes-paper/src/runner.rs`**
+- [x] **Step 1: Append the test module to `crates/apexes-paper/src/runner.rs`**
 
 ```rust
 
@@ -1478,7 +1478,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the new tests**
+- [x] **Step 2: Run the new tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1486,7 +1486,7 @@ cargo test -p apexes-paper runner:: -- --nocapture
 ```
 Expected: 4 passed, 0 failed.
 
-- [ ] **Step 3: Run the full `apexes-paper` test suite, clippy, and fmt**
+- [x] **Step 3: Run the full `apexes-paper` test suite, clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1496,7 +1496,7 @@ cargo fmt --check
 ```
 Expected: 8 tests passed (4 `account` + 4 `runner`), 0 failed; clippy and fmt clean (auto-fix with `cargo fmt` if needed and re-run all three commands).
 
-- [ ] **Step 4: Full workspace verification**
+- [x] **Step 4: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1507,7 +1507,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1527,7 +1527,7 @@ git push origin master
 - Consumes: `apexes_paper::{PaperTradingConfig, run_paper_trading, LatencyModel}` (Tasks 2-3), `apexes_market_data::BinanceMarketDataProvider` (existing). Requires a real network connection to Binance's public WebSocket endpoints -- marked `#[ignore]`, matching `apexes-market-data`'s established pattern (`crates/apexes-market-data/tests/live_binance.rs`).
 - Produces: nothing new consumed by later tasks -- this is the plan's final behavioral proof point before Task 6's whole-effort verification.
 
-- [ ] **Step 1: Write `crates/apexes-paper/tests/live_binance.rs`**
+- [x] **Step 1: Write `crates/apexes-paper/tests/live_binance.rs`**
 
 ```rust
 //! Live integration test against a real Binance WebSocket feed, proving
@@ -1615,7 +1615,7 @@ async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
 }
 ```
 
-- [ ] **Step 2: Run the live test (requires network access)**
+- [x] **Step 2: Run the live test (requires network access)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1623,7 +1623,7 @@ cargo test -p apexes-paper --test live_binance -- --ignored --nocapture
 ```
 Expected: `1 passed` (takes about 10 seconds to run, per the sleep-then-stop-signal in the test). If it fails due to network unavailability in your environment, note that in your report rather than treating it as a code defect -- this is the same caveat `apexes-market-data`'s own live test carries.
 
-- [ ] **Step 3: Run the full `apexes-paper` test suite (ignored + non-ignored), clippy, and fmt**
+- [x] **Step 3: Run the full `apexes-paper` test suite (ignored + non-ignored), clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1634,7 +1634,7 @@ cargo fmt --check
 ```
 Expected: non-ignored: 8 passed (4 `account` + 4 `runner`). Ignored: 1 passed (this task's live test). Clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all four commands).
 
-- [ ] **Step 4: Full workspace verification**
+- [x] **Step 4: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1645,7 +1645,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1660,7 +1660,7 @@ git push origin master
 
 **Files:** None created/modified -- this task only runs verification commands, updates `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1668,7 +1668,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite (non-ignored)**
+- [x] **Step 2: Full workspace test suite (non-ignored)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1676,7 +1676,7 @@ cargo test --workspace
 ```
 Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-strategy`/`apexes-storage`/`apexes-strategy-registry`/`apexes-optimize`/`apexes-risk` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-backtest` is unchanged in test COUNT (70 lib unit tests, unchanged from before the refactor) plus 6 new `latency.rs` tests; `apexes-paper` is brand new with 8 non-ignored tests (4 `account` + 4 `runner`).
 
-- [ ] **Step 3: Full workspace test suite (ignored/live-network)**
+- [x] **Step 3: Full workspace test suite (ignored/live-network)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1688,7 +1688,7 @@ cargo test -p apexes-paper -- --ignored
 (Note: `apexes-storage`/`apexes-strategy-registry`'s ignored tests need a live ClickHouse instance -- run `docker compose up -d && sleep 5` first if testing those.)
 Expected: `apexes-market-data`'s pre-existing ignored test still passes unchanged; `apexes-storage`/`apexes-strategy-registry`'s pre-existing ignored tests still pass unchanged; `apexes-paper` contributes 1 new ignored test (Task 5's live Binance test), passing (network permitting).
 
-- [ ] **Step 4: Full workspace clippy**
+- [x] **Step 4: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1696,7 +1696,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 5: Full workspace fmt check**
+- [x] **Step 5: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1704,7 +1704,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 6: Update `docs/FEATURES.md`**
+- [x] **Step 6: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find rows `4.1` (Virtual account & virtual fund management, currently `🔲 Not Started`) and `4.2` (Real-time-feed-driven paper matching engine reusing the backtest matching kernel, currently `🔲 Not Started`). Update BOTH rows' Status to `✅ Done`.
 
@@ -1720,7 +1720,7 @@ apexes-paper crate: run_paper_trading reuses apexes-backtest's exact matching-en
 
 **Important:** before finalizing, do not just increment counts by 2/2 -- actually count the current `✅ Done` / `🔲 Not Started` / `⏸️ Deferred` rows in the file (e.g. `grep -c` against the row-level status markers, excluding the legend rows and the Summary table's own rows) and confirm your new numbers match Done+2, Not Started-2, Total unchanged, against the real counts. Update the Summary counts table accordingly and the "Current active work" paragraph to note sub-project `#6`'s first two rows (`4.1`/`4.2`) are complete via the new `apexes-paper` crate, alongside the already-`Done` row `4.3`; leave "what's next" unstated since sub-project `#7` (OMS), `#8` (first live gateway), the PyO3 bindings evaluation, and `apexes-risk`'s `6.4`/`6.5` are all still open/deferred options -- don't guess which one the user picks next.
 
-- [ ] **Step 7: Commit the FEATURES.md update**
+- [x] **Step 7: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1729,7 +1729,7 @@ git commit -S -s -m "docs: mark paper trading account and matching engine comple
 git push origin master
 ```
 
-- [ ] **Step 8: Mark this plan's checkboxes complete**
+- [x] **Step 8: Mark this plan's checkboxes complete**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1743,7 +1743,7 @@ git commit -S -s -m "docs: mark apexes-paper plan complete"
 git push origin master
 ```
 
-- [ ] **Step 9: Report final summary**
+- [x] **Step 9: Report final summary**
 
 Summarize: `apexes-backtest`'s refactored file list (new `event_loop.rs`/`latency.rs`, shrunk `runner.rs`) with line counts, `apexes-paper` crate's file list and line counts, total test count (broken down: `apexes-backtest`'s unchanged + new `latency.rs` tests, `apexes-paper`'s unit + ignored/live tests), confirmation that every other crate's pre-existing tests still pass unchanged, and the `apexes` commit SHAs for Tasks 1-6. No further commit needed for this verification-only task.
 
