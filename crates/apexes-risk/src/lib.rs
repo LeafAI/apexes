@@ -6,5 +6,9 @@
 //! prevention) and 6.2 (in-trade: position-limit circuit breaker).
 
 pub mod error;
+pub mod in_trade;
+pub mod pre_trade;
 
 pub use error::{CircuitBreakerScope, RiskViolation};
+pub use in_trade::InTradeMonitor;
+pub use pre_trade::PreTradeCheck;
