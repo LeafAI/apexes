@@ -184,6 +184,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-risk"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-strategy",
+ "chrono",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "apexes-storage"
 version = "0.1.0"
 dependencies = [
