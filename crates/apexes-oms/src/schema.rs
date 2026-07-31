@@ -3,7 +3,7 @@
 //! bidirectional `TryFrom` conversions), adapted for `sqlx`/PostgreSQL
 //! instead of the `clickhouse` client.
 
-use apexes_core::{Fill, FillId, Order, OrderId, OrderStatus, OrderType, Side, Venue};
+use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS orders
     exchange_order_id   TEXT,
     symbol              TEXT NOT NULL,
     venue               TEXT NOT NULL,
+    asset_class         TEXT NOT NULL,
     side                TEXT NOT NULL,
     order_type          TEXT NOT NULL,
     quantity            NUMERIC(38, 10) NOT NULL,
@@ -61,6 +62,7 @@ pub struct OrderRow {
     pub exchange_order_id: Option<String>,
     pub symbol: String,
     pub venue: String,
+    pub asset_class: String,
     pub side: String,
     pub order_type: String,
     pub quantity: Decimal,
@@ -79,6 +81,7 @@ impl From<&Order> for OrderRow {
             exchange_order_id: order.exchange_order_id.clone(),
             symbol: order.symbol.clone(),
             venue: format!("{:?}", order.venue),
+            asset_class: format!("{:?}", order.asset_class),
             side: format!("{:?}", order.side),
             order_type: format!("{:?}", order.order_type),
             quantity: order.quantity,
@@ -101,6 +104,7 @@ impl TryFrom<OrderRow> for Order {
             exchange_order_id: row.exchange_order_id,
             symbol: row.symbol,
             venue: parse_venue(&row.venue)?,
+            asset_class: parse_asset_class(&row.asset_class)?,
             side: parse_side(&row.side)?,
             order_type: parse_order_type(&row.order_type)?,
             quantity: row.quantity,
@@ -180,6 +184,19 @@ fn parse_venue(value: &str) -> Result<Venue, OmsError> {
     }
 }
 
+fn parse_asset_class(value: &str) -> Result<AssetClass, OmsError> {
+    match value {
+        "Spot" => Ok(AssetClass::Spot),
+        "Perpetual" => Ok(AssetClass::Perpetual),
+        "Future" => Ok(AssetClass::Future),
+        "Option" => Ok(AssetClass::Option),
+        "Equity" => Ok(AssetClass::Equity),
+        other => Err(OmsError::InvalidRow {
+            reason: format!("unknown asset_class: {other}"),
+        }),
+    }
+}
+
 fn parse_side(value: &str) -> Result<Side, OmsError> {
     match value {
         "Buy" => Ok(Side::Buy),
@@ -226,6 +243,7 @@ mod tests {
             exchange_order_id: Some("EX123".to_string()),
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1.5),

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apexes_core::{OrderStatus, OrderType, Side, Venue};
+use apexes_core::{AssetClass, OrderStatus, OrderType, Side, Venue};
 use apexes_oms::{ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore};
 use apexes_strategy::OrderIntent;
 use rust_decimal_macros::dec;
@@ -21,6 +21,7 @@ fn sample_intent() -> OrderIntent {
     OrderIntent {
         symbol: "BTCUSDT".to_string(),
         venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
         side: Side::Buy,
         order_type: OrderType::Market,
         quantity: dec!(1),

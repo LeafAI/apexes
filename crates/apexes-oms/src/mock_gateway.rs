@@ -155,7 +155,7 @@ impl ExecutionGateway for MockExecutionGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{Order, OrderType, Side, Venue};
+    use apexes_core::{AssetClass, Order, OrderType, Side, Venue};
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
@@ -165,6 +165,7 @@ mod tests {
             exchange_order_id: None,
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: dec!(1),

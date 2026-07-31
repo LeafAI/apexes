@@ -44,8 +44,8 @@ impl OrderStore {
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
         sqlx::query(
-            "INSERT INTO orders (id, exchange_order_id, symbol, venue, side, order_type, quantity, price, stop_price, filled_quantity, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, filled_quantity, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 filled_quantity = EXCLUDED.filled_quantity,
@@ -56,6 +56,7 @@ impl OrderStore {
         .bind(&row.exchange_order_id)
         .bind(&row.symbol)
         .bind(&row.venue)
+        .bind(&row.asset_class)
         .bind(&row.side)
         .bind(&row.order_type)
         .bind(row.quantity)

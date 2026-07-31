@@ -96,6 +96,7 @@ impl OrderManager {
             exchange_order_id: None,
             symbol: intent.symbol,
             venue: intent.venue,
+            asset_class: intent.asset_class,
             side: intent.side,
             order_type: intent.order_type,
             quantity: intent.quantity,
@@ -353,7 +354,7 @@ impl OrderManager {
 mod tests {
     use super::*;
     use crate::mock_gateway::MockExecutionGateway;
-    use apexes_core::{OrderType, Side, Venue};
+    use apexes_core::{AssetClass, OrderType, Side, Venue};
     use apexes_risk::RiskViolation;
     use chrono::DateTime;
     use rust_decimal_macros::dec;
@@ -385,6 +386,7 @@ mod tests {
         OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: dec!(1),
