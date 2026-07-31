@@ -100,7 +100,8 @@ async fn order_manager_recovers_open_orders_after_simulated_restart_and_reconcil
     // queries `query_order_status` individually for local orders still
     // open that pass 1 didn't report.
     let changed = manager.reconcile().await.unwrap();
-    assert_eq!(changed, vec![order_id]);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].0, order_id);
     assert!(manager.open_orders().get(&order_id).is_none());
 
     // `OrderManager::store` is a private field, so verify persistence

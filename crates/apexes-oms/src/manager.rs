@@ -6,10 +6,10 @@
 //! so a process restart recovers its view of in-flight orders without
 //! waiting for the next `reconcile()` call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use apexes_core::{Order, OrderId, OrderStatus};
+use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus};
 use apexes_risk::PreTradeCheck;
 use apexes_strategy::{OrderIntent, Position};
 use chrono::Utc;
@@ -194,83 +194,201 @@ impl OrderManager {
         }
     }
 
-    /// Reconnect reconciliation, in two passes:
+    /// Applies one authoritative exchange-reported status update to a
+    /// single local order -- the shared core both `reconcile()`'s two
+    /// passes (below) and live push-based updates (Binance User Data
+    /// Stream, via `apexes-gateway-binance`'s `ExchangeUpdate` stream)
+    /// call, so this overwrite/persist/fill-fetch logic exists in
+    /// exactly one place.
     ///
-    /// **Pass 1** -- calls `gateway.query_all_open_orders()`, and for
-    /// every `(client_order_id, exchange_order_id, exchange_status)`
-    /// triple returned, looks up the matching local order BY
-    /// `client_order_id` (our own `OrderId` -- NOT `exchange_order_id`,
-    /// which may still be unknown locally for `Uncertain`-outcome
-    /// orders). If found: sets `order.exchange_order_id` (populating it
-    /// if it was `None`) and OVERWRITES the local status with the
-    /// exchange's reported status UNCONDITIONALLY -- bypassing
-    /// `OrderStatus::can_transition_to`'s validation entirely, per this
-    /// design's explicit decision that the exchange is authoritative
-    /// during reconciliation. If NOT found (a `client_order_id` the
-    /// exchange reports that we have no local record of at all), logs a
-    /// `tracing::error!` and skips it.
+    /// Unconditionally overwrites local status with `status` if it
+    /// differs from the order's current status (same
+    /// authoritative-exchange rationale as this method's callers --
+    /// bypassing `OrderStatus::can_transition_to`'s normal-operation
+    /// validation is intentional: a transition it would reject during
+    /// live operation reflects a real event that happened while
+    /// disconnected or between poll intervals, not a bug). If
+    /// `exchange_order_id` is `Some` and differs from what's currently
+    /// stored, populates/updates it.
     ///
-    /// **Pass 2** -- `query_all_open_orders` is documented to report
-    /// ONLY non-terminal orders, so it can never surface a `Filled`/
-    /// `Cancelled`/`Rejected` transition on its own. For every local
-    /// order still `New`/`PartiallyFilled` that pass 1 did NOT see
-    /// (and that has a known `exchange_order_id`), this pass calls
-    /// `gateway.query_order_status` individually (which DOES report
-    /// terminal statuses) and applies the same unconditional-overwrite
-    /// treatment. A local order with no `exchange_order_id` yet (an
-    /// unresolved `Uncertain` submission) and not reported by pass 1
-    /// either cannot be resolved via the current `ExecutionGateway`
-    /// interface -- logged via `tracing::warn!`, left unchanged.
+    /// If either the status or `exchange_order_id` changed, persists
+    /// the order via `store.upsert_order`. If the status transition
+    /// lands on `PartiallyFilled` or `Filled` (and actually changed --
+    /// a repeated push of the same already-applied status is a no-op),
+    /// calls `gateway.query_fills_for_order`, deduplicates each
+    /// returned `ExchangeFill` against `OrderStore` via
+    /// `exchange_trade_id`, persists any genuinely-new ones, and
+    /// returns them. If the new status is terminal (`Filled`,
+    /// `Cancelled`, `Rejected`), removes the order from `open_orders`.
     ///
-    /// Every status change (either pass) is persisted via
-    /// `store.upsert_order` and reflected in `open_orders`. Returns the
-    /// list of `OrderId`s whose status actually changed.
-    pub async fn reconcile(&mut self) -> Result<Vec<OrderId>, OmsError> {
-        let exchange_orders = self
-            .gateway
-            .query_all_open_orders()
-            .await
-            .map_err(|reason| OmsError::QueryFailed { reason })?;
+    /// Returns `Ok(new_fills)` -- empty if the order wasn't found
+    /// locally (logs `tracing::error!`), if nothing changed, or if no
+    /// new fills were found beyond what was already recorded.
+    pub async fn apply_exchange_update(
+        &mut self,
+        client_order_id: OrderId,
+        exchange_order_id: Option<String>,
+        status: OrderStatus,
+    ) -> Result<Vec<Fill>, OmsError> {
+        let Some(previous_status) = self
+            .open_orders
+            .get(&client_order_id)
+            .map(|order| order.status)
+        else {
+            tracing::error!(
+                order_id = ?client_order_id,
+                "apply_exchange_update: exchange reports an order we have no local record of"
+            );
+            return Ok(Vec::new());
+        };
 
-        let mut changed = Vec::new();
-        let reported_client_ids: std::collections::HashSet<OrderId> =
-            exchange_orders.iter().map(|(id, _, _)| *id).collect();
+        let status_changed = previous_status != status;
+        let mut exchange_order_id_changed = false;
 
-        // First pass: orders the exchange still considers open (or has
-        // just transitioned between non-terminal states). Matched by
-        // OUR client order ID, never by exchange_order_id -- see
-        // ExecutionGateway::query_all_open_orders's docs for why.
-        for (client_order_id, exchange_order_id, exchange_status) in exchange_orders {
-            match self.open_orders.get_mut(&client_order_id) {
-                Some(order) => {
-                    let status_changed = order.status != exchange_status;
-                    if exchange_order_id.is_some() {
-                        order.exchange_order_id = exchange_order_id;
-                    }
-                    if status_changed {
-                        order.status = exchange_status;
-                        order.updated_at = Utc::now();
-                        self.store.upsert_order(order).await?;
-                        changed.push(client_order_id);
+        if let Some(order) = self.open_orders.get_mut(&client_order_id) {
+            if exchange_order_id.is_some() && order.exchange_order_id != exchange_order_id {
+                order.exchange_order_id = exchange_order_id;
+                exchange_order_id_changed = true;
+            }
+            if status_changed {
+                order.status = status;
+                order.updated_at = Utc::now();
+            }
+        }
+
+        if !status_changed && !exchange_order_id_changed {
+            return Ok(Vec::new());
+        }
+
+        let order_snapshot = self.open_orders.get(&client_order_id).unwrap().clone();
+        self.store.upsert_order(&order_snapshot).await?;
+
+        let mut new_fills = Vec::new();
+        if status_changed
+            && matches!(status, OrderStatus::PartiallyFilled | OrderStatus::Filled)
+            && order_snapshot.exchange_order_id.is_some()
+        {
+            match self.gateway.query_fills_for_order(&order_snapshot).await {
+                Ok(exchange_fills) => {
+                    for exchange_fill in exchange_fills {
+                        let fill = Fill {
+                            id: FillId(Uuid::new_v4()),
+                            order_id: client_order_id,
+                            symbol: order_snapshot.symbol.clone(),
+                            venue: order_snapshot.venue,
+                            side: order_snapshot.side,
+                            price: exchange_fill.price,
+                            quantity: exchange_fill.quantity,
+                            fee: exchange_fill.fee,
+                            fee_currency: exchange_fill.fee_currency.clone(),
+                            filled_at: exchange_fill.filled_at,
+                        };
+                        let inserted = self
+                            .store
+                            .insert_fill(&fill, &exchange_fill.exchange_trade_id)
+                            .await?;
+                        if inserted {
+                            new_fills.push(fill);
+                        }
                     }
                 }
-                None => {
-                    tracing::error!(
+                Err(reason) => {
+                    tracing::warn!(
                         order_id = ?client_order_id,
-                        "reconcile: exchange reports an open order we have no local record of"
+                        reason,
+                        "apply_exchange_update: query_fills_for_order failed; fills for this transition may be recovered on a later call"
                     );
                 }
             }
         }
 
-        // Second pass: local orders still New/PartiallyFilled that the
-        // exchange did NOT report as open in the first pass. This is
-        // NOT an edge case -- it is the primary way a Filled/Cancelled/
-        // Rejected transition is ever discovered, since
-        // query_all_open_orders structurally never reports terminal
-        // orders. For each such local order that HAS an
-        // exchange_order_id, query it individually (query_order_status
-        // DOES return terminal statuses).
+        if matches!(
+            status,
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+        ) {
+            self.open_orders.remove(&client_order_id);
+        }
+
+        Ok(new_fills)
+    }
+
+    /// Reconnect reconciliation, in two passes, both delegating the
+    /// actual per-order state application to `apply_exchange_update`
+    /// (above):
+    ///
+    /// **Pass 1** -- for each distinct `asset_class` among locally-open
+    /// orders, calls `gateway.query_all_open_orders(asset_class)` (real
+    /// exchange APIs scope "list open orders" to one API family, e.g.
+    /// Binance's spot vs. futures open-orders endpoints are entirely
+    /// separate -- this is why the call happens once per asset class
+    /// rather than once for the whole account). For every
+    /// `(client_order_id, exchange_order_id, exchange_status)` triple
+    /// returned, applies it via `apply_exchange_update`.
+    ///
+    /// **Pass 2** -- `query_all_open_orders` is documented to report
+    /// ONLY non-terminal orders, so it can never surface a `Filled`/
+    /// `Cancelled`/`Rejected` transition on its own. For every local
+    /// order still `New`/`PartiallyFilled` that pass 1 did NOT report
+    /// (and that has a known `exchange_order_id`), this pass calls
+    /// `gateway.query_order_status` individually (which DOES report
+    /// terminal statuses) and applies the result the same way. A local
+    /// order with no `exchange_order_id` yet, not reported by pass 1
+    /// either, cannot be resolved via the current `ExecutionGateway`
+    /// interface -- logged via `tracing::warn!`, left unchanged.
+    ///
+    /// Returns one `(OrderId, Vec<Fill>)` entry for every order whose
+    /// status actually changed OR that produced new fills, so a caller
+    /// (e.g. `apexes-live-trading`'s event loop) can both log/alert on
+    /// what changed and apply any new `Fill`s to its own portfolio
+    /// tracking.
+    pub async fn reconcile(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
+        let asset_classes: HashSet<AssetClass> = self
+            .open_orders
+            .values()
+            .map(|order| order.asset_class)
+            .collect();
+
+        let mut all_exchange_orders: Vec<(OrderId, Option<String>, OrderStatus)> = Vec::new();
+        for asset_class in &asset_classes {
+            let exchange_orders = self
+                .gateway
+                .query_all_open_orders(*asset_class)
+                .await
+                .map_err(|reason| OmsError::QueryFailed { reason })?;
+            all_exchange_orders.extend(exchange_orders);
+        }
+
+        let reported_client_ids: HashSet<OrderId> =
+            all_exchange_orders.iter().map(|(id, _, _)| *id).collect();
+
+        let mut results: Vec<(OrderId, Vec<Fill>)> = Vec::new();
+
+        // Pass 1: orders the exchange still considers open (or has just
+        // transitioned between non-terminal states).
+        for (client_order_id, exchange_order_id, exchange_status) in all_exchange_orders {
+            let Some(previous_status) = self
+                .open_orders
+                .get(&client_order_id)
+                .map(|order| order.status)
+            else {
+                tracing::error!(
+                    order_id = ?client_order_id,
+                    "reconcile: exchange reports an open order we have no local record of"
+                );
+                continue;
+            };
+
+            let new_fills = self
+                .apply_exchange_update(client_order_id, exchange_order_id, exchange_status)
+                .await?;
+            if previous_status != exchange_status || !new_fills.is_empty() {
+                results.push((client_order_id, new_fills));
+            }
+        }
+
+        // Pass 2: local orders still New/PartiallyFilled that the
+        // exchange did NOT report as open in pass 1 -- the primary way
+        // a Filled/Cancelled/Rejected transition is ever discovered.
         let still_locally_open: Vec<OrderId> = self
             .open_orders
             .iter()
@@ -285,18 +403,12 @@ impl OrderManager {
             .collect();
 
         for client_order_id in still_locally_open {
-            let exchange_order_id = self
-                .open_orders
-                .get(&client_order_id)
-                .and_then(|order| order.exchange_order_id.clone());
-
-            let Some(exchange_order_id) = exchange_order_id else {
-                // Uncertain submission that was never accepted into the
-                // exchange's open-order list either -- nothing to query
-                // by yet. Log and move on; this specific combination
-                // (Uncertain + never became visible as open + went
-                // straight to a terminal state) cannot be resolved with
-                // the current ExecutionGateway interface.
+            let Some(order) = self.open_orders.get(&client_order_id) else {
+                continue;
+            };
+            let previous_status = order.status;
+            let asset_class = order.asset_class;
+            let Some(exchange_order_id) = order.exchange_order_id.clone() else {
                 tracing::warn!(
                     order_id = ?client_order_id,
                     "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
@@ -304,15 +416,17 @@ impl OrderManager {
                 continue;
             };
 
-            match self.gateway.query_order_status(&exchange_order_id).await {
+            match self
+                .gateway
+                .query_order_status(&exchange_order_id, asset_class)
+                .await
+            {
                 Ok(Some(status)) => {
-                    if let Some(order) = self.open_orders.get_mut(&client_order_id)
-                        && order.status != status
-                    {
-                        order.status = status;
-                        order.updated_at = Utc::now();
-                        self.store.upsert_order(order).await?;
-                        changed.push(client_order_id);
+                    let new_fills = self
+                        .apply_exchange_update(client_order_id, Some(exchange_order_id), status)
+                        .await?;
+                    if previous_status != status || !new_fills.is_empty() {
+                        results.push((client_order_id, new_fills));
                     }
                 }
                 Ok(None) => {
@@ -332,17 +446,7 @@ impl OrderManager {
             }
         }
 
-        // Remove any orders that reconciliation moved to a terminal
-        // status from the open-orders map (mirroring submit_order/
-        // cancel_order's own bookkeeping).
-        self.open_orders.retain(|_, order| {
-            matches!(
-                order.status,
-                OrderStatus::New | OrderStatus::PartiallyFilled
-            )
-        });
-
-        Ok(changed)
+        Ok(results)
     }
 
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {
@@ -556,7 +660,9 @@ mod tests {
 
         let changed = manager.reconcile().await.unwrap();
 
-        assert_eq!(changed, vec![order_id]);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, order_id);
+        assert!(changed[0].1.is_empty());
         assert_eq!(
             manager.open_orders().get(&order_id).unwrap().status,
             OrderStatus::PartiallyFilled
@@ -581,7 +687,8 @@ mod tests {
 
         let changed = manager.reconcile().await.unwrap();
 
-        assert_eq!(changed, vec![order_id]);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, order_id);
         assert!(manager.open_orders().get(&order_id).is_none());
 
         let persisted = manager.store.get_order(order_id).await.unwrap().unwrap();
@@ -624,7 +731,8 @@ mod tests {
 
         let changed = manager.reconcile().await.unwrap();
 
-        assert_eq!(changed, vec![order_id]);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, order_id);
         let order = manager.open_orders().get(&order_id).unwrap();
         assert_eq!(order.status, OrderStatus::PartiallyFilled);
         assert_eq!(order.exchange_order_id, Some("EX-999".to_string()));
@@ -644,6 +752,46 @@ mod tests {
         // Cancelled order is terminal and no longer in open_orders;
         // reconcile should not error or resurrect it.
         let changed = manager.reconcile().await.unwrap();
-        assert!(!changed.contains(&order_id));
+        assert!(!changed.iter().any(|(id, _)| *id == order_id));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_pass_two_fetches_and_persists_fills_on_fill_transition() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        gateway.set_exchange_state(order_id, OrderStatus::Filled);
+        gateway.set_fills_for_order(
+            order_id,
+            vec![crate::gateway::ExchangeFill {
+                exchange_trade_id: "T1".to_string(),
+                price: dec!(65000),
+                quantity: dec!(1),
+                fee: dec!(1.5),
+                fee_currency: Some("USDT".to_string()),
+                filled_at: Utc::now(),
+            }],
+        );
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, order_id);
+        assert_eq!(changed[0].1.len(), 1);
+        assert_eq!(changed[0].1[0].quantity, dec!(1));
+
+        let persisted_fills = manager.store.get_fills_for_order(order_id).await.unwrap();
+        assert_eq!(persisted_fills.len(), 1);
+
+        gateway.set_exchange_state(order_id, OrderStatus::Filled);
+        let changed_again = manager.reconcile().await.unwrap();
+        assert!(changed_again.is_empty());
+        let persisted_fills_again = manager.store.get_fills_for_order(order_id).await.unwrap();
+        assert_eq!(persisted_fills_again.len(), 1);
     }
 }
