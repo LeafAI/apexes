@@ -1717,16 +1717,208 @@ git push origin master
 
 ---
 
-### Task 7: `OrderManager` integration tests (require live PostgreSQL)
+### Task 7: Fix `reconcile()`'s terminal-status detection gap, then add `OrderManager` integration tests (require live PostgreSQL)
+
+**IMPORTANT -- this task starts with a real bug fix, not just tests.** While writing this plan's own tests, a genuine gap was found in Task 6's already-committed `OrderManager::reconcile()`: `ExecutionGateway::query_all_open_orders` is documented (and `MockExecutionGateway`'s Task 3 implementation enforces) to return ONLY non-terminal (`New`/`PartiallyFilled`) orders -- by design, matching real exchange "list open orders" APIs. This means `reconcile()`'s current implementation, which only compares against `query_all_open_orders`'s results, can **structurally never** detect that a local `New`/`PartiallyFilled` order has actually reached a terminal state like `Filled` on the exchange side -- the very scenario reconciliation exists to catch. The original design spec incorrectly treated this as an out-of-scope edge case (fixed in commit `29b34fb`, "docs: fix apexes-oms design spec's reconcile() -- query_order_status needed to detect terminal-status transitions" -- read that spec's current §六 `reconcile()` docs in full before starting, they now describe the corrected two-pass design). This task fixes the actual code to match.
 
 **Files:**
-- Modify: `crates/apexes-oms/src/manager.rs` (append `#[cfg(test)] mod tests`)
+- Modify: `crates/apexes-oms/src/manager.rs` (fix `reconcile()`'s body, then append `#[cfg(test)] mod tests`)
+- Modify: `crates/apexes-oms/src/mock_gateway.rs` (add `force_register_exchange_order`)
 
 **Interfaces:**
 - Consumes: `crate::manager::OrderManager` (Task 6), `crate::store::OrderStore` (Task 5), `crate::mock_gateway::MockExecutionGateway` (Task 3), `apexes_risk::{PreTradeCheck, RiskViolation}` (existing). Requires a live PostgreSQL connection -- all tests here are `#[ignore]`, matching `apexes-storage`'s established pattern.
-- Produces: nothing new consumed by later tasks -- this task only adds test coverage for the plan's most safety-critical logic.
+- Produces: a corrected `OrderManager::reconcile()`. Consumed by Task 8's end-to-end test.
 
-- [ ] **Step 1: Append the test module to `crates/apexes-oms/src/manager.rs`**
+- [ ] **Step 1: Fix `OrderManager::reconcile()` to add a second pass using `query_order_status`**
+
+In `crates/apexes-oms/src/manager.rs`, find the current `reconcile` method (it ends with the `open_orders.retain(...)` call and `Ok(changed)`). Replace its ENTIRE body with:
+
+```rust
+    pub async fn reconcile(&mut self) -> Result<Vec<OrderId>, OmsError> {
+        let exchange_orders = self
+            .gateway
+            .query_all_open_orders()
+            .await
+            .map_err(|reason| OmsError::QueryFailed { reason })?;
+
+        let mut changed = Vec::new();
+        let reported_client_ids: std::collections::HashSet<OrderId> =
+            exchange_orders.iter().map(|(id, _, _)| *id).collect();
+
+        // First pass: orders the exchange still considers open (or has
+        // just transitioned between non-terminal states). Matched by
+        // OUR client order ID, never by exchange_order_id -- see
+        // ExecutionGateway::query_all_open_orders's docs for why.
+        for (client_order_id, exchange_order_id, exchange_status) in exchange_orders {
+            match self.open_orders.get_mut(&client_order_id) {
+                Some(order) => {
+                    let status_changed = order.status != exchange_status;
+                    if exchange_order_id.is_some() {
+                        order.exchange_order_id = exchange_order_id;
+                    }
+                    if status_changed {
+                        order.status = exchange_status;
+                        order.updated_at = Utc::now();
+                        self.store.upsert_order(order).await?;
+                        changed.push(client_order_id);
+                    }
+                }
+                None => {
+                    tracing::error!(
+                        order_id = ?client_order_id,
+                        "reconcile: exchange reports an open order we have no local record of"
+                    );
+                }
+            }
+        }
+
+        // Second pass: local orders still New/PartiallyFilled that the
+        // exchange did NOT report as open in the first pass. This is
+        // NOT an edge case -- it is the primary way a Filled/Cancelled/
+        // Rejected transition is ever discovered, since
+        // query_all_open_orders structurally never reports terminal
+        // orders. For each such local order that HAS an
+        // exchange_order_id, query it individually (query_order_status
+        // DOES return terminal statuses).
+        let still_locally_open: Vec<OrderId> = self
+            .open_orders
+            .iter()
+            .filter(|(id, order)| {
+                !reported_client_ids.contains(*id)
+                    && matches!(order.status, OrderStatus::New | OrderStatus::PartiallyFilled)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for client_order_id in still_locally_open {
+            let exchange_order_id = self
+                .open_orders
+                .get(&client_order_id)
+                .and_then(|order| order.exchange_order_id.clone());
+
+            let Some(exchange_order_id) = exchange_order_id else {
+                // Uncertain submission that was never accepted into the
+                // exchange's open-order list either -- nothing to query
+                // by yet. Log and move on; this specific combination
+                // (Uncertain + never became visible as open + went
+                // straight to a terminal state) cannot be resolved with
+                // the current ExecutionGateway interface.
+                tracing::warn!(
+                    order_id = ?client_order_id,
+                    "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
+                );
+                continue;
+            };
+
+            match self.gateway.query_order_status(&exchange_order_id).await {
+                Ok(Some(status)) => {
+                    if let Some(order) = self.open_orders.get_mut(&client_order_id) {
+                        if order.status != status {
+                            order.status = status;
+                            order.updated_at = Utc::now();
+                            self.store.upsert_order(order).await?;
+                            changed.push(client_order_id);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        order_id = ?client_order_id,
+                        exchange_order_id,
+                        "reconcile: exchange has no record at all of an order we believe is open"
+                    );
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        order_id = ?client_order_id,
+                        reason,
+                        "reconcile: query_order_status failed for this order; will retry on next reconcile() call"
+                    );
+                }
+            }
+        }
+
+        // Remove any orders that reconciliation moved to a terminal
+        // status from the open-orders map (mirroring submit_order/
+        // cancel_order's own bookkeeping).
+        self.open_orders.retain(|_, order| {
+            matches!(order.status, OrderStatus::New | OrderStatus::PartiallyFilled)
+        });
+
+        Ok(changed)
+    }
+```
+
+Also update this method's doc comment (immediately above `pub async fn reconcile`) to:
+
+```rust
+    /// Reconnect reconciliation, in two passes:
+    ///
+    /// **Pass 1** -- calls `gateway.query_all_open_orders()`, and for
+    /// every `(client_order_id, exchange_order_id, exchange_status)`
+    /// triple returned, looks up the matching local order BY
+    /// `client_order_id` (our own `OrderId` -- NOT `exchange_order_id`,
+    /// which may still be unknown locally for `Uncertain`-outcome
+    /// orders). If found: sets `order.exchange_order_id` (populating it
+    /// if it was `None`) and OVERWRITES the local status with the
+    /// exchange's reported status UNCONDITIONALLY -- bypassing
+    /// `OrderStatus::can_transition_to`'s validation entirely, per this
+    /// design's explicit decision that the exchange is authoritative
+    /// during reconciliation. If NOT found (a `client_order_id` the
+    /// exchange reports that we have no local record of at all), logs a
+    /// `tracing::error!` and skips it.
+    ///
+    /// **Pass 2** -- `query_all_open_orders` is documented to report
+    /// ONLY non-terminal orders, so it can never surface a `Filled`/
+    /// `Cancelled`/`Rejected` transition on its own. For every local
+    /// order still `New`/`PartiallyFilled` that pass 1 did NOT see
+    /// (and that has a known `exchange_order_id`), this pass calls
+    /// `gateway.query_order_status` individually (which DOES report
+    /// terminal statuses) and applies the same unconditional-overwrite
+    /// treatment. A local order with no `exchange_order_id` yet (an
+    /// unresolved `Uncertain` submission) and not reported by pass 1
+    /// either cannot be resolved via the current `ExecutionGateway`
+    /// interface -- logged via `tracing::warn!`, left unchanged.
+    ///
+    /// Every status change (either pass) is persisted via
+    /// `store.upsert_order` and reflected in `open_orders`. Returns the
+    /// list of `OrderId`s whose status actually changed.
+```
+
+- [ ] **Step 2: Verify the fix compiles**
+
+```bash
+cd ~/src/oss/apexes
+cargo check -p apexes-oms
+```
+Expected: succeeds, 0 errors.
+
+- [ ] **Step 3: Add `force_register_exchange_order` to `MockExecutionGateway`**
+
+Edit `crates/apexes-oms/src/mock_gateway.rs`, adding this method inside the existing `impl MockExecutionGateway` block (after `set_exchange_state`):
+
+```rust
+    /// Directly registers exchange-side state for `client_order_id`
+    /// WITHOUT requiring a prior `submit_order` call to have gone
+    /// through this mock -- needed because a programmed `Uncertain`
+    /// `submit_order` outcome does NOT itself populate `exchange_state`.
+    /// Used to simulate an order whose `submit_order` returned
+    /// `Uncertain` later being confirmed by the exchange -- the exact
+    /// scenario `OrderManager::reconcile` exists to resolve.
+    pub fn force_register_exchange_order(
+        &self,
+        client_order_id: OrderId,
+        exchange_order_id: &str,
+        status: OrderStatus,
+    ) {
+        self.exchange_state
+            .lock()
+            .unwrap()
+            .insert(client_order_id, (exchange_order_id.to_string(), status));
+    }
+```
+
+- [ ] **Step 4: Append the test module to `crates/apexes-oms/src/manager.rs`**
 
 ```rust
 
@@ -1774,8 +1966,26 @@ mod tests {
         }
     }
 
+    /// Deletes all rows from both tables before a test runs, so tests
+    /// sharing one live PostgreSQL database don't see leftover state
+    /// from earlier tests (e.g. `OrderManager::new`'s
+    /// `get_open_orders()` recovery would otherwise pick up unrelated
+    /// New-status orders from a previous test run).
+    async fn clean_db(store: &OrderStore) {
+        // OrderStore has no public "delete everything" method (by
+        // design -- production code should never truncate order
+        // history). Test-only cleanup goes directly through sqlx.
+        // OrderStore does not expose its pool, so this helper
+        // reconnects independently for the sole purpose of clearing
+        // state; production code never does this.
+        let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+        sqlx::query("TRUNCATE fills, orders").execute(&pool).await.unwrap();
+        let _ = store; // parameter kept for call-site symmetry/clarity
+    }
+
     async fn fresh_manager(gateway: Arc<dyn ExecutionGateway>) -> OrderManager {
         let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        clean_db(&store).await;
         OrderManager::new(store, gateway, None).await.unwrap()
     }
 
@@ -1783,6 +1993,7 @@ mod tests {
     #[ignore]
     async fn submit_order_with_failing_risk_check_creates_no_order() {
         let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        clean_db(&store).await;
         let gateway = Arc::new(MockExecutionGateway::new());
         let mut manager = OrderManager::new(store, gateway, Some(Box::new(AlwaysRejectCheck)))
             .await
@@ -1895,7 +2106,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn reconcile_overwrites_local_status_from_exchange_even_skipping_partially_filled() {
+    async fn reconcile_pass_one_overwrites_local_status_for_a_reported_open_order() {
         let gateway = Arc::new(MockExecutionGateway::new());
         let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
         let order_id = manager
@@ -1907,17 +2118,38 @@ mod tests {
             OrderStatus::New
         );
 
-        // Simulate the exchange having gone straight to Filled while we
-        // were disconnected -- a transition OrderStatus::can_transition_to
-        // would normally allow (New -> Filled is valid), but this test's
-        // real point is proven by the NEXT test below, which uses a
-        // transition can_transition_to would reject.
+        // PartiallyFilled is NON-terminal, so it still appears in
+        // query_all_open_orders -- this exercises pass 1.
+        gateway.set_exchange_state(order_id, OrderStatus::PartiallyFilled);
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed, vec![order_id]);
+        assert_eq!(
+            manager.open_orders().get(&order_id).unwrap().status,
+            OrderStatus::PartiallyFilled
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_pass_two_discovers_a_terminal_status_via_query_order_status() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        // Filled is TERMINAL -- query_all_open_orders will no longer
+        // report this order (by MockExecutionGateway's own filtering,
+        // matching the real ExecutionGateway contract), so pass 1 alone
+        // cannot see this. Only pass 2's query_order_status call can.
         gateway.set_exchange_state(order_id, OrderStatus::Filled);
 
         let changed = manager.reconcile().await.unwrap();
 
         assert_eq!(changed, vec![order_id]);
-        // Filled is terminal -- order should no longer be in open_orders.
         assert!(manager.open_orders().get(&order_id).is_none());
 
         let persisted = manager.store.get_order(order_id).await.unwrap().unwrap();
@@ -1926,7 +2158,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn reconcile_populates_exchange_order_id_for_a_previously_uncertain_order() {
+    async fn reconcile_resolves_a_previously_uncertain_order_via_pass_one() {
         let gateway = Arc::new(MockExecutionGateway::new());
         gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
             reason: "timeout".to_string(),
@@ -1941,37 +2173,20 @@ mod tests {
             None
         );
 
-        // The mock gateway's submit_order, even with a programmed
-        // Uncertain outcome for the RETURN VALUE, does not record
-        // exchange-side state in this scenario since Uncertain doesn't
-        // trigger the mock's internal bookkeeping (see
-        // MockExecutionGateway::submit_order: only Accepted outcomes --
-        // programmed or default -- populate exchange_state). To
-        // exercise reconcile()'s client-order-id-matching path for a
-        // truly uncertain order, this test directly seeds the mock's
-        // exchange_state as if the exchange DID actually process the
-        // order despite our local Uncertain result -- this is exactly
-        // the scenario reconcile() exists to resolve. Since
-        // MockExecutionGateway has no public API to seed state without
-        // first calling submit_order successfully, submit a second,
-        // separate order through the SAME manager with a normal
-        // Accepted outcome first to obtain a valid client_order_id/
-        // exchange_order_id pairing pattern, then directly verify
-        // reconcile()'s no-op behavior when nothing changed:
+        // The exchange actually accepted the order despite our local
+        // Uncertain result, and it is still open (non-terminal) --
+        // this is reported via query_all_open_orders (pass 1), which
+        // is why force_register_exchange_order (not set_exchange_state,
+        // which requires a prior submit_order through this mock) is
+        // used here.
+        gateway.force_register_exchange_order(order_id, "EX-999", OrderStatus::PartiallyFilled);
+
         let changed = manager.reconcile().await.unwrap();
-        // No exchange-side record exists yet for the Uncertain order
-        // (the mock never registered it), so query_all_open_orders
-        // returns nothing for it, and reconcile makes no change here --
-        // this test documents that limitation of the mock rather than
-        // asserting a false positive. A true "Uncertain order later
-        // confirmed by the exchange" scenario requires
-        // MockExecutionGateway to expose a way to register exchange
-        // state for an order it never itself accepted; if this
-        // limitation blocks meaningful test coverage, extend
-        // MockExecutionGateway with a `force_register(order_id,
-        // exchange_order_id, status)` method in this task rather than
-        // skipping the scenario -- do not leave this gap unaddressed.
-        assert!(changed.is_empty());
+
+        assert_eq!(changed, vec![order_id]);
+        let order = manager.open_orders().get(&order_id).unwrap();
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.exchange_order_id, Some("EX-999".to_string()));
     }
 
     #[tokio::test]
@@ -1993,71 +2208,7 @@ mod tests {
 }
 ```
 
-**IMPORTANT -- flagged gap in this task's own test coverage**: the `reconcile_populates_exchange_order_id_for_a_previously_uncertain_order` test above documents (via its own comments) that `MockExecutionGateway` as designed in Task 3 has no way to register exchange-side state for an order whose `submit_order` call returned `Uncertain` (since the mock only records state for outcomes it itself returns as `Accepted`). This is a real coverage gap for one of this plan's most important scenarios (an `Uncertain` order later confirmed live by the exchange, reconciled via client order ID). Before considering this task done, add a `pub fn force_register_exchange_order(&self, client_order_id: OrderId, exchange_order_id: &str, status: OrderStatus)` method to `MockExecutionGateway` (in `crates/apexes-oms/src/mock_gateway.rs`) that directly inserts into `exchange_state` regardless of prior `submit_order` calls, then rewrite `reconcile_populates_exchange_order_id_for_a_previously_uncertain_order` to use it: call `force_register_exchange_order(order_id, "EX-999", OrderStatus::Filled)` after the `Uncertain` submission, then call `reconcile()` and assert `changed == vec![order_id]`, the order is removed from `open_orders` (terminal), and `manager.store.get_order(order_id).await.unwrap().unwrap().exchange_order_id == Some("EX-999".to_string())`. This is not optional polish -- it is the test that actually proves the design's core reconciliation-for-uncertain-orders guarantee.
-
-- [ ] **Step 2: Add `force_register_exchange_order` to `MockExecutionGateway`**
-
-Edit `crates/apexes-oms/src/mock_gateway.rs`, adding this method inside the existing `impl MockExecutionGateway` block (after `set_exchange_state`):
-
-```rust
-    /// Directly registers exchange-side state for `client_order_id`
-    /// WITHOUT requiring a prior `submit_order` call to have gone
-    /// through this mock -- used to simulate an order whose
-    /// `submit_order` returned `Uncertain` (so the mock never itself
-    /// recorded exchange state for it) later being confirmed live by
-    /// the exchange, the scenario `OrderManager::reconcile` exists to
-    /// resolve.
-    pub fn force_register_exchange_order(
-        &self,
-        client_order_id: OrderId,
-        exchange_order_id: &str,
-        status: OrderStatus,
-    ) {
-        self.exchange_state
-            .lock()
-            .unwrap()
-            .insert(client_order_id, (exchange_order_id.to_string(), status));
-    }
-```
-
-- [ ] **Step 3: Rewrite the previously-flagged test to use it**
-
-Replace the `reconcile_populates_exchange_order_id_for_a_previously_uncertain_order` test's body (in `crates/apexes-oms/src/manager.rs`) with:
-
-```rust
-    #[tokio::test]
-    #[ignore]
-    async fn reconcile_populates_exchange_order_id_for_a_previously_uncertain_order() {
-        let gateway = Arc::new(MockExecutionGateway::new());
-        gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
-            reason: "timeout".to_string(),
-        });
-        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
-        let order_id = manager
-            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.open_orders().get(&order_id).unwrap().exchange_order_id,
-            None
-        );
-
-        // The exchange actually processed the order despite our local
-        // Uncertain result, and it has since been filled.
-        gateway.force_register_exchange_order(order_id, "EX-999", OrderStatus::Filled);
-
-        let changed = manager.reconcile().await.unwrap();
-
-        assert_eq!(changed, vec![order_id]);
-        assert!(manager.open_orders().get(&order_id).is_none());
-
-        let persisted = manager.store.get_order(order_id).await.unwrap().unwrap();
-        assert_eq!(persisted.status, OrderStatus::Filled);
-        assert_eq!(persisted.exchange_order_id, Some("EX-999".to_string()));
-    }
-```
-
-- [ ] **Step 4: Start PostgreSQL and run the tests**
+- [ ] **Step 5: Start PostgreSQL and run the tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2065,9 +2216,9 @@ docker compose up -d
 sleep 5
 cargo test -p apexes-oms --lib -- --ignored --nocapture
 ```
-Expected: all 10 `#[ignore]`d tests in `manager.rs` pass (9 original + the rewritten uncertain-order test), plus `mock_gateway.rs`'s existing non-ignored tests remain unaffected (run separately, they are not `#[ignore]`d).
+Expected: all 10 `#[ignore]`d tests in `manager.rs` pass, plus `mock_gateway.rs`'s existing non-ignored tests remain unaffected (run separately, not `#[ignore]`d).
 
-- [ ] **Step 5: Run the full non-ignored suite, clippy, and fmt**
+- [ ] **Step 6: Run the full non-ignored suite, clippy, and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2075,9 +2226,9 @@ cargo test -p apexes-oms
 cargo clippy -p apexes-oms --all-targets -- -D warnings
 cargo fmt --check
 ```
-Expected: non-ignored tests unchanged from before this task (3 error + 6 mock_gateway + 6 schema = 15), clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all three commands plus Step 4's ignored-test command to confirm nothing regressed).
+Expected: non-ignored tests unchanged from before this task (3 error + 6 mock_gateway + 6 schema = 15), clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all three commands plus Step 5's ignored-test command to confirm nothing regressed).
 
-- [ ] **Step 6: Full workspace verification**
+- [ ] **Step 7: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -2088,12 +2239,12 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 cd ~/src/oss/apexes
 git add crates/apexes-oms/src/manager.rs crates/apexes-oms/src/mock_gateway.rs
-git commit -S -s -m "test: add OrderManager integration tests including reconnect reconciliation"
+git commit -S -s -m "fix: OrderManager::reconcile detects terminal-status transitions via query_order_status; add integration tests"
 git push origin master
 ```
 
@@ -2297,7 +2448,7 @@ apexes-oms crate: OrderManager::submit_order runs apexes-risk's PreTradeCheck (c
 
 Row `5.1.3`'s Notes:
 ```
-apexes-oms crate: introduces PostgreSQL (via sqlx) as the project's first relational-database backend, per the roadmap's long-planned "OMS needs durable order storage" trigger point (docs/FEATURES.md row 8.2) -- ClickHouse (apexes-storage, apexes-strategy-registry) is left unchanged, since its OLAP/append-only characteristics are a poor fit for the strong-consistency/low-latency-point-query/idempotent-write requirements order persistence has, which this sub-project's non-negotiable-quality-bar status made worth addressing head-on rather than deferring. Orders/Fills persist to PostgreSQL (persist-before-submit ordering: a local record the gateway never accepted is recoverable; a gateway-accepted order with no local record is not). OrderManager::new rebuilds its open-order snapshot from PostgreSQL on construction (process-restart recovery); OrderManager::reconcile() then resolves any exchange-side state changes that happened while disconnected, matching by client order ID (our own OrderId, not the exchange's ID, since Uncertain-outcome orders never learn an exchange ID any other way) and unconditionally overwriting local status with the exchange's authoritative report -- deliberately bypassing OrderStatus::can_transition_to's normal-operation validation, since a "disallowed" transition during reconciliation reflects real events that happened while disconnected, not a bug. No automatic retry of Uncertain outcomes (deferred to a future iteration pending a dedicated idempotency-key design); no Strategy/MatchingEngine integration (deferred to #8); no multi-account support (deferred to #11).
+apexes-oms crate: introduces PostgreSQL (via sqlx) as the project's first relational-database backend, per the roadmap's long-planned "OMS needs durable order storage" trigger point (docs/FEATURES.md row 8.2) -- ClickHouse (apexes-storage, apexes-strategy-registry) is left unchanged, since its OLAP/append-only characteristics are a poor fit for the strong-consistency/low-latency-point-query/idempotent-write requirements order persistence has, which this sub-project's non-negotiable-quality-bar status made worth addressing head-on rather than deferring. Orders/Fills persist to PostgreSQL (persist-before-submit ordering: a local record the gateway never accepted is recoverable; a gateway-accepted order with no local record is not). OrderManager::new rebuilds its open-order snapshot from PostgreSQL on construction (process-restart recovery); OrderManager::reconcile() then resolves any exchange-side state changes that happened while disconnected in two passes -- matching non-terminal orders by client order ID via query_all_open_orders (our own OrderId, not the exchange's ID, since Uncertain-outcome orders never learn an exchange ID any other way), then individually querying (via query_order_status) any local order still open that the first pass didn't report, since query_all_open_orders is documented to never report terminal orders and would otherwise make Filled/Cancelled/Rejected transitions permanently undetectable -- both passes unconditionally overwrite local status with the exchange's authoritative report, deliberately bypassing OrderStatus::can_transition_to's normal-operation validation, since a "disallowed" transition during reconciliation reflects real events that happened while disconnected, not a bug. No automatic retry of Uncertain outcomes (deferred to a future iteration pending a dedicated idempotency-key design); no Strategy/MatchingEngine integration (deferred to #8); no multi-account support (deferred to #11).
 ```
 
 **Important:** before finalizing, do not just increment counts by 2/2 -- actually count the current `✅ Done` / `🔲 Not Started` / `⏸️ Deferred` (and any other status symbols present) rows in the file (e.g. `grep -cE "^\| [0-9].*<symbol>"` against each status marker, restricted to actual data rows -- NOT the legend rows near the top of the file and NOT the Summary table's own rows, which is exactly the distinction a prior plan's Task 6 got wrong and had to be corrected for) and confirm your new numbers match Done+2, Not Started-2, Total unchanged, against the real counts. Update the Summary counts table accordingly and the "Current active work" paragraph to note sub-project `#7`'s rows `5.1.1`/`5.1.3` are complete via the new `apexes-oms` crate (alongside the already-`Done` row `5.1.2`); leave "what's next" unstated since sub-project `#8` (first live gateway, now unlocked since it depends on `#7`), `#9`/`#11` (EMS, account management), the PyO3 bindings evaluation, and `apexes-risk`'s `6.4`/`6.5` are all still open/deferred options -- don't guess which one the user picks next.
@@ -2337,4 +2488,6 @@ Summarize: `apexes-oms` crate's file list and line counts, total test count (bro
 
 **Type consistency check:** `ExecutionGateway::submit_order`/`cancel_order` both return `GatewayOutcome` (Task 2) and are called/matched identically in `MockExecutionGateway` (Task 3) and `OrderManager` (Task 6). `query_all_open_orders`'s `Vec<(OrderId, Option<String>, OrderStatus)>` return type is identical across its Task 2 trait definition, Task 3's mock implementation, and Task 6's `reconcile()` consumption. `OrderStore`'s five methods (`new`/`upsert_order`/`get_order`/`get_open_orders`/`insert_fill`/`get_fills_for_order`) match exactly between Task 5's definition and Task 6/7/8's usage. `OrderManager::submit_order`'s three parameters (`intent`, `positions`, `balances`) are consistent between Task 6's definition and every call site in Tasks 7-8's tests. `OmsError::ExchangeOrderIdUnknown { order_id }` is defined in Task 1 and both constructed (Task 6's `cancel_order`) and matched (Task 7's test) with the same shape.
 
-**Placeholder scan:** No "TBD"/"TODO" strings; every code step contains complete, concrete Rust source, including full test module bodies. Task 7's mid-task self-correction (writing a flawed test, then explicitly flagging the gap it revealed in `MockExecutionGateway`'s design, then fixing both the mock and the test) is a deliberate choice to model the exact "notice a real gap while testing and close it before declaring the task done" discipline this plan's own author used while writing this plan -- not a placeholder, but a two-step task structure with a clearly labeled reason for the extra step.
+**Placeholder scan:** No "TBD"/"TODO" strings; every code step contains complete, concrete Rust source, including full test module bodies.
+
+**Post-implementation correction record (Task 6/7 boundary):** While a subagent was implementing this plan's original Task 7, it correctly identified and refused to paper over a genuine design flaw: `ExecutionGateway::query_all_open_orders` is documented (and `MockExecutionGateway` enforces) to report ONLY non-terminal orders, which meant Task 6's already-committed `reconcile()` could structurally never detect a `New`/`PartiallyFilled -> Filled` (or other terminal) transition -- the exact scenario reconciliation exists to catch. The design spec (commit `29b34fb`) and this plan's Task 7 (rewritten to lead with a `reconcile()` bug fix before adding tests) were both corrected in response: `reconcile()` now runs a second pass using `query_order_status` for local orders the first pass's `query_all_open_orders` didn't report, since that method (unlike `query_all_open_orders`) is documented to return terminal statuses. This is recorded here rather than silently rewritten in place because it is exactly the kind of gap the plan's own "verify before trusting" discipline exists to catch -- a subagent stopping and flagging it, and the plan being corrected in response, is the process working as intended, not a plan defect.
