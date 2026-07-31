@@ -98,7 +98,7 @@ fn has_open_order_fn(open_orders: HashMap<OrderId, Order>) -> NativeFn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{OrderStatus, OrderType, Side, Venue};
+    use apexes_core::{AssetClass, OrderStatus, OrderType, Side, Venue};
     use rust_decimal_macros::dec;
     use uuid::Uuid;
 
@@ -176,6 +176,7 @@ mod tests {
                 exchange_order_id: None,
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
                 side: Side::Sell,
                 order_type: OrderType::Limit,
                 quantity: dec!(1),

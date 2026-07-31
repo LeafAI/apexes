@@ -1,4 +1,4 @@
-use apexes_core::{Order, OrderId, OrderType, Side, Venue};
+use apexes_core::{AssetClass, Order, OrderId, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -55,6 +55,7 @@ pub struct StrategyContext<'a> {
 pub struct OrderIntent {
     pub symbol: String,
     pub venue: Venue,
+    pub asset_class: AssetClass,
     pub side: Side,
     pub order_type: OrderType,
     pub quantity: Decimal,
@@ -97,6 +98,7 @@ mod tests {
             vec![OrderIntent {
                 symbol: self.symbol.clone(),
                 venue: self.venue,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Market,
                 quantity: dec!(1),

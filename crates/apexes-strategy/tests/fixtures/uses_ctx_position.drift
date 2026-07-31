@@ -13,6 +13,7 @@ function on_market_event(event, ctx) {
   return [{
     symbol: event.symbol,
     venue: event.venue,
+    asset_class: "spot",
     side: "buy",
     order_type: "market",
     quantity: 1,

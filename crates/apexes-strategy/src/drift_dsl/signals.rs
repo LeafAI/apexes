@@ -247,6 +247,10 @@ fn rebalance_order_fn() -> NativeFn {
             order.insert("symbol".to_string(), DriftValue::String(Arc::new(symbol)));
             order.insert("venue".to_string(), DriftValue::String(Arc::new(venue)));
             order.insert(
+                "asset_class".to_string(),
+                DriftValue::String(Arc::new("spot".to_string())),
+            );
+            order.insert(
                 "side".to_string(),
                 DriftValue::String(Arc::new(
                     if diff > 0.0 { "buy" } else { "sell" }.to_string(),

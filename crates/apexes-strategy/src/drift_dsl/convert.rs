@@ -3,8 +3,8 @@
 //! names and script-facing shapes are precisely controlled.
 
 use apexes_core::{
-    Bar, BarInterval, DepthUpdate, MarketEvent, OrderType, PriceLevel, Side, Tick, TradeEvent,
-    Venue,
+    AssetClass, Bar, BarInterval, DepthUpdate, MarketEvent, OrderType, PriceLevel, Side, Tick,
+    TradeEvent, Venue,
 };
 use drift_script::DriftValue;
 use std::collections::HashMap;
@@ -306,6 +306,17 @@ fn parse_venue(s: &str, fn_name: &str) -> Result<Venue, String> {
     }
 }
 
+fn parse_asset_class(s: &str, fn_name: &str) -> Result<AssetClass, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "spot" => Ok(AssetClass::Spot),
+        "perpetual" => Ok(AssetClass::Perpetual),
+        "future" => Ok(AssetClass::Future),
+        "option" => Ok(AssetClass::Option),
+        "equity" => Ok(AssetClass::Equity),
+        other => Err(format!("{fn_name}: unknown asset_class {other:?}")),
+    }
+}
+
 fn f64_to_decimal(value: f64, field: &str, fn_name: &str) -> Result<rust_decimal::Decimal, String> {
     rust_decimal::Decimal::try_from(value)
         .map_err(|_| format!("{fn_name}: field {field:?} is not a finite number ({value})"))
@@ -340,6 +351,7 @@ pub fn order_intents_from_drift_value(value: DriftValue) -> Result<Vec<OrderInte
 
             let symbol = str_field(&obj, "symbol", FN)?.to_string();
             let venue = parse_venue(str_field(&obj, "venue", FN)?, FN)?;
+            let asset_class = parse_asset_class(str_field(&obj, "asset_class", FN)?, FN)?;
             let side = parse_side(str_field(&obj, "side", FN)?, FN)?;
             let order_type = parse_order_type(str_field(&obj, "order_type", FN)?, FN)?;
             let quantity = f64_to_decimal(num_field(&obj, "quantity", FN)?, "quantity", FN)?;
@@ -368,6 +380,7 @@ pub fn order_intents_from_drift_value(value: DriftValue) -> Result<Vec<OrderInte
             Ok(OrderIntent {
                 symbol,
                 venue,
+                asset_class,
                 side,
                 order_type,
                 quantity,
@@ -531,6 +544,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("Binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("BUY")),
             ("order_type", string_value("market")),
             ("quantity", DriftValue::Number(1.5)),
@@ -539,6 +553,7 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].symbol, "BTCUSDT");
         assert_eq!(intents[0].venue, Venue::Binance);
+        assert_eq!(intents[0].asset_class, AssetClass::Spot);
         assert_eq!(intents[0].side, Side::Buy);
         assert_eq!(intents[0].order_type, OrderType::Market);
         assert_eq!(intents[0].quantity, dec!(1.5));
@@ -550,6 +565,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("sell")),
             ("order_type", string_value("limit")),
             ("quantity", DriftValue::Number(1.0)),
@@ -578,6 +594,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("buy")),
             ("order_type", string_value("market")),
             // missing "quantity"
@@ -591,6 +608,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("sideways")),
             ("order_type", string_value("market")),
             ("quantity", DriftValue::Number(1.0)),
@@ -604,6 +622,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("buy")),
             ("order_type", string_value("trailing_stop")),
             ("quantity", DriftValue::Number(1.0)),
@@ -626,10 +645,25 @@ mod tests {
     }
 
     #[test]
+    fn invalid_asset_class_string_is_rejected() {
+        let value = DriftValue::Array(vec![drift_object(&[
+            ("symbol", string_value("BTCUSDT")),
+            ("venue", string_value("binance")),
+            ("asset_class", string_value("dogecoin_futures")),
+            ("side", string_value("buy")),
+            ("order_type", string_value("market")),
+            ("quantity", DriftValue::Number(1.0)),
+        ])]);
+        let err = order_intents_from_drift_value(value).unwrap_err();
+        assert!(err.contains("unknown asset_class"));
+    }
+
+    #[test]
     fn limit_order_missing_price_is_rejected() {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("buy")),
             ("order_type", string_value("limit")),
             ("quantity", DriftValue::Number(1.0)),
@@ -643,6 +677,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("buy")),
             ("order_type", string_value("stop")),
             ("quantity", DriftValue::Number(1.0)),
@@ -656,6 +691,7 @@ mod tests {
         let value = DriftValue::Array(vec![drift_object(&[
             ("symbol", string_value("BTCUSDT")),
             ("venue", string_value("binance")),
+            ("asset_class", string_value("spot")),
             ("side", string_value("buy")),
             ("order_type", string_value("market")),
             ("quantity", DriftValue::Number(f64::NAN)),
