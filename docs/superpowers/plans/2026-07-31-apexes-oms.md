@@ -163,12 +163,14 @@ rust_decimal = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
-uuid = { workspace = true, features = ["v4"] }
 ```
+
+Note: `uuid` is listed under `[dependencies]`, not `[dev-dependencies]` -- non-test code (`OrderManager::submit_order` in Task 6, `MockExecutionGateway` in Task 3) constructs `OrderId(Uuid::new_v4())` outside any `#[cfg(test)]` block, so `uuid` must be a normal dependency, not a dev-only one.
 
 - [ ] **Step 4: Write `crates/apexes-oms/src/error.rs`**
 
