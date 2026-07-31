@@ -61,24 +61,26 @@ pub trait ExecutionGateway: Send + Sync {
     /// (an `Uncertain` outcome from this call).
     async fn submit_order(&self, order: &Order) -> GatewayOutcome;
 
-    /// Cancels an already-submitted order, identified by its
-    /// `exchange_order_id` (the caller -- `OrderManager` -- guarantees
-    /// this is `Some` before calling, since `OrderManager::cancel_order`
-    /// refuses to call this method for orders where it's still `None`).
-    async fn cancel_order(&self, exchange_order_id: &str) -> GatewayOutcome;
+    /// Cancels an already-submitted order (the caller -- `OrderManager`
+    /// -- guarantees `order.exchange_order_id` is `Some` before
+    /// calling). Takes the full `Order` (not just its
+    /// `exchange_order_id`) because real exchanges' cancel-by-ID
+    /// endpoints commonly also require the order's `symbol` (Binance:
+    /// order IDs are unique per-symbol, not globally) -- discovered
+    /// during `apexes-gateway-binance`'s implementation (sub-project
+    /// #8) and folded back into this trait rather than worked around.
+    async fn cancel_order(&self, order: &Order) -> GatewayOutcome;
 
-    /// Queries the exchange's current authoritative status for a single
-    /// order. `asset_class` tells implementations which API family to
+    /// Queries the exchange's current authoritative status for a
+    /// single order. Takes the full `Order` for the same
+    /// symbol-required-for-lookup reason as `cancel_order`.
+    /// `order.asset_class` tells implementations which API family to
     /// query (e.g. `BinanceExecutionGateway` routes `Spot` to
     /// `api.binance.com` and `Perpetual` to `fapi.binance.com` -- see
     /// `apexes-gateway-binance`'s design). Returns `Ok(None)` if the
     /// exchange has no record of this order ID at all (distinct from
     /// "query failed" -- that's `Err`).
-    async fn query_order_status(
-        &self,
-        exchange_order_id: &str,
-        asset_class: AssetClass,
-    ) -> Result<Option<OrderStatus>, String>;
+    async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String>;
 
     /// Queries the exchange for every currently open (not Filled/
     /// Cancelled/Rejected) order within ONE asset class -- used by

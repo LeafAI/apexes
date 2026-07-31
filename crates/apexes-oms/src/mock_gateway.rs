@@ -129,12 +129,13 @@ impl ExecutionGateway for MockExecutionGateway {
         GatewayOutcome::Accepted { exchange_order_id }
     }
 
-    async fn cancel_order(&self, exchange_order_id: &str) -> GatewayOutcome {
+    async fn cancel_order(&self, order: &Order) -> GatewayOutcome {
         if let Some(outcome) = self.next_cancel_outcome.lock().unwrap().take() {
             return outcome;
         }
 
         let mut state = self.exchange_state.lock().unwrap();
+        let exchange_order_id = order.exchange_order_id.as_deref().unwrap_or_default();
         if let Some((_, status, _)) = state
             .values_mut()
             .find(|(id, _, _)| id == exchange_order_id)
@@ -150,11 +151,8 @@ impl ExecutionGateway for MockExecutionGateway {
         }
     }
 
-    async fn query_order_status(
-        &self,
-        exchange_order_id: &str,
-        _asset_class: AssetClass,
-    ) -> Result<Option<OrderStatus>, String> {
+    async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String> {
+        let exchange_order_id = order.exchange_order_id.as_deref().unwrap_or_default();
         let state = self.exchange_state.lock().unwrap();
         Ok(state
             .values()
@@ -285,10 +283,9 @@ mod tests {
     #[tokio::test]
     async fn query_order_status_returns_none_for_unknown_exchange_order_id() {
         let gateway = MockExecutionGateway::new();
-        let result = gateway
-            .query_order_status("never-submitted", AssetClass::Spot)
-            .await
-            .unwrap();
+        let mut order = sample_order();
+        order.exchange_order_id = Some("never-submitted".to_string());
+        let result = gateway.query_order_status(&order).await.unwrap();
         assert_eq!(result, None);
     }
 
@@ -300,14 +297,13 @@ mod tests {
         let GatewayOutcome::Accepted { exchange_order_id } = outcome else {
             panic!("expected Accepted");
         };
+        let mut order_with_id = order.clone();
+        order_with_id.exchange_order_id = Some(exchange_order_id.clone());
 
-        let cancel_outcome = gateway.cancel_order(&exchange_order_id).await;
+        let cancel_outcome = gateway.cancel_order(&order_with_id).await;
         assert!(matches!(cancel_outcome, GatewayOutcome::Accepted { .. }));
 
-        let status = gateway
-            .query_order_status(&exchange_order_id, AssetClass::Spot)
-            .await
-            .unwrap();
+        let status = gateway.query_order_status(&order_with_id).await.unwrap();
         assert_eq!(status, Some(OrderStatus::Cancelled));
     }
 

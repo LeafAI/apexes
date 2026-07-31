@@ -10,9 +10,11 @@
 
 pub mod config;
 pub mod error;
+pub mod gateway;
 pub mod rest;
 pub mod signing;
 
 pub use config::BinanceGatewayConfig;
 pub use error::BinanceApiError;
+pub use gateway::BinanceExecutionGateway;
 pub use rest::{ApiFamily, BinanceRestClient};

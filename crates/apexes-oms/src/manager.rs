@@ -169,12 +169,12 @@ impl OrderManager {
             });
         }
 
-        let exchange_order_id = order
-            .exchange_order_id
-            .clone()
-            .ok_or(OmsError::ExchangeOrderIdUnknown { order_id })?;
+        if order.exchange_order_id.is_none() {
+            return Err(OmsError::ExchangeOrderIdUnknown { order_id });
+        }
+        let order_snapshot = order.clone();
 
-        match self.gateway.cancel_order(&exchange_order_id).await {
+        match self.gateway.cancel_order(&order_snapshot).await {
             GatewayOutcome::Accepted { .. } => {
                 let mut order = self.open_orders.remove(&order_id).unwrap();
                 order.status = OrderStatus::Cancelled;
@@ -407,20 +407,17 @@ impl OrderManager {
                 continue;
             };
             let previous_status = order.status;
-            let asset_class = order.asset_class;
-            let Some(exchange_order_id) = order.exchange_order_id.clone() else {
+            if order.exchange_order_id.is_none() {
                 tracing::warn!(
                     order_id = ?client_order_id,
                     "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
                 );
                 continue;
-            };
+            }
+            let order_snapshot = order.clone();
+            let exchange_order_id = order_snapshot.exchange_order_id.clone().unwrap();
 
-            match self
-                .gateway
-                .query_order_status(&exchange_order_id, asset_class)
-                .await
-            {
+            match self.gateway.query_order_status(&order_snapshot).await {
                 Ok(Some(status)) => {
                     let new_fills = self
                         .apply_exchange_update(client_order_id, Some(exchange_order_id), status)
