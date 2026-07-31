@@ -105,6 +105,7 @@ dependencies = [
  "barter-data",
  "chrono",
  "futures",
+ "rand 0.10.2",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

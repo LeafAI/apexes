@@ -6,6 +6,11 @@
 //! that future live-trading sub-projects (#6 Paper Trading, #7 OMS, #8 live
 //! crypto gateway) will implement against unchanged, per the project's
 //! non-negotiable backtest/live logic-parity requirement.
+//!
+//! [`event_loop`] holds the shared core `run_backtest` and
+//! `apexes-paper`'s `run_paper_trading` both drive -- it is `pub` (so
+//! `apexes-paper` can reach it) but deliberately not re-exported here;
+//! `run_backtest` remains this crate's primary public entry point.
 
 pub mod error;
 
@@ -17,6 +22,9 @@ pub mod order_book;
 
 // Populated in Task 5.
 pub mod cost_model;
+
+pub mod event_loop;
+pub mod latency;
 
 // Populated in Task 7.
 pub mod ledger;
@@ -40,6 +48,7 @@ pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
 };
 pub use error::ApexesError;
+pub use latency::LatencyModel;
 pub use ledger::PortfolioLedger;
 pub use market_data_source::{
     HistoricalMarketDataSource, InMemoryMarketDataSource, StorageMarketDataSource,

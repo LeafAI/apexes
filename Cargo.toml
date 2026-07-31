@@ -25,3 +25,4 @@ clickhouse = { version = "0.15", features = ["chrono"] }
 fixnum = { version = "0.9", features = ["i128", "serde"] }
 barter = "0.12"
 sha2 = "0.10"
+rand = "0.10"

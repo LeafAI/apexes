@@ -1,13 +1,11 @@
 use crate::clock::{BacktestClock, ReplaySpeed};
 use crate::cost_model::CostModel;
-use crate::ledger::PortfolioLedger;
+use crate::event_loop::{EventLoopConfig, run_event_loop};
 use crate::market_data_source::HistoricalMarketDataSource;
-use crate::matching_engine::MatchingEngine;
-use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
-use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Order, OrderId, OrderType};
+use apexes_core::{ApexesError, Instrument};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{Strategy, StrategyContext};
+use apexes_strategy::Strategy;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -48,226 +46,31 @@ pub struct BacktestConfig {
 /// through `strategy`, simulating fills via a `MatchingEngine`, tracking
 /// portfolio state via a `PortfolioLedger`, and producing a
 /// `BacktestReport` with overall + per-symbol + per-venue performance
-/// summaries (design spec §8).
+/// summaries (design spec §8). Internally delegates to the shared
+/// `crate::event_loop::run_event_loop` core (see that module's docs) --
+/// this function's only job is to adapt `HistoricalMarketDataSource`'s
+/// pre-loaded `Vec<MarketEvent>` into the `Stream` the shared core
+/// expects, and to pass `stop_signal: None`/`latency_model: None` since
+/// neither concept applies to historical replay.
 pub async fn run_backtest(
-    mut config: BacktestConfig,
+    config: BacktestConfig,
     market_data: impl HistoricalMarketDataSource,
-    mut strategy: impl Strategy,
+    strategy: impl Strategy,
 ) -> Result<BacktestReport, ApexesError> {
     let events = market_data.events().await?;
+    let event_stream = futures::stream::iter(events);
+    let clock = BacktestClock::new(config.speed);
 
-    let instruments_by_symbol: HashMap<String, Instrument> = config
-        .instruments
-        .iter()
-        .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
-        .collect();
+    let event_loop_config = EventLoopConfig {
+        instruments: config.instruments,
+        initial_balances: config.initial_balances,
+        cost_model: config.cost_model,
+        queue_position_factor: config.queue_position_factor,
+        risk_free_return: config.risk_free_return,
+        risk_checker: config.risk_checker,
+    };
 
-    let mut ledger = PortfolioLedger::new(
-        instruments_by_symbol.clone(),
-        config.initial_balances.clone(),
-    );
-    let mut matching_engine = MatchingEngine::new(config.cost_model, config.queue_position_factor);
-    let mut clock = BacktestClock::new(config.speed);
-    let mut overall_tracker = PerformanceTracker::new(config.risk_free_return);
-    let mut per_symbol_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
-    let mut per_venue_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
-    let mut open_orders: HashMap<OrderId, Order> = HashMap::new();
-    let mut last_prices: HashMap<String, Decimal> = HashMap::new();
-    let mut all_fills: Vec<Fill> = Vec::new();
-
-    // Record the run's TRUE initial equity point (before any event's
-    // fills are applied) so `PerformanceSummary.total_pnl` -- computed
-    // as last-minus-first of the curve -- includes whatever P&L (e.g.
-    // fees) occurred during the very first processed event.
-    if let Some(first_event) = events.first() {
-        let initial_equity = ledger.equity(&last_prices)?;
-        overall_tracker.record_equity_point(event_timestamp(first_event), initial_equity);
-    }
-
-    for event in &events {
-        let timestamp = event_timestamp(event);
-        clock.wait_for_next_event(timestamp).await;
-
-        match event {
-            MarketEvent::Depth(update) => {
-                matching_engine.on_depth_update(update);
-            }
-            MarketEvent::Trade(trade) => {
-                if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
-                    && let Some(base) = &instrument.base_currency
-                {
-                    last_prices.insert(base.clone(), trade.price);
-                }
-                let fill_results = matching_engine.on_trade_event(trade, timestamp);
-                for (order_id, fills) in fill_results {
-                    apply_fills(
-                        &mut ledger,
-                        &mut overall_tracker,
-                        &mut per_symbol_trackers,
-                        &mut per_venue_trackers,
-                        &mut all_fills,
-                        &fills,
-                        config.risk_free_return,
-                    )?;
-                    if let Some(risk_checker) = &mut config.risk_checker {
-                        for fill in &fills {
-                            if let Err(violations) =
-                                risk_checker.on_fill(fill, ledger.positions(), ledger.balances())
-                            {
-                                tracing::warn!(
-                                    ?violations,
-                                    symbol = %fill.symbol,
-                                    "in-trade risk monitor flagged a violation"
-                                );
-                            }
-                        }
-                    }
-                    if let Some(order) = open_orders.get_mut(&order_id)
-                        && let Some(last_fill) = fills.last()
-                    {
-                        order.filled_quantity += fills.iter().map(|f| f.quantity).sum::<Decimal>();
-                        order.updated_at = last_fill.filled_at;
-                        if order.filled_quantity >= order.quantity {
-                            order.status = apexes_core::OrderStatus::Filled;
-                        } else {
-                            order.status = apexes_core::OrderStatus::PartiallyFilled;
-                        }
-                    }
-                }
-            }
-            _ => {} // Tick/Bar events currently only advance the clock/context; no direct matching-engine action.
-        }
-
-        let ctx = StrategyContext {
-            positions: ledger.positions(),
-            balances: ledger.balances(),
-            open_orders: &open_orders,
-            now: timestamp,
-        };
-        let intents = strategy.on_market_event(event, &ctx);
-
-        for intent in intents {
-            if let Some(risk_checker) = &config.risk_checker
-                && let Err(violations) = risk_checker.check(
-                    &intent,
-                    ledger.positions(),
-                    ledger.balances(),
-                    &open_orders,
-                    timestamp,
-                )
-            {
-                tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
-                continue;
-            }
-
-            let submit_result = match intent.order_type {
-                OrderType::Market => matching_engine
-                    .submit_market_order(&intent, timestamp)
-                    .map(|(order, fills)| (order, Some(fills))),
-                OrderType::Limit => matching_engine
-                    .submit_limit_order(&intent, timestamp)
-                    .map(|order| (order, None)),
-                OrderType::Stop | OrderType::StopLimit => matching_engine
-                    .submit_stop_order(&intent, timestamp)
-                    .map(|order| (order, None)),
-            };
-
-            match submit_result {
-                Ok((order, immediate_fills)) => {
-                    open_orders.insert(order.id, order);
-                    if let Some(fills) = immediate_fills {
-                        apply_fills(
-                            &mut ledger,
-                            &mut overall_tracker,
-                            &mut per_symbol_trackers,
-                            &mut per_venue_trackers,
-                            &mut all_fills,
-                            &fills,
-                            config.risk_free_return,
-                        )?;
-                        if let Some(risk_checker) = &mut config.risk_checker {
-                            for fill in &fills {
-                                if let Err(violations) = risk_checker.on_fill(
-                                    fill,
-                                    ledger.positions(),
-                                    ledger.balances(),
-                                ) {
-                                    tracing::warn!(
-                                        ?violations,
-                                        symbol = %fill.symbol,
-                                        "in-trade risk monitor flagged a violation"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(?error, symbol = %intent.symbol, "order submission rejected");
-                }
-            }
-        }
-
-        // Mark-to-market equity point for the overall tracker after
-        // processing this event.
-        let equity = ledger.equity(&last_prices)?;
-        overall_tracker.record_equity_point(timestamp, equity);
-    }
-
-    Ok(BacktestReport {
-        overall: overall_tracker.summary().into(),
-        per_symbol: per_symbol_trackers
-            .into_iter()
-            .map(|(k, v)| (k, v.summary().into()))
-            .collect(),
-        per_venue: per_venue_trackers
-            .into_iter()
-            .map(|(k, v)| (k, v.summary().into()))
-            .collect(),
-        equity_curve: overall_tracker.equity_curve().to_vec(),
-        trades: all_fills,
-    })
-}
-
-/// Applies a batch of `Fill`s produced by the matching engine: updates
-/// the ledger, records each fill into the overall/per-symbol/per-venue
-/// `PerformanceTracker`s, and accumulates every fill into `all_fills`
-/// (the `BacktestReport.trades` source) in occurrence order.
-/// `risk_free_return` is threaded through from `BacktestConfig` so the
-/// per-symbol/per-venue trackers' Sharpe/Sortino/Calmar are computed
-/// with the same risk-free rate as the overall summary.
-fn apply_fills(
-    ledger: &mut PortfolioLedger,
-    overall_tracker: &mut PerformanceTracker,
-    per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
-    per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
-    all_fills: &mut Vec<Fill>,
-    fills: &[Fill],
-    risk_free_return: Decimal,
-) -> Result<(), ApexesError> {
-    for fill in fills {
-        ledger.apply_fill(fill)?;
-        overall_tracker.record_fill(fill);
-        per_symbol_trackers
-            .entry(fill.symbol.clone())
-            .or_insert_with(|| PerformanceTracker::new(risk_free_return))
-            .record_fill(fill);
-        per_venue_trackers
-            .entry(format!("{:?}", fill.venue))
-            .or_insert_with(|| PerformanceTracker::new(risk_free_return))
-            .record_fill(fill);
-    }
-    all_fills.extend_from_slice(fills);
-    Ok(())
-}
-
-fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
-    match event {
-        MarketEvent::Tick(tick) => tick.timestamp,
-        MarketEvent::Depth(depth) => depth.timestamp,
-        MarketEvent::Bar(bar) => bar.open_time,
-        MarketEvent::Trade(trade) => trade.timestamp,
-    }
+    run_event_loop(event_loop_config, event_stream, clock, strategy, None, None).await
 }
 
 #[cfg(test)]
@@ -275,8 +78,10 @@ mod tests {
     use super::*;
     use crate::clock::ReplaySpeed;
     use crate::market_data_source::InMemoryMarketDataSource;
-    use apexes_core::{AssetClass, DepthUpdate, MarketType, PriceLevel, Side, TradeEvent, Venue};
-    use apexes_strategy::OrderIntent;
+    use apexes_core::{
+        AssetClass, DepthUpdate, MarketType, OrderType, PriceLevel, Side, TradeEvent, Venue,
+    };
+    use apexes_strategy::{OrderIntent, StrategyContext};
     use chrono::{Duration, TimeZone, Utc};
     use rust_decimal_macros::dec;
 
@@ -287,10 +92,10 @@ mod tests {
     impl Strategy for BuyOnceStrategy {
         fn on_market_event(
             &mut self,
-            event: &MarketEvent,
+            event: &apexes_core::MarketEvent,
             _ctx: &StrategyContext,
         ) -> Vec<OrderIntent> {
-            if !self.bought && matches!(event, MarketEvent::Trade(_)) {
+            if !self.bought && matches!(event, apexes_core::MarketEvent::Trade(_)) {
                 self.bought = true;
                 return vec![OrderIntent {
                     symbol: "BTCUSDT".to_string(),
@@ -342,7 +147,7 @@ mod tests {
     async fn equity_curve_marks_held_base_asset_at_real_trade_price() {
         let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let events = vec![
-            MarketEvent::Depth(DepthUpdate {
+            apexes_core::MarketEvent::Depth(DepthUpdate {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
                 bids: vec![PriceLevel {
@@ -357,7 +162,7 @@ mod tests {
                 is_snapshot: true,
                 timestamp: t0,
             }),
-            MarketEvent::Trade(TradeEvent {
+            apexes_core::MarketEvent::Trade(TradeEvent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
                 price: dec!(100),
@@ -366,7 +171,7 @@ mod tests {
                 trade_id: None,
                 timestamp: t0 + Duration::seconds(1),
             }),
-            MarketEvent::Trade(TradeEvent {
+            apexes_core::MarketEvent::Trade(TradeEvent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
                 price: dec!(110),
