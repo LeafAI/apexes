@@ -4709,15 +4709,58 @@ fn testnet_config() -> BinanceGatewayConfig {
     }
 }
 
+/// Fetches the current BTCUSDT price from Binance Testnet's public,
+/// unauthenticated `ticker/price` endpoint and derives a limit price
+/// far enough below it to rest indefinitely without filling, while
+/// staying inside Binance's `PERCENT_PRICE_BY_SIDE` filter (a buy must
+/// be >= 0.5x the 5-minute weighted average price) and above the
+/// `NOTIONAL` filter's minimum (`price * quantity >= 5 USDT`). A fixed
+/// price literal (e.g. `1000`) is rejected outright by both filters at
+/// any BTCUSDT price level seen since 2017 -- this was found during
+/// Task 21's review (verified against the live testnet's public
+/// `exchangeInfo`/`avgPrice` endpoints) and is why this helper exists
+/// instead of a hardcoded literal.
+async fn safe_resting_limit_price(spot_base_url: &str, qty: rust_decimal::Decimal) -> Decimal {
+    let url = format!("{spot_base_url}/api/v3/ticker/price?symbol=BTCUSDT");
+    let body = reqwest::get(&url)
+        .await
+        .expect("failed to reach Binance Testnet's public ticker/price endpoint")
+        .text()
+        .await
+        .expect("failed to read ticker/price response body");
+
+    #[derive(serde::Deserialize)]
+    struct TickerPrice {
+        price: String,
+    }
+    let ticker: TickerPrice = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("parse error: {error}; body={body}"));
+    let last_price: Decimal = ticker
+        .price
+        .parse()
+        .unwrap_or_else(|error| panic!("could not parse ticker price {:?}: {error}", ticker.price));
+
+    let price = (last_price * dec!(0.6)).round_dp(2);
+    let notional = price * qty;
+    assert!(
+        notional >= dec!(5),
+        "derived price {price} * qty {qty} = {notional} notional, below Binance's 5 USDT NOTIONAL minimum -- increase qty"
+    );
+    price
+}
+
 #[tokio::test]
 #[ignore]
 async fn submit_and_cancel_a_limit_order_far_from_market_price_on_spot_testnet() {
     let gateway = BinanceExecutionGateway::new(testnet_config());
 
-    // A limit price far below any realistic BTCUSDT market price, so
-    // this order rests indefinitely on the book rather than filling
-    // during the test (avoiding any real, even testnet-fake-money,
-    // execution as a side effect of running this test).
+    // A limit price derived from the live testnet price (see
+    // `safe_resting_limit_price`'s doc comment): far enough below
+    // market to rest indefinitely without filling, but not so far that
+    // Binance's own PERCENT_PRICE_BY_SIDE/NOTIONAL submission filters
+    // reject it outright.
+    let quantity = dec!(0.001);
+    let price = safe_resting_limit_price("https://testnet.binance.vision", quantity).await;
     let order = Order {
         id: OrderId(Uuid::new_v4()),
         exchange_order_id: None,
@@ -4726,8 +4769,8 @@ async fn submit_and_cancel_a_limit_order_far_from_market_price_on_spot_testnet()
         asset_class: AssetClass::Spot,
         side: Side::Buy,
         order_type: OrderType::Limit,
-        quantity: dec!(0.001),
-        price: Some(dec!(1000)),
+        quantity,
+        price: Some(price),
         stop_price: None,
         filled_quantity: dec!(0),
         status: OrderStatus::New,
@@ -4755,6 +4798,8 @@ async fn submit_and_cancel_a_limit_order_far_from_market_price_on_spot_testnet()
 async fn query_all_open_orders_returns_the_order_just_placed() {
     let gateway = BinanceExecutionGateway::new(testnet_config());
 
+    let quantity = dec!(0.001);
+    let price = safe_resting_limit_price("https://testnet.binance.vision", quantity).await;
     let order = Order {
         id: OrderId(Uuid::new_v4()),
         exchange_order_id: None,
@@ -4763,8 +4808,8 @@ async fn query_all_open_orders_returns_the_order_just_placed() {
         asset_class: AssetClass::Spot,
         side: Side::Buy,
         order_type: OrderType::Limit,
-        quantity: dec!(0.001),
-        price: Some(dec!(1000)),
+        quantity,
+        price: Some(price),
         stop_price: None,
         filled_quantity: dec!(0),
         status: OrderStatus::New,
@@ -4796,13 +4841,19 @@ async fn query_all_open_orders_returns_the_order_just_placed() {
 #[ignore]
 async fn user_data_stream_connects_and_receives_at_least_the_initial_handshake() {
     let gateway = BinanceExecutionGateway::new(testnet_config());
-    let (_handle, mut stream) = gateway.start_user_data_stream().await.unwrap();
+    let (_handle, stream) = gateway.start_user_data_stream().await.unwrap();
+    // The merged user-data stream is `!Unpin` (it contains
+    // `pin-project`-based websocket machinery internally), so pin it on
+    // the stack to make `StreamExt::next()` callable.
+    futures::pin_mut!(stream);
 
     // Submit an order to generate a User Data Stream event, then wait
     // briefly for it to arrive. This test only proves connectivity and
     // basic event delivery -- it does not assert on specific field
     // values (those are covered by user_data_stream.rs's unit tests
     // against synthetic JSON).
+    let quantity = dec!(0.001);
+    let price = safe_resting_limit_price("https://testnet.binance.vision", quantity).await;
     let order = Order {
         id: OrderId(Uuid::new_v4()),
         exchange_order_id: None,
@@ -4811,18 +4862,27 @@ async fn user_data_stream_connects_and_receives_at_least_the_initial_handshake()
         asset_class: AssetClass::Spot,
         side: Side::Buy,
         order_type: OrderType::Limit,
-        quantity: dec!(0.001),
-        price: Some(dec!(1000)),
+        quantity,
+        price: Some(price),
         stop_price: None,
         filled_quantity: dec!(0),
         status: OrderStatus::New,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    gateway.submit_order(&order).await;
+    let outcome = gateway.submit_order(&order).await;
 
     use futures::StreamExt;
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
+
+    // Clean up: cancel the resting order so it doesn't linger on the
+    // testnet account across repeated runs of this test.
+    if let GatewayOutcome::Accepted { exchange_order_id } = outcome {
+        let mut order_with_id = order.clone();
+        order_with_id.exchange_order_id = Some(exchange_order_id);
+        gateway.cancel_order(&order_with_id).await;
+    }
+
     assert!(
         result.is_ok(),
         "expected at least one ExchangeUpdate within 10 seconds of submitting an order"
