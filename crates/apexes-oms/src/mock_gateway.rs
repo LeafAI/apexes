@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use apexes_core::{Order, OrderId, OrderStatus};
+use apexes_core::{AssetClass, Order, OrderId, OrderStatus};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -20,12 +20,14 @@ pub struct MockExecutionGateway {
     next_submit_outcome: Mutex<Option<GatewayOutcome>>,
     next_cancel_outcome: Mutex<Option<GatewayOutcome>>,
     /// Exchange-side authoritative state, keyed by OUR client order ID
-    /// (`OrderId`) -- tests mutate this directly (simulating "the
-    /// exchange processed something while we were disconnected")
-    /// before calling `OrderManager::reconcile`. Each entry stores the
-    /// exchange-assigned ID string this mock generated at
-    /// `submit_order` time, so `query_all_open_orders` can return both.
-    exchange_state: Mutex<HashMap<OrderId, (String, OrderStatus)>>,
+    /// (`OrderId`). Each entry stores the exchange-assigned ID string,
+    /// current status, and the order's `asset_class` (needed so
+    /// `query_all_open_orders` can filter by the caller-requested
+    /// asset class, matching the real `ExecutionGateway` contract).
+    exchange_state: Mutex<HashMap<OrderId, (String, OrderStatus, AssetClass)>>,
+    /// Programmable fills returned by `query_fills_for_order`, keyed by
+    /// client order ID. Tests populate this via `set_fills_for_order`.
+    fills: Mutex<HashMap<OrderId, Vec<crate::gateway::ExchangeFill>>>,
 }
 
 impl Default for MockExecutionGateway {
@@ -40,6 +42,7 @@ impl MockExecutionGateway {
             next_submit_outcome: Mutex::new(None),
             next_cancel_outcome: Mutex::new(None),
             exchange_state: Mutex::new(HashMap::new()),
+            fills: Mutex::new(HashMap::new()),
         }
     }
 
@@ -67,19 +70,30 @@ impl MockExecutionGateway {
     /// WITHOUT requiring a prior `submit_order` call to have gone
     /// through this mock -- needed because a programmed `Uncertain`
     /// `submit_order` outcome does NOT itself populate `exchange_state`.
-    /// Used to simulate an order whose `submit_order` returned
-    /// `Uncertain` later being confirmed by the exchange -- the exact
-    /// scenario `OrderManager::reconcile` exists to resolve.
     pub fn force_register_exchange_order(
         &self,
         client_order_id: OrderId,
         exchange_order_id: &str,
         status: OrderStatus,
+        asset_class: AssetClass,
     ) {
-        self.exchange_state
-            .lock()
-            .unwrap()
-            .insert(client_order_id, (exchange_order_id.to_string(), status));
+        self.exchange_state.lock().unwrap().insert(
+            client_order_id,
+            (exchange_order_id.to_string(), status, asset_class),
+        );
+    }
+
+    /// Programs the fills `query_fills_for_order` returns for
+    /// `client_order_id`. Returns the full `Vec` every call (matching
+    /// the real trait contract's "full trade history every call"
+    /// semantics) -- does not accumulate across multiple calls to this
+    /// setter; the last call wins.
+    pub fn set_fills_for_order(
+        &self,
+        client_order_id: OrderId,
+        fills: Vec<crate::gateway::ExchangeFill>,
+    ) {
+        self.fills.lock().unwrap().insert(client_order_id, fills);
     }
 }
 
@@ -91,19 +105,27 @@ impl ExecutionGateway for MockExecutionGateway {
             // exchange-side state so query_all_open_orders/reconcile
             // tests can find it.
             if let GatewayOutcome::Accepted { exchange_order_id } = &outcome {
-                self.exchange_state
-                    .lock()
-                    .unwrap()
-                    .insert(order.id, (exchange_order_id.clone(), OrderStatus::New));
+                self.exchange_state.lock().unwrap().insert(
+                    order.id,
+                    (
+                        exchange_order_id.clone(),
+                        OrderStatus::New,
+                        order.asset_class,
+                    ),
+                );
             }
             return outcome;
         }
 
         let exchange_order_id = Uuid::new_v4().to_string();
-        self.exchange_state
-            .lock()
-            .unwrap()
-            .insert(order.id, (exchange_order_id.clone(), OrderStatus::New));
+        self.exchange_state.lock().unwrap().insert(
+            order.id,
+            (
+                exchange_order_id.clone(),
+                OrderStatus::New,
+                order.asset_class,
+            ),
+        );
         GatewayOutcome::Accepted { exchange_order_id }
     }
 
@@ -113,7 +135,10 @@ impl ExecutionGateway for MockExecutionGateway {
         }
 
         let mut state = self.exchange_state.lock().unwrap();
-        if let Some((_, status)) = state.values_mut().find(|(id, _)| id == exchange_order_id) {
+        if let Some((_, status, _)) = state
+            .values_mut()
+            .find(|(id, _, _)| id == exchange_order_id)
+        {
             *status = OrderStatus::Cancelled;
             GatewayOutcome::Accepted {
                 exchange_order_id: exchange_order_id.to_string(),
@@ -128,27 +153,43 @@ impl ExecutionGateway for MockExecutionGateway {
     async fn query_order_status(
         &self,
         exchange_order_id: &str,
+        _asset_class: AssetClass,
     ) -> Result<Option<OrderStatus>, String> {
         let state = self.exchange_state.lock().unwrap();
         Ok(state
             .values()
-            .find(|(id, _)| id == exchange_order_id)
-            .map(|(_, status)| *status))
+            .find(|(id, _, _)| id == exchange_order_id)
+            .map(|(_, status, _)| *status))
     }
 
     async fn query_all_open_orders(
         &self,
+        asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
         let state = self.exchange_state.lock().unwrap();
         Ok(state
             .iter()
-            .filter(|(_, (_, status))| {
-                matches!(status, OrderStatus::New | OrderStatus::PartiallyFilled)
+            .filter(|(_, (_, status, order_asset_class))| {
+                *order_asset_class == asset_class
+                    && matches!(status, OrderStatus::New | OrderStatus::PartiallyFilled)
             })
-            .map(|(client_order_id, (exchange_order_id, status))| {
+            .map(|(client_order_id, (exchange_order_id, status, _))| {
                 (*client_order_id, Some(exchange_order_id.clone()), *status)
             })
             .collect())
+    }
+
+    async fn query_fills_for_order(
+        &self,
+        order: &Order,
+    ) -> Result<Vec<crate::gateway::ExchangeFill>, String> {
+        Ok(self
+            .fills
+            .lock()
+            .unwrap()
+            .get(&order.id)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -215,7 +256,10 @@ mod tests {
 
         gateway.set_exchange_state(order.id, OrderStatus::Filled);
 
-        let open_orders = gateway.query_all_open_orders().await.unwrap();
+        let open_orders = gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap();
         // Filled is a terminal state -- no longer "open".
         assert!(open_orders.iter().all(|(id, _, _)| *id != order.id));
     }
@@ -229,7 +273,10 @@ mod tests {
         gateway.submit_order(&order2).await;
         gateway.set_exchange_state(order2.id, OrderStatus::PartiallyFilled);
 
-        let open_orders = gateway.query_all_open_orders().await.unwrap();
+        let open_orders = gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap();
         assert_eq!(open_orders.len(), 2);
         assert!(open_orders.iter().any(|(id, _, _)| *id == order1.id));
         assert!(open_orders.iter().any(|(id, _, _)| *id == order2.id));
@@ -238,7 +285,10 @@ mod tests {
     #[tokio::test]
     async fn query_order_status_returns_none_for_unknown_exchange_order_id() {
         let gateway = MockExecutionGateway::new();
-        let result = gateway.query_order_status("never-submitted").await.unwrap();
+        let result = gateway
+            .query_order_status("never-submitted", AssetClass::Spot)
+            .await
+            .unwrap();
         assert_eq!(result, None);
     }
 
@@ -255,9 +305,66 @@ mod tests {
         assert!(matches!(cancel_outcome, GatewayOutcome::Accepted { .. }));
 
         let status = gateway
-            .query_order_status(&exchange_order_id)
+            .query_order_status(&exchange_order_id, AssetClass::Spot)
             .await
             .unwrap();
         assert_eq!(status, Some(OrderStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn query_fills_for_order_returns_programmed_fills() {
+        use crate::gateway::ExchangeFill;
+
+        let gateway = MockExecutionGateway::new();
+        let order = sample_order();
+        gateway.submit_order(&order).await;
+
+        let fill = ExchangeFill {
+            exchange_trade_id: "T1".to_string(),
+            price: dec!(65000),
+            quantity: dec!(0.5),
+            fee: dec!(1.2),
+            fee_currency: Some("USDT".to_string()),
+            filled_at: Utc::now(),
+        };
+        gateway.set_fills_for_order(order.id, vec![fill.clone()]);
+
+        let fills = gateway.query_fills_for_order(&order).await.unwrap();
+        assert_eq!(fills, vec![fill]);
+    }
+
+    #[tokio::test]
+    async fn query_fills_for_order_returns_empty_when_none_programmed() {
+        let gateway = MockExecutionGateway::new();
+        let order = sample_order();
+        gateway.submit_order(&order).await;
+
+        let fills = gateway.query_fills_for_order(&order).await.unwrap();
+        assert!(fills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_all_open_orders_filters_by_asset_class() {
+        let gateway = MockExecutionGateway::new();
+        let mut spot_order = sample_order();
+        spot_order.asset_class = AssetClass::Spot;
+        let mut perp_order = sample_order();
+        perp_order.asset_class = AssetClass::Perpetual;
+        gateway.submit_order(&spot_order).await;
+        gateway.submit_order(&perp_order).await;
+
+        let spot_open = gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap();
+        assert_eq!(spot_open.len(), 1);
+        assert_eq!(spot_open[0].0, spot_order.id);
+
+        let perp_open = gateway
+            .query_all_open_orders(AssetClass::Perpetual)
+            .await
+            .unwrap();
+        assert_eq!(perp_open.len(), 1);
+        assert_eq!(perp_open[0].0, perp_order.id);
     }
 }

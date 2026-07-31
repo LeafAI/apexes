@@ -615,7 +615,12 @@ mod tests {
         // is why force_register_exchange_order (not set_exchange_state,
         // which requires a prior submit_order through this mock) is
         // used here.
-        gateway.force_register_exchange_order(order_id, "EX-999", OrderStatus::PartiallyFilled);
+        gateway.force_register_exchange_order(
+            order_id,
+            "EX-999",
+            OrderStatus::PartiallyFilled,
+            AssetClass::Spot,
+        );
 
         let changed = manager.reconcile().await.unwrap();
 

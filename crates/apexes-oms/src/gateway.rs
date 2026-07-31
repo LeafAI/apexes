@@ -1,11 +1,13 @@
 //! [`ExecutionGateway`]: the abstraction `OrderManager` submits/cancels/
 //! queries orders through, decoupling order-lifecycle management from
 //! any specific exchange's API. Sub-project #8 (first live gateway)
-//! implements this trait against a real exchange; this crate ships only
+//! implements it against a real exchange; this crate ships only
 //! [`crate::mock_gateway::MockExecutionGateway`] for testing.
 
-use apexes_core::{Order, OrderId, OrderStatus};
+use apexes_core::{AssetClass, Order, OrderId, OrderStatus};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 
 /// The outcome of a `submit_order`/`cancel_order` call, distinguishing
 /// three cases `OrderManager` must handle differently:
@@ -23,6 +25,27 @@ pub enum GatewayOutcome {
     Accepted { exchange_order_id: String },
     Rejected { reason: String },
     Uncertain { reason: String },
+}
+
+/// A single trade execution as reported by the exchange, keyed by the
+/// exchange's own per-trade identifier (`exchange_trade_id`) so
+/// `OrderManager` can deduplicate against fills it has already recorded.
+/// Real exchanges' "my trades"-style endpoints return the FULL trade
+/// history for an order every call, not just new trades since the last
+/// call -- naively inserting every returned entry as a fresh `Fill`
+/// would create duplicates across repeated calls. Not
+/// `apexes_core::Fill` directly: the gateway has no knowledge of our
+/// locally-assigned `FillId`, which `OrderManager` assigns only for
+/// genuinely-new trades (see `OrderStore::insert_fill`'s dedup logic,
+/// Task 10).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExchangeFill {
+    pub exchange_trade_id: String,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub fee: Decimal,
+    pub fee_currency: Option<String>,
+    pub filled_at: DateTime<Utc>,
 }
 
 #[async_trait]
@@ -45,16 +68,28 @@ pub trait ExecutionGateway: Send + Sync {
     async fn cancel_order(&self, exchange_order_id: &str) -> GatewayOutcome;
 
     /// Queries the exchange's current authoritative status for a single
-    /// order. Returns `Ok(None)` if the exchange has no record of this
-    /// order ID at all (distinct from "query failed" -- that's `Err`).
+    /// order. `asset_class` tells implementations which API family to
+    /// query (e.g. `BinanceExecutionGateway` routes `Spot` to
+    /// `api.binance.com` and `Perpetual` to `fapi.binance.com` -- see
+    /// `apexes-gateway-binance`'s design). Returns `Ok(None)` if the
+    /// exchange has no record of this order ID at all (distinct from
+    /// "query failed" -- that's `Err`).
     async fn query_order_status(
         &self,
         exchange_order_id: &str,
+        asset_class: AssetClass,
     ) -> Result<Option<OrderStatus>, String>;
 
     /// Queries the exchange for every currently open (not Filled/
-    /// Cancelled/Rejected) order across the whole account -- used by
-    /// `OrderManager::reconcile` after a reconnect.
+    /// Cancelled/Rejected) order within ONE asset class -- used by
+    /// `OrderManager::reconcile` after a reconnect. Callers needing
+    /// full-account reconciliation across multiple asset classes call
+    /// this once per asset class they have local open orders in (see
+    /// `OrderManager::reconcile`, Task 10) -- this method itself never
+    /// mixes asset classes in one call, since real exchanges' "list
+    /// open orders" endpoints are themselves scoped to one API family
+    /// (e.g. Binance's spot open-orders endpoint cannot return futures
+    /// orders and vice versa).
     ///
     /// Returns `(client_order_id, exchange_order_id, status)` triples.
     /// `client_order_id` is OUR locally-assigned `OrderId` (`Order.id`),
@@ -62,5 +97,17 @@ pub trait ExecutionGateway: Send + Sync {
     /// for why implementations must echo it back here.
     async fn query_all_open_orders(
         &self,
+        asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String>;
+
+    /// Returns every trade execution the exchange has recorded for
+    /// `order` (identified by `order.exchange_order_id`, which the
+    /// caller guarantees is `Some`, and `order.asset_class`, used the
+    /// same way as `query_order_status`/`query_all_open_orders` to pick
+    /// an API family). Returns the FULL trade history for this order
+    /// every call (matching real exchanges' typical "my trades"
+    /// endpoint shape) -- deduplication against previously recorded
+    /// fills is `OrderManager`'s responsibility (via
+    /// `exchange_trade_id`), not this method's.
+    async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String>;
 }
