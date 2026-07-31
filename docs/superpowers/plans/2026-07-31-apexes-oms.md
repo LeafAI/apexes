@@ -2216,7 +2216,7 @@ docker compose up -d
 sleep 5
 cargo test -p apexes-oms --lib -- --ignored --nocapture
 ```
-Expected: all 10 `#[ignore]`d tests in `manager.rs` pass, plus `mock_gateway.rs`'s existing non-ignored tests remain unaffected (run separately, not `#[ignore]`d).
+Expected: all 11 `#[ignore]`d tests in `manager.rs` pass (4 `submit_order`-focused + 3 `cancel_order`-focused + 4 `reconcile`-focused), plus `mock_gateway.rs`'s existing non-ignored tests remain unaffected (run separately, not `#[ignore]`d). Note: these tests share one live PostgreSQL database via `clean_db()`, so run them with `--test-threads=1` if you see occasional cross-test interference under default parallel execution -- this is a known limitation of the shared-database test-isolation approach, not a code defect.
 
 - [ ] **Step 6: Run the full non-ignored suite, clippy, and fmt**
 
@@ -2363,7 +2363,7 @@ cargo test -p apexes-oms -- --ignored
 cargo clippy -p apexes-oms --all-targets -- -D warnings
 cargo fmt --check
 ```
-Expected: non-ignored: 15 passed (3 error + 6 mock_gateway + 6 schema). Ignored: 11 passed (10 from Task 7's `manager.rs` tests + 1 from this task's `live_postgres.rs`). Clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all four commands).
+Expected: non-ignored: 15 passed (3 error + 6 mock_gateway + 6 schema). Ignored: 12 passed (11 from Task 7's `manager.rs` tests + 1 from this task's `live_postgres.rs`) -- run with `--test-threads=1` if you see cross-test interference (these tests share one live PostgreSQL database). Clippy and fmt clean (auto-fix with `cargo fmt` if needed, then re-run all four commands).
 
 - [ ] **Step 4: Full workspace verification**
 
@@ -2419,7 +2419,7 @@ cargo test -p apexes-strategy-registry -- --ignored
 cargo test -p apexes-paper -- --ignored
 cargo test -p apexes-oms -- --ignored
 ```
-Expected: `apexes-market-data`/`apexes-storage`/`apexes-strategy-registry`/`apexes-paper`'s pre-existing ignored tests behave exactly as they did before this plan started (unchanged -- note `apexes-market-data`'s and `apexes-paper`'s live Binance tests may be affected by this sandbox's known pre-existing network limitations documented in the prior `apexes-paper` plan; that is unrelated to this plan's work). `apexes-oms` contributes 11 new ignored tests (10 `manager.rs` + 1 `live_postgres.rs`), all passing against the live PostgreSQL container started above.
+Expected: `apexes-market-data`/`apexes-storage`/`apexes-strategy-registry`/`apexes-paper`'s pre-existing ignored tests behave exactly as they did before this plan started (unchanged -- note `apexes-market-data`'s and `apexes-paper`'s live Binance tests may be affected by this sandbox's known pre-existing network limitations documented in the prior `apexes-paper` plan; that is unrelated to this plan's work). `apexes-oms` contributes 12 new ignored tests (11 `manager.rs` + 1 `live_postgres.rs`), all passing against the live PostgreSQL container started above (run `manager.rs`'s tests with `--test-threads=1` if cross-test interference occurs, since they share one live database).
 
 - [ ] **Step 4: Full workspace clippy**
 
