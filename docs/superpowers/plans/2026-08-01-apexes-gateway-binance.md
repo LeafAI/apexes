@@ -2714,13 +2714,14 @@ impl BinanceRestClient {
 
     /// Sends a signed request to `family`'s base URL + `path`, with
     /// `extra_params` as the unsigned portion of the query string (see
-    /// `build_signed_query`). `method` is `"GET"`, `"POST"`, or
-    /// `"DELETE"` per Binance's documented HTTP method per endpoint.
-    /// Returns the raw response body text plus HTTP status code --
-    /// callers (`gateway.rs`) are responsible for parsing the body into
-    /// the expected success shape or `BinanceApiError`, and for mapping
-    /// both into `GatewayOutcome`/`Result<_, String>` per-call, since
-    /// each endpoint's success shape differs.
+    /// `build_signed_query`). `method` is `"GET"`, `"POST"`, `"PUT"`, or
+    /// `"DELETE"` per Binance's documented HTTP method per endpoint
+    /// (`PUT` is used by the User Data Stream listenKey-renewal
+    /// endpoints). Returns the raw response body text plus HTTP status
+    /// code -- callers (`gateway.rs`) are responsible for parsing the
+    /// body into the expected success shape or `BinanceApiError`, and
+    /// for mapping both into `GatewayOutcome`/`Result<_, String>`
+    /// per-call, since each endpoint's success shape differs.
     pub async fn signed_request(
         &self,
         method: &str,
@@ -2734,6 +2735,7 @@ impl BinanceRestClient {
         let request = match method {
             "GET" => self.http.get(&url),
             "POST" => self.http.post(&url),
+            "PUT" => self.http.put(&url),
             "DELETE" => self.http.delete(&url),
             other => return Err(format!("unsupported HTTP method: {other}")),
         }

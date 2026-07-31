@@ -130,7 +130,18 @@ fn parse_binance_status(status: &str) -> Option<OrderStatus> {
         "FILLED" => Some(OrderStatus::Filled),
         "CANCELED" | "EXPIRED" => Some(OrderStatus::Cancelled),
         "REJECTED" => Some(OrderStatus::Rejected),
-        _ => None,
+        // Statuses outside this gateway's current OrderStatus mapping
+        // (e.g. spot's EXPIRED_IN_MATCH, futures' NEW_INSURANCE /
+        // NEW_ADL) intentionally drop the whole event rather than
+        // guessing a mapping -- logged so a silent gap is diagnosable
+        // in production rather than invisible.
+        other => {
+            tracing::debug!(
+                status = other,
+                "unmapped Binance order status; event dropped"
+            );
+            None
+        }
     }
 }
 
@@ -237,6 +248,140 @@ fn spawn_stream_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BinanceGatewayConfig;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rest_against(mock_server: &MockServer) -> BinanceRestClient {
+        BinanceRestClient::new(BinanceGatewayConfig {
+            api_key: "test-api-key".to_string(),
+            api_secret: "test-api-secret".to_string(),
+            spot_base_url: mock_server.uri(),
+            futures_base_url: mock_server.uri(),
+            recv_window_ms: 5000,
+        })
+    }
+
+    #[tokio::test]
+    async fn obtain_listen_key_sends_post_and_parses_the_key() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v3/userDataStream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "listenKey": "spot-key-123"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        let key = obtain_listen_key(&rest, ApiFamily::Spot).await.unwrap();
+
+        assert_eq!(key, "spot-key-123");
+    }
+
+    #[tokio::test]
+    async fn obtain_listen_key_uses_futures_path_for_futures_family() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/fapi/v1/listenKey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "listenKey": "futures-key-456"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        let key = obtain_listen_key(&rest, ApiFamily::Futures).await.unwrap();
+
+        assert_eq!(key, "futures-key-456");
+    }
+
+    #[tokio::test]
+    async fn obtain_listen_key_surfaces_an_error_on_non_success_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v3/userDataStream"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "code": -2015,
+                "msg": "Invalid API-key"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        let result = obtain_listen_key(&rest, ApiFamily::Spot).await;
+
+        assert!(result.is_err());
+    }
+
+    // Regression test for the Task 17 review's Critical finding:
+    // `renew_listen_key` calls `signed_request("PUT", ...)`, which
+    // would fail with "unsupported HTTP method: PUT" before any
+    // network call if `signed_request` didn't support PUT. This test
+    // asserts the real PUT request actually reaches the mock server
+    // with the correct path and `listenKey` param, which fails loudly
+    // if PUT support regresses.
+    #[tokio::test]
+    async fn renew_listen_key_sends_put_with_the_listen_key_param() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v3/userDataStream"))
+            .and(query_param("listenKey", "spot-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        renew_listen_key(&rest, ApiFamily::Spot, "spot-key-123")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn renew_listen_key_uses_futures_path_for_futures_family() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/fapi/v1/listenKey"))
+            .and(query_param("listenKey", "futures-key-456"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        renew_listen_key(&rest, ApiFamily::Futures, "futures-key-456")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn renew_listen_key_surfaces_an_error_on_non_success_status() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/v3/userDataStream"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -1125,
+                "msg": "This listenKey does not exist."
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let rest = rest_against(&mock_server);
+        let result = renew_listen_key(&rest, ApiFamily::Spot, "expired-key").await;
+
+        assert!(result.is_err());
+    }
 
     #[test]
     fn parses_spot_execution_report_into_exchange_update() {
