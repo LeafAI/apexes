@@ -33,7 +33,7 @@
 **Interfaces:**
 - Produces: `pub enum RegistryError` (in `crate::error`), `pub struct VersionRow` / `pub struct CurrentVersionRow` (in `crate::schema`), `STRATEGY_VERSIONS_TABLE_DDL` / `STRATEGY_CURRENT_VERSION_TABLE_DDL` constants. Consumed by Task 2's `VersionStore`.
 
-- [ ] **Step 1: Add `sha2` to the workspace and register the new crate**
+- [x] **Step 1: Add `sha2` to the workspace and register the new crate**
 
 ```bash
 cd ~/src/oss/apexes
@@ -72,7 +72,7 @@ barter = "0.12"
 sha2 = "0.10"
 ```
 
-- [ ] **Step 2: Create `crates/apexes-strategy-registry/Cargo.toml`**
+- [x] **Step 2: Create `crates/apexes-strategy-registry/Cargo.toml`**
 
 ```toml
 [package]
@@ -102,7 +102,7 @@ rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 ```
 
-- [ ] **Step 3: Write `crates/apexes-strategy-registry/src/error.rs`**
+- [x] **Step 3: Write `crates/apexes-strategy-registry/src/error.rs`**
 
 ```rust
 //! Error type for `apexes-strategy-registry`.
@@ -171,7 +171,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run the error module's tests**
+- [x] **Step 4: Run the error module's tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -179,7 +179,7 @@ cargo test -p apexes-strategy-registry error:: -- --nocapture
 ```
 Expected: FAIL with a compile error (crate has no `lib.rs` yet) -- proceed to Step 5.
 
-- [ ] **Step 5: Write `crates/apexes-strategy-registry/src/schema.rs`**
+- [x] **Step 5: Write `crates/apexes-strategy-registry/src/schema.rs`**
 
 ```rust
 //! ClickHouse table schemas for `apexes-strategy-registry`.
@@ -277,7 +277,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: Write `crates/apexes-strategy-registry/src/lib.rs`**
+- [x] **Step 6: Write `crates/apexes-strategy-registry/src/lib.rs`**
 
 ```rust
 //! Apexes strategy version management & simplified (backtest-only)
@@ -298,7 +298,7 @@ pub use version_store::{VersionRecord, VersionStore};
 
 This will fail to compile until Tasks 2 and 3 create `version_store.rs`/`comparator.rs` -- that's expected; do not create empty stub files for them in this task.
 
-- [ ] **Step 7: Run only the modules that exist so far**
+- [x] **Step 7: Run only the modules that exist so far**
 
 ```bash
 cd ~/src/oss/apexes
@@ -306,7 +306,7 @@ cargo test -p apexes-strategy-registry error:: schema:: 2>&1 | head -40
 ```
 Expected: compile error referencing missing `comparator`/`version_store` modules (from `lib.rs`'s `pub mod` declarations) -- this is expected and resolved by Task 2. Do NOT attempt to fix it in this task.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 Since the crate does not compile yet (by design -- `lib.rs` declares modules Task 2/3 create), do not commit yet. Proceed directly to Task 2; Task 2's Step 8 will make the first commit covering both this task's and Task 2's files together, since a plan task must leave the workspace in a state where `cargo build --workspace` succeeds before committing (per Global Constraints).
 
@@ -321,7 +321,7 @@ Since the crate does not compile yet (by design -- `lib.rs` declares modules Tas
 - Consumes: `crate::error::RegistryError`, `crate::schema::{STRATEGY_VERSIONS_TABLE_DDL, STRATEGY_CURRENT_VERSION_TABLE_DDL, VersionRow, CurrentVersionRow}` (Task 1).
 - Produces: `pub struct VersionStore`, `pub struct VersionRecord`, with methods `new`, `publish`, `get_version`, `list_versions`, `current_version`, `set_current`. Consumed by Task 3's `CanaryComparator` and Task 4's integration test.
 
-- [ ] **Step 1: Write `crates/apexes-strategy-registry/src/version_store.rs`**
+- [x] **Step 1: Write `crates/apexes-strategy-registry/src/version_store.rs`**
 
 ```rust
 //! [`VersionStore`]: persists `.drift` script versions to ClickHouse
@@ -670,7 +670,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the new unit tests**
+- [x] **Step 2: Run the new unit tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -678,7 +678,7 @@ cargo test -p apexes-strategy-registry version_store:: -- --nocapture
 ```
 Expected: still a compile error, because `lib.rs` also declares `pub mod comparator;` which doesn't exist yet (Task 3). Confirm the ONLY remaining error mentions `comparator` -- if any error mentions `version_store` or `schema` or `error`, fix those first before proceeding.
 
-- [ ] **Step 3: Commit is deferred to Task 3**
+- [x] **Step 3: Commit is deferred to Task 3**
 
 Do not commit yet -- `cargo build --workspace` still fails until Task 3 creates `comparator.rs` (referenced by `lib.rs`'s `pub mod comparator;`). Proceed directly to Task 3.
 
@@ -693,7 +693,7 @@ Do not commit yet -- `cargo build --workspace` still fails until Task 3 creates 
 - Consumes: `crate::version_store::{VersionStore, VersionRecord}` (Task 2), `crate::error::RegistryError` (Task 1), `apexes_optimize::Evaluator` (existing), `apexes_backtest::InMemoryMarketDataSource` (existing).
 - Produces: `pub struct CanaryComparator<'a>` with `new`, `compare`, `compare_and_promote`. Consumed by Task 5's end-to-end integration test.
 
-- [ ] **Step 1: Write `crates/apexes-strategy-registry/src/comparator.rs`**
+- [x] **Step 1: Write `crates/apexes-strategy-registry/src/comparator.rs`**
 
 ```rust
 //! [`CanaryComparator`]: a simplified, backtest-only "canary" comparison
@@ -810,7 +810,7 @@ impl<'a> CanaryComparator<'a> {
 }
 ```
 
-- [ ] **Step 2: Run `cargo check` for the whole crate**
+- [x] **Step 2: Run `cargo check` for the whole crate**
 
 ```bash
 cd ~/src/oss/apexes
@@ -818,7 +818,7 @@ cargo check -p apexes-strategy-registry 2>&1 | tail -40
 ```
 Expected: succeeds with 0 errors (all three modules -- `error`, `schema`, `version_store`, `comparator` -- now exist and `lib.rs` compiles).
 
-- [ ] **Step 3: Run all unit tests written so far**
+- [x] **Step 3: Run all unit tests written so far**
 
 ```bash
 cd ~/src/oss/apexes
@@ -826,7 +826,7 @@ cargo test -p apexes-strategy-registry
 ```
 Expected: all tests from Tasks 1-3 pass (`error::tests` 2, `schema::tests` 2, `version_store::tests` 6), 0 failed. `comparator.rs` has no unit tests yet -- its logic is covered by Task 4's mock-based tests and Task 5's end-to-end test.
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -835,7 +835,7 @@ cargo fmt --check
 ```
 Expected clean. If `cargo fmt --check` reports diffs, run `cargo fmt` to auto-fix, then re-run this step's two commands again to confirm both are clean.
 
-- [ ] **Step 5: Full workspace build check**
+- [x] **Step 5: Full workspace build check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -843,7 +843,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors -- this is the first point in this plan where the new crate compiles as part of the whole workspace.
 
-- [ ] **Step 6: Commit Tasks 1-3 together**
+- [x] **Step 6: Commit Tasks 1-3 together**
 
 Tasks 1-3 are committed as one unit because `lib.rs`'s `pub mod` declarations mean the crate does not compile until all three modules exist (per Global Constraints: every task that touches compiled code must leave `cargo build --workspace` passing before committing).
 
@@ -865,11 +865,11 @@ git push origin master
 - Consumes: `crate::comparator::CanaryComparator` (Task 3), `crate::version_store::VersionStore` (Task 2). Requires a live ClickHouse instance for `VersionStore::new`/`publish` (this task's tests connect to `http://localhost:8123`, matching `apexes-storage`'s pattern of ClickHouse-dependent tests being `#[ignore]`d rather than mocked at the `VersionStore` layer -- see Step 1's rationale below).
 - Produces: nothing new consumed by later tasks -- this task only adds test coverage.
 
-- [ ] **Step 1: Decide test strategy for `CanaryComparator` (uses real `VersionStore`, marked `#[ignore]`)**
+- [x] **Step 1: Decide test strategy for `CanaryComparator` (uses real `VersionStore`, marked `#[ignore]`)**
 
 `CanaryComparator` takes `&VersionStore` directly (not a trait), and `VersionStore` has no in-memory/mock variant (per the design spec, ClickHouse is the sole backend, and introducing a parallel trait solely to enable mocking would contradict the "no new storage backend" constraint and add speculative abstraction not requested by the design). Therefore `CanaryComparator`'s tests require a real ClickHouse connection and are marked `#[ignore]`, consistent with `crates/apexes-storage/tests/live_clickhouse.rs`'s established pattern for any test that needs a live database. These tests live in `comparator.rs`'s own `#[cfg(test)]` module (not a separate `tests/` integration file) since they exercise `CanaryComparator` in isolation from the rest of the crate's public API surface, matching how `apexes-optimize/src/grid_search.rs` keeps its `MockEvaluator`-based tests inline in the same file as the code under test.
 
-- [ ] **Step 2: Append the test module to `crates/apexes-strategy-registry/src/comparator.rs`**
+- [x] **Step 2: Append the test module to `crates/apexes-strategy-registry/src/comparator.rs`**
 
 ```rust
 
@@ -1132,7 +1132,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Start ClickHouse and run the new tests**
+- [x] **Step 3: Start ClickHouse and run the new tests**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1142,7 +1142,7 @@ cargo test -p apexes-strategy-registry -- --ignored --nocapture
 ```
 Expected: all 6 new `#[ignore]`d tests pass (plus any prior `#[ignore]`d tests from `apexes-storage` if run in the same invocation -- run `cargo test -p apexes-strategy-registry -- --ignored` scoped to this crate only, as shown, to avoid coupling this task's pass/fail to unrelated crates).
 
-- [ ] **Step 4: Run the full (non-ignored) test suite plus clippy/fmt**
+- [x] **Step 4: Run the full (non-ignored) test suite plus clippy/fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1152,7 +1152,7 @@ cargo fmt --check
 ```
 Expected: non-ignored suite passes (10 tests: 2 error + 2 schema + 6 version_store), clippy clean, fmt clean. If `cargo fmt --check` reports diffs, run `cargo fmt`, then re-run all three commands in this step again to confirm.
 
-- [ ] **Step 5: Full workspace verification**
+- [x] **Step 5: Full workspace verification**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1163,7 +1163,7 @@ cargo fmt --check
 ```
 Expected: all clean, 0 failures.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1185,7 +1185,7 @@ git push origin master
 - Consumes: `apexes_strategy_registry::{VersionStore, CanaryComparator}` (Tasks 2-3), `apexes_strategy::drift_dsl::DriftScriptStrategy::from_file_with_params` (existing), `apexes_backtest::{run_backtest, BacktestConfig, CostModel, FlatFeeSchedule, ReplaySpeed, InMemoryMarketDataSource}` (existing), `apexes_optimize::Evaluator` (existing).
 - Produces: nothing new consumed by later tasks -- this is the plan's final behavioral proof point before Task 6's whole-effort verification.
 
-- [ ] **Step 1: Create the two fixture scripts**
+- [x] **Step 1: Create the two fixture scripts**
 
 ```bash
 mkdir -p ~/src/oss/apexes/crates/apexes-strategy-registry/tests/fixtures
@@ -1230,7 +1230,7 @@ function on_market_event(event, ctx) {
 EOF
 ```
 
-- [ ] **Step 2: Write the end-to-end test**
+- [x] **Step 2: Write the end-to-end test**
 
 Create `crates/apexes-strategy-registry/tests/registry_end_to_end.rs`:
 
@@ -1539,7 +1539,7 @@ async fn publish_compare_and_promote_selects_the_threshold_with_more_trades() {
 }
 ```
 
-- [ ] **Step 3: Add `uuid` as a dev-dependency (used by `tempfile_holder`)**
+- [x] **Step 3: Add `uuid` as a dev-dependency (used by `tempfile_holder`)**
 
 Edit `crates/apexes-strategy-registry/Cargo.toml`'s `[dev-dependencies]` section:
 
@@ -1553,7 +1553,7 @@ uuid = { workspace = true }
 apexes-core = { path = "../apexes-core" }
 ```
 
-- [ ] **Step 4: Run the end-to-end test**
+- [x] **Step 4: Run the end-to-end test**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1563,7 +1563,7 @@ cargo test -p apexes-strategy-registry --test registry_end_to_end -- --ignored -
 ```
 Expected: `1 passed`. If `results[0]`/`results[1]`'s trade counts don't match `dec!(4)`/`dec!(6)`, print `results` (temporarily) and cross-check against `sample_events()`'s six trade prices (`90000, 95000, 100000, 105000, 110000, 100000`) and each version's `threshold` (v1: `97000` -> prices `100000, 105000, 110000, 100000` exceed it = 4; v2: `80000` -> all six exceed it = 6) before assuming the fixture's math is wrong -- this is the same trade-counting logic already proven correct in `apexes-optimize`'s end-to-end test (`crates/apexes-optimize/tests/grid_search_end_to_end.rs`), reused here with the same depth-snapshot-before-any-trade ordering requirement.
 
-- [ ] **Step 5: Run the full crate test suite (ignored + non-ignored)**
+- [x] **Step 5: Run the full crate test suite (ignored + non-ignored)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1572,7 +1572,7 @@ cargo test -p apexes-strategy-registry -- --ignored
 ```
 Expected: non-ignored: 10 passed (2 error + 2 schema + 6 version_store). Ignored: 7 passed (6 from Task 4's `comparator.rs` tests + 1 from this task's `registry_end_to_end.rs`).
 
-- [ ] **Step 6: Run clippy and fmt**
+- [x] **Step 6: Run clippy and fmt**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1581,7 +1581,7 @@ cargo fmt --check
 ```
 Expected clean (auto-fix with `cargo fmt` if needed, then re-run both commands plus Step 5's non-ignored test command once more to confirm nothing regressed).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1596,7 +1596,7 @@ git push origin master
 
 **Files:** None created/modified -- this task only runs verification commands, updates `docs/FEATURES.md`, and confirms the end state.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1604,7 +1604,7 @@ cargo build --workspace
 ```
 Expected: succeeds, 0 errors.
 
-- [ ] **Step 2: Full workspace test suite (non-ignored)**
+- [x] **Step 2: Full workspace test suite (non-ignored)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1612,7 +1612,7 @@ cargo test --workspace
 ```
 Expected: all tests across all crates pass. Confirm `apexes-core`/`apexes-market-data`/`apexes-indicators`/`apexes-backtest`/`apexes-strategy`/`apexes-optimize` are completely unaffected by this plan (unchanged pass counts from before Task 1 started); `apexes-storage` unaffected; `apexes-strategy-registry` contributes exactly 10 new non-ignored tests (2 `error` + 2 `schema` + 6 `version_store`).
 
-- [ ] **Step 3: Full workspace test suite (ignored/live-ClickHouse)**
+- [x] **Step 3: Full workspace test suite (ignored/live-ClickHouse)**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1623,7 +1623,7 @@ cargo test -p apexes-strategy-registry -- --ignored
 ```
 Expected: `apexes-storage`'s pre-existing `#[ignore]`d tests still pass unchanged; `apexes-strategy-registry` contributes 7 new `#[ignore]`d tests (6 from `comparator.rs` + 1 end-to-end), all passing.
 
-- [ ] **Step 4: Full workspace clippy**
+- [x] **Step 4: Full workspace clippy**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1631,7 +1631,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: 0 warnings.
 
-- [ ] **Step 5: Full workspace fmt check**
+- [x] **Step 5: Full workspace fmt check**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1639,7 +1639,7 @@ cargo fmt --check
 ```
 Expected: 0 diffs.
 
-- [ ] **Step 6: Update `docs/FEATURES.md`**
+- [x] **Step 6: Update `docs/FEATURES.md`**
 
 Read `docs/FEATURES.md`, find row `2.5` (`Strategy version management & canary release`, currently `🔲 Not Started`). Update its Status to `✅ Done` and its Notes column to:
 ```
@@ -1648,7 +1648,7 @@ apexes-strategy-registry crate: VersionStore (ClickHouse-backed, append-only str
 
 **Important:** before finalizing, do not just increment the prior counts by 1/1 -- actually count the current `✅ Done` / `🔲 Not Started` / `⏸️ Deferred` rows in the file (e.g. `grep -c` against the row-level status markers, excluding the legend rows and the Summary table's own rows) and confirm your new numbers match Done+1, Not Started-1, Total unchanged, against the real counts. Update the Summary counts table accordingly and the "Current active work" paragraph to note sub-project `#4`'s five roadmap-scoped phases (`2.1`-`2.5`) are now all complete (PyO3 bindings, part of `2.1`'s full scope per the roadmap, remain explicitly deferred and unscheduled); leave "what's next" unstated since sub-project `#5` (risk engine) and the PyO3 evaluation are both still open options -- don't guess which one the user picks next.
 
-- [ ] **Step 7: Commit the FEATURES.md update**
+- [x] **Step 7: Commit the FEATURES.md update**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1657,7 +1657,7 @@ git commit -S -s -m "docs: mark strategy version management complete in FEATURES
 git push origin master
 ```
 
-- [ ] **Step 8: Mark this plan's checkboxes complete**
+- [x] **Step 8: Mark this plan's checkboxes complete**
 
 ```bash
 cd ~/src/oss/apexes
@@ -1671,7 +1671,7 @@ git commit -S -s -m "docs: mark apexes-strategy-registry plan complete"
 git push origin master
 ```
 
-- [ ] **Step 9: Report final summary**
+- [x] **Step 9: Report final summary**
 
 Summarize: `apexes-strategy-registry` crate's file list and line counts, total test count (broken down: unit tests per module, ignored/live-ClickHouse tests, the end-to-end integration test), confirmation that every other crate's pre-existing tests still pass unchanged, and the `apexes` commit SHAs for Tasks 1-6. No further commit needed for this verification-only task.
 
