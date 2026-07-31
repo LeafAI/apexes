@@ -157,12 +157,12 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 43 |
-| 📝 Designing | 1 |
-| 📋 Planned | 1 |
-| 🚧 In Progress | 1 |
-| ✅ Done | 28 |
-| ⏸️ Deferred | 2 |
-| **Total** | **76** |
+| 🔲 Not Started | 42 |
+| 📝 Designing | 0 |
+| 📋 Planned | 0 |
+| 🚧 In Progress | 0 |
+| ✅ Done | 27 |
+| ⏸️ Deferred | 1 |
+| **Total** | **70** |
 
 **Current active work:** Sub-projects `#0` (Foundation skeleton), `#1` (Binance Spot market data ingestion), `#2` (historical data storage — ClickHouse via `apexes-storage`), and `#3` (backtest engine via `apexes-backtest`) — all implementation complete (all plan tasks done, workspace builds/tests/clippy/fmt clean, live ClickHouse integration tests passing). Sub-project `#4`'s five roadmap-scoped phases (`2.1`-`2.5`) are now all complete: the strategy SDK (Rust-native strategy trait API + Drift Script integration, row `2.1`) via the `apexes-strategy` crate, the factor/technical indicator library (row `2.2`) via the `apexes-indicators` crate wired into `DriftScriptStrategy` as the `indicators.*` Drift Script binding, the multi-signal combination & position generation engine (row `2.3`) via the `signals.*` Drift Script binding (`signals.combine`/`signals.target_position`/`signals.rebalance_order`), the parameter optimization interface (row `2.4`) via the `apexes-optimize` crate (`SearchSpace`/`ParameterOptimizer`/`GridSearchOptimizer`/`ExternalProcessOptimizer`) plus `apexes-strategy`'s `param(name, default)` binding, and strategy version management & canary release (row `2.5`) via the `apexes-strategy-registry` crate (`VersionStore`/`CanaryComparator`). PyO3 bindings (part of `2.1`'s full scope per the roadmap) remain explicitly deferred and unscheduled. Sub-project `#5` (risk engine)'s first phase -- pre-trade and in-trade risk controls, rows `6.1`/`6.2` -- is now complete via the `apexes-risk` crate. Row `6.3` (post-trade risk & compliance reporting, owned by sub-project `#15`) and rows `6.4`/`6.5` (margin/leverage monitoring, extreme-market circuit breakers with automatic strategy de-risking) remain unstarted/deferred. Sub-project `#6` (paper trading)'s first two rows are now complete via the new `apexes-paper` crate: row `4.1` (virtual account & virtual fund management) via `PaperAccount`, and row `4.2` (real-time-feed-driven paper matching engine reusing the backtest matching kernel) via `run_paper_trading` on the shared event-loop core extracted from `apexes-backtest`; row `4.3` (order lifecycle state machine consistent with live trading) was already `Done` since sub-project `#0` and required no new work. What's next is not yet decided: the PyO3 bindings evaluation, rows `6.4`/`6.5`, and the next major sub-project (`#7` OMS, `#8` first live gateway, etc.) are all still open options.
