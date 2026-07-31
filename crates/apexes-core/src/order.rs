@@ -1,5 +1,5 @@
 use crate::error::ApexesError;
-use crate::instrument::Venue;
+use crate::instrument::{AssetClass, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ pub struct Order {
     pub exchange_order_id: Option<String>,
     pub symbol: String,
     pub venue: Venue,
+    pub asset_class: AssetClass,
     pub side: Side,
     pub order_type: OrderType,
     pub quantity: Decimal,
@@ -190,6 +191,7 @@ mod tests {
             exchange_order_id: None,
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: rust_decimal_macros::dec!(1.5),
@@ -213,6 +215,7 @@ mod tests {
             exchange_order_id: None,
             symbol: "AAPL".to_string(),
             venue: Venue::Nasdaq,
+            asset_class: AssetClass::Equity,
             side: Side::Sell,
             order_type: OrderType::Market,
             quantity: rust_decimal_macros::dec!(10),
@@ -235,6 +238,7 @@ mod tests {
             exchange_order_id: None,
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Sell,
             order_type: OrderType::Stop,
             quantity: rust_decimal_macros::dec!(1.0),
@@ -260,6 +264,7 @@ mod tests {
             exchange_order_id: None,
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::StopLimit,
             quantity: rust_decimal_macros::dec!(1.0),
