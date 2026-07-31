@@ -6,6 +6,7 @@ use crate::matching_engine::MatchingEngine;
 use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Order, OrderId, OrderType};
+use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{Strategy, StrategyContext};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -32,6 +33,15 @@ pub struct BacktestConfig {
     /// (design spec §8, matching `barter::statistic::metric`'s
     /// `calculate` signatures).
     pub risk_free_return: Decimal,
+    /// Optional risk checks run before submitting each `OrderIntent`
+    /// (rejected intents are logged via `tracing::warn!` and never
+    /// reach the matching engine) and after each `Fill` (violations are
+    /// logged, not propagated -- an in-trade violation does not undo a
+    /// fill that already happened, per `apexes-risk`'s design spec §一
+    /// "no automatic liquidation" decision). `None` means no risk
+    /// checking is performed, preserving this crate's pre-existing
+    /// behavior exactly.
+    pub risk_checker: Option<CompositeRiskChecker>,
 }
 
 /// Runs a full backtest: replays `market_data` in chronological order
@@ -40,7 +50,7 @@ pub struct BacktestConfig {
 /// `BacktestReport` with overall + per-symbol + per-venue performance
 /// summaries (design spec §8).
 pub async fn run_backtest(
-    config: BacktestConfig,
+    mut config: BacktestConfig,
     market_data: impl HistoricalMarketDataSource,
     mut strategy: impl Strategy,
 ) -> Result<BacktestReport, ApexesError> {
@@ -99,6 +109,19 @@ pub async fn run_backtest(
                         &fills,
                         config.risk_free_return,
                     )?;
+                    if let Some(risk_checker) = &mut config.risk_checker {
+                        for fill in &fills {
+                            if let Err(violations) =
+                                risk_checker.on_fill(fill, ledger.positions(), ledger.balances())
+                            {
+                                tracing::warn!(
+                                    ?violations,
+                                    symbol = %fill.symbol,
+                                    "in-trade risk monitor flagged a violation"
+                                );
+                            }
+                        }
+                    }
                     if let Some(order) = open_orders.get_mut(&order_id)
                         && let Some(last_fill) = fills.last()
                     {
@@ -124,6 +147,19 @@ pub async fn run_backtest(
         let intents = strategy.on_market_event(event, &ctx);
 
         for intent in intents {
+            if let Some(risk_checker) = &config.risk_checker
+                && let Err(violations) = risk_checker.check(
+                    &intent,
+                    ledger.positions(),
+                    ledger.balances(),
+                    &open_orders,
+                    timestamp,
+                )
+            {
+                tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+                continue;
+            }
+
             let submit_result = match intent.order_type {
                 OrderType::Market => matching_engine
                     .submit_market_order(&intent, timestamp)
@@ -149,6 +185,21 @@ pub async fn run_backtest(
                             &fills,
                             config.risk_free_return,
                         )?;
+                        if let Some(risk_checker) = &mut config.risk_checker {
+                            for fill in &fills {
+                                if let Err(violations) = risk_checker.on_fill(
+                                    fill,
+                                    ledger.positions(),
+                                    ledger.balances(),
+                                ) {
+                                    tracing::warn!(
+                                        ?violations,
+                                        symbol = %fill.symbol,
+                                        "in-trade risk monitor flagged a violation"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -338,6 +389,7 @@ mod tests {
             speed: ReplaySpeed::AsFastAsPossible,
             queue_position_factor: dec!(0.5),
             risk_free_return: Decimal::ZERO,
+            risk_checker: None,
         };
 
         let report = run_backtest(

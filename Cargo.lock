@@ -98,6 +98,7 @@ name = "apexes-backtest"
 version = "0.1.0"
 dependencies = [
  "apexes-core",
+ "apexes-risk",
  "apexes-storage",
  "apexes-strategy",
  "barter",

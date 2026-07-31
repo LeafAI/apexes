@@ -104,6 +104,7 @@ async fn full_backtest_produces_a_report_with_the_expected_trade() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        risk_checker: None,
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
@@ -139,6 +140,7 @@ async fn backtest_with_no_events_produces_an_empty_report_without_erroring() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        risk_checker: None,
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
@@ -247,6 +249,7 @@ async fn triggered_buy_stop_fill_reaches_report_trades_and_ledger() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        risk_checker: None,
     };
     let strategy = BuyStopOnceStrategy { has_placed: false };
 

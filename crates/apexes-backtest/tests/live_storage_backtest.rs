@@ -93,6 +93,7 @@ async fn backtest_reads_real_data_from_clickhouse_via_storage_market_data_source
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        risk_checker: None,
     };
 
     let report = run_backtest(config, market_data, NoOpStrategy)
