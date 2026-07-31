@@ -6,6 +6,7 @@
 //! prevention) and 6.2 (in-trade: position-limit circuit breaker).
 
 pub mod circuit_breaker;
+pub mod composite;
 pub mod error;
 pub mod in_trade;
 pub mod limits;
@@ -16,6 +17,7 @@ pub mod self_trade;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerInTradeAdapter, CircuitBreakerPreTradeAdapter,
 };
+pub use composite::CompositeRiskChecker;
 pub use error::{CircuitBreakerScope, RiskViolation};
 pub use in_trade::InTradeMonitor;
 pub use limits::{LimitChecker, RiskLimits};
