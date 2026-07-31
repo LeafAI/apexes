@@ -100,6 +100,7 @@ mod tests {
                 return vec![OrderIntent {
                     symbol: "BTCUSDT".to_string(),
                     venue: Venue::Binance,
+                    asset_class: AssetClass::Spot,
                     side: Side::Buy,
                     order_type: OrderType::Market,
                     quantity: dec!(1),

@@ -98,6 +98,7 @@ impl Strategy for BuyOnceStrategy {
         vec![OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: apexes_core::Side::Buy,
             order_type: apexes_core::OrderType::Market,
             quantity: dec!(1),

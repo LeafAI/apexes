@@ -261,6 +261,7 @@ impl MatchingEngine {
             exchange_order_id: None,
             symbol: intent.symbol.clone(),
             venue: intent.venue,
+            asset_class: intent.asset_class,
             side: intent.side,
             order_type: intent.order_type,
             quantity: intent.quantity,
@@ -310,6 +311,7 @@ impl MatchingEngine {
             exchange_order_id: None,
             symbol: intent.symbol.clone(),
             venue: intent.venue,
+            asset_class: intent.asset_class,
             side: intent.side,
             order_type: intent.order_type,
             quantity: intent.quantity,
@@ -398,6 +400,7 @@ impl MatchingEngine {
             exchange_order_id: None,
             symbol: intent.symbol.clone(),
             venue: intent.venue,
+            asset_class: intent.asset_class,
             side: intent.side,
             order_type: intent.order_type,
             quantity: intent.quantity,
@@ -681,7 +684,7 @@ impl MatchingEngine {
 mod tests {
     use super::*;
     use crate::cost_model::FlatFeeSchedule;
-    use apexes_core::Venue;
+    use apexes_core::{AssetClass, Venue};
     use rust_decimal_macros::dec;
 
     fn level(price: Decimal, quantity: Decimal) -> PriceLevel {
@@ -768,6 +771,7 @@ mod tests {
         OrderIntent {
             symbol: symbol.to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity,
@@ -879,6 +883,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Sell,
             order_type: OrderType::Market,
             quantity: dec!(1),
@@ -950,6 +955,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -980,6 +986,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -1015,6 +1022,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -1058,6 +1066,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -1099,6 +1108,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(5),
@@ -1137,6 +1147,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -1158,6 +1169,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: dec!(1),
@@ -1180,6 +1192,7 @@ mod tests {
             let intent = OrderIntent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Limit,
                 quantity,
@@ -1204,6 +1217,7 @@ mod tests {
             let intent = OrderIntent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Market,
                 quantity,
@@ -1226,6 +1240,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Stop,
             quantity: dec!(1),
@@ -1245,6 +1260,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::StopLimit,
             quantity: dec!(1),
@@ -1263,6 +1279,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Stop,
             quantity: dec!(1),
@@ -1293,6 +1310,7 @@ mod tests {
             let intent = OrderIntent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Stop,
                 quantity,
@@ -1324,6 +1342,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Stop,
             quantity: dec!(1),
@@ -1356,6 +1375,7 @@ mod tests {
                 &OrderIntent {
                     symbol: "BTCUSDT".to_string(),
                     venue: Venue::Binance,
+                    asset_class: AssetClass::Spot,
                     side: Side::Buy,
                     order_type: OrderType::Market,
                     quantity: dec!(4),
@@ -1374,6 +1394,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::Stop,
             quantity: dec!(1),
@@ -1392,6 +1413,7 @@ mod tests {
                 &OrderIntent {
                     symbol: "BTCUSDT".to_string(),
                     venue: Venue::Binance,
+                    asset_class: AssetClass::Spot,
                     side: Side::Buy,
                     order_type: OrderType::Market,
                     quantity: dec!(1),
@@ -1419,6 +1441,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Sell,
             order_type: OrderType::Stop,
             quantity: dec!(1),
@@ -1446,6 +1469,7 @@ mod tests {
                 &OrderIntent {
                     symbol: "BTCUSDT".to_string(),
                     venue: Venue::Binance,
+                    asset_class: AssetClass::Spot,
                     side: Side::Sell,
                     order_type: OrderType::Market,
                     quantity: dec!(4),
@@ -1473,6 +1497,7 @@ mod tests {
         let intent = OrderIntent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
             side: Side::Buy,
             order_type: OrderType::StopLimit,
             quantity: dec!(1),

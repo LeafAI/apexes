@@ -30,6 +30,7 @@ impl Strategy for BuyOnceStrategy {
             return vec![OrderIntent {
                 symbol: trade.symbol.clone(),
                 venue: trade.venue,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Market,
                 quantity: dec!(0.1),
@@ -166,6 +167,7 @@ impl Strategy for BuyStopOnceStrategy {
             return vec![OrderIntent {
                 symbol: trade.symbol.clone(),
                 venue: trade.venue,
+                asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 order_type: OrderType::Stop,
                 quantity: dec!(0.1),
