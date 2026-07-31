@@ -407,15 +407,14 @@ impl OrderManager {
                 continue;
             };
             let previous_status = order.status;
-            if order.exchange_order_id.is_none() {
+            let Some(exchange_order_id) = order.exchange_order_id.clone() else {
                 tracing::warn!(
                     order_id = ?client_order_id,
                     "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
                 );
                 continue;
-            }
+            };
             let order_snapshot = order.clone();
-            let exchange_order_id = order_snapshot.exchange_order_id.clone().unwrap();
 
             match self.gateway.query_order_status(&order_snapshot).await {
                 Ok(Some(status)) => {

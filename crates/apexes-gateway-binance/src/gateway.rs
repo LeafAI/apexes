@@ -271,7 +271,10 @@ impl ExecutionGateway for BinanceExecutionGateway {
 
     async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {
         let family = ApiFamily::from(order.asset_class);
-        let params = format!("symbol={}", order.symbol);
+        let Some(exchange_order_id) = &order.exchange_order_id else {
+            return Ok(Vec::new());
+        };
+        let params = format!("symbol={}&orderId={exchange_order_id}", order.symbol);
         let (status, body) = self
             .rest
             .signed_request("GET", family, Self::my_trades_path(family), &params)
