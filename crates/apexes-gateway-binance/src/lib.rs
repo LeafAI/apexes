@@ -9,6 +9,10 @@
 //! stub as of the version available when this crate was written).
 
 pub mod config;
+pub mod error;
+pub mod rest;
 pub mod signing;
 
 pub use config::BinanceGatewayConfig;
+pub use error::BinanceApiError;
+pub use rest::{ApiFamily, BinanceRestClient};
