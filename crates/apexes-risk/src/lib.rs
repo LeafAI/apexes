@@ -8,9 +8,11 @@
 pub mod error;
 pub mod in_trade;
 pub mod limits;
+pub mod lists;
 pub mod pre_trade;
 
 pub use error::{CircuitBreakerScope, RiskViolation};
 pub use in_trade::InTradeMonitor;
 pub use limits::{LimitChecker, RiskLimits};
+pub use lists::{ListMode, SymbolVenueList};
 pub use pre_trade::PreTradeCheck;
