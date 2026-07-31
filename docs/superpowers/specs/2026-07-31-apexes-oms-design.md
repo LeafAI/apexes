@@ -451,17 +451,46 @@ impl OrderManager {
     /// database was reset, or an order placed by a different process
     /// sharing the account), logs a `tracing::error!` and skips it (out
     /// of scope to fabricate a local record for an order we never
-    /// created). Local orders NOT present in the exchange's open-order
-    /// list are left unchanged if already terminal, or logged as a
-    /// discrepancy (`tracing::warn!`) if the local status is still
-    /// `New`/`PartiallyFilled` (meaning the exchange no longer
-    /// considers it open -- it must have reached a terminal state the
-    /// exchange isn't reporting via this endpoint; a full investigation
-    /// mechanism for this edge case is out of scope, see §十一).
-    /// Every status change made during reconciliation is persisted via
-    /// `store.upsert_order` and reflected in `open_orders`. Returns the
-    /// list of `OrderId`s whose status actually changed, so a caller can
-    /// log/alert on what reconciliation found.
+    /// created).
+    ///
+    /// **Second pass -- resolving orders the exchange no longer reports
+    /// as open (CORRECTED from an earlier draft of this design, which
+    /// treated this as an out-of-scope edge case; it is not -- it is
+    /// the PRIMARY mechanism by which an `Uncertain`/`New` order's
+    /// eventual `Filled` outcome is ever discovered, since
+    /// `ExecutionGateway::query_all_open_orders` is documented to
+    /// return only non-terminal orders by design and therefore
+    /// structurally cannot report a `Filled` order through the first
+    /// pass above no matter how many times it's called):** for every
+    /// local order still `New`/`PartiallyFilled` whose `client_order_id`
+    /// did NOT appear in the first pass's exchange-reported list, call
+    /// `gateway.query_order_status(exchange_order_id)` (this method,
+    /// unlike `query_all_open_orders`, is documented to return a
+    /// terminal status if one exists -- see §三). Three outcomes:
+    /// - `Ok(Some(status))`: overwrite local status with it
+    ///   unconditionally (same authoritative-exchange rationale as the
+    ///   first pass), persist, record in the returned changed-list.
+    /// - `Ok(None)`: the exchange has no record of this order at all
+    ///   (distinct from "still open" or "terminal") -- log
+    ///   `tracing::error!`, leave local status unchanged (do not guess).
+    /// - `Err(reason)`: the individual query failed (e.g. transient
+    ///   network error on this one call) -- log `tracing::warn!` and
+    ///   leave local status unchanged; does NOT abort the rest of
+    ///   `reconcile()` for other orders (one order's query failure must
+    ///   not block resolving every other order).
+    /// A local order with `exchange_order_id: None` (an `Uncertain`
+    /// submission that has never been resolved by any prior
+    /// `reconcile()` call) cannot be queried this way -- there is
+    /// nothing to query by yet -- and is instead handled by the first
+    /// pass above (matched by `client_order_id`, which
+    /// `query_all_open_orders` reports regardless of whether the local
+    /// side knows the `exchange_order_id`).
+    ///
+    /// Every status change made during reconciliation (either pass) is
+    /// persisted via `store.upsert_order` and reflected in
+    /// `open_orders`. Returns the list of `OrderId`s whose status
+    /// actually changed, so a caller can log/alert on what
+    /// reconciliation found.
     pub async fn reconcile(&mut self) -> Result<Vec<OrderId>, OmsError>;
 
     pub fn open_orders(&self) -> &HashMap<OrderId, Order>;
@@ -513,8 +542,33 @@ impl MockExecutionGateway {
     /// submitted as `client_order_id`, simulating a state change a test
     /// wants `reconcile()` to discover. Panics if `client_order_id` was
     /// never submitted through this mock (a test setup error, not a
-    /// runtime condition to handle gracefully).
+    /// runtime condition to handle gracefully). Setting a TERMINAL
+    /// status (e.g. `Filled`) here is exactly how a test exercises
+    /// `reconcile()`'s second pass (`query_order_status`-based
+    /// resolution, see §六) -- `query_order_status`'s mock
+    /// implementation searches the full `exchange_state` map
+    /// unfiltered, so a terminal status set here remains discoverable
+    /// via `query_order_status` even though `query_all_open_orders`
+    /// (which DOES filter to non-terminal statuses) will no longer
+    /// report it.
     pub fn set_exchange_state(&self, client_order_id: OrderId, status: OrderStatus);
+
+    /// Directly registers exchange-side state for `client_order_id`
+    /// WITHOUT requiring a prior `submit_order` call to have gone
+    /// through this mock -- needed because a programmed `Uncertain`
+    /// `submit_order` outcome does NOT itself populate `exchange_state`
+    /// (there is nothing to record: the mock doesn't know whether the
+    /// exchange actually processed it). Used to simulate an order whose
+    /// `submit_order` returned `Uncertain` later being confirmed
+    /// (accepted, or gone straight to a terminal status) by the
+    /// exchange -- the exact scenario `OrderManager::reconcile` exists
+    /// to resolve.
+    pub fn force_register_exchange_order(
+        &self,
+        client_order_id: OrderId,
+        exchange_order_id: &str,
+        status: OrderStatus,
+    );
 }
 
 #[async_trait]
@@ -608,7 +662,12 @@ volumes:
 2. **`MockExecutionGateway` 自身单元测试**：验证可编程的 outcome 被正确消费（用一次即清空，未编程时默认 `Accepted`）、`set_exchange_state`/`query_all_open_orders` 正确反映测试设置的状态。
 3. **`OrderManager::submit_order` 单元测试**（用 `MockExecutionGateway`，`OrderStore` 指向一个真实但每测试独立的 PostgreSQL schema/database，或用 `#[ignore]` 处理——见下方测试隔离说明）：风控检查失败时不创建任何订单；`GatewayOutcome::Accepted` 时订单进入 `open_orders`且 `exchange_order_id` 被正确设置；`Rejected` 时订单标记 `Rejected`且不进入 `open_orders`；`Uncertain` 时订单保持 `New`且**仍然**进入 `open_orders`（后续等待 reconcile）。
 4. **`OrderManager::cancel_order` 单元测试**：撤销不存在的订单返回 `OrderNotFound`；撤销已终结状态订单（如 `Filled`）返回 `OrderNotCancellable`；三种 `GatewayOutcome` 分支行为与 `submit_order`对应逻辑一致地验证。
-5. **`OrderManager::reconcile` 单元测试**（本设计的核心验证点）：模拟"断线前提交一个订单（`Accepted`，本地 `New`）→ 测试直接用 `set_exchange_state(order_id, ...)`把交易所侧状态改为 `Filled`（模拟断线期间成交）→ 调用 `reconcile()`→ 验证本地订单状态被更新为 `Filled`，即使这个转换按 `can_transition_to`规则是不允许跳过 `PartiallyFilled`的"；验证 reconcile 返回的"状态变化订单列表"准确；验证交易所未报告的本地非终态订单被记录警告（不 panic，不静默丢弃）；**新增关键场景**：验证一个 `submit_order`返回 `Uncertain`（本地 `exchange_order_id`仍为 `None`）的订单，在 `reconcile()`按 `client_order_id`（而非 `exchange_order_id`）匹配到交易所记录后，`exchange_order_id`被正确回填、状态被正确更新——这是验证"客户端订单号"关联机制本身工作正常的测试，也是本设计对 §三 提出的"`Uncertain`订单如何最终被对账解决"问题的具体回答。
+5. **`OrderManager::reconcile` 单元测试**（本设计的核心验证点，**因 `query_all_open_orders`"仅报告未结束订单"的契约，测试策略已修正**——见 §六对 `reconcile()` 的更新说明）：
+   - **第一遍（client_order_id 匹配 + 无条件覆盖）**：提交订单（`Accepted`，本地 `New`）→ 用 `set_exchange_state`把交易所侧状态改为 `PartiallyFilled`（**注意：不能用 `Filled`，因为 `Filled` 是终态，`MockExecutionGateway::query_all_open_orders`按其自身实现只返回 `New`/`PartiallyFilled`，`Filled`订单永远不会出现在这一路径的结果里**）→ 调用 `reconcile()`→ 验证本地状态被更新为 `PartiallyFilled`。
+   - **第二遍（`query_order_status`解析终态，这才是订单变 `Filled`被发现的路径）**：提交订单（`Accepted`，本地 `New`，已有 `exchange_order_id`）→ 用 mock 网关的一个新方法把该 `exchange_order_id`对应的"单独查询"结果设为 `Filled`（同时确保它不再出现在 `query_all_open_orders`的返回列表里，模拟"已成交、不再是未结束订单"）→ 调用 `reconcile()`→ 验证：a) 该订单未出现在第一遍的 `query_all_open_orders`结果里；b) `reconcile()`对这类"本地非终态但交易所未报告为开放"的订单，改为调用 `gateway.query_order_status(exchange_order_id)` 得到 `Ok(Some(Filled))`；c) 本地状态被正确更新为 `Filled`，订单从 `open_orders`中移除，变化被记录进返回的"状态变化订单列表"。
+   - **`query_order_status`返回 `Ok(None)`的边界情况**：验证本地非终态订单查询后交易所完全没有记录时，只记录 `tracing::error!`，本地状态不变，不 panic、不猜测。
+   - **`query_order_status`返回 `Err`的边界情况**：验证单个订单查询失败（如临时网络错误）不会中断其余订单的对账处理。
+   - **`Uncertain`订单的对账关键场景**：验证一个 `submit_order`返回 `Uncertain`（本地 `exchange_order_id`仍为 `None`）的订单，在 `reconcile()`第一遍按 `client_order_id`（而非 `exchange_order_id`）匹配到交易所 `query_all_open_orders`报告的记录后，`exchange_order_id`被正确回填、状态被正确更新——这是验证"客户端订单号"关联机制本身工作正常的测试。注意：如果该 `Uncertain`订单最终状态是终态（如直接 `Filled`)，则它既不会出现在 `query_all_open_orders`里，本地也没有 `exchange_order_id`可供 `query_order_status`查询——这种"提交结果不确定 + 交易所侧从未变成过'开放'状态就直接终结"的情况，本设计承认无法通过现有 `ExecutionGateway`接口自动解决，需要留给未来评估（可能需要交易所支持"按客户端订单号查询"的额外接口能力）。
 6. **端到端集成测试**（`crates/apexes-oms/tests/live_postgres.rs`，`#[ignore]`，需要真实 PostgreSQL，沿用 `apexes-storage`既有的 `#[ignore]`模式）：完整走一遍"构造 `OrderManager` → 提交订单 → 模拟进程重启（新建一个指向同一 PostgreSQL 的 `OrderManager` 实例）→ 验证 `open_orders`从数据库正确恢复 → 调用 `reconcile` → 验证最终状态"的全流程。
 7. **全工作区验证**：`cargo build --workspace` / `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --check`。
 
@@ -625,5 +684,5 @@ volumes:
 - 不做订单提交/撤单的自动重试机制（"结果不确定"时只保留原状态等待对账，不自动重发）
 - 不迁移 `apexes-strategy-registry`到 PostgreSQL（保持现有 ClickHouse 实现不变）
 - 不做可插拔的关系型数据库后端抽象（直接绑定 PostgreSQL）
-- 不解决"本地非终态订单、但交易所未在 `query_all_open_orders`结果中报告"这一边界情况的自动化处理——本轮只记录警告，深入调查机制留给未来评估
+- **（已修正，不再是非目标）**"本地非终态订单、但交易所未在 `query_all_open_orders`结果中报告"这一场景**必须**处理，不能只记录警告——这正是 `Uncertain`/`New` 订单最终变成 `Filled` 被发现的**主要路径**，因为 `query_all_open_orders` 按其自身契约（"仅返回未结束订单"）结构性地永远不会报告终态订单。`reconcile()` 对这类订单改为调用 `query_order_status`（能返回任意终态）逐一解析真实状态。仍然不做的是：查询到"交易所完全没有这笔订单记录"（`Ok(None)`）时的自动化调查/修复——这种情况只记录 `tracing::error!`，不猜测、不自动修正，深入调查机制留给未来评估。
 - 不做持仓/余额跟踪——`OrderManager::submit_order`所需的 `positions`/`balances`快照由调用方提供（类似 `apexes_backtest::PortfolioLedger`的能力留给 `#11`账户与资金管理去补齐，本轮 OMS 不重新实现）
