@@ -77,6 +77,22 @@ impl BinanceExecutionGateway {
             })
         }
     }
+
+    /// Starts the Binance User Data Stream (both Spot and Futures),
+    /// returning a handle that must be kept alive for as long as the
+    /// stream should keep running, plus the merged update stream
+    /// itself. See `crate::user_data_stream` for details.
+    pub async fn start_user_data_stream(
+        &self,
+    ) -> Result<
+        (
+            crate::user_data_stream::UserDataStreamHandle,
+            impl futures::Stream<Item = apexes_oms::ExchangeUpdate>,
+        ),
+        String,
+    > {
+        crate::user_data_stream::start_user_data_stream(self.rest.clone()).await
+    }
 }
 
 /// Binance's order-response JSON shape (both submit and cancel

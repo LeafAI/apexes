@@ -13,8 +13,10 @@ pub mod error;
 pub mod gateway;
 pub mod rest;
 pub mod signing;
+pub mod user_data_stream;
 
 pub use config::BinanceGatewayConfig;
 pub use error::BinanceApiError;
 pub use gateway::BinanceExecutionGateway;
 pub use rest::{ApiFamily, BinanceRestClient};
+pub use user_data_stream::UserDataStreamHandle;
