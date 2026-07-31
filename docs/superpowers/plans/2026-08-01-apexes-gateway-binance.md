@@ -2395,6 +2395,8 @@ sha2 = "0.10"
 hex = "0.4"
 ```
 
+**Post-implementation correction (discovered during Task 13):** `hmac = "0.13"` is incompatible with the workspace's pinned `sha2 = "0.10"` — `hmac 0.13` depends on `digest 0.11`, while `sha2 0.10` depends on `digest 0.10`, and the resulting duplicate-`digest`-major-version conflict fails to compile (`E0599: no function or associated item named 'new_from_slice'`, plus a `HashMarker` trait-bound mismatch). Task 13's implementer downgraded the workspace dependency to `hmac = "0.12"` (verified independently by the controller: `hmac 0.13` reproducibly fails against `sha2 0.10`, `hmac 0.12` compiles cleanly) — use `hmac = "0.12"`, not `"0.13"`, if replicating this setup.
+
 Note: `wiremock` is NOT added here. It's a dev-dependency only, and this codebase's existing convention is that per-crate `[dev-dependencies]` sections pin their own versions directly (e.g. `rust_decimal_macros = "1.40"` appears independently in every crate's `[dev-dependencies]`, never hoisted to `[workspace.dependencies]`) — `wiremock = "0.6"` is declared directly in `apexes-gateway-binance/Cargo.toml`'s `[dev-dependencies]` in Step 2 below, matching that precedent.
 
 Add to the workspace's `members` list:
@@ -2548,7 +2550,7 @@ mod tests {
         let signature = sign_query_string(secret, query);
         assert_eq!(
             signature,
-            "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b1"
+            "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
         );
     }
 
