@@ -5,6 +5,7 @@
 //! rows 6.1 (pre-trade: limits, black/white lists, self-trade
 //! prevention) and 6.2 (in-trade: position-limit circuit breaker).
 
+pub mod circuit_breaker;
 pub mod error;
 pub mod in_trade;
 pub mod limits;
@@ -12,6 +13,9 @@ pub mod lists;
 pub mod pre_trade;
 pub mod self_trade;
 
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerInTradeAdapter, CircuitBreakerPreTradeAdapter,
+};
 pub use error::{CircuitBreakerScope, RiskViolation};
 pub use in_trade::InTradeMonitor;
 pub use limits::{LimitChecker, RiskLimits};
