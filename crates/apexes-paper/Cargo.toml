@@ -1,0 +1,24 @@
+[package]
+name = "apexes-paper"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-backtest = { path = "../apexes-backtest" }
+apexes-market-data = { path = "../apexes-market-data" }
+apexes-risk = { path = "../apexes-risk" }
+tokio = { workspace = true, features = ["time", "sync"] }
+futures = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

@@ -186,6 +186,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-paper"
+version = "0.1.0"
+dependencies = [
+ "apexes-backtest",
+ "apexes-core",
+ "apexes-market-data",
+ "apexes-risk",
+ "apexes-strategy",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "apexes-risk"
 version = "0.1.0"
 dependencies = [
