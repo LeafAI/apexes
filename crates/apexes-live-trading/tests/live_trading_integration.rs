@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use apexes_core::registry::Registry;
 use apexes_core::{
     AssetClass, DepthUpdate, Instrument, MarketDataProvider, MarketEvent, MarketType, OrderType,
     PriceLevel, Side, TradeEvent, Venue,
@@ -27,6 +28,25 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use rust_decimal_macros::dec;
 use tokio::sync::oneshot;
+
+/// Each test constructs its own isolated `Registry` (rather than using
+/// the process-wide `apexes_core::registry::global()`), so each test's
+/// `MockExecutionGateway`/`MockMarketDataProvider` instances don't
+/// collide with any other test's registrations -- see
+/// `apexes-oms`'s own test module for the identical rationale.
+fn registry_with(
+    gateway: Arc<dyn ExecutionGateway>,
+    provider: Arc<dyn MarketDataProvider>,
+) -> Registry {
+    let registry = Registry::new();
+    registry
+        .register::<Arc<dyn ExecutionGateway>, ()>((), gateway)
+        .unwrap();
+    registry
+        .register::<Arc<dyn MarketDataProvider>, Venue>(Venue::Binance, provider)
+        .unwrap();
+    registry
+}
 
 const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
 
@@ -144,20 +164,16 @@ fn base_config() -> LiveTradingConfig {
 #[ignore]
 async fn strategy_order_is_submitted_and_a_push_update_produces_a_fill() {
     clean_db().await;
-    let gateway = Arc::new(MockExecutionGateway::new());
-    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
-    let order_manager = OrderManager::new(
-        store,
-        Arc::clone(&gateway) as Arc<dyn ExecutionGateway>,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let provider = MockMarketDataProvider {
+    let gateway: Arc<dyn ExecutionGateway> = Arc::new(MockExecutionGateway::new());
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(MockMarketDataProvider {
         events: sample_events(),
         keep_open: false,
-    };
+    });
+    let registry = registry_with(Arc::clone(&gateway), provider);
+
+    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+    let order_manager = OrderManager::new(store, &registry).await.unwrap();
+
     let (_tx, rx) = oneshot::channel();
 
     // No exchange_updates in this run (empty stream) -- exercises only
@@ -166,10 +182,9 @@ async fn strategy_order_is_submitted_and_a_push_update_produces_a_fill() {
 
     let report = run_live_trading(
         base_config(),
-        &provider,
+        &registry,
         BuyOnceStrategy { bought: false },
         order_manager,
-        None,
         exchange_updates,
         rx,
     )
@@ -190,14 +205,14 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
 
     clean_db().await;
     let gateway = Arc::new(MockExecutionGateway::new());
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(MockMarketDataProvider {
+        events: vec![],
+        keep_open: true,
+    });
+    let registry = registry_with(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>, provider);
+
     let store = OrderStore::new(POSTGRES_URL).await.unwrap();
-    let mut order_manager = OrderManager::new(
-        store,
-        Arc::clone(&gateway) as Arc<dyn ExecutionGateway>,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut order_manager = OrderManager::new(store, &registry).await.unwrap();
 
     // Submit one order directly (bypassing the strategy path) so we
     // have a known OrderId to push an ExchangeUpdate for.
@@ -231,11 +246,6 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
         }],
     );
 
-    let provider = MockMarketDataProvider {
-        events: vec![],
-        keep_open: true,
-    };
-
     let exchange_order_id = order_manager
         .open_orders()
         .get(&order_id)
@@ -261,10 +271,9 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
 
     let report = run_live_trading(
         base_config(),
-        &provider,
+        &registry,
         BuyOnceStrategy { bought: true }, // already "bought" so it emits no new intents
         order_manager,
-        None,
         exchange_updates,
         rx_stop,
     )

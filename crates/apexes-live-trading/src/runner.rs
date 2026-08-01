@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use apexes_backtest::{PerformanceSummary, PerformanceTracker, PortfolioLedger};
-use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent};
+use apexes_core::registry::Registry;
+use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent, Venue};
 use apexes_oms::{ExchangeUpdate, OrderManager};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{Strategy, StrategyContext};
@@ -56,10 +59,9 @@ pub struct LiveTradingReport {
 /// passed to `risk_checker`'s `on_fill` in addition to `check`.
 pub async fn run_live_trading(
     config: LiveTradingConfig,
-    market_data_provider: &dyn MarketDataProvider,
+    registry: &Registry,
     mut strategy: impl Strategy,
     mut order_manager: OrderManager,
-    mut risk_checker: Option<CompositeRiskChecker>,
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin,
     mut stop_signal: oneshot::Receiver<()>,
 ) -> Result<LiveTradingReport, ApexesError> {
@@ -69,7 +71,13 @@ pub async fn run_live_trading(
         });
     }
 
-    let mut market_events = market_data_provider.subscribe(&config.instruments).await?;
+    let mut risk_checker: Option<Arc<CompositeRiskChecker>> = registry
+        .try_one::<Arc<CompositeRiskChecker>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
+        })?;
+
+    let mut market_events = subscribe_all_venues(registry, &config.instruments).await?;
 
     // Once `exchange_updates` ends (returns `None`), chain in a
     // `pending()` stream that never resolves, so this branch stops
@@ -173,7 +181,7 @@ pub async fn run_live_trading(
 async fn handle_market_event(
     event: &MarketEvent,
     strategy: &mut impl Strategy,
-    risk_checker: &Option<CompositeRiskChecker>,
+    risk_checker: &Option<Arc<CompositeRiskChecker>>,
     order_manager: &mut OrderManager,
     ledger: &PortfolioLedger,
 ) {
@@ -222,7 +230,7 @@ async fn handle_market_event(
 fn apply_new_fills(
     ledger: &mut PortfolioLedger,
     tracker: &mut PerformanceTracker,
-    risk_checker: &mut Option<CompositeRiskChecker>,
+    risk_checker: &mut Option<Arc<CompositeRiskChecker>>,
     all_fills: &mut Vec<Fill>,
     new_fills: Vec<Fill>,
 ) {
@@ -275,4 +283,48 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
     }
+}
+
+/// Groups `instruments` by `Venue`, looks up the one registered
+/// `Arc<dyn MarketDataProvider>` for each distinct venue involved
+/// (`registry.get::<Arc<dyn MarketDataProvider>, Venue>()`), subscribes
+/// each provider to its own subset of `instruments`, and merges all the
+/// resulting streams into one via `futures::stream::select_all` -- so
+/// the rest of `run_live_trading`'s event loop sees a single unified
+/// `MarketEvent` stream regardless of how many distinct venues
+/// `config.instruments` actually spans. Returns
+/// `Err(ApexesError::SubscriptionFailed)` if any involved venue has no
+/// registered provider.
+async fn subscribe_all_venues(
+    registry: &Registry,
+    instruments: &[Instrument],
+) -> Result<futures::stream::SelectAll<futures::stream::BoxStream<'static, MarketEvent>>, ApexesError>
+{
+    let providers = registry.get::<Arc<dyn MarketDataProvider>, Venue>();
+
+    let mut instruments_by_venue: HashMap<Venue, Vec<Instrument>> = HashMap::new();
+    for instrument in instruments {
+        instruments_by_venue
+            .entry(instrument.venue)
+            .or_default()
+            .push(instrument.clone());
+    }
+
+    let mut streams = Vec::new();
+    for (venue, venue_instruments) in instruments_by_venue {
+        let provider = providers
+            .get(&venue)
+            .ok_or_else(|| ApexesError::SubscriptionFailed {
+                symbol: venue_instruments
+                    .first()
+                    .map(|i| i.symbol.clone())
+                    .unwrap_or_default(),
+                venue,
+                reason: "no MarketDataProvider registered for this venue".to_string(),
+                source_detail: None,
+            })?;
+        streams.push(provider.subscribe(&venue_instruments).await?);
+    }
+
+    Ok(futures::stream::select_all(streams))
 }
