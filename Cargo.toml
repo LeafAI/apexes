@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms", "crates/apexes-gateway-binance", "crates/apexes-live-trading"]
+members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms", "crates/apexes-gateway-binance", "crates/apexes-live-trading", "crates/apexes-ems"]
 
 [workspace.package]
 edition = "2024"

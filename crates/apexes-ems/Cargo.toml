@@ -1,0 +1,25 @@
+[package]
+name = "apexes-ems"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-oms = { path = "../apexes-oms" }
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-storage = { path = "../apexes-storage" }
+tokio = { workspace = true, features = ["time", "sync"] }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

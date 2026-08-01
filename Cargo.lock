@@ -139,6 +139,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-ems"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-oms",
+ "apexes-storage",
+ "apexes-strategy",
+ "async-trait",
+ "chrono",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "apexes-gateway-binance"
 version = "0.1.0"
 dependencies = [
