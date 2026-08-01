@@ -46,6 +46,7 @@ async fn subscribing_to_btcusdt_produces_all_four_market_event_variants() {
                 MarketEvent::Tick(_) => saw_tick = true,
                 MarketEvent::Depth(_) => saw_depth = true,
                 MarketEvent::Bar(_) => saw_bar = true,
+                MarketEvent::MarkPrice(_) => {} // Spot-only test; MarkPrice never emitted for Spot instruments.
             },
             Ok(None) => break,
             Err(_timeout) => break,

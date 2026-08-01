@@ -371,6 +371,7 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Depth(depth) => depth.timestamp,
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
+        MarketEvent::MarkPrice(mark_price) => mark_price.timestamp,
     }
 }
 

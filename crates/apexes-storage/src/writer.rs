@@ -66,6 +66,9 @@ impl StorageWriter {
             BatchVariant::Tick => self.write_ticks(events).await,
             BatchVariant::Depth => self.write_depth(events).await,
             BatchVariant::Bar => self.write_bars(events).await,
+            BatchVariant::MarkPrice => Err(StorageError::QueryFailed {
+                reason: "MarkPrice writing not yet implemented (see Task 5)".to_string(),
+            }),
         }
     }
 
@@ -129,6 +132,7 @@ enum BatchVariant {
     Tick,
     Depth,
     Bar,
+    MarkPrice,
 }
 
 fn variant_of(event: &MarketEvent) -> BatchVariant {
@@ -137,6 +141,7 @@ fn variant_of(event: &MarketEvent) -> BatchVariant {
         MarketEvent::Tick(_) => BatchVariant::Tick,
         MarketEvent::Depth(_) => BatchVariant::Depth,
         MarketEvent::Bar(_) => BatchVariant::Bar,
+        MarketEvent::MarkPrice(_) => BatchVariant::MarkPrice,
     }
 }
 

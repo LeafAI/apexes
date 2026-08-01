@@ -22,6 +22,7 @@ pub enum EventType {
     Tick,
     Depth,
     Bar,
+    MarkPrice,
 }
 
 /// A day-independent intraday volume distribution: the fraction of a
@@ -72,6 +73,9 @@ impl StorageReader {
             EventType::Tick => self.read_ticks(symbol, &venue_str, start, end).await,
             EventType::Depth => self.read_depth(symbol, &venue_str, start, end).await,
             EventType::Bar => self.read_bars(symbol, &venue_str, start, end).await,
+            EventType::MarkPrice => Err(StorageError::QueryFailed {
+                reason: "MarkPrice reading not yet implemented (see Task 4)".to_string(),
+            }),
         }
     }
 

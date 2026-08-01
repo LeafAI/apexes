@@ -16,6 +16,7 @@ pub use error::ApexesError;
 pub use fill::{Fill, FillId};
 pub use instrument::{AssetClass, Instrument, MarketType, Venue};
 pub use market_data::{
-    Bar, BarInterval, DepthUpdate, MarketDataProvider, MarketEvent, PriceLevel, Tick, TradeEvent,
+    Bar, BarInterval, DepthUpdate, MarkPriceUpdate, MarketDataProvider, MarketEvent, PriceLevel,
+    Tick, TradeEvent,
 };
 pub use order::{Order, OrderId, OrderStatus, OrderType, Side};

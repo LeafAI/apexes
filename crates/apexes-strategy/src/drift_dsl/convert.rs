@@ -3,8 +3,8 @@
 //! names and script-facing shapes are precisely controlled.
 
 use apexes_core::{
-    AssetClass, Bar, BarInterval, DepthUpdate, MarketEvent, OrderType, PriceLevel, Side, Tick,
-    TradeEvent, Venue,
+    AssetClass, Bar, BarInterval, DepthUpdate, MarkPriceUpdate, MarketEvent, OrderType, PriceLevel,
+    Side, Tick, TradeEvent, Venue,
 };
 use drift_script::DriftValue;
 use std::collections::HashMap;
@@ -179,6 +179,21 @@ pub fn market_event_to_drift_value(event: &MarketEvent) -> DriftValue {
                     .map(string_value)
                     .unwrap_or(DriftValue::Null),
             );
+            obj.insert(
+                "timestamp".to_string(),
+                string_value(timestamp.to_rfc3339()),
+            );
+        }
+        MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol,
+            venue,
+            mark_price,
+            timestamp,
+        }) => {
+            obj.insert("type".to_string(), string_value("mark_price"));
+            obj.insert("symbol".to_string(), string_value(symbol.clone()));
+            obj.insert("venue".to_string(), string_value(venue_to_str(*venue)));
+            obj.insert("mark_price".to_string(), decimal_to_number(*mark_price));
             obj.insert(
                 "timestamp".to_string(),
                 string_value(timestamp.to_rfc3339()),
