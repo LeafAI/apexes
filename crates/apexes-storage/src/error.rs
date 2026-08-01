@@ -19,6 +19,14 @@ pub enum StorageError {
 
     #[error("ClickHouse query failed: {reason}")]
     QueryFailed { reason: String },
+
+    #[error(
+        "insufficient history for intraday volume curve: requested {requested_days} days, only {available_days} available"
+    )]
+    InsufficientHistory {
+        available_days: u32,
+        requested_days: u32,
+    },
 }
 
 impl From<clickhouse::error::Error> for StorageError {
@@ -59,6 +67,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "failed to convert Decimal to ClickHouse FixedPoint: overflow"
+        );
+    }
+
+    #[test]
+    fn insufficient_history_display() {
+        let err = StorageError::InsufficientHistory {
+            available_days: 3,
+            requested_days: 10,
+        };
+        assert_eq!(
+            err.to_string(),
+            "insufficient history for intraday volume curve: requested 10 days, only 3 available"
         );
     }
 }

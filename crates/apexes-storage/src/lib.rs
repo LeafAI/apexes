@@ -10,5 +10,5 @@ pub mod schema;
 pub mod writer;
 
 pub use error::StorageError;
-pub use reader::{EventType, StorageReader};
+pub use reader::{EventType, StorageReader, VolumeCurve};
 pub use writer::StorageWriter;

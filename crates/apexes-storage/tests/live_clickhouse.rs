@@ -6,8 +6,9 @@
 use apexes_core::{
     Bar, BarInterval, DepthUpdate, MarketEvent, PriceLevel, Side, Tick, TradeEvent, Venue,
 };
-use apexes_storage::{EventType, StorageReader, StorageWriter};
-use chrono::Utc;
+use apexes_storage::{EventType, StorageError, StorageReader, StorageWriter};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 const CLICKHOUSE_URL: &str = "http://localhost:8123";
@@ -241,4 +242,99 @@ async fn write_batch_rejects_mixed_event_types() {
         result.is_err(),
         "write_batch should reject a mixed-variant batch"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn intraday_volume_curve_averages_across_lookback_days() {
+    let writer = StorageWriter::new(CLICKHOUSE_URL).await.unwrap();
+    let reader = StorageReader::new(CLICKHOUSE_URL).await.unwrap();
+
+    // Seed 2 days of 1-hour bars for the same symbol/venue, each day
+    // with the SAME hourly volume distribution (50% of daily volume in
+    // the first bar, 50% in the second) so the averaged curve has an
+    // exactly predictable shape regardless of which two days ClickHouse
+    // picks up.
+    let day1_bars = vec![
+        test_bar(
+            "EMSCURVE",
+            Venue::Binance,
+            "2026-01-01T00:00:00Z",
+            dec!(100),
+        ),
+        test_bar(
+            "EMSCURVE",
+            Venue::Binance,
+            "2026-01-01T01:00:00Z",
+            dec!(100),
+        ),
+    ];
+    let day2_bars = vec![
+        test_bar(
+            "EMSCURVE",
+            Venue::Binance,
+            "2026-01-02T00:00:00Z",
+            dec!(200),
+        ),
+        test_bar(
+            "EMSCURVE",
+            Venue::Binance,
+            "2026-01-02T01:00:00Z",
+            dec!(200),
+        ),
+    ];
+    let events: Vec<MarketEvent> = day1_bars
+        .into_iter()
+        .chain(day2_bars)
+        .map(MarketEvent::Bar)
+        .collect();
+    writer.write_batch(&events).await.unwrap();
+
+    let curve = reader
+        .intraday_volume_curve("EMSCURVE", Venue::Binance, 2)
+        .await
+        .unwrap();
+
+    // Both days split their volume 50/50 across the two bars, so the
+    // averaged cumulative curve must be exactly [0.5, 1.0] regardless
+    // of each day's absolute volume (100+100 vs 200+200) -- proving
+    // this is a FRACTION-of-day curve, not an absolute-volume curve.
+    assert_eq!(curve.cumulative_fractions.len(), 2);
+    assert_eq!(curve.cumulative_fractions[0].1, dec!(0.5));
+    assert_eq!(curve.cumulative_fractions[1].1, dec!(1.0));
+}
+
+#[tokio::test]
+#[ignore]
+async fn intraday_volume_curve_errors_on_insufficient_history() {
+    let reader = StorageReader::new(CLICKHOUSE_URL).await.unwrap();
+
+    // No bars seeded at all for this symbol -- 0 available days.
+    let result = reader
+        .intraday_volume_curve("EMSCURVE_NO_HISTORY", Venue::Binance, 5)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(StorageError::InsufficientHistory {
+            available_days: 0,
+            requested_days: 5,
+        })
+    ));
+}
+
+fn test_bar(symbol: &str, venue: Venue, open_time_rfc3339: &str, volume: Decimal) -> Bar {
+    let open_time: DateTime<Utc> = open_time_rfc3339.parse().unwrap();
+    Bar {
+        symbol: symbol.to_string(),
+        venue,
+        open: dec!(100),
+        high: dec!(100),
+        low: dec!(100),
+        close: dec!(100),
+        volume,
+        interval: BarInterval::OneHour,
+        open_time,
+        close_time: open_time + chrono::Duration::hours(1),
+    }
 }
