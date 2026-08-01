@@ -1,12 +1,14 @@
 //! [`BinanceExecutionGateway`]: implements `apexes_oms::ExecutionGateway`
 //! against real Binance Spot and USDS-M Perpetual Futures REST APIs.
 
-use apexes_core::{AssetClass, Order, OrderId, OrderStatus};
+use apexes_core::{AssetClass, MarginMode, Order, OrderId, OrderStatus};
 use apexes_oms::{ExchangeFill, ExecutionGateway, GatewayOutcome};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::config::BinanceGatewayConfig;
 use crate::error::BinanceApiError;
@@ -14,13 +16,92 @@ use crate::rest::{ApiFamily, BinanceRestClient};
 
 pub struct BinanceExecutionGateway {
     rest: BinanceRestClient,
+    /// Per-symbol leverage/margin-mode last successfully set on the
+    /// exchange -- avoids redundant `POST /fapi/v1/leverage`/
+    /// `marginType` calls when consecutive orders for the same symbol
+    /// use the same settings (Binance requires calling these BEFORE
+    /// order submission, but not on every single order if unchanged).
+    leverage_cache: Mutex<HashMap<String, (Decimal, MarginMode)>>,
 }
 
 impl BinanceExecutionGateway {
     pub fn new(config: BinanceGatewayConfig) -> Self {
         Self {
             rest: BinanceRestClient::new(config),
+            leverage_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Ensures `symbol` is set to `leverage`/`margin_mode` on the
+    /// exchange BEFORE an order using them is submitted -- Binance
+    /// requires `POST /fapi/v1/marginType` and `POST /fapi/v1/leverage`
+    /// as separate, prior calls (not part of the order-submission
+    /// request itself). Skips both calls entirely if the cache already
+    /// reflects the requested values (no-op for repeated same-leverage
+    /// orders). Returns `Err(reason)` if either call fails -- the
+    /// caller (`submit_order`) treats this as `GatewayOutcome::Rejected`,
+    /// never attempting the order submission itself.
+    async fn ensure_leverage_and_margin_mode(
+        &self,
+        symbol: &str,
+        leverage: Decimal,
+        margin_mode: MarginMode,
+    ) -> Result<(), String> {
+        {
+            let cache = self
+                .leverage_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if cache.get(symbol) == Some(&(leverage, margin_mode)) {
+                return Ok(());
+            }
+        }
+
+        let margin_type_str = match margin_mode {
+            MarginMode::Isolated => "ISOLATED",
+            MarginMode::Cross => "CROSSED",
+        };
+        let margin_type_params = format!("symbol={symbol}&marginType={margin_type_str}");
+        let (status, body) = self
+            .rest
+            .signed_request(
+                "POST",
+                ApiFamily::Futures,
+                "/fapi/v1/marginType",
+                &margin_type_params,
+            )
+            .await?;
+        // Binance returns an error code -4046 ("No need to change margin
+        // type") when the requested mode is already active -- treat
+        // this specific case as success, not a failure, since it means
+        // the desired end state is already true.
+        if !status.is_success() && !body.contains("-4046") {
+            return Err(format!(
+                "failed to set margin type for {symbol}: HTTP {status}: {body}"
+            ));
+        }
+
+        let leverage_params = format!("symbol={symbol}&leverage={leverage}");
+        let (status, body) = self
+            .rest
+            .signed_request(
+                "POST",
+                ApiFamily::Futures,
+                "/fapi/v1/leverage",
+                &leverage_params,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!(
+                "failed to set leverage for {symbol}: HTTP {status}: {body}"
+            ));
+        }
+
+        self.leverage_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(symbol.to_string(), (leverage, margin_mode));
+        Ok(())
     }
 
     fn order_path(family: ApiFamily) -> &'static str {
@@ -177,6 +258,16 @@ fn millis_to_datetime(millis: i64) -> Result<DateTime<Utc>, String> {
 #[async_trait]
 impl ExecutionGateway for BinanceExecutionGateway {
     async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+        if let (Some(leverage), Some(margin_mode)) = (order.leverage, order.margin_mode)
+            && let Err(reason) = self
+                .ensure_leverage_and_margin_mode(&order.symbol, leverage, margin_mode)
+                .await
+        {
+            return GatewayOutcome::Rejected {
+                reason: format!("leverage/margin mode setup failed: {reason}"),
+            };
+        }
+
         let family = ApiFamily::from(order.asset_class);
         let side = match order.side {
             apexes_core::Side::Buy => "BUY",
