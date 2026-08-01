@@ -106,6 +106,8 @@ fn score_as_intent(
         stop_price: None,
         execution_algo: None,
         routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
     };
     scorer.score(&intent, candidates, market_state)
 }

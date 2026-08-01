@@ -64,6 +64,8 @@ impl ChildOrderSink for OrderManagerChildOrderSink {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let empty_positions: HashMap<String, apexes_strategy::Position> = HashMap::new();
         let empty_balances: HashMap<String, rust_decimal::Decimal> = HashMap::new();

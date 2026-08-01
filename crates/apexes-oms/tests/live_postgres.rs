@@ -30,6 +30,8 @@ fn sample_intent() -> OrderIntent {
         stop_price: None,
         execution_algo: None,
         routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
     }
 }
 

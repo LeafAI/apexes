@@ -403,6 +403,8 @@ pub fn order_intents_from_drift_value(value: DriftValue) -> Result<Vec<OrderInte
                 stop_price,
                 execution_algo: None,
                 routing: crate::strategy::OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             })
         })
         .collect()
@@ -413,6 +415,7 @@ mod tests {
     use super::*;
     use apexes_core::TradeEvent;
     use chrono::Utc;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     fn get_str<'a>(obj: &'a HashMap<String, DriftValue>, key: &str) -> &'a str {
@@ -529,6 +532,9 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             quantity: dec!(2.5),
             average_entry_price: dec!(64500),
+            leverage: None,
+            margin_mode: None,
+            allocated_margin: Decimal::ZERO,
         };
         let DriftValue::Object(obj) = position_to_drift_value(&position) else {
             panic!("expected Object");

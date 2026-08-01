@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 apexes-core = { path = "../apexes-core" }
 apexes-indicators = { path = "../apexes-indicators" }
+async-trait = { workspace = true }
 drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
 drift-script-math = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
 tokio = { workspace = true }

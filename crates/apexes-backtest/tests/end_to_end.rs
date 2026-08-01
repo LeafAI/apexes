@@ -39,6 +39,8 @@ impl Strategy for BuyOnceStrategy {
                 stop_price: None,
                 execution_algo: None,
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }];
         }
         vec![]
@@ -182,6 +184,8 @@ impl Strategy for BuyStopOnceStrategy {
                 stop_price: Some(dec!(66000)),
                 execution_algo: None,
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }];
         }
         vec![]
@@ -334,6 +338,8 @@ impl Strategy for TwapOnceStrategy {
                     slices: 1,
                 }),
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }];
         }
         vec![]
@@ -477,6 +483,8 @@ impl Strategy for IcebergOnceStrategy {
                     visible_qty: dec!(1),
                 }),
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }];
         }
         vec![]

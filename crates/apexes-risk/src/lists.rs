@@ -102,6 +102,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 

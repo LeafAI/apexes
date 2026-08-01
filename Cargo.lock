@@ -330,6 +330,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-core",
  "apexes-indicators",
+ "async-trait",
  "chrono",
  "drift-script",
  "drift-script-math",

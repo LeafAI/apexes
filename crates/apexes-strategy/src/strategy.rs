@@ -1,4 +1,4 @@
-use apexes_core::{AssetClass, Order, OrderId, OrderType, Side, Venue};
+use apexes_core::{AssetClass, MarginMode, Order, OrderId, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -152,6 +152,13 @@ pub struct OrderIntent {
     /// exactly: submit to `asset_class` as specified, no routing
     /// decision made.
     pub routing: OrderRouting,
+    /// `None`: spot order (today's behavior). `Some(leverage)`: open/add
+    /// to a leveraged perpetual position at this leverage.
+    pub leverage: Option<Decimal>,
+    /// Only read when `leverage.is_some()`; `None` defaults to
+    /// `MarginMode::Isolated` (the safer default -- an isolated
+    /// position's liquidation cannot cascade into other positions).
+    pub margin_mode: Option<MarginMode>,
 }
 
 /// A net position in a single symbol.
@@ -161,6 +168,23 @@ pub struct Position {
     /// Signed: positive = long, negative = short.
     pub quantity: Decimal,
     pub average_entry_price: Decimal,
+    /// `None`: spot net position (today's behavior, unchanged). `Some`:
+    /// this is a leveraged perpetual position opened at this leverage.
+    pub leverage: Option<Decimal>,
+    /// Only meaningful when `leverage.is_some()`.
+    pub margin_mode: Option<MarginMode>,
+    /// Only meaningful when `leverage.is_some()`. The margin actually
+    /// allocated/reserved for this position, maintained INCREMENTALLY
+    /// by `PortfolioLedger::apply_fill` (see the Plan Amendment task
+    /// "apexes-core/apexes-backtest: leveraged Fill accounting" for the
+    /// full accounting rules) -- NOT recomputed from `quantity *
+    /// average_entry_price / leverage` on every read, because real
+    /// exchanges (including Binance) accumulate margin per-fill rather
+    /// than recompute the whole position's margin against its current
+    /// average entry price on every trade. `Decimal::ZERO` for spot
+    /// positions (`leverage: None`) and for any Position before its
+    /// first leveraged fill.
+    pub allocated_margin: Decimal,
 }
 
 #[cfg(test)]
@@ -195,6 +219,8 @@ mod tests {
                 stop_price: None,
                 execution_algo: None,
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }]
         }
     }
@@ -243,6 +269,9 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 quantity: dec!(2),
                 average_entry_price: dec!(64000),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         let balances = HashMap::new();

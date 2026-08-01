@@ -2,6 +2,7 @@ use apexes_core::{MarketEvent, Side, TradeEvent, Venue};
 use apexes_strategy::drift_dsl::DriftScriptStrategy;
 use apexes_strategy::{Position, Strategy, StrategyContext};
 use chrono::Utc;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -107,6 +108,9 @@ fn uses_ctx_position_skips_when_already_long() {
                 symbol: "BTCUSDT".to_string(),
                 quantity: dec!(1),
                 average_entry_price: dec!(64000),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         let balances = HashMap::new();

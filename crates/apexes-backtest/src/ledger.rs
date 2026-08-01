@@ -159,6 +159,9 @@ impl PortfolioLedger {
                 symbol: fill.symbol.clone(),
                 quantity: Decimal::ZERO,
                 average_entry_price: Decimal::ZERO,
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             });
 
         let same_direction = position.quantity.is_zero()

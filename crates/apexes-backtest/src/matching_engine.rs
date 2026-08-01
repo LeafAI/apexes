@@ -267,11 +267,8 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: None,
             stop_price: None,
-            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
-            // fields yet -- Task 2 adds them and must replace these with
-            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
-            leverage: None,
-            margin_mode: None,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
             filled_quantity,
             status,
             created_at: now,
@@ -322,11 +319,8 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: Some(limit_price),
             stop_price: None,
-            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
-            // fields yet -- Task 2 adds them and must replace these with
-            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
-            leverage: None,
-            margin_mode: None,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,
@@ -416,11 +410,8 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: intent.price,
             stop_price: Some(stop_price),
-            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
-            // fields yet -- Task 2 adds them and must replace these with
-            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
-            leverage: None,
-            margin_mode: None,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,
@@ -794,6 +785,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -908,6 +901,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let (order, fills) = engine.submit_market_order(&intent, Utc::now()).unwrap();
 
@@ -982,6 +977,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
 
         let order = engine.submit_limit_order(&intent, Utc::now()).unwrap();
@@ -1015,6 +1012,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let order = engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1053,6 +1052,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1099,6 +1100,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
         // volume_ahead_required = 10 * 1.0 = 10
@@ -1143,6 +1146,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1184,6 +1189,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1208,6 +1215,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1233,6 +1242,8 @@ mod tests {
                 stop_price: None,
                 execution_algo: None,
                 routing: apexes_strategy::OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             };
 
             let result = engine.submit_limit_order(&intent, Utc::now());
@@ -1260,6 +1271,8 @@ mod tests {
                 stop_price: None,
                 execution_algo: None,
                 routing: apexes_strategy::OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             };
 
             let result = engine.submit_market_order(&intent, Utc::now());
@@ -1285,6 +1298,8 @@ mod tests {
             stop_price: Some(dec!(66000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
 
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
@@ -1307,6 +1322,8 @@ mod tests {
             stop_price: Some(dec!(66000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
 
         let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1328,6 +1345,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
 
         let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1361,6 +1380,8 @@ mod tests {
                 stop_price: Some(dec!(66000)),
                 execution_algo: None,
                 routing: apexes_strategy::OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             };
 
             let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1395,6 +1416,8 @@ mod tests {
             stop_price: Some(dec!(66000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1430,6 +1453,8 @@ mod tests {
                     stop_price: None,
                     execution_algo: None,
                     routing: apexes_strategy::OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
                 },
                 Utc::now(),
             )
@@ -1451,6 +1476,8 @@ mod tests {
             stop_price: Some(dec!(66000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1472,6 +1499,8 @@ mod tests {
                     stop_price: None,
                     execution_algo: None,
                     routing: apexes_strategy::OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
                 },
                 Utc::now(),
             )
@@ -1502,6 +1531,8 @@ mod tests {
             stop_price: Some(dec!(64000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1532,6 +1563,8 @@ mod tests {
                     stop_price: None,
                     execution_algo: None,
                     routing: apexes_strategy::OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
                 },
                 Utc::now(),
             )
@@ -1562,6 +1595,8 @@ mod tests {
             stop_price: Some(dec!(66000)),
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         engine.submit_stop_order(&intent, Utc::now()).unwrap();
 

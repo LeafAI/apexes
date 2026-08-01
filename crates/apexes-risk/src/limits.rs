@@ -244,6 +244,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -360,6 +362,9 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 quantity: dec!(8),
                 average_entry_price: dec!(100),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         let intent = sample_intent("BTCUSDT", Side::Buy, dec!(5), None);
@@ -393,6 +398,9 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 quantity: dec!(-8),
                 average_entry_price: dec!(100),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         let intent = sample_intent("BTCUSDT", Side::Sell, dec!(5), None);

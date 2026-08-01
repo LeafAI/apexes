@@ -127,6 +127,9 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 quantity: dec!(2),
                 average_entry_price: dec!(64000),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         let f = get_position_fn(positions);

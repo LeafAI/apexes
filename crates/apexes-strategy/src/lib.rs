@@ -7,10 +7,15 @@
 
 pub mod drift_dsl;
 pub mod error;
+pub mod margin_tier;
+pub mod mark_price_provider;
 pub mod strategy;
 pub mod venue_scorer;
 
+pub use apexes_core::MarginMode;
 pub use error::StrategyError;
+pub use margin_tier::{MarginTier, MarginTierTable, PositionMarginStatus};
+pub use mark_price_provider::MarkPriceProvider;
 pub use strategy::{
     ExecutionAlgoSpec, OrderIntent, OrderRouting, ParentOrderId, ParentOrderStatus, Position,
     Strategy, StrategyContext,

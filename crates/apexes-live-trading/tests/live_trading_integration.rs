@@ -103,6 +103,8 @@ impl Strategy for BuyOnceStrategy {
                 stop_price: None,
                 execution_algo: None,
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             }];
         }
         vec![]
@@ -232,6 +234,8 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
                 stop_price: None,
                 execution_algo: None,
                 routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
             },
             &HashMap::new(),
             &HashMap::new(),

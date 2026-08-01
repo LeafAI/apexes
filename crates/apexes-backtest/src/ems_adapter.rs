@@ -66,6 +66,8 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         };
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         let (order, fills) = engine

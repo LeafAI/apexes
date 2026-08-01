@@ -236,6 +236,8 @@ mod tests {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -262,6 +264,9 @@ mod tests {
                 symbol: symbol.to_string(),
                 quantity,
                 average_entry_price: dec!(100),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
             },
         );
         map
