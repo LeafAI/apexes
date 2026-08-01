@@ -4747,12 +4747,15 @@ git commit -S -s -m "feat(apexes-ems): InMemoryEms Iceberg/POV/VWAP scheduling"
 
 **Design decision: every EMS child order submits as a Market order.** `ChildOrderIntent` (Task 12) has no `order_type`/`price`/`stop_price` fields -- only `symbol`/`venue`/`asset_class`/`side`/`quantity`. This is a deliberate initial-scope simplification: all four execution algorithms (TWAP/VWAP/Iceberg/POV) submit their child-order slices as Market orders against the current book, consistent with how real-world execution algorithms typically work (a TWAP/VWAP/POV slice is usually a small marketable order, not a resting limit order -- Iceberg is the one conceptual exception in some real implementations, but this initial scope keeps all four uniform for simplicity, matching the design spec's `AlgoOrderRequest`/`ChildOrderIntent` shapes exactly as specified). A future iteration could extend `ChildOrderIntent` with an optional limit price if resting-order Iceberg behavior becomes a requirement; out of scope here, and not silently worked around -- flagged explicitly in this adapter's own doc comment too.
 
-- [ ] **Step 1: Add the `apexes-ems` dependency to `apexes-backtest`**
+- [ ] **Step 1: Add the `apexes-ems` and `async-trait` dependencies to `apexes-backtest`**
 
 ```toml
 # crates/apexes-backtest/Cargo.toml -- add to [dependencies]:
 apexes-ems = { path = "../apexes-ems" }
+async-trait = { workspace = true }
 ```
+
+(`async-trait` is required because `ems_adapter.rs`'s `ChildOrderSink` impl uses the `#[async_trait]` macro -- confirmed via hands-on verification during this plan's own drafting that `apexes-backtest` did not already depend on it.)
 
 - [ ] **Step 2: Write `ems_adapter.rs` with its tests**
 
@@ -4858,10 +4861,13 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn engine_with_book() -> Arc<Mutex<MatchingEngine>> {
-        let cost_model = CostModel::new(Box::new(FlatFeeSchedule {
-            maker_bps: dec!(0),
-            taker_bps: dec!(0),
-        }));
+        let cost_model = CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        };
         let mut engine = MatchingEngine::new(cost_model, dec!(0));
         engine.on_depth_update(&DepthUpdate {
             symbol: "BTCUSDT".to_string(),
@@ -4948,7 +4954,7 @@ Expected: clean (run `cargo fmt` first if not).
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/apexes-backtest/Cargo.toml crates/apexes-backtest/src/lib.rs crates/apexes-backtest/src/ems_adapter.rs
+git add crates/apexes-backtest/Cargo.toml crates/apexes-backtest/src/lib.rs crates/apexes-backtest/src/ems_adapter.rs Cargo.lock
 git commit -S -s -m "feat(apexes-backtest): add MatchingEngineChildOrderSink adapter for apexes-ems"
 ```
 
