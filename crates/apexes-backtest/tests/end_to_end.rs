@@ -105,11 +105,13 @@ async fn full_backtest_produces_a_report_with_the_expected_trade() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
-        risk_checker: None,
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
-    let report = run_backtest(config, market_data, strategy).await.unwrap();
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_backtest(config, &registry, market_data, strategy)
+        .await
+        .unwrap();
 
     assert_eq!(report.trades.len(), 1);
     assert_eq!(report.trades[0].symbol, "BTCUSDT");
@@ -141,11 +143,13 @@ async fn backtest_with_no_events_produces_an_empty_report_without_erroring() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
-        risk_checker: None,
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
-    let report = run_backtest(config, market_data, strategy).await.unwrap();
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_backtest(config, &registry, market_data, strategy)
+        .await
+        .unwrap();
 
     assert!(report.trades.is_empty());
     assert!(report.equity_curve.is_empty());
@@ -251,11 +255,13 @@ async fn triggered_buy_stop_fill_reaches_report_trades_and_ledger() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
-        risk_checker: None,
     };
     let strategy = BuyStopOnceStrategy { has_placed: false };
 
-    let report = run_backtest(config, market_data, strategy).await.unwrap();
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_backtest(config, &registry, market_data, strategy)
+        .await
+        .unwrap();
 
     // (1) report.trades MUST contain the triggered Stop's fill.
     assert_eq!(

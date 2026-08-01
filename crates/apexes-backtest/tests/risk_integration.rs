@@ -1,7 +1,7 @@
-//! Integration tests proving `BacktestConfig.risk_checker` actually
-//! gates order submission and reacts to fills inside `run_backtest`'s
-//! real event loop -- not just unit-testing `apexes-risk`'s types in
-//! isolation.
+//! Integration tests proving the registry-resolved `CompositeRiskChecker`
+//! actually gates order submission and reacts to fills inside
+//! `run_backtest`'s real event loop -- not just unit-testing
+//! `apexes-risk`'s types in isolation.
 
 use apexes_backtest::{
     BacktestConfig, CostModel, FlatFeeSchedule, InMemoryMarketDataSource, ReplaySpeed, run_backtest,
@@ -73,7 +73,6 @@ fn base_config(events_range_end_day: chrono::NaiveDate) -> BacktestConfig {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
-        risk_checker: None,
     }
 }
 
@@ -110,12 +109,17 @@ impl Strategy for BuyOnceStrategy {
 
 #[tokio::test]
 async fn risk_checker_none_behaves_identically_to_no_risk_checking() {
-    let mut config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
-    config.risk_checker = None;
+    let config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    let registry = apexes_core::registry::Registry::new();
     let market_data = InMemoryMarketDataSource::new(sample_events());
-    let report = run_backtest(config, market_data, BuyOnceStrategy { has_bought: false })
-        .await
-        .unwrap();
+    let report = run_backtest(
+        config,
+        &registry,
+        market_data,
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
     assert_eq!(report.trades.len(), 1);
 }
 
@@ -126,13 +130,21 @@ async fn blacklisted_symbol_is_rejected_before_reaching_the_matching_engine() {
     let risk_checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(
         SymbolVenueList::new(ListMode::Blacklist(blacklist), ListMode::Disabled),
     ));
-
-    let mut config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
-    config.risk_checker = Some(risk_checker);
-    let market_data = InMemoryMarketDataSource::new(sample_events());
-    let report = run_backtest(config, market_data, BuyOnceStrategy { has_bought: false })
-        .await
+    let registry = apexes_core::registry::Registry::new();
+    registry
+        .register::<std::sync::Arc<CompositeRiskChecker>, ()>((), std::sync::Arc::new(risk_checker))
         .unwrap();
+
+    let config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    let market_data = InMemoryMarketDataSource::new(sample_events());
+    let report = run_backtest(
+        config,
+        &registry,
+        market_data,
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
 
     assert!(report.trades.is_empty());
 }
@@ -144,13 +156,21 @@ async fn non_blacklisted_symbol_still_trades_normally_through_a_configured_risk_
     let risk_checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(
         SymbolVenueList::new(ListMode::Blacklist(blacklist), ListMode::Disabled),
     ));
-
-    let mut config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
-    config.risk_checker = Some(risk_checker);
-    let market_data = InMemoryMarketDataSource::new(sample_events());
-    let report = run_backtest(config, market_data, BuyOnceStrategy { has_bought: false })
-        .await
+    let registry = apexes_core::registry::Registry::new();
+    registry
+        .register::<std::sync::Arc<CompositeRiskChecker>, ()>((), std::sync::Arc::new(risk_checker))
         .unwrap();
+
+    let config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    let market_data = InMemoryMarketDataSource::new(sample_events());
+    let report = run_backtest(
+        config,
+        &registry,
+        market_data,
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(report.trades.len(), 1);
 }

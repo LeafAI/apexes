@@ -152,7 +152,6 @@ impl Evaluator for DriftScriptEvaluator {
             speed: ReplaySpeed::AsFastAsPossible,
             queue_position_factor: dec!(0.0),
             risk_free_return: dec!(0),
-            risk_checker: None,
         };
         let market_data_events = market_data.events().await.map_err(|e| e.to_string())?;
 
@@ -169,7 +168,8 @@ impl Evaluator for DriftScriptEvaluator {
                     let strategy =
                         DriftScriptStrategy::from_file_with_params(&script_path, owned_params)
                             .map_err(|e| e.to_string())?;
-                    let report = run_backtest(config, market_data, strategy)
+                    let registry = apexes_core::registry::Registry::new();
+                    let report = run_backtest(config, &registry, market_data, strategy)
                         .await
                         .map_err(|e| e.to_string())?;
                     Ok(Decimal::from(report.overall.trade_count))

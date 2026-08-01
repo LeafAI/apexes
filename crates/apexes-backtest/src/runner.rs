@@ -3,6 +3,7 @@ use crate::cost_model::CostModel;
 use crate::event_loop::{EventLoopConfig, run_event_loop};
 use crate::market_data_source::HistoricalMarketDataSource;
 use crate::report::BacktestReport;
+use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::Strategy;
@@ -10,6 +11,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Configuration for a single backtest run (design spec §8).
 pub struct BacktestConfig {
@@ -31,15 +33,6 @@ pub struct BacktestConfig {
     /// (design spec §8, matching `barter::statistic::metric`'s
     /// `calculate` signatures).
     pub risk_free_return: Decimal,
-    /// Optional risk checks run before submitting each `OrderIntent`
-    /// (rejected intents are logged via `tracing::warn!` and never
-    /// reach the matching engine) and after each `Fill` (violations are
-    /// logged, not propagated -- an in-trade violation does not undo a
-    /// fill that already happened, per `apexes-risk`'s design spec §一
-    /// "no automatic liquidation" decision). `None` means no risk
-    /// checking is performed, preserving this crate's pre-existing
-    /// behavior exactly.
-    pub risk_checker: Option<CompositeRiskChecker>,
 }
 
 /// Runs a full backtest: replays `market_data` in chronological order
@@ -52,11 +45,23 @@ pub struct BacktestConfig {
 /// pre-loaded `Vec<MarketEvent>` into the `Stream` the shared core
 /// expects, and to pass `stop_signal: None`/`latency_model: None` since
 /// neither concept applies to historical replay.
+/// `registry` (sub-project #9's registry retrofit) is used to resolve
+/// an optional `CompositeRiskChecker` via
+/// `registry.try_one::<Arc<CompositeRiskChecker>>()` -- absent means no
+/// risk checking is performed, preserving this crate's pre-existing
+/// `None`-means-no-risk-checking behavior exactly.
 pub async fn run_backtest(
     config: BacktestConfig,
+    registry: &Registry,
     market_data: impl HistoricalMarketDataSource,
     strategy: impl Strategy,
 ) -> Result<BacktestReport, ApexesError> {
+    let risk_checker = registry
+        .try_one::<Arc<CompositeRiskChecker>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
+        })?;
+
     let events = market_data.events().await?;
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
@@ -67,7 +72,7 @@ pub async fn run_backtest(
         cost_model: config.cost_model,
         queue_position_factor: config.queue_position_factor,
         risk_free_return: config.risk_free_return,
-        risk_checker: config.risk_checker,
+        risk_checker,
     };
 
     run_event_loop(event_loop_config, event_stream, clock, strategy, None, None).await
@@ -195,11 +200,12 @@ mod tests {
             speed: ReplaySpeed::AsFastAsPossible,
             queue_position_factor: dec!(0.5),
             risk_free_return: Decimal::ZERO,
-            risk_checker: None,
         };
 
+        let registry = Registry::new();
         let report = run_backtest(
             config,
+            &registry,
             InMemoryMarketDataSource::new(events),
             BuyOnceStrategy { bought: false },
         )

@@ -5,10 +5,12 @@
 //! historical data.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use apexes_backtest::clock::BacktestClock;
 use apexes_backtest::event_loop::{EventLoopConfig, run_event_loop};
 use apexes_backtest::{BacktestReport, CostModel, LatencyModel, ReplaySpeed};
+use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::Strategy;
@@ -21,7 +23,6 @@ pub struct PaperTradingConfig {
     pub cost_model: CostModel,
     pub queue_position_factor: Decimal,
     pub risk_free_return: Decimal,
-    pub risk_checker: Option<CompositeRiskChecker>,
     pub latency_model: LatencyModel,
 }
 
@@ -31,12 +32,27 @@ pub struct PaperTradingConfig {
 /// that passes its `PreTradeCheck` reaches the matching engine. Exits
 /// gracefully (returning the `BacktestReport` accumulated so far, not an
 /// error) once `stop_signal` fires or its sender is dropped.
+///
+/// `registry` (sub-project #9's registry retrofit) is used to resolve
+/// an optional `CompositeRiskChecker` via
+/// `registry.try_one::<Arc<CompositeRiskChecker>>()` -- absent means no
+/// risk checking is performed, preserving this crate's pre-existing
+/// `None`-means-no-risk-checking behavior exactly. `provider` stays a
+/// direct parameter (NOT a registry lookup) -- paper trading only ever
+/// needs one directly-supplied provider.
 pub async fn run_paper_trading(
     config: PaperTradingConfig,
+    registry: &Registry,
     provider: &dyn MarketDataProvider,
     strategy: impl Strategy,
     stop_signal: oneshot::Receiver<()>,
 ) -> Result<BacktestReport, ApexesError> {
+    let risk_checker = registry
+        .try_one::<Arc<CompositeRiskChecker>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
+        })?;
+
     let event_stream = provider.subscribe(&config.instruments).await?;
     let clock = BacktestClock::new(ReplaySpeed::AsFastAsPossible);
 
@@ -46,7 +62,7 @@ pub async fn run_paper_trading(
         cost_model: config.cost_model,
         queue_position_factor: config.queue_position_factor,
         risk_free_return: config.risk_free_return,
-        risk_checker: config.risk_checker,
+        risk_checker,
     };
 
     run_event_loop(
@@ -179,7 +195,6 @@ mod tests {
             cost_model: zero_cost_model(),
             queue_position_factor: dec!(0.0),
             risk_free_return: dec!(0),
-            risk_checker: None,
             latency_model: LatencyModel::None,
         }
     }
@@ -189,10 +204,12 @@ mod tests {
         let provider = MockMarketDataProvider {
             events: sample_events(),
         };
+        let registry = Registry::new();
         let (_tx, rx) = oneshot::channel();
 
         let report = run_paper_trading(
             base_config(),
+            &registry,
             &provider,
             BuyOnceStrategy { bought: false },
             rx,
@@ -210,12 +227,19 @@ mod tests {
         };
         let mut config = base_config();
         config.latency_model = LatencyModel::Fixed(Duration::from_millis(100));
+        let registry = Registry::new();
         let (_tx, rx) = oneshot::channel();
 
         let start = tokio::time::Instant::now();
-        let report = run_paper_trading(config, &provider, BuyOnceStrategy { bought: false }, rx)
-            .await
-            .unwrap();
+        let report = run_paper_trading(
+            config,
+            &registry,
+            &provider,
+            BuyOnceStrategy { bought: false },
+            rx,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.trades.len(), 1);
         assert!(start.elapsed() >= Duration::from_millis(100));
@@ -231,13 +255,22 @@ mod tests {
         let risk_checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(
             SymbolVenueList::new(ListMode::Blacklist(blacklist), ListMode::Disabled),
         ));
-        let mut config = base_config();
-        config.risk_checker = Some(risk_checker);
+        let registry = Registry::new();
+        registry
+            .register::<Arc<CompositeRiskChecker>, ()>((), Arc::new(risk_checker))
+            .unwrap();
+        let config = base_config();
         let (_tx, rx) = oneshot::channel();
 
-        let report = run_paper_trading(config, &provider, BuyOnceStrategy { bought: false }, rx)
-            .await
-            .unwrap();
+        let report = run_paper_trading(
+            config,
+            &registry,
+            &provider,
+            BuyOnceStrategy { bought: false },
+            rx,
+        )
+        .await
+        .unwrap();
 
         assert!(report.trades.is_empty());
     }
@@ -266,9 +299,11 @@ mod tests {
         };
         let (tx, rx) = oneshot::channel();
         tx.send(()).unwrap();
+        let registry = Registry::new();
 
         let report = run_paper_trading(
             base_config(),
+            &registry,
             &provider,
             BuyOnceStrategy { bought: false },
             rx,

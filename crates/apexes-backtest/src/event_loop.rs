@@ -31,14 +31,19 @@ use std::collections::HashMap;
 /// loop core. `BacktestConfig` (in `runner.rs`) is the historical-replay
 /// caller's public config type; `apexes-paper`'s `PaperTradingConfig` is
 /// the live-trading caller's public config type. Both construct this
-/// shared internal struct before calling `run_event_loop`.
+/// shared internal struct before calling `run_event_loop`. `risk_checker`
+/// is `Option<Arc<CompositeRiskChecker>>` (not owned `CompositeRiskChecker`)
+/// because both callers resolve it via
+/// `registry.try_one::<Arc<CompositeRiskChecker>>()` (sub-project #9's
+/// registry retrofit) before constructing this struct -- `run_event_loop`
+/// itself stays `Registry`-agnostic.
 pub struct EventLoopConfig {
     pub instruments: Vec<Instrument>,
     pub initial_balances: HashMap<String, Decimal>,
     pub cost_model: CostModel,
     pub queue_position_factor: Decimal,
     pub risk_free_return: Decimal,
-    pub risk_checker: Option<CompositeRiskChecker>,
+    pub risk_checker: Option<std::sync::Arc<CompositeRiskChecker>>,
 }
 
 /// Runs the shared event loop: consumes `events` in order through

@@ -64,7 +64,6 @@ async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
         },
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
-        risk_checker: None,
         latency_model: LatencyModel::None,
     };
 
@@ -74,7 +73,8 @@ async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
         let _ = tx.send(());
     });
 
-    let report = run_paper_trading(config, &provider, NoOpStrategy, rx)
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_paper_trading(config, &registry, &provider, NoOpStrategy, rx)
         .await
         .expect("run_paper_trading should not error against a real Binance feed");
 
