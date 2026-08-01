@@ -11,6 +11,7 @@ use apexes_core::{
     TradeEvent, Venue,
 };
 use chrono::{NaiveDate, TimeZone, Utc};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 
@@ -447,5 +448,117 @@ async fn full_backtest_with_execution_algo_applies_child_order_fills_to_the_ledg
             .iter()
             .any(|(_, equity)| *equity != dec!(100000)),
         "equity curve must reflect the EMS child-order fill, not the untouched initial balance"
+    );
+}
+
+/// Submits ONE Iceberg parent order (quantity 3, visible_qty 1 -- three
+/// slices) the first time it sees any event, then does nothing else.
+struct IcebergOnceStrategy {
+    has_submitted: bool,
+}
+
+impl Strategy for IcebergOnceStrategy {
+    fn on_market_event(&mut self, event: &MarketEvent, _ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if self.has_submitted {
+            return vec![];
+        }
+        if let MarketEvent::Depth(update) = event {
+            self.has_submitted = true;
+            return vec![OrderIntent {
+                symbol: update.symbol.clone(),
+                venue: update.venue,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(3),
+                price: None,
+                stop_price: None,
+                execution_algo: Some(apexes_strategy::ExecutionAlgoSpec::Iceberg {
+                    visible_qty: dec!(1),
+                }),
+                routing: OrderRouting::Fixed,
+            }];
+        }
+        vec![]
+    }
+}
+
+/// Regression guard for a real Critical bug caught in sub-project #9's
+/// Task 18 whole-branch review: `MatchingEngineChildOrderSink::order_status`
+/// used to always return `Ok(None)`, which `InMemoryEms`'s Iceberg
+/// scheduling (`refill_iceberg_allocation`) treats identically to "the
+/// resting child has not yet reached a terminal state" -- so every real
+/// Iceberg parent order submitted through the real (non-mocked) adapter
+/// would submit exactly one visible-quantity slice and then stall in
+/// `ParentOrderStatus::Scheduling` forever, silently under-executing
+/// with no error. This test drives a 3-slice Iceberg order (quantity 3,
+/// visible_qty 1) through a real `run_backtest` call and asserts it
+/// fully completes: all 3 slices fill and the parent order's quantity
+/// is fully reflected in `report.trades`/the equity curve. Without the
+/// fix, `report.trades.len()` would be 1 (only the first slice), not 3.
+#[tokio::test]
+async fn full_backtest_with_iceberg_execution_algo_completes_all_slices() {
+    let t0 = Utc::now();
+
+    // One event per slice is enough: `on_market_event` calls
+    // `process_iceberg_parents` on every tick, and since this adapter's
+    // `order_status` now reports each submitted slice as immediately
+    // terminal (Filled), one event advances exactly one slice.
+    let events: Vec<MarketEvent> = (0i64..5)
+        .map(|i| {
+            MarketEvent::Depth(DepthUpdate {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: dec!(65000),
+                    quantity: dec!(10),
+                }],
+                sequence: Some(i as u64),
+                is_snapshot: i == 0,
+                timestamp: t0 + chrono::Duration::seconds(i),
+            })
+        })
+        .collect();
+    let market_data = InMemoryMarketDataSource::new(events);
+
+    let mut initial_balances = HashMap::new();
+    initial_balances.insert("USDT".to_string(), dec!(1000000));
+
+    let config = BacktestConfig {
+        instruments: vec![btc_usdt_instrument()],
+        date_range: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+            ..NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
+        initial_balances,
+        cost_model: CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        },
+        speed: ReplaySpeed::AsFastAsPossible,
+        queue_position_factor: dec!(0.0),
+        risk_free_return: dec!(0),
+    };
+    let strategy = IcebergOnceStrategy {
+        has_submitted: false,
+    };
+
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_backtest(config, &registry, market_data, strategy)
+        .await
+        .unwrap();
+
+    let total_filled: Decimal = report.trades.iter().map(|fill| fill.quantity).sum();
+    assert_eq!(
+        total_filled,
+        dec!(3),
+        "all 3 Iceberg slices must fill, not just the first one before it stalls"
+    );
+    assert_eq!(
+        report.trades.len(),
+        3,
+        "Iceberg must submit exactly 3 slices (quantity 3 / visible_qty 1), not stall after 1"
     );
 }

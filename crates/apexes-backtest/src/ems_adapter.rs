@@ -14,6 +14,7 @@
 //! `MatchingEngine::submit_market_order`. See this task's own plan
 //! entry for the full rationale.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use apexes_core::{Order, OrderId, OrderType};
@@ -21,16 +22,30 @@ use apexes_ems::{ChildOrderIntent, ChildOrderSink, EmsError};
 use apexes_strategy::OrderIntent;
 use async_trait::async_trait;
 use chrono::Utc;
+use rust_decimal::Decimal;
 
 use crate::matching_engine::MatchingEngine;
 
 pub struct MatchingEngineChildOrderSink {
     engine: Arc<Mutex<MatchingEngine>>,
+    /// Every order this sink has ever submitted, keyed by `OrderId`,
+    /// recording the terminal (or partially-filled) `Order` snapshot
+    /// `submit_market_order` returned at submission time. `MatchingEngine`
+    /// itself does not retain a lookup table for orders after they fill
+    /// (see `order_status`'s doc comment for why a lookup table is
+    /// needed HERE instead), so this adapter keeps its own -- required
+    /// for `Ems`'s Iceberg scheduling, whose `refill_iceberg_allocation`
+    /// polls `order_status` to detect when a resting child has reached a
+    /// terminal state before submitting the next visible slice.
+    submitted: Mutex<HashMap<OrderId, Order>>,
 }
 
 impl MatchingEngineChildOrderSink {
     pub fn new(engine: Arc<Mutex<MatchingEngine>>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            submitted: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -59,6 +74,39 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
                 reason: error.to_string(),
             })?;
+
+        // `submit_market_order` runs synchronously to completion -- this
+        // order will NEVER receive any further fill or status change
+        // once this call returns (there is no resting-order concept for
+        // Market orders), regardless of whether `order.status` came
+        // back as `Filled` (fully executed), `PartiallyFilled`
+        // (insufficient book depth), or `New` (no liquidity at all, see
+        // `MatchingEngine::submit_market_order`'s own `tracing::warn!`
+        // for that case). Record it as `Filled` (any quantity filled)
+        // or `Rejected` (none filled) here -- NOT the literal
+        // `order.status` -- so `order_status` reports one of the
+        // genuinely terminal statuses `Ems`'s Iceberg scheduling
+        // (`refill_iceberg_allocation`) checks for. Reporting the
+        // literal `New`/`PartiallyFilled` status instead would make
+        // Iceberg wait forever for a "resting" order that, for this
+        // Market-only sink, never actually rests -- this was a real bug
+        // caught in sub-project #9's Task 18 whole-branch review: every
+        // Iceberg parent order submitted through this adapter in a real
+        // backtest/paper-trading run would submit exactly one slice and
+        // then stall in `Scheduling` permanently, since this method
+        // previously always returned `Ok(None)`.
+        let terminal_status = if order.filled_quantity > Decimal::ZERO {
+            apexes_core::OrderStatus::Filled
+        } else {
+            apexes_core::OrderStatus::Rejected
+        };
+        let mut tracked_order = order.clone();
+        tracked_order.status = terminal_status;
+        self.submitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(order.id, tracked_order);
+
         Ok((order.id, fills))
     }
 
@@ -71,25 +119,23 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         Ok(())
     }
 
-    async fn order_status(&self, _order_id: OrderId) -> Result<Option<Order>, EmsError> {
-        // MatchingEngine does not currently track submitted orders by
-        // ID after they fill (it returns the filled Order directly from
-        // submit_market_order, and does not retain a lookup table) --
-        // Iceberg's refill logic only actually needs order_status for
-        // NON-immediately-filled orders (e.g. resting Limit orders),
-        // which Market-order child orders never are. Since every child
-        // order submitted through this adapter is a Market order that
-        // fills (fully or partially) synchronously within
-        // submit_child_order itself, Iceberg's "wait for the resting
-        // child to reach a terminal state" check is trivially satisfied
-        // the moment submission returns -- so returning `Ok(None)` here
-        // (rather than tracking real state) is safe: Iceberg's
-        // `refill_iceberg_allocation` treats a `None` status the same
-        // as "not yet terminal" and will simply retry on the next
-        // `on_market_event` call, converging in one extra tick instead
-        // of zero. Flagged here explicitly as an accepted minor pacing
-        // imprecision, not a silent bug.
-        Ok(None)
+    async fn order_status(&self, order_id: OrderId) -> Result<Option<Order>, EmsError> {
+        // Every order submitted through this adapter is a Market order
+        // that fills (fully or partially) synchronously within
+        // submit_child_order itself -- there is no resting-order concept
+        // here, so by the time this method could ever be called, the
+        // order this adapter recorded is already permanently terminal.
+        // Returns that recorded snapshot (with `status` normalized to
+        // `Filled`/`Rejected` at submission time, see
+        // `submit_child_order`'s doc comment) so Iceberg's
+        // `refill_iceberg_allocation` correctly detects completion on
+        // its very next poll instead of waiting forever.
+        Ok(self
+            .submitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&order_id)
+            .cloned())
     }
 }
 
@@ -158,7 +204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_status_returns_none_for_any_order_id() {
+    async fn order_status_returns_none_for_an_unknown_order_id() {
         let engine = engine_with_book();
         let sink = MatchingEngineChildOrderSink::new(engine);
         let status = sink
@@ -166,5 +212,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, None);
+    }
+
+    #[tokio::test]
+    async fn order_status_reports_filled_for_a_submitted_order_with_liquidity() {
+        // Regression test for a real Critical bug caught in sub-project
+        // #9's Task 18 whole-branch review: this method used to always
+        // return `Ok(None)` regardless of the order_id, which made
+        // `InMemoryEms`'s Iceberg scheduling (`refill_iceberg_allocation`,
+        // which treats `None` identically to "still resting, not yet
+        // terminal") wait forever for a resting child that, for this
+        // Market-only sink, never actually rests -- permanently
+        // stalling every real Iceberg parent order after its first
+        // slice in backtest/paper-trading.
+        let engine = engine_with_book();
+        let sink = MatchingEngineChildOrderSink::new(Arc::clone(&engine));
+
+        let (order_id, fills) = sink
+            .submit_child_order(ChildOrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                quantity: dec!(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 1, "sufficient book depth must fully fill");
+
+        let status = sink.order_status(order_id).await.unwrap();
+        assert_eq!(
+            status.map(|order| order.status),
+            Some(apexes_core::OrderStatus::Filled)
+        );
+    }
+
+    #[tokio::test]
+    async fn order_status_reports_rejected_for_a_submitted_order_with_no_liquidity() {
+        // Same bug as above, exercised via the "no book depth at all"
+        // path (`filled_quantity` stays zero) -- must still report a
+        // TERMINAL status, not `None`/`New`, so Iceberg does not stall.
+        let cost_model = CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        };
+        let engine = Arc::new(Mutex::new(MatchingEngine::new(cost_model, dec!(0))));
+        let sink = MatchingEngineChildOrderSink::new(Arc::clone(&engine));
+
+        let (order_id, fills) = sink
+            .submit_child_order(ChildOrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                quantity: dec!(1),
+            })
+            .await
+            .unwrap();
+        assert!(fills.is_empty(), "no book depth means no fill at all");
+
+        let status = sink.order_status(order_id).await.unwrap();
+        assert_eq!(
+            status.map(|order| order.status),
+            Some(apexes_core::OrderStatus::Rejected)
+        );
     }
 }
