@@ -80,6 +80,7 @@ impl HistoricalMarketDataSource for StorageMarketDataSource {
             EventType::Tick,
             EventType::Depth,
             EventType::Bar,
+            EventType::MarkPrice,
         ] {
             let events = self
                 .reader
