@@ -751,7 +751,7 @@ fn event_timestamp(event: &MarketEvent) -> DateTime<Utc> {
 /// first entry, or `1.0` if `elapsed` is past the curve's last entry
 /// (the algorithm's full duration has elapsed -- submit everything
 /// remaining).
-fn target_fraction_for_elapsed(
+pub(crate) fn target_fraction_for_elapsed(
     curve: &apexes_storage::reader::VolumeCurve,
     elapsed: chrono::Duration,
 ) -> Decimal {
