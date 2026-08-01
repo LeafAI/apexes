@@ -13,6 +13,7 @@ pub enum MarketEvent {
     Depth(DepthUpdate),
     Bar(Bar),
     Trade(TradeEvent),
+    MarkPrice(MarkPriceUpdate),
 }
 
 /// A best bid/ask quote update for a symbol.
@@ -84,6 +85,23 @@ pub struct TradeEvent {
     /// Aggressor (taker) side, if known. Not all data sources provide this.
     pub side: Option<Side>,
     pub trade_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// A perpetual/futures instrument's current mark price -- the
+/// index-and-funding-basis-adjusted price real exchanges use for
+/// margin ratio / liquidation / unrealized PnL calculations,
+/// DELIBERATELY separate from `TradeEvent.price` (last trade) or
+/// order-book mid, both of which are more easily manipulated/noisy
+/// for that purpose. Meaningless for `AssetClass::Spot` instruments --
+/// never emitted for them. See
+/// `docs/superpowers/specs/2026-08-02-apexes-mark-price-pipeline-design.md`
+/// for the full rationale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkPriceUpdate {
+    pub symbol: String,
+    pub venue: Venue,
+    pub mark_price: Decimal,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -200,6 +218,19 @@ mod tests {
             quantity: dec!(100),
             side: Some(Side::Sell),
             trade_id: Some("T123456".to_string()),
+            timestamp: Utc::now(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let round_tripped: MarketEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, round_tripped);
+    }
+
+    #[test]
+    fn mark_price_event_serde_round_trip() {
+        let event = MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(65012.34),
             timestamp: Utc::now(),
         });
         let json = serde_json::to_string(&event).unwrap();
