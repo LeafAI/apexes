@@ -20,8 +20,10 @@ pub mod child_order_sink;
 pub mod ems;
 pub mod error;
 pub mod in_memory;
+pub mod volume_curve_provider;
 
 pub use child_order_sink::{ChildOrderIntent, ChildOrderSink};
 pub use ems::{AlgoOrderRequest, Ems};
 pub use error::EmsError;
 pub use in_memory::InMemoryEms;
+pub use volume_curve_provider::VolumeCurveProvider;

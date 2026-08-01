@@ -14,10 +14,22 @@ use crate::ems::AlgoOrderRequest;
 /// `Split`) and never recomputed afterward -- mid-flight re-routing is
 /// out of scope (design spec's "not included" list: no dynamic
 /// `ExecutionAlgoSpec`/routing changes after submission).
+#[derive(Clone)]
 pub(crate) struct VenueAllocation {
     pub asset_class: AssetClass,
     pub quantity: Decimal,
     pub submitted_quantity: Decimal,
+    /// Iceberg only: the child order currently resting for this
+    /// allocation, if any. `None` means "no resting order -- safe to
+    /// submit the next visible slice".
+    pub current_resting_child: Option<OrderId>,
+}
+
+impl VenueAllocation {
+    /// Remaining quantity not yet submitted for this allocation.
+    pub fn cloned_summary(&self) -> (Decimal, Decimal) {
+        (self.quantity - self.submitted_quantity, self.quantity)
+    }
 }
 
 pub(crate) struct ParentOrderState {
@@ -28,9 +40,17 @@ pub(crate) struct ParentOrderState {
     pub allocations: Vec<VenueAllocation>,
     pub child_order_ids: Vec<OrderId>,
     /// Algorithm-specific scheduling state, populated based on
-    /// `request.execution_algo`'s variant -- see Task 14 for
-    /// `Vwap`/`Iceberg`/`Pov` fields; this task only populates `Twap`'s.
+    /// `request.execution_algo`'s variant.
     pub scheduling: SchedulingState,
+}
+
+impl ParentOrderState {
+    /// The `AssetClass` of every venue allocation this parent order has,
+    /// as a plain `Vec` (used by iteration sites that need to release
+    /// the parent-order lock before making further per-allocation calls).
+    pub fn clone_as_asset_classes(&self) -> Vec<AssetClass> {
+        self.allocations.iter().map(|a| a.asset_class).collect()
+    }
 }
 
 pub(crate) enum SchedulingState {
@@ -40,22 +60,22 @@ pub(crate) enum SchedulingState {
         slice_quantity: Decimal,
         slices_remaining: u32,
     },
-    /// Populated by Task 14 (constructed there; until then, dead code
-    /// by design -- the variant exists so Task 14 only fills in fields
-    /// rather than reshaping this enum).
-    #[allow(dead_code)]
     Vwap {
-        deadline: DateTime<Utc>,
-        started_at: DateTime<Utc>,
         curve: apexes_storage::reader::VolumeCurve,
+        started_at: DateTime<Utc>,
+        /// The highest cumulative-fraction target this schedule has
+        /// already submitted up through -- used so `on_market_event`
+        /// only submits the INCREMENTAL quantity needed to catch up to
+        /// the curve's current target fraction, not the whole target
+        /// fraction again every call.
         last_target_fraction_submitted: Decimal,
     },
-    /// Populated by Task 14 (see `Vwap`'s note).
-    #[allow(dead_code)]
-    Iceberg { visible_qty: Decimal },
-    /// Populated by Task 14 (see `Vwap`'s note).
-    #[allow(dead_code)]
-    Pov { participation_rate: Decimal },
+    Iceberg {
+        visible_qty: Decimal,
+    },
+    Pov {
+        participation_rate: Decimal,
+    },
 }
 
 /// Tracks the most recently observed best bid/ask per `(symbol,

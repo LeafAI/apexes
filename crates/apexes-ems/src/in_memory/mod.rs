@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::child_order_sink::{ChildOrderIntent, ChildOrderSink};
 use crate::ems::{AlgoOrderRequest, Ems};
 use crate::error::EmsError;
+use crate::volume_curve_provider::VolumeCurveProvider;
 use state::{MarketStateTracker, ParentOrderState, SchedulingState};
 
 pub struct InMemoryEms {
@@ -31,6 +32,11 @@ pub struct InMemoryEms {
     /// see `state.rs`'s `MarketStateTracker` doc comment for why this
     /// isn't a `FeeSchedule` dependency.
     estimated_fee_bps: HashMap<AssetClass, Decimal>,
+    /// Historical intraday volume curves for VWAP pacing. `None` makes
+    /// every `Vwap` request fail immediately with
+    /// `EmsError::InsufficientVwapHistory`; `Twap`/`Iceberg`/`Pov` are
+    /// unaffected.
+    volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
     parent_orders: Mutex<HashMap<ParentOrderId, ParentOrderState>>,
     market_state: Mutex<MarketStateTracker>,
 }
@@ -40,11 +46,13 @@ impl InMemoryEms {
         sink: Arc<dyn ChildOrderSink>,
         scorer: Arc<dyn VenueScorer>,
         estimated_fee_bps: HashMap<AssetClass, Decimal>,
+        volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
     ) -> Self {
         Self {
             sink,
             scorer,
             estimated_fee_bps,
+            volume_curve_provider,
             parent_orders: Mutex::new(HashMap::new()),
             market_state: Mutex::new(MarketStateTracker::default()),
         }
@@ -66,7 +74,7 @@ impl InMemoryEms {
 
     /// Submits one child-order slice of `quantity` for `allocation`'s
     /// `asset_class` -- shared by every algorithm's slice-submission
-    /// logic (TWAP here; Iceberg/POV/VWAP in Task 14).
+    /// logic (TWAP, Iceberg, POV, and VWAP).
     async fn submit_slice(
         &self,
         parent_id: ParentOrderId,
@@ -182,6 +190,396 @@ impl InMemoryEms {
 
         Ok(())
     }
+
+    /// Records `parent_id` as `Failed { reason }` with no allocations
+    /// and no child orders submitted -- used when a request cannot even
+    /// begin scheduling (VWAP history insufficient/no provider
+    /// configured, or routing couldn't resolve any venue).
+    async fn fail_parent_order(
+        &self,
+        parent_id: ParentOrderId,
+        request: AlgoOrderRequest,
+        reason: String,
+    ) -> Result<ParentOrderId, EmsError> {
+        let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        parent_orders.insert(
+            parent_id,
+            ParentOrderState {
+                request,
+                status: ParentOrderStatus::Failed { reason },
+                allocations: Vec::new(),
+                child_order_ids: Vec::new(),
+                scheduling: SchedulingState::Iceberg {
+                    visible_qty: Decimal::ZERO,
+                },
+            },
+        );
+        Ok(parent_id)
+    }
+
+    /// For every `Scheduling` parent order using `Iceberg` pacing,
+    /// checks each venue allocation's `current_resting_child` (if any)
+    /// via `sink.order_status` -- if it has reached a terminal status
+    /// (`Filled`/`Cancelled`/`Rejected`), clears it and (if quantity
+    /// remains for that allocation) submits the next `visible_qty`
+    /// slice. Marks the parent `Completed` once every allocation has
+    /// fully submitted its total quantity AND has no resting child left.
+    async fn process_iceberg_parents(&self) -> Result<(), EmsError> {
+        let candidates: Vec<ParentOrderId> = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders
+                .iter()
+                .filter(|(_, state)| {
+                    matches!(state.status, ParentOrderStatus::Scheduling)
+                        && matches!(state.scheduling, SchedulingState::Iceberg { .. })
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        for parent_id in candidates {
+            self.process_one_iceberg_parent(parent_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn process_one_iceberg_parent(&self, parent_id: ParentOrderId) -> Result<(), EmsError> {
+        let (symbol, venue, side, visible_qty, allocations) = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(state) = parent_orders.get(&parent_id) else {
+                return Ok(());
+            };
+            let SchedulingState::Iceberg { visible_qty } = &state.scheduling else {
+                return Ok(());
+            };
+            (
+                state.request.symbol.clone(),
+                state.request.venue,
+                state.request.side,
+                *visible_qty,
+                state.clone_as_asset_classes(),
+            )
+        };
+
+        let mut all_done = true;
+        for asset_class in allocations {
+            let done = self
+                .refill_iceberg_allocation(
+                    parent_id,
+                    &symbol,
+                    venue,
+                    side,
+                    asset_class,
+                    visible_qty,
+                )
+                .await?;
+            all_done &= done;
+        }
+
+        if all_done {
+            let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = parent_orders.get_mut(&parent_id) {
+                state.status = ParentOrderStatus::Completed;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if this allocation is fully done (all quantity
+    /// submitted and no resting child left).
+    async fn refill_iceberg_allocation(
+        &self,
+        parent_id: ParentOrderId,
+        symbol: &str,
+        venue: apexes_core::Venue,
+        side: apexes_core::Side,
+        asset_class: AssetClass,
+        visible_qty: Decimal,
+    ) -> Result<bool, EmsError> {
+        let resting_child = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders[&parent_id]
+                .allocations
+                .iter()
+                .find(|a| a.asset_class == asset_class)
+                .and_then(|a| a.current_resting_child)
+        };
+
+        if let Some(child_id) = resting_child {
+            let status = self.sink.order_status(child_id).await?;
+            let terminal = matches!(
+                status.map(|o| o.status),
+                Some(
+                    apexes_core::OrderStatus::Filled
+                        | apexes_core::OrderStatus::Cancelled
+                        | apexes_core::OrderStatus::Rejected
+                )
+            );
+            if !terminal {
+                return Ok(false);
+            }
+            let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = parent_orders.get_mut(&parent_id)
+                && let Some(allocation) = state
+                    .allocations
+                    .iter_mut()
+                    .find(|a| a.asset_class == asset_class)
+            {
+                allocation.current_resting_child = None;
+            }
+        }
+
+        let (remaining, _total) = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders[&parent_id]
+                .allocations
+                .iter()
+                .find(|a| a.asset_class == asset_class)
+                .map(|a| a.cloned_summary())
+                .unwrap_or((Decimal::ZERO, Decimal::ZERO))
+        };
+        if remaining.is_zero() {
+            return Ok(true);
+        }
+
+        let slice_quantity = visible_qty.min(remaining);
+        let child_id = self
+            .submit_slice(parent_id, symbol, venue, side, asset_class, slice_quantity)
+            .await?;
+
+        let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = parent_orders.get_mut(&parent_id)
+            && let Some(allocation) = state
+                .allocations
+                .iter_mut()
+                .find(|a| a.asset_class == asset_class)
+        {
+            allocation.submitted_quantity += slice_quantity;
+            allocation.current_resting_child = Some(child_id);
+        }
+        Ok(false)
+    }
+
+    /// For every `Scheduling` parent order using `Pov` pacing whose
+    /// symbol matches `trade.symbol`, submits
+    /// `trade.quantity * participation_rate` (capped at each
+    /// allocation's own remaining quantity, split proportionally across
+    /// allocations the same way TWAP's slice-splitting works) and marks
+    /// the parent `Completed` once every allocation's full quantity has
+    /// been submitted.
+    async fn process_pov_parents(&self, trade: &apexes_core::TradeEvent) -> Result<(), EmsError> {
+        let candidates: Vec<(ParentOrderId, Decimal)> = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders
+                .iter()
+                .filter_map(|(id, state)| {
+                    let SchedulingState::Pov { participation_rate } = &state.scheduling else {
+                        return None;
+                    };
+                    if state.request.symbol != trade.symbol
+                        || !matches!(state.status, ParentOrderStatus::Scheduling)
+                    {
+                        return None;
+                    }
+                    Some((*id, *participation_rate))
+                })
+                .collect()
+        };
+
+        for (parent_id, participation_rate) in candidates {
+            let target_quantity = trade.quantity * participation_rate;
+            self.submit_pov_increment(parent_id, target_quantity)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn submit_pov_increment(
+        &self,
+        parent_id: ParentOrderId,
+        target_quantity: Decimal,
+    ) -> Result<(), EmsError> {
+        let (symbol, venue, side, allocations) = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(state) = parent_orders.get(&parent_id) else {
+                return Ok(());
+            };
+            (
+                state.request.symbol.clone(),
+                state.request.venue,
+                state.request.side,
+                state.clone_as_asset_classes(),
+            )
+        };
+
+        let mut remaining_to_submit = target_quantity;
+        for asset_class in allocations {
+            if remaining_to_submit.is_zero() {
+                break;
+            }
+            let remaining_for_allocation = {
+                let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+                parent_orders[&parent_id]
+                    .allocations
+                    .iter()
+                    .find(|a| a.asset_class == asset_class)
+                    .map(|a| a.quantity - a.submitted_quantity)
+                    .unwrap_or(Decimal::ZERO)
+            };
+            let slice = remaining_to_submit.min(remaining_for_allocation);
+            if slice.is_zero() {
+                continue;
+            }
+            let _child_id = self
+                .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
+                .await?;
+            remaining_to_submit -= slice;
+
+            let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = parent_orders.get_mut(&parent_id)
+                && let Some(allocation) = state
+                    .allocations
+                    .iter_mut()
+                    .find(|a| a.asset_class == asset_class)
+            {
+                allocation.submitted_quantity += slice;
+            }
+        }
+
+        let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = parent_orders.get_mut(&parent_id)
+            && state
+                .allocations
+                .iter()
+                .all(|a| a.submitted_quantity >= a.quantity)
+        {
+            state.status = ParentOrderStatus::Completed;
+        }
+        Ok(())
+    }
+
+    /// For every `Scheduling` parent order using `Vwap` pacing, computes
+    /// the curve's target cumulative fraction at the current elapsed
+    /// time since `started_at` and submits whatever INCREMENTAL
+    /// quantity is needed to catch the total submitted quantity up to
+    /// `target_fraction * request.quantity` (split proportionally
+    /// across allocations, same as TWAP/POV). Marks `Completed` once
+    /// the curve's final fraction (`1.0`) has been reached AND fully
+    /// submitted.
+    async fn process_vwap_parents(&self, now: DateTime<Utc>) -> Result<(), EmsError> {
+        let candidates: Vec<(ParentOrderId, Decimal)> = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders
+                .iter()
+                .filter_map(|(id, state)| {
+                    let SchedulingState::Vwap {
+                        curve, started_at, ..
+                    } = &state.scheduling
+                    else {
+                        return None;
+                    };
+                    if !matches!(state.status, ParentOrderStatus::Scheduling) {
+                        return None;
+                    }
+                    let elapsed = now.signed_duration_since(*started_at);
+                    let target_fraction = target_fraction_for_elapsed(curve, elapsed);
+                    Some((*id, target_fraction))
+                })
+                .collect()
+        };
+
+        for (parent_id, target_fraction) in candidates {
+            self.submit_vwap_increment(parent_id, target_fraction)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn submit_vwap_increment(
+        &self,
+        parent_id: ParentOrderId,
+        target_fraction: Decimal,
+    ) -> Result<(), EmsError> {
+        let (symbol, venue, side, total_quantity, already_submitted_fraction, allocations) = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(state) = parent_orders.get(&parent_id) else {
+                return Ok(());
+            };
+            let SchedulingState::Vwap {
+                last_target_fraction_submitted,
+                ..
+            } = &state.scheduling
+            else {
+                return Ok(());
+            };
+            (
+                state.request.symbol.clone(),
+                state.request.venue,
+                state.request.side,
+                state.request.quantity,
+                *last_target_fraction_submitted,
+                state.clone_as_asset_classes(),
+            )
+        };
+
+        if target_fraction <= already_submitted_fraction {
+            return Ok(());
+        }
+        let mut increment = total_quantity * (target_fraction - already_submitted_fraction);
+
+        for asset_class in allocations {
+            if increment.is_zero() {
+                break;
+            }
+            let remaining_for_allocation = {
+                let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+                parent_orders[&parent_id]
+                    .allocations
+                    .iter()
+                    .find(|a| a.asset_class == asset_class)
+                    .map(|a| a.quantity - a.submitted_quantity)
+                    .unwrap_or(Decimal::ZERO)
+            };
+            let slice = increment.min(remaining_for_allocation);
+            if slice.is_zero() {
+                continue;
+            }
+            let _child_id = self
+                .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
+                .await?;
+            increment -= slice;
+
+            let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(state) = parent_orders.get_mut(&parent_id)
+                && let Some(allocation) = state
+                    .allocations
+                    .iter_mut()
+                    .find(|a| a.asset_class == asset_class)
+            {
+                allocation.submitted_quantity += slice;
+            }
+        }
+
+        let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = parent_orders.get_mut(&parent_id) {
+            if let SchedulingState::Vwap {
+                last_target_fraction_submitted,
+                ..
+            } = &mut state.scheduling
+            {
+                *last_target_fraction_submitted = target_fraction;
+            }
+            if target_fraction >= Decimal::ONE
+                && state
+                    .allocations
+                    .iter()
+                    .all(|a| a.submitted_quantity >= a.quantity)
+            {
+                state.status = ParentOrderStatus::Completed;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -198,30 +596,17 @@ impl Ems for InMemoryEms {
             match routing::resolve_allocations(&request, self.scorer.as_ref(), &market_state) {
                 Ok(allocations) => allocations,
                 Err(error) => {
-                    let mut parent_orders =
-                        self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
-                    parent_orders.insert(
-                        parent_id,
-                        ParentOrderState {
-                            request,
-                            status: ParentOrderStatus::Failed {
-                                reason: error.to_string(),
-                            },
-                            allocations: Vec::new(),
-                            child_order_ids: Vec::new(),
-                            scheduling: SchedulingState::Twap {
-                                next_slice_at: Utc::now(),
-                                slice_interval: chrono::Duration::zero(),
-                                slice_quantity: Decimal::ZERO,
-                                slices_remaining: 0,
-                            },
-                        },
-                    );
-                    return Ok(parent_id);
+                    return self
+                        .fail_parent_order(parent_id, request, error.to_string())
+                        .await;
                 }
             };
 
-        let scheduling = match &request.execution_algo {
+        // Matched on a clone so the failure paths below can move
+        // `request` into `fail_parent_order` while the match is still
+        // borrowing the spec.
+        let execution_algo = request.execution_algo.clone();
+        let scheduling = match &execution_algo {
             apexes_strategy::ExecutionAlgoSpec::Twap { duration, slices } => {
                 let slices = (*slices).max(1);
                 let slice_interval = chrono::Duration::from_std(*duration)
@@ -234,10 +619,33 @@ impl Ems for InMemoryEms {
                     slices_remaining: slices,
                 }
             }
-            // Populated by Task 14.
-            apexes_strategy::ExecutionAlgoSpec::Vwap { .. } => SchedulingState::Iceberg {
-                visible_qty: Decimal::ZERO,
-            },
+            apexes_strategy::ExecutionAlgoSpec::Vwap { lookback_days, .. } => {
+                let Some(provider) = &self.volume_curve_provider else {
+                    return self
+                        .fail_parent_order(
+                            parent_id,
+                            request,
+                            "no VolumeCurveProvider configured for this InMemoryEms instance"
+                                .to_string(),
+                        )
+                        .await;
+                };
+                match provider
+                    .intraday_volume_curve(&request.symbol, request.venue, *lookback_days)
+                    .await
+                {
+                    Ok(curve) => SchedulingState::Vwap {
+                        curve,
+                        started_at: Utc::now(),
+                        last_target_fraction_submitted: Decimal::ZERO,
+                    },
+                    Err(error) => {
+                        return self
+                            .fail_parent_order(parent_id, request, error.to_string())
+                            .await;
+                    }
+                }
+            }
             apexes_strategy::ExecutionAlgoSpec::Iceberg { visible_qty } => {
                 SchedulingState::Iceberg {
                     visible_qty: *visible_qty,
@@ -316,6 +724,12 @@ impl Ems for InMemoryEms {
             self.submit_due_twap_slice(parent_id, now).await?;
         }
 
+        self.process_iceberg_parents().await?;
+        self.process_vwap_parents(now).await?;
+        if let MarketEvent::Trade(trade) = event {
+            self.process_pov_parents(trade).await?;
+        }
+
         Ok(())
     }
 }
@@ -329,13 +743,47 @@ fn event_timestamp(event: &MarketEvent) -> DateTime<Utc> {
     }
 }
 
+/// Looks up the cumulative fraction target for `elapsed` time since a
+/// VWAP schedule started, per `curve`'s `cumulative_fractions` (sorted
+/// ascending by offset). Returns the fraction of the LAST entry whose
+/// offset is `<= elapsed` (i.e. "how far should we be by now,
+/// according to history"), or `0.0` if `elapsed` precedes the curve's
+/// first entry, or `1.0` if `elapsed` is past the curve's last entry
+/// (the algorithm's full duration has elapsed -- submit everything
+/// remaining).
+fn target_fraction_for_elapsed(
+    curve: &apexes_storage::reader::VolumeCurve,
+    elapsed: chrono::Duration,
+) -> Decimal {
+    curve
+        .cumulative_fractions
+        .iter()
+        .rev()
+        .find(|(offset, _)| *offset <= elapsed)
+        .map(|(_, fraction)| *fraction)
+        .unwrap_or(Decimal::ZERO)
+        .max(
+            if curve
+                .cumulative_fractions
+                .last()
+                .is_some_and(|(offset, _)| elapsed >= *offset)
+            {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            },
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{OrderId, Side, Venue};
+    use apexes_core::{OrderId, OrderStatus, Side, Venue};
+    use apexes_storage::reader::VolumeCurve;
     use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, PriceAndFeeScorer};
     use rust_decimal_macros::dec;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct RecordingSink {
         submitted: StdMutex<Vec<ChildOrderIntent>>,
@@ -397,7 +845,12 @@ mod tests {
     #[tokio::test]
     async fn twap_submits_one_slice_immediately_on_submission() {
         let sink = Arc::new(RecordingSink::new());
-        let ems = InMemoryEms::new(sink.clone(), Arc::new(PriceAndFeeScorer), HashMap::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
         let parent_id = ems.submit_algo_order(sample_request()).await.unwrap();
 
         // The FIRST slice is due at submission time (`next_slice_at:
@@ -416,7 +869,12 @@ mod tests {
     #[tokio::test]
     async fn twap_completes_after_all_slices_are_submitted_across_advancing_virtual_time() {
         let sink = Arc::new(RecordingSink::new());
-        let ems = InMemoryEms::new(sink.clone(), Arc::new(PriceAndFeeScorer), HashMap::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
         let parent_id = ems.submit_algo_order(sample_request()).await.unwrap();
 
         let mut now = Utc::now();
@@ -446,7 +904,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_parent_order_stops_further_slices_and_cancels_submitted_children() {
         let sink = Arc::new(RecordingSink::new());
-        let ems = InMemoryEms::new(sink.clone(), Arc::new(PriceAndFeeScorer), HashMap::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
         let parent_id = ems.submit_algo_order(sample_request()).await.unwrap();
 
         let now = Utc::now();
@@ -463,6 +926,311 @@ mod tests {
         assert_eq!(
             ems.parent_order_status(parent_id).await.unwrap(),
             Some(ParentOrderStatus::Cancelled)
+        );
+    }
+
+    /// Extends RecordingSink with settable order statuses (needed for
+    /// Iceberg's order_status-polling refill logic) and a submission
+    /// counter (needed to assert "no more slices submitted after
+    /// completion").
+    struct SteppableSink {
+        submitted: StdMutex<Vec<ChildOrderIntent>>,
+        statuses: StdMutex<HashMap<OrderId, OrderStatus>>,
+        next_id: AtomicU32,
+        last_id: StdMutex<Option<OrderId>>,
+    }
+
+    impl SteppableSink {
+        fn new() -> Self {
+            Self {
+                submitted: StdMutex::new(Vec::new()),
+                statuses: StdMutex::new(HashMap::new()),
+                next_id: AtomicU32::new(0),
+                last_id: StdMutex::new(None),
+            }
+        }
+
+        fn set_status(&self, order_id: OrderId, status: OrderStatus) {
+            self.statuses.lock().unwrap().insert(order_id, status);
+        }
+
+        fn last_submitted_id(&self) -> OrderId {
+            self.last_id
+                .lock()
+                .unwrap()
+                .expect("no order submitted yet")
+        }
+    }
+
+    #[async_trait]
+    impl ChildOrderSink for SteppableSink {
+        async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+            self.submitted.lock().unwrap().push(intent);
+            let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let id = OrderId(Uuid::from_u128(n as u128 + 1));
+            *self.last_id.lock().unwrap() = Some(id);
+            Ok(id)
+        }
+
+        async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {
+            Ok(())
+        }
+
+        async fn order_status(
+            &self,
+            order_id: OrderId,
+        ) -> Result<Option<apexes_core::Order>, EmsError> {
+            let status = self.statuses.lock().unwrap().get(&order_id).copied();
+            Ok(status.map(|status| apexes_core::Order {
+                id: order_id,
+                exchange_order_id: None,
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                order_type: apexes_core::OrderType::Market,
+                quantity: dec!(1),
+                price: None,
+                stop_price: None,
+                filled_quantity: dec!(1),
+                status,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }))
+        }
+    }
+
+    fn iceberg_request(visible_qty: Decimal, quantity: Decimal) -> AlgoOrderRequest {
+        AlgoOrderRequest {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            quantity,
+            execution_algo: ExecutionAlgoSpec::Iceberg { visible_qty },
+            routing: OrderRouting::Fixed,
+        }
+    }
+
+    #[tokio::test]
+    async fn iceberg_submits_one_visible_slice_then_waits_for_it_to_fill_before_refilling() {
+        let sink = Arc::new(SteppableSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        let parent_id = ems
+            .submit_algo_order(iceberg_request(dec!(1), dec!(3)))
+            .await
+            .unwrap();
+
+        ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+
+        // Second call before the resting slice fills -- no new slice.
+        ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+
+        // Mark the resting child Filled -- next call should refill.
+        sink.set_status(sink.last_submitted_id(), OrderStatus::Filled);
+        ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 2);
+
+        assert_eq!(
+            ems.parent_order_status(parent_id).await.unwrap(),
+            Some(ParentOrderStatus::Scheduling)
+        );
+    }
+
+    #[tokio::test]
+    async fn iceberg_completes_once_all_quantity_submitted_and_last_slice_fills() {
+        let sink = Arc::new(SteppableSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        let _parent_id = ems
+            .submit_algo_order(iceberg_request(dec!(2), dec!(2)))
+            .await
+            .unwrap();
+
+        ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(sink.submitted.lock().unwrap()[0].quantity, dec!(2));
+
+        sink.set_status(sink.last_submitted_id(), OrderStatus::Filled);
+        ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+
+        // Fully submitted (2 of 2) and the resting child is terminal ->
+        // no further slice submitted, parent marked Completed.
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+    }
+
+    fn pov_request(participation_rate: Decimal) -> AlgoOrderRequest {
+        AlgoOrderRequest {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            quantity: dec!(100),
+            execution_algo: ExecutionAlgoSpec::Pov { participation_rate },
+            routing: OrderRouting::Fixed,
+        }
+    }
+
+    fn trade_event(symbol: &str, quantity: Decimal, now: DateTime<Utc>) -> MarketEvent {
+        MarketEvent::Trade(apexes_core::TradeEvent {
+            symbol: symbol.to_string(),
+            venue: Venue::Binance,
+            price: dec!(65000),
+            quantity,
+            side: None,
+            trade_id: None,
+            timestamp: now,
+        })
+    }
+
+    #[tokio::test]
+    async fn pov_submits_a_fraction_of_each_observed_trades_quantity() {
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        ems.submit_algo_order(pov_request(dec!(0.1))).await.unwrap();
+
+        ems.on_market_event(&trade_event("BTCUSDT", dec!(10), Utc::now()))
+            .await
+            .unwrap();
+
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(sink.submitted.lock().unwrap()[0].quantity, dec!(1));
+    }
+
+    #[tokio::test]
+    async fn pov_ignores_trades_for_a_different_symbol() {
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        ems.submit_algo_order(pov_request(dec!(0.1))).await.unwrap();
+
+        ems.on_market_event(&trade_event("ETHUSDT", dec!(10), Utc::now()))
+            .await
+            .unwrap();
+
+        assert_eq!(sink.submitted.lock().unwrap().len(), 0);
+    }
+
+    struct AlwaysInsufficientHistory;
+
+    #[async_trait]
+    impl VolumeCurveProvider for AlwaysInsufficientHistory {
+        async fn intraday_volume_curve(
+            &self,
+            _symbol: &str,
+            _venue: Venue,
+            _lookback_days: u32,
+        ) -> Result<VolumeCurve, EmsError> {
+            Err(EmsError::InsufficientVwapHistory {
+                reason: "only 1 of 5 requested days available".to_string(),
+            })
+        }
+    }
+
+    fn vwap_request() -> AlgoOrderRequest {
+        AlgoOrderRequest {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            quantity: dec!(10),
+            execution_algo: ExecutionAlgoSpec::Vwap {
+                duration: std::time::Duration::from_secs(3600),
+                lookback_days: 5,
+            },
+            routing: OrderRouting::Fixed,
+        }
+    }
+
+    #[tokio::test]
+    async fn vwap_fails_the_parent_order_when_history_is_insufficient() {
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        let parent_id = ems.submit_algo_order(vwap_request()).await.unwrap();
+
+        match ems.parent_order_status(parent_id).await.unwrap() {
+            Some(ParentOrderStatus::Failed { reason }) => {
+                assert!(reason.contains("VolumeCurveProvider") || reason.contains("history"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(sink.submitted.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn vwap_paces_submission_against_the_curves_cumulative_fractions() {
+        let sink = Arc::new(RecordingSink::new());
+        let provider = Arc::new(AlwaysInsufficientHistory);
+        // Deliberately unused for the success path below -- swapped for
+        // a curve-returning provider inline via a second small mock.
+        let _ = provider;
+
+        struct FixedCurveProvider;
+        #[async_trait]
+        impl VolumeCurveProvider for FixedCurveProvider {
+            async fn intraday_volume_curve(
+                &self,
+                _symbol: &str,
+                _venue: Venue,
+                _lookback_days: u32,
+            ) -> Result<VolumeCurve, EmsError> {
+                Ok(VolumeCurve {
+                    cumulative_fractions: vec![
+                        (chrono::Duration::zero(), dec!(0.5)),
+                        (chrono::Duration::seconds(60), dec!(1.0)),
+                    ],
+                })
+            }
+        }
+
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            Some(Arc::new(FixedCurveProvider)),
+        );
+        let parent_id = ems.submit_algo_order(vwap_request()).await.unwrap();
+
+        let started_at = Utc::now();
+        // At t=0, target fraction is already 0.5 (first curve entry's
+        // offset is zero) -- expect an immediate first submission of
+        // half the total quantity.
+        ems.on_market_event(&depth_event(started_at)).await.unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(sink.submitted.lock().unwrap()[0].quantity, dec!(5));
+
+        // At t=60s, target fraction is 1.0 -- expect the remaining half.
+        ems.on_market_event(&depth_event(started_at + chrono::Duration::seconds(60)))
+            .await
+            .unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 2);
+        assert_eq!(sink.submitted.lock().unwrap()[1].quantity, dec!(5));
+
+        assert_eq!(
+            ems.parent_order_status(parent_id).await.unwrap(),
+            Some(ParentOrderStatus::Completed)
         );
     }
 }

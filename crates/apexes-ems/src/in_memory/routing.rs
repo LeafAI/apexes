@@ -40,6 +40,7 @@ pub(crate) fn resolve_allocations(
             asset_class: AssetClass::Spot,
             quantity: request.quantity,
             submitted_quantity: Decimal::ZERO,
+            current_resting_child: None,
         }]),
         OrderRouting::RouteToBest => {
             let candidates = [AssetClass::Spot, AssetClass::Perpetual];
@@ -55,6 +56,7 @@ pub(crate) fn resolve_allocations(
                 asset_class: best.0,
                 quantity: request.quantity,
                 submitted_quantity: Decimal::ZERO,
+                current_resting_child: None,
             }])
         }
         OrderRouting::Split(candidates) => {
@@ -73,6 +75,7 @@ pub(crate) fn resolve_allocations(
                     asset_class,
                     quantity: request.quantity * (score / total),
                     submitted_quantity: Decimal::ZERO,
+                    current_resting_child: None,
                 })
                 .collect())
         }
