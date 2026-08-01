@@ -19,7 +19,9 @@
 pub mod child_order_sink;
 pub mod ems;
 pub mod error;
+pub mod in_memory;
 
 pub use child_order_sink::{ChildOrderIntent, ChildOrderSink};
 pub use ems::{AlgoOrderRequest, Ems};
 pub use error::EmsError;
+pub use in_memory::InMemoryEms;
