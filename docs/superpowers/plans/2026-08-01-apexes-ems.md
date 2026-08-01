@@ -6703,6 +6703,351 @@ git commit -S -s -m "feat: integrate Ems into StrategyContext, run_event_loop, a
 
 ---
 
+### Task 17b: Wire EMS child-order fills back into the ledger/tracker/report
+
+**Why this task exists (not in the original design spec's task list):** Task 17's own implementer and reviewer both independently confirmed a real correctness gap: `MatchingEngineChildOrderSink::submit_child_order` (Task 15) discards the `Vec<Fill>` that `MatchingEngine::submit_market_order` returns. There is no path connecting an EMS-driven child order's fills back to `PortfolioLedger`/`PerformanceTracker`/`BacktestReport.trades` in backtest or paper trading. A strategy using `execution_algo` (TWAP/VWAP/Iceberg/POV) currently sees CORRECT order-book price impact (the shared `MatchingEngine`/order book genuinely reflects every child order) but the ledger/equity-curve/trade-report silently miss every one of those fills — wrong (understated) equity, wrong (missing) positions, and an incomplete `BacktestReport.trades`/`LiveTradingReport.trades` list, all with no error or warning surfaced anywhere. Confirmed NOT to affect `apexes-live-trading`'s correctness in the same way: `OrderManagerChildOrderSink` (Task 16) submits child orders through the real, persisted `OrderManager`, whose fills already reach `run_live_trading`'s `ledger`/`tracker` via the pre-existing `apply_exchange_update`/`reconcile()` push/poll paths — `OrderManagerChildOrderSink::submit_child_order` itself just needs its return type widened to match the trait (see Step 2), returning an always-empty fill list, not a design change.
+
+**Files:**
+- Modify: `crates/apexes-ems/src/child_order_sink.rs`
+- Modify: `crates/apexes-ems/src/ems.rs`
+- Modify: `crates/apexes-ems/src/in_memory/mod.rs`
+- Modify: `crates/apexes-ems/src/postgres/mod.rs`
+- Modify: `crates/apexes-ems/src/postgres/order_manager_sink.rs`
+- Modify: `crates/apexes-ems/tests/live_postgres.rs`
+- Modify: `crates/apexes-backtest/src/ems_adapter.rs`
+- Modify: `crates/apexes-backtest/src/event_loop.rs`
+- Modify: `crates/apexes-live-trading/src/runner.rs`
+
+**Interfaces:**
+- Changes: `ChildOrderSink::submit_child_order`'s return type widens from `Result<OrderId, EmsError>` to `Result<(OrderId, Vec<Fill>), EmsError>` (`apexes_core::Fill`, empty `Vec` meaning "no fill happened synchronously at submission time — fills for this order, if any, will arrive through this sink's own separate fill-reporting mechanism instead", which is exactly `OrderManagerChildOrderSink`'s case).
+- Changes: `Ems::on_market_event`'s return type widens from `Result<(), EmsError>` to `Result<Vec<Fill>, EmsError>` (every fill produced by any child-order slice submitted during that one call, aggregated in submission order).
+- No change to `Ems::submit_algo_order`/`parent_order_status`/`cancel_parent_order`'s signatures.
+
+**Design decision, settled here:** fills flow out through the exact same call the caller already makes every loop iteration (`ems.on_market_event`), not through a new separate polling method — `InMemoryEms`'s TWAP/Iceberg/POV/VWAP slice submissions ALL happen from inside its `on_market_event` implementation already (see `submit_due_twap_slice`/`process_iceberg_parents`/`process_pov_parents`/`process_vwap_parents`, all called from `on_market_event`), so this is a minimally-invasive, no-new-plumbing change: every one of those `self.submit_slice(..)` call sites just needs its returned `(OrderId, Vec<Fill>)` tuple's fill half collected into one `Vec<Fill>` that `on_market_event` returns at the end. `PostgresEms::on_market_event` only ever drives POV (TWAP/VWAP/Iceberg are paced by real background `tokio::spawn` tasks there, per Task 16's design) — those background tasks' fills are NOT surfaced through `on_market_event`'s return value (no caller could receive them in time regardless, since they're produced on independent tokio tasks running between event-loop iterations); `PostgresEms` is unaffected in practice anyway (see this task's opening paragraph), so this asymmetry is acceptable and should be documented in `on_market_event`'s doc comment, not silently left implicit.
+
+- [ ] **Step 1: Widen `ChildOrderSink::submit_child_order`'s return type**
+
+```rust
+// crates/apexes-ems/src/child_order_sink.rs -- change the trait method:
+use apexes_core::{AssetClass, Fill, Order, OrderId, Side, Venue};
+// ...
+    /// Submits `intent` for immediate execution, returning the
+    /// resulting `OrderId` and any `Fill`s that happened synchronously
+    /// as part of submission (e.g. a Market order against a live local
+    /// order book fills immediately; an order routed through a real
+    /// broker/exchange gateway does NOT, and returns an empty `Vec` --
+    /// its fills, if any, arrive later through that sink's own
+    /// separate fill-reporting mechanism, e.g. `apexes_oms::OrderManager`'s
+    /// `apply_exchange_update`/`reconcile()`).
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError>;
+```
+
+- [ ] **Step 2: Update `MatchingEngineChildOrderSink` to return its real fills**
+
+```rust
+// crates/apexes-backtest/src/ems_adapter.rs -- change submit_child_order:
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        let order_intent = OrderIntent {
+            symbol: intent.symbol,
+            venue: intent.venue,
+            asset_class: intent.asset_class,
+            side: intent.side,
+            order_type: OrderType::Market,
+            quantity: intent.quantity,
+            price: None,
+            stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
+        };
+        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let (order, fills) = engine
+            .submit_market_order(&order_intent, Utc::now())
+            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
+                parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
+                reason: error.to_string(),
+            })?;
+        Ok((order.id, fills))
+    }
+```
+
+(No longer discards `_fills` -- this is the crux of the whole task.) Update this file's own `submit_child_order_fills_immediately_against_the_shared_book` test to destructure `(order_id, fills)` and additionally assert `fills.len() == 1` and `fills[0].quantity == dec!(1)`.
+
+- [ ] **Step 3: Update `OrderManagerChildOrderSink` to match the widened signature (empty fill list)**
+
+```rust
+// crates/apexes-ems/src/postgres/order_manager_sink.rs -- change submit_child_order:
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        // ... (body unchanged through order_manager.submit_order(..)) ...
+        let order_id = order_manager
+            .submit_order(order_intent, &empty_positions, &empty_balances)
+            .await
+            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
+                parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
+                reason: error.to_string(),
+            })?;
+        // OrderManager's own fills arrive later via
+        // apply_exchange_update/reconcile(), never synchronously from
+        // submit_order -- always an empty Vec here, by design (see
+        // this task's opening paragraph for why this is correct, not
+        // a shortcut).
+        Ok((order_id, Vec::new()))
+    }
+```
+
+Add a doc comment sentence to this file's existing module-level doc comment explaining the always-empty return (one sentence, referencing `apply_exchange_update`/`reconcile()` as where those fills actually surface).
+
+- [ ] **Step 4: Update `InMemoryEms`'s internal callers of `submit_slice`/`ChildOrderSink` to collect fills, and change `on_market_event`'s return type**
+
+Every one of `submit_slice`/`submit_due_twap_slice`/`refill_iceberg_allocation`/`submit_pov_increment`/`submit_vwap_increment` in `crates/apexes-ems/src/in_memory/mod.rs` currently discards or ignores the `OrderId` half of `self.sink.submit_child_order(..)`'s result in some call sites and binds it as `child_id`/`_child_id` in others -- re-grep with `file_grep pattern="submit_child_order\\(|\\.submit_slice\\(" path="crates/apexes-ems/src/in_memory/mod.rs"` before editing, since this task must touch every single call site, not just the ones excerpted below.
+
+Change `submit_slice`'s own return type to propagate fills:
+
+```rust
+    async fn submit_slice(
+        &self,
+        parent_id: ParentOrderId,
+        symbol: &str,
+        venue: apexes_core::Venue,
+        side: apexes_core::Side,
+        asset_class: AssetClass,
+        quantity: Decimal,
+    ) -> Result<(apexes_core::OrderId, Vec<apexes_core::Fill>), EmsError> {
+        self.sink
+            .submit_child_order(ChildOrderIntent {
+                symbol: symbol.to_string(),
+                venue,
+                asset_class,
+                side,
+                quantity,
+            })
+            .await
+            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
+                parent_id,
+                reason: error.to_string(),
+            })
+    }
+```
+
+Every caller of `self.submit_slice(..)` (in `submit_due_twap_slice`, `refill_iceberg_allocation`, `submit_pov_increment`, `submit_vwap_increment`) now receives `(child_id, slice_fills)` instead of a bare `child_id` -- destructure accordingly and thread `slice_fills` upward into a `Vec<Fill>` each of those four methods itself now returns (changing each of their own return types from `Result<(), EmsError>` / `Result<bool, EmsError>` to also carry a `Vec<Fill>`, e.g. `refill_iceberg_allocation` becomes `Result<(bool, Vec<Fill>), EmsError>`). `process_iceberg_parents`/`process_pov_parents`/`process_vwap_parents` (the methods that call these per-parent-order helpers in a loop over candidates) each accumulate every candidate's fills into one combined `Vec<Fill>` and return it.
+
+Change `on_market_event`'s signature and body to aggregate every one of these four paths' fills:
+
+```rust
+    async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<apexes_core::Fill>, EmsError> {
+        if let MarketEvent::Depth(update) = event {
+            let mut tracker = self.market_state.lock().unwrap_or_else(|p| p.into_inner());
+            for asset_class in [AssetClass::Spot, AssetClass::Perpetual] {
+                tracker.record_depth(&update.symbol, asset_class, update);
+            }
+        }
+
+        let now = event_timestamp(event);
+        let due: Vec<ParentOrderId> = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            parent_orders
+                .iter()
+                .filter(|(_, state)| {
+                    matches!(state.status, ParentOrderStatus::Scheduling)
+                        && matches!(
+                            &state.scheduling,
+                            SchedulingState::Twap { next_slice_at, .. } if *next_slice_at <= now
+                        )
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        let mut all_fills = Vec::new();
+        for parent_id in due {
+            all_fills.extend(self.submit_due_twap_slice(parent_id, now).await?);
+        }
+
+        all_fills.extend(self.process_iceberg_parents().await?);
+        all_fills.extend(self.process_vwap_parents(now).await?);
+        if let MarketEvent::Trade(trade) = event {
+            all_fills.extend(self.process_pov_parents(trade).await?);
+        }
+
+        Ok(all_fills)
+    }
+```
+
+(`submit_due_twap_slice` also changes from `Result<(), EmsError>` to `Result<Vec<Fill>, EmsError>`, same pattern as the other three.)
+
+Update every one of this file's existing `#[cfg(test)] mod tests` call sites of `ems.on_market_event(..).await.unwrap();` (13 at the time this plan entry was written -- re-count via `file_grep pattern="on_market_event" path="crates/apexes-ems/src/in_memory/mod.rs"`) that don't already inspect the return value -- they only need `.unwrap();` to keep compiling against the new `Result<Vec<Fill>, EmsError>` (no assertion changes required for those). Add ONE new test, `twap_slice_fills_are_returned_from_on_market_event`, using `RecordingSink` extended to also return a synthetic non-empty `Fill` from `submit_child_order` (mirroring `SteppableSink`'s existing pattern of adding fields for richer test behavior) and asserting `on_market_event`'s returned `Vec<Fill>` is non-empty with the expected quantity on the slice-submission tick.
+
+- [ ] **Step 5: Update `RecordingSink`/`SteppableSink` test doubles in `in_memory/mod.rs` and `live_postgres.rs` for the widened trait signature**
+
+Both test-only `ChildOrderSink` implementations (`RecordingSink`, `SteppableSink` in `crates/apexes-ems/src/in_memory/mod.rs`; `RecordingSink` in `crates/apexes-ems/tests/live_postgres.rs`) must change their `submit_child_order` signatures to return `Result<(OrderId, Vec<apexes_core::Fill>), EmsError>` -- all can simply return `Ok((order_id, Vec::new()))` (empty fill list) EXCEPT the one new test double introduced in Step 4, which returns a non-empty `Vec<Fill>` deliberately to exercise the new pass-through path.
+
+- [ ] **Step 6: Update `PostgresEms::on_market_event` and its `submit_and_record_child` caller for the widened `submit_child_order` signature**
+
+```rust
+// crates/apexes-ems/src/postgres/mod.rs -- submit_and_record_child's call site changes:
+        let (child_order_id, _fills) = self
+            .sink
+            .submit_child_order(ChildOrderIntent {
+                symbol: row.symbol.clone(),
+                venue,
+                asset_class: AssetClass::Spot,
+                side,
+                quantity,
+            })
+            .await?;
+```
+
+(`_fills` is deliberately discarded here -- per this task's opening paragraph, `OrderManagerChildOrderSink` always returns an empty `Vec` and `PostgresEms`'s own crash-recoverable fill-tracking already happens entirely through `OrderManager`'s own persisted state, not through this return value.)
+
+```rust
+// crates/apexes-ems/src/postgres/mod.rs -- on_market_event's signature:
+    async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<apexes_core::Fill>, EmsError> {
+        // TWAP/VWAP/Iceberg are paced by their own background tasks
+        // (spawned in submit_algo_order/recover_scheduling_parent_orders),
+        // independent of this call -- only POV reacts here, since POV is
+        // inherently trade-driven regardless of virtual vs. real clock
+        // (see this module's docs). This implementation never returns
+        // any fills here (see this trait method's own doc comment on
+        // `Ems` for why: `PostgresEms`'s `ChildOrderSink` is always
+        // `OrderManagerChildOrderSink`, whose fills surface later via
+        // `OrderManager::apply_exchange_update`/`reconcile()`, not
+        // synchronously here).
+        if let MarketEvent::Trade(trade) = event {
+            self.process_pov_on_trade(trade).await?;
+        }
+        Ok(Vec::new())
+    }
+```
+
+Update `process_pov_on_trade` and anything else in this file calling `submit_and_record_child` similarly (destructure and discard the fill half).
+
+- [ ] **Step 7: Update `Ems::on_market_event`'s trait signature and doc comment**
+
+```rust
+// crates/apexes-ems/src/ems.rs -- change the trait method:
+use apexes_core::{Fill, MarketEvent, Side, Venue};
+// ...
+    /// Notifies this `Ems` of a new `MarketEvent` observed by the
+    /// caller's event loop, returning every `Fill` that happened
+    /// synchronously as a result of any child-order slice submitted
+    /// during this call (aggregated across every parent order this
+    /// call advanced, in submission order) -- callers apply these
+    /// exactly like any other `Fill`s (ledger/tracker/report), the
+    /// same way they already apply direct-strategy order fills.
+    /// `InMemoryEms` uses this event's timestamp to drive
+    /// virtual-clock-paced scheduling (TWAP/VWAP/Iceberg) and
+    /// `MarketEvent::Trade.quantity` to drive POV participation, and
+    /// returns real fills from its `MatchingEngineChildOrderSink`.
+    /// `PostgresEms` ignores everything except `MarketEvent::Trade`
+    /// (used for its own POV scheduling only -- TWAP/VWAP/Iceberg are
+    /// paced by real background timers there, independent of this
+    /// call) and always returns an empty `Vec` -- its `ChildOrderSink`
+    /// (`OrderManagerChildOrderSink`) never fills synchronously; those
+    /// fills surface later through the caller's own
+    /// `OrderManager::apply_exchange_update`/`reconcile()` handling,
+    /// same as any other live order. Callers (Task 17) call this once
+    /// per event, for every event, regardless of whether any parent
+    /// orders are currently scheduling.
+    async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError>;
+```
+
+- [ ] **Step 8: Wire `run_event_loop` to apply `ems.on_market_event`'s returned fills**
+
+```rust
+// crates/apexes-backtest/src/event_loop.rs -- change the ems.on_market_event call site:
+        let ems_fills = ems
+            .on_market_event(&event)
+            .await
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("ems.on_market_event failed: {error}"),
+            })?;
+        if !ems_fills.is_empty() {
+            apply_fills(
+                &mut ledger,
+                &mut overall_tracker,
+                &mut per_symbol_trackers,
+                &mut per_venue_trackers,
+                &mut all_fills,
+                &ems_fills,
+                config.risk_free_return,
+            )?;
+            if let Some(checker) = &mut risk_checker {
+                for fill in &ems_fills {
+                    if let Err(violations) =
+                        checker.on_fill(fill, ledger.positions(), ledger.balances())
+                    {
+                        tracing::warn!(
+                            ?violations,
+                            symbol = %fill.symbol,
+                            "in-trade risk monitor flagged a violation"
+                        );
+                    }
+                }
+            }
+        }
+        refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+```
+
+(Mirrors this same function's existing `MarketEvent::Trade` fill-application block exactly -- `apply_fills` + per-fill `risk_checker.on_fill`, just for EMS-sourced fills instead of direct matching-engine fills. Placed BEFORE `refresh_open_parent_orders` so a parent order that completes on this very tick already reflects its fills in `ledger`/`overall_tracker` by the time `StrategyContext` is built later in this same loop iteration.)
+
+- [ ] **Step 9: Wire `run_live_trading` to apply `ems.on_market_event`'s returned fills (always empty in practice, but must compile against the new signature)**
+
+```rust
+// crates/apexes-live-trading/src/runner.rs -- change the ems.on_market_event call site:
+                match ems.on_market_event(&event).await {
+                    Ok(ems_fills) if !ems_fills.is_empty() => {
+                        apply_new_fills(&mut ledger, &mut tracker, &mut risk_checker, &mut all_fills, ems_fills);
+                        let equity = ledger.equity(&last_prices)?;
+                        tracker.record_equity_point(chrono::Utc::now(), equity);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(?error, "ems.on_market_event failed"),
+                }
+```
+
+(Structurally mirrors this same file's existing `apply_exchange_update`/`reconcile()` match arms exactly. In practice `ems_fills` is always empty here -- per this task's opening paragraph -- but wiring it through keeps `run_live_trading` consistent with `run_event_loop` and correct if `PostgresEms`'s `on_market_event` behavior ever changes in the future.)
+
+- [ ] **Step 10: Add an end-to-end backtest test proving EMS child-order fills reach the ledger/report**
+
+Add to `crates/apexes-backtest/tests/end_to_end.rs`: a new test, `full_backtest_with_execution_algo_applies_child_order_fills_to_the_ledger_and_report`, using a strategy that submits ONE `OrderIntent` with `execution_algo: Some(ExecutionAlgoSpec::Twap { duration: ..., slices: 1 })` (a single-slice TWAP submits its one child order on the very first `on_market_event` tick, per `InMemoryEms`'s own `next_slice_at: Utc::now()` semantics -- no need to simulate multiple ticks), against a `Vec<MarketEvent>` with a `Depth` update providing book liquidity followed by enough further events to let one `on_market_event` tick fire. Assert on the returned `BacktestReport`: `report.trades` is non-empty and contains a fill for the expected symbol/quantity, AND `report.overall`'s summary reflects a non-zero-equity-impacting trade (e.g. checking the equity curve moved, or checking a position exists via a second `run_backtest` call's `PortfolioLedger` state if `BacktestReport` doesn't directly expose positions -- inspect `BacktestReport`'s actual fields via `file_read` before writing this assertion, don't guess its shape). This test is the actual regression test for the bug this whole task fixes -- without Step 2's fix, this test must fail (verify this negatively if practical, e.g. by temporarily reverting Step 2 locally and confirming the new test fails, then re-applying the fix -- not required to keep as a permanent step, just as your own verification before considering this task done).
+
+- [ ] **Step 11: Run this crate's and the workspace's full test suite, clippy, and fmt**
+
+Run: `cargo test -p apexes-ems -- --test-threads=1`
+Expected: PASS, all tests including the new Step 4 test.
+
+Run: `cargo test -p apexes-backtest`
+Expected: PASS, including the new Step 10 test.
+
+Run: `cargo test -p apexes-live-trading -- --test-threads=1`
+Expected: PASS, 0 failures (no behavior change expected here, only a compiling signature change).
+
+Run: `cargo test --workspace --no-fail-fast -- --test-threads=1`
+Expected: 0 failures (except the same pre-existing environmental-limitation failures already documented in `.superpowers/sdd/progress.md`).
+
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Expected: 0 warnings.
+
+Run: `cargo fmt --check`
+Expected: clean (run `cargo fmt` first if not).
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add -A
+git commit -S -s -m "fix(apexes-ems): wire EMS child-order fills back into the ledger/tracker/report"
+```
+
+---
+
 ### Task 18: Final whole-branch code review and `docs/FEATURES.md` update
 
 **Files:**
