@@ -15,37 +15,43 @@ pub enum BinanceExchangeKind {
     Perpetual,
 }
 
-/// Filters `instruments` down to those tradable via this provider: Binance
-/// venue and Spot asset class. Non-matching instruments are skipped with a
-/// warning rather than causing the whole call to fail.
-fn filter_binance_spot_instruments(instruments: &[Instrument]) -> Vec<&Instrument> {
-    instruments
-        .iter()
-        .filter(|instrument| {
-            if instrument.venue != Venue::Binance {
+/// Filters `instruments` down to those tradable via this provider:
+/// `Venue::Binance` + (`AssetClass::Spot` or `AssetClass::Perpetual`).
+/// Non-matching instruments are skipped with a warning rather than
+/// causing the whole call to fail. Returns `(spot_instruments,
+/// perpetual_instruments)` so `subscribe` can route each group to its
+/// own `BinanceExchangeKind`.
+fn filter_binance_instruments(instruments: &[Instrument]) -> (Vec<&Instrument>, Vec<&Instrument>) {
+    let mut spot = Vec::new();
+    let mut perpetual = Vec::new();
+    for instrument in instruments {
+        if instrument.venue != Venue::Binance {
+            tracing::warn!(
+                symbol = %instrument.symbol,
+                venue = ?instrument.venue,
+                "skipping instrument: BinanceMarketDataProvider only supports Venue::Binance"
+            );
+            continue;
+        }
+        match instrument.asset_class {
+            AssetClass::Spot => spot.push(instrument),
+            AssetClass::Perpetual => perpetual.push(instrument),
+            other => {
                 tracing::warn!(
                     symbol = %instrument.symbol,
-                    venue = ?instrument.venue,
-                    "skipping instrument: BinanceMarketDataProvider only supports Venue::Binance"
+                    asset_class = ?other,
+                    "skipping instrument: BinanceMarketDataProvider only supports AssetClass::Spot and AssetClass::Perpetual"
                 );
-                return false;
             }
-            if instrument.asset_class != AssetClass::Spot {
-                tracing::warn!(
-                    symbol = %instrument.symbol,
-                    asset_class = ?instrument.asset_class,
-                    "skipping instrument: BinanceMarketDataProvider only supports AssetClass::Spot"
-                );
-                return false;
-            }
-            true
-        })
-        .collect()
+        }
+    }
+    (spot, perpetual)
 }
 
-/// A `MarketDataProvider` backed by Binance Spot public WebSocket feeds,
-/// via `barter-data`. Produces `Trade`, `Tick`, `Depth`, and self-aggregated
-/// `Bar` events.
+/// A `MarketDataProvider` backed by Binance Spot and USDS-M Perpetual
+/// public WebSocket feeds, via `barter-data` (plus a hand-rolled
+/// mark-price stream for Perpetual). Produces `Trade`, `Tick`, `Depth`,
+/// self-aggregated `Bar`, and (Perpetual only) `MarkPrice` events.
 pub struct BinanceMarketDataProvider;
 
 impl BinanceMarketDataProvider {
@@ -66,37 +72,63 @@ impl MarketDataProvider for BinanceMarketDataProvider {
         &self,
         instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
-        let filtered = filter_binance_spot_instruments(instruments);
+        let (spot, perpetual) = filter_binance_instruments(instruments);
 
-        if filtered.is_empty() {
+        if spot.is_empty() && perpetual.is_empty() {
             return Err(ApexesError::SubscriptionFailed {
                 symbol: instruments
                     .first()
                     .map(|i| i.symbol.clone())
                     .unwrap_or_default(),
                 venue: Venue::Binance,
-                reason: "no instruments matched Venue::Binance + AssetClass::Spot after filtering"
+                reason: "no instruments matched Venue::Binance + (AssetClass::Spot or AssetClass::Perpetual) after filtering"
                     .to_string(),
                 source_detail: None,
             });
         }
 
-        let symbols: Vec<String> = filtered.iter().map(|i| i.symbol.clone()).collect();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        spawn_task_thread("trade_task", {
-            let symbols = symbols.clone();
-            let tx = tx.clone();
-            move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, tx)
-        });
-        spawn_task_thread("ticker_task", {
-            let symbols = symbols.clone();
-            let tx = tx.clone();
-            move || crate::ticker_task::run(symbols, BinanceExchangeKind::Spot, tx)
-        });
-        spawn_task_thread("depth_task", move || {
-            crate::depth_task::run(symbols, BinanceExchangeKind::Spot, tx)
-        });
+        if !spot.is_empty() {
+            let symbols: Vec<String> = spot.iter().map(|i| i.symbol.clone()).collect();
+            spawn_task_thread("trade_task_spot", {
+                let symbols = symbols.clone();
+                let tx = tx.clone();
+                move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, tx)
+            });
+            spawn_task_thread("ticker_task_spot", {
+                let symbols = symbols.clone();
+                let tx = tx.clone();
+                move || crate::ticker_task::run(symbols, BinanceExchangeKind::Spot, tx)
+            });
+            spawn_task_thread("depth_task_spot", {
+                let tx = tx.clone();
+                move || crate::depth_task::run(symbols, BinanceExchangeKind::Spot, tx)
+            });
+        }
+
+        if !perpetual.is_empty() {
+            let symbols: Vec<String> = perpetual.iter().map(|i| i.symbol.clone()).collect();
+            spawn_task_thread("trade_task_perpetual", {
+                let symbols = symbols.clone();
+                let tx = tx.clone();
+                move || crate::trade_task::run(symbols, BinanceExchangeKind::Perpetual, tx)
+            });
+            spawn_task_thread("ticker_task_perpetual", {
+                let symbols = symbols.clone();
+                let tx = tx.clone();
+                move || crate::ticker_task::run(symbols, BinanceExchangeKind::Perpetual, tx)
+            });
+            spawn_task_thread("depth_task_perpetual", {
+                let symbols = symbols.clone();
+                let tx = tx.clone();
+                move || crate::depth_task::run(symbols, BinanceExchangeKind::Perpetual, tx)
+            });
+            spawn_task_thread("mark_price_task", {
+                let tx = tx.clone();
+                move || crate::mark_price_task::run(symbols, tx)
+            });
+        }
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
@@ -194,23 +226,40 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn filters_out_non_binance_venue() {
-        let instruments = vec![non_binance_instrument(), binance_spot_instrument("BTCUSDT")];
-        let filtered = filter_binance_spot_instruments(&instruments);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].symbol, "BTCUSDT");
+    fn binance_unsupported_asset_class_instrument() -> Instrument {
+        Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Future,
+            None,
+            None,
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn filters_out_non_spot_asset_class() {
+    fn filters_out_non_binance_venue() {
+        let instruments = vec![non_binance_instrument(), binance_spot_instrument("BTCUSDT")];
+        let (spot, perpetual) = filter_binance_instruments(&instruments);
+        assert_eq!(spot.len(), 1);
+        assert_eq!(spot[0].symbol, "BTCUSDT");
+        assert!(perpetual.is_empty());
+    }
+
+    #[test]
+    fn filters_out_unsupported_asset_class() {
         let instruments = vec![
-            binance_perpetual_instrument(),
+            binance_unsupported_asset_class_instrument(),
             binance_spot_instrument("ETHUSDT"),
         ];
-        let filtered = filter_binance_spot_instruments(&instruments);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].symbol, "ETHUSDT");
+        let (spot, perpetual) = filter_binance_instruments(&instruments);
+        assert_eq!(spot.len(), 1);
+        assert_eq!(spot[0].symbol, "ETHUSDT");
+        assert!(perpetual.is_empty());
     }
 
     #[test]
@@ -219,8 +268,22 @@ mod tests {
             binance_spot_instrument("BTCUSDT"),
             binance_spot_instrument("ETHUSDT"),
         ];
-        let filtered = filter_binance_spot_instruments(&instruments);
-        assert_eq!(filtered.len(), 2);
+        let (spot, perpetual) = filter_binance_instruments(&instruments);
+        assert_eq!(spot.len(), 2);
+        assert!(perpetual.is_empty());
+    }
+
+    #[test]
+    fn perpetual_instruments_are_kept_separately_from_spot() {
+        let instruments = vec![
+            binance_spot_instrument("BTCUSDT"),
+            binance_perpetual_instrument(),
+        ];
+        let (spot, perpetual) = filter_binance_instruments(&instruments);
+        assert_eq!(spot.len(), 1);
+        assert_eq!(spot[0].symbol, "BTCUSDT");
+        assert_eq!(perpetual.len(), 1);
+        assert_eq!(perpetual[0].symbol, "BTCUSDT");
     }
 
     #[tokio::test]

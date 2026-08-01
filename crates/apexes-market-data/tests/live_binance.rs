@@ -70,3 +70,44 @@ async fn subscribing_to_btcusdt_produces_all_four_market_event_variants() {
         "expected at least one MarketEvent::Bar within 90s (requires at least one OneSecond interval boundary crossed with a trade before it)"
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn subscribing_to_a_perpetual_instrument_produces_mark_price_events() {
+    let provider = BinanceMarketDataProvider::new();
+    let instrument = Instrument::new(
+        "BTCUSDT",
+        MarketType::Crypto,
+        Venue::Binance,
+        AssetClass::Perpetual,
+        Some("BTC".to_string()),
+        Some("USDT".to_string()),
+        dec!(0.01),
+        dec!(0.001),
+        dec!(1),
+    )
+    .unwrap();
+
+    let mut stream = provider
+        .subscribe(&[instrument])
+        .await
+        .expect("subscribe should succeed for a valid Binance Perpetual instrument");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut saw_mark_price = false;
+
+    while tokio::time::Instant::now() < deadline && !saw_mark_price {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(MarketEvent::MarkPrice(_))) => saw_mark_price = true,
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_timeout) => break,
+        }
+    }
+
+    assert!(
+        saw_mark_price,
+        "expected at least one MarketEvent::MarkPrice within 30s"
+    );
+}
