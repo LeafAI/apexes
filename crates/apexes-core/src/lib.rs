@@ -19,4 +19,4 @@ pub use market_data::{
     Bar, BarInterval, DepthUpdate, MarkPriceUpdate, MarketDataProvider, MarketEvent, PriceLevel,
     Tick, TradeEvent,
 };
-pub use order::{Order, OrderId, OrderStatus, OrderType, Side};
+pub use order::{MarginMode, Order, OrderId, OrderStatus, OrderType, Side};
