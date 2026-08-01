@@ -1,6 +1,6 @@
 use crate::conversion::fixed_to_decimal;
 use crate::error::StorageError;
-use crate::schema::{BarRow, DepthRow, TickRow, TradeRow};
+use crate::schema::{BarRow, DepthRow, MarkPriceRow, TickRow, TradeRow};
 use apexes_core::{MarketEvent, Venue};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clickhouse::Client;
@@ -73,9 +73,7 @@ impl StorageReader {
             EventType::Tick => self.read_ticks(symbol, &venue_str, start, end).await,
             EventType::Depth => self.read_depth(symbol, &venue_str, start, end).await,
             EventType::Bar => self.read_bars(symbol, &venue_str, start, end).await,
-            EventType::MarkPrice => Err(StorageError::QueryFailed {
-                reason: "MarkPrice reading not yet implemented (see Task 4)".to_string(),
-            }),
+            EventType::MarkPrice => self.read_mark_prices(symbol, &venue_str, start, end).await,
         }
     }
 
@@ -172,6 +170,30 @@ impl StorageReader {
 
         rows.into_iter()
             .map(|row| Ok(MarketEvent::Bar(row.try_into()?)))
+            .collect()
+    }
+
+    async fn read_mark_prices(
+        &self,
+        symbol: &str,
+        venue: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<MarketEvent>, StorageError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM mark_prices WHERE venue = ? AND symbol = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+            )
+            .bind(venue)
+            .bind(symbol)
+            .bind(start.format(CLICKHOUSE_DATETIME_FORMAT).to_string())
+            .bind(end.format(CLICKHOUSE_DATETIME_FORMAT).to_string())
+            .fetch_all::<MarkPriceRow>()
+            .await?;
+
+        rows.into_iter()
+            .map(|row| Ok(MarketEvent::MarkPrice(row.try_into()?)))
             .collect()
     }
 

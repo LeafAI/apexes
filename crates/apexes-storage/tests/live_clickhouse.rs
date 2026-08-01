@@ -4,7 +4,8 @@
 //!   cargo test -p apexes-storage -- --ignored
 
 use apexes_core::{
-    Bar, BarInterval, DepthUpdate, MarketEvent, PriceLevel, Side, Tick, TradeEvent, Venue,
+    Bar, BarInterval, DepthUpdate, MarkPriceUpdate, MarketEvent, PriceLevel, Side, Tick,
+    TradeEvent, Venue,
 };
 use apexes_storage::{EventType, StorageError, StorageReader, StorageWriter};
 use chrono::{DateTime, Utc};
@@ -208,6 +209,49 @@ async fn write_and_read_back_bars() {
     assert_eq!(bar.open, dec!(65000));
     assert_eq!(bar.volume, dec!(500.25));
     assert_eq!(bar.interval, BarInterval::OneMinute);
+}
+
+#[tokio::test]
+#[ignore]
+async fn write_and_read_back_mark_prices() {
+    let writer = StorageWriter::new(CLICKHOUSE_URL)
+        .await
+        .expect("StorageWriter::new should succeed with ClickHouse running locally");
+    let reader = StorageReader::new(CLICKHOUSE_URL)
+        .await
+        .expect("StorageReader::new should succeed");
+
+    let now = Utc::now();
+    let symbol = unique_symbol("TESTMARKPRICE", now);
+    let events = vec![MarketEvent::MarkPrice(MarkPriceUpdate {
+        symbol: symbol.clone(),
+        venue: Venue::Binance,
+        mark_price: dec!(65012.34567),
+        timestamp: now,
+    })];
+
+    writer
+        .write_batch(&events)
+        .await
+        .expect("write_batch should succeed");
+
+    let date = now.date_naive();
+    let read_back = reader
+        .read_batch(
+            &symbol,
+            Venue::Binance,
+            date..(date.succ_opt().unwrap()),
+            EventType::MarkPrice,
+        )
+        .await
+        .expect("read_batch should succeed");
+
+    assert_eq!(read_back.len(), 1);
+    let MarketEvent::MarkPrice(update) = &read_back[0] else {
+        panic!("expected MarketEvent::MarkPrice");
+    };
+    assert_eq!(update.symbol, symbol);
+    assert_eq!(update.mark_price, dec!(65012.34567));
 }
 
 #[tokio::test]

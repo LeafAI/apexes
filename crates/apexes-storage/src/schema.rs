@@ -1,6 +1,8 @@
 use crate::conversion::{CkDecimal, decimal_to_fixed, fixed_to_decimal};
 use crate::error::StorageError;
-use apexes_core::{Bar, BarInterval, DepthUpdate, PriceLevel, Side, Tick, TradeEvent, Venue};
+use apexes_core::{
+    Bar, BarInterval, DepthUpdate, MarkPriceUpdate, PriceLevel, Side, Tick, TradeEvent, Venue,
+};
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,54 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(open_time)
 ORDER BY (venue, symbol, interval, open_time)
 ";
+
+pub const MARK_PRICES_TABLE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS mark_prices
+(
+    symbol      String,
+    venue       String,
+    mark_price  Decimal(38, 10),
+    timestamp   DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (venue, symbol, timestamp)
+";
+
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct MarkPriceRow {
+    pub symbol: String,
+    pub venue: String,
+    pub mark_price: CkDecimal,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl TryFrom<&MarkPriceUpdate> for MarkPriceRow {
+    type Error = StorageError;
+
+    fn try_from(update: &MarkPriceUpdate) -> Result<Self, StorageError> {
+        Ok(MarkPriceRow {
+            symbol: update.symbol.clone(),
+            venue: format!("{:?}", update.venue),
+            mark_price: decimal_to_fixed(update.mark_price)?,
+            timestamp: update.timestamp,
+        })
+    }
+}
+
+impl TryFrom<MarkPriceRow> for MarkPriceUpdate {
+    type Error = StorageError;
+
+    fn try_from(row: MarkPriceRow) -> Result<Self, StorageError> {
+        Ok(MarkPriceUpdate {
+            symbol: row.symbol,
+            venue: parse_venue(&row.venue)?,
+            mark_price: fixed_to_decimal(row.mark_price),
+            timestamp: row.timestamp,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct TradeRow {
@@ -399,6 +449,19 @@ mod tests {
     fn parse_venue_rejects_unknown_string() {
         let result = parse_venue("NotARealVenue");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mark_price_row_round_trips_through_try_from() {
+        let update = MarkPriceUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(65012.34),
+            timestamp: Utc::now(),
+        };
+        let row = MarkPriceRow::try_from(&update).unwrap();
+        let round_tripped = MarkPriceUpdate::try_from(row).unwrap();
+        assert_eq!(update, round_tripped);
     }
 
     #[test]

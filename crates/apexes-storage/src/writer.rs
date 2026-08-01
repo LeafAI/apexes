@@ -1,7 +1,7 @@
 use crate::error::StorageError;
 use crate::schema::{
-    BARS_TABLE_DDL, BarRow, DEPTH_UPDATES_TABLE_DDL, DepthRow, TICKS_TABLE_DDL, TRADES_TABLE_DDL,
-    TickRow, TradeRow,
+    BARS_TABLE_DDL, BarRow, DEPTH_UPDATES_TABLE_DDL, DepthRow, MARK_PRICES_TABLE_DDL, MarkPriceRow,
+    TICKS_TABLE_DDL, TRADES_TABLE_DDL, TickRow, TradeRow,
 };
 use apexes_core::MarketEvent;
 use clickhouse::Client;
@@ -18,7 +18,7 @@ pub struct StorageWriter {
 
 impl StorageWriter {
     /// Connects to ClickHouse at `url` (e.g. "http://localhost:8123") and
-    /// ensures all 4 tables exist (CREATE TABLE IF NOT EXISTS).
+    /// ensures all 5 tables exist (CREATE TABLE IF NOT EXISTS).
     pub async fn new(url: &str) -> Result<Self, StorageError> {
         let client = Client::default().with_url(url);
 
@@ -50,6 +50,13 @@ impl StorageWriter {
             .map_err(|error| StorageError::ConnectionFailed {
                 reason: format!("failed to create bars table: {error}"),
             })?;
+        client
+            .query(MARK_PRICES_TABLE_DDL)
+            .execute()
+            .await
+            .map_err(|error| StorageError::ConnectionFailed {
+                reason: format!("failed to create mark_prices table: {error}"),
+            })?;
 
         Ok(StorageWriter { client })
     }
@@ -66,9 +73,7 @@ impl StorageWriter {
             BatchVariant::Tick => self.write_ticks(events).await,
             BatchVariant::Depth => self.write_depth(events).await,
             BatchVariant::Bar => self.write_bars(events).await,
-            BatchVariant::MarkPrice => Err(StorageError::QueryFailed {
-                reason: "MarkPrice writing not yet implemented (see Task 5)".to_string(),
-            }),
+            BatchVariant::MarkPrice => self.write_mark_prices(events).await,
         }
     }
 
@@ -124,6 +129,18 @@ impl StorageWriter {
         insert.end().await?;
         Ok(())
     }
+
+    async fn write_mark_prices(&self, events: &[MarketEvent]) -> Result<(), StorageError> {
+        let mut insert = self.client.insert::<MarkPriceRow>("mark_prices").await?;
+        for event in events {
+            let MarketEvent::MarkPrice(update) = event else {
+                return Err(StorageError::MixedBatch);
+            };
+            insert.write(&MarkPriceRow::try_from(update)?).await?;
+        }
+        insert.end().await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +183,7 @@ fn classify_batch(events: &[MarketEvent]) -> Result<BatchVariant, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apexes_core::{Bar, BarInterval, Tick, TradeEvent, Venue};
+    use apexes_core::{Bar, BarInterval, MarkPriceUpdate, Tick, TradeEvent, Venue};
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
@@ -190,6 +207,15 @@ mod tests {
             bid_size: dec!(1),
             ask_price: dec!(65001),
             ask_size: dec!(1),
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn sample_mark_price() -> MarketEvent {
+        MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(65012.34),
             timestamp: Utc::now(),
         })
     }
@@ -219,6 +245,13 @@ mod tests {
         let events = vec![sample_tick(), sample_tick()];
         let result = classify_batch(&events);
         assert_eq!(result.unwrap(), BatchVariant::Tick);
+    }
+
+    #[test]
+    fn classify_batch_accepts_homogeneous_mark_prices() {
+        let events = vec![sample_mark_price(), sample_mark_price()];
+        let result = classify_batch(&events);
+        assert_eq!(result.unwrap(), BatchVariant::MarkPrice);
     }
 
     #[test]
