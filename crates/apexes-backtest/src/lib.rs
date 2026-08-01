@@ -14,6 +14,8 @@
 
 pub mod error;
 
+pub mod ems_adapter;
+
 // Populated in Task 3.
 pub mod market_data_source;
 
