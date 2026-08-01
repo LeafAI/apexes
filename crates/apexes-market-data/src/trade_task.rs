@@ -1,8 +1,11 @@
 use crate::bar_aggregator::BarAggregator;
+use crate::provider::BinanceExchangeKind;
 use crate::symbol::{split_symbol, symbol_of};
 use apexes_core::{MarketEvent, Side as ApexesSide, TradeEvent, Venue};
 use barter_data::{
-    exchange::binance::spot::BinanceSpot, streams::Streams, subscription::trade::PublicTrades,
+    exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
+    streams::Streams,
+    subscription::trade::PublicTrades,
 };
 use barter_instrument::{
     Side as BarterSide, instrument::market_data::kind::MarketDataInstrumentKind,
@@ -34,58 +37,18 @@ fn f64_to_decimal(value: f64, field_name: &str) -> Decimal {
     })
 }
 
-/// Subscribes to Binance Spot public trades for `symbols`, converts each
-/// trade into `MarketEvent::Trade`, and drives a per-symbol `BarAggregator`
+/// Subscribes to Binance public trades for `symbols` on `exchange`
+/// (`BinanceExchangeKind::Spot` or `::Perpetual`), converts each trade
+/// into `MarketEvent::Trade`, and drives a per-symbol `BarAggregator`
 /// to also emit `MarketEvent::Bar` when intervals close. Runs until the
 /// underlying `barter-data` stream ends (which, given `barter-data`'s
-/// internal auto-reconnect, is effectively "forever" under normal operation).
-pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
-    let subscriptions: Vec<_> = symbols
-        .iter()
-        .filter_map(|symbol| {
-            let (base, quote) = match split_symbol(symbol) {
-                Some(pair) => pair,
-                None => {
-                    tracing::warn!(
-                        %symbol,
-                        "trade_task: skipping symbol with unrecognized quote currency"
-                    );
-                    return None;
-                }
-            };
-            Some((
-                BinanceSpot::default(),
-                base,
-                quote,
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            ))
-        })
-        .collect();
-
-    if subscriptions.is_empty() {
-        tracing::warn!(
-            ?symbols,
-            "trade_task: no valid Binance spot subscriptions derived from symbols"
-        );
-        return;
-    }
-
-    let streams = match Streams::<PublicTrades>::builder()
-        .subscribe(subscriptions)
-        .init()
-        .await
-    {
-        Ok(streams) => streams,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "trade_task: failed to initialize barter-data PublicTrades stream"
-            );
-            return;
-        }
-    };
-
+/// internal auto-reconnect, is effectively "forever" under normal
+/// operation).
+pub async fn run(
+    symbols: Vec<String>,
+    exchange: BinanceExchangeKind,
+    tx: UnboundedSender<MarketEvent>,
+) {
     let mut aggregators: HashMap<String, BarAggregator> = symbols
         .iter()
         .map(|symbol| {
@@ -96,7 +59,73 @@ pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
         })
         .collect();
 
-    let mut merged = streams.select_all();
+    let mut merged = match exchange {
+        BinanceExchangeKind::Spot => {
+            let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                (
+                    BinanceSpot::default(),
+                    base,
+                    quote,
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                )
+            });
+            if subscriptions.is_empty() {
+                tracing::warn!(
+                    ?symbols,
+                    "trade_task: no valid Binance spot subscriptions derived from symbols"
+                );
+                return;
+            }
+            match Streams::<PublicTrades>::builder()
+                .subscribe(subscriptions)
+                .init()
+                .await
+            {
+                Ok(streams) => streams.select_all(),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "trade_task: failed to initialize barter-data PublicTrades stream (spot)"
+                    );
+                    return;
+                }
+            }
+        }
+        BinanceExchangeKind::Perpetual => {
+            let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                (
+                    BinanceFuturesUsd::default(),
+                    base,
+                    quote,
+                    MarketDataInstrumentKind::Perpetual,
+                    PublicTrades,
+                )
+            });
+            if subscriptions.is_empty() {
+                tracing::warn!(
+                    ?symbols,
+                    "trade_task: no valid Binance perpetual subscriptions derived from symbols"
+                );
+                return;
+            }
+            match Streams::<PublicTrades>::builder()
+                .subscribe(subscriptions)
+                .init()
+                .await
+            {
+                Ok(streams) => streams.select_all(),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "trade_task: failed to initialize barter-data PublicTrades stream (perpetual)"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
     while let Some(event) = merged.next().await {
         let market_event = match event {
             barter_data::streams::reconnect::Event::Item(Ok(market_event)) => market_event,
@@ -144,6 +173,29 @@ pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
             }
         }
     }
+}
+
+/// Builds one subscription tuple per valid symbol via `make_tuple`,
+/// skipping (with a warning) any symbol whose quote currency isn't
+/// recognized by `split_symbol`. Shared helper so the Spot/Perpetual
+/// branches above don't duplicate this filter-and-log logic.
+fn build_subscriptions<T>(symbols: &[String], make_tuple: impl Fn(String, String) -> T) -> Vec<T> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let (base, quote) = match split_symbol(symbol) {
+                Some(pair) => pair,
+                None => {
+                    tracing::warn!(
+                        %symbol,
+                        "trade_task: skipping symbol with unrecognized quote currency"
+                    );
+                    return None;
+                }
+            };
+            Some(make_tuple(base, quote))
+        })
+        .collect()
 }
 
 #[cfg(test)]

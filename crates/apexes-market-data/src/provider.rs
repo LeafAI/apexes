@@ -3,6 +3,18 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+/// Which Binance market this instrument's data comes from -- Spot public
+/// market data and USDS-M Perpetual Futures public market data are
+/// separate `barter-data` exchange types (`BinanceSpot` vs.
+/// `BinanceFuturesUsd`) with separate WebSocket hosts, so every
+/// ingestion task takes this enum to know which one to use per
+/// subscription batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinanceExchangeKind {
+    Spot,
+    Perpetual,
+}
+
 /// Filters `instruments` down to those tradable via this provider: Binance
 /// venue and Spot asset class. Non-matching instruments are skipped with a
 /// warning rather than causing the whole call to fail.
@@ -75,14 +87,16 @@ impl MarketDataProvider for BinanceMarketDataProvider {
         spawn_task_thread("trade_task", {
             let symbols = symbols.clone();
             let tx = tx.clone();
-            move || crate::trade_task::run(symbols, tx)
+            move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, tx)
         });
         spawn_task_thread("ticker_task", {
             let symbols = symbols.clone();
             let tx = tx.clone();
-            move || crate::ticker_task::run(symbols, tx)
+            move || crate::ticker_task::run(symbols, BinanceExchangeKind::Spot, tx)
         });
-        spawn_task_thread("depth_task", move || crate::depth_task::run(symbols, tx));
+        spawn_task_thread("depth_task", move || {
+            crate::depth_task::run(symbols, BinanceExchangeKind::Spot, tx)
+        });
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
