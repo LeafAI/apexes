@@ -5,6 +5,7 @@
 pub mod bar_aggregator;
 pub mod depth_converter;
 pub mod depth_task;
+pub mod ingestion;
 pub mod mark_price_task;
 pub mod provider;
 pub mod symbol;

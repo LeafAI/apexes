@@ -222,6 +222,7 @@ name = "apexes-market-data"
 version = "0.1.0"
 dependencies = [
  "apexes-core",
+ "apexes-storage",
  "async-trait",
  "barter-data",
  "barter-instrument",

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 apexes-core = { path = "../apexes-core" }
+apexes-storage = { path = "../apexes-storage" }
 barter-data = { workspace = true }
 barter-instrument = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
