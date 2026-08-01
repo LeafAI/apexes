@@ -13,7 +13,7 @@ use apexes_backtest::{BacktestReport, CostModel, LatencyModel, ReplaySpeed};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::Strategy;
+use apexes_strategy::{Strategy, VenueScorer};
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
@@ -52,6 +52,17 @@ pub async fn run_paper_trading(
         .map_err(|error| ApexesError::InvalidBacktestConfig {
             reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
         })?;
+    let venue_scorer = registry
+        .try_one::<Arc<dyn VenueScorer>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VenueScorer failed: {error}"),
+        })?
+        .unwrap_or_else(|| Arc::new(apexes_strategy::PriceAndFeeScorer));
+    let volume_curve_provider = registry
+        .try_one::<Arc<dyn apexes_ems::VolumeCurveProvider>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
+        })?;
 
     let event_stream = provider.subscribe(&config.instruments).await?;
     let clock = BacktestClock::new(ReplaySpeed::AsFastAsPossible);
@@ -69,6 +80,8 @@ pub async fn run_paper_trading(
         event_loop_config,
         event_stream,
         clock,
+        venue_scorer,
+        volume_curve_provider,
         strategy,
         Some(stop_signal),
         Some(config.latency_model),

@@ -43,6 +43,14 @@ pub struct StrategyContext<'a> {
     /// docs/superpowers/plans/2026-07-28-apexes-backtest.md Task 14 for
     /// full rationale.
     pub open_orders: &'a HashMap<OrderId, Order>,
+    /// Aggregate status of every currently-tracked EMS parent order
+    /// (algorithmically-scheduled order), keyed by `ParentOrderId` --
+    /// a snapshot from the caller's most recent
+    /// `Ems::parent_order_status` batch query. A strategy that never
+    /// sets `OrderIntent.execution_algo` will simply see this map stay
+    /// empty. See `docs/superpowers/specs/2026-08-01-apexes-ems-design.md`
+    /// §五's integration-points section.
+    pub open_parent_orders: &'a HashMap<ParentOrderId, ParentOrderStatus>,
     /// Current simulated (backtest) or real (live) time.
     pub now: DateTime<Utc>,
 }
@@ -200,10 +208,12 @@ mod tests {
         let positions = HashMap::new();
         let balances = HashMap::new();
         let open_orders = HashMap::new();
+        let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
+            open_parent_orders: &open_parent_orders,
             now: Utc::now(),
         };
         let event = MarketEvent::Trade(apexes_core::TradeEvent {
@@ -237,12 +247,14 @@ mod tests {
         );
         let balances = HashMap::new();
         let open_orders = HashMap::new();
+        let open_parent_orders = HashMap::new();
         let now = Utc::now();
 
         let ctx = StrategyContext {
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
+            open_parent_orders: &open_parent_orders,
             now,
         };
 

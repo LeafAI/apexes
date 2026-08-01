@@ -6,7 +6,7 @@ use crate::report::BacktestReport;
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::Strategy;
+use apexes_strategy::{Strategy, VenueScorer};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -61,6 +61,17 @@ pub async fn run_backtest(
         .map_err(|error| ApexesError::InvalidBacktestConfig {
             reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
         })?;
+    let venue_scorer = registry
+        .try_one::<Arc<dyn VenueScorer>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VenueScorer failed: {error}"),
+        })?
+        .unwrap_or_else(|| Arc::new(apexes_strategy::PriceAndFeeScorer));
+    let volume_curve_provider = registry
+        .try_one::<Arc<dyn apexes_ems::VolumeCurveProvider>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
+        })?;
 
     let events = market_data.events().await?;
     let event_stream = futures::stream::iter(events);
@@ -75,7 +86,17 @@ pub async fn run_backtest(
         risk_checker,
     };
 
-    run_event_loop(event_loop_config, event_stream, clock, strategy, None, None).await
+    run_event_loop(
+        event_loop_config,
+        event_stream,
+        clock,
+        venue_scorer,
+        volume_curve_provider,
+        strategy,
+        None,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]

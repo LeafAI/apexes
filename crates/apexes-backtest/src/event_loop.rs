@@ -21,11 +21,13 @@ use crate::matching_engine::MatchingEngine;
 use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Order, OrderId, OrderType};
+use apexes_ems::Ems;
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{Strategy, StrategyContext};
+use apexes_strategy::{ParentOrderId, ParentOrderStatus, Strategy, StrategyContext, VenueScorer};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Configuration shared by `run_backtest` and `run_paper_trading`'s event
 /// loop core. `BacktestConfig` (in `runner.rs`) is the historical-replay
@@ -69,10 +71,17 @@ pub struct EventLoopConfig {
 /// `run_backtest` always passes `None` (historical replay has no
 /// "order submission delay" concept -- recorded timestamps are already
 /// fixed).
+// The 8-parameter shape is plan-mandated (Task 17 added `venue_scorer`/
+// `volume_curve_provider` alongside the pre-existing 6); packing them
+// into `EventLoopConfig` was considered but rejected to keep the plan's
+// explicitly-specified signature.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_event_loop(
     config: EventLoopConfig,
     mut events: impl Stream<Item = MarketEvent> + Unpin,
     mut clock: BacktestClock,
+    venue_scorer: Arc<dyn VenueScorer>,
+    volume_curve_provider: Option<Arc<dyn apexes_ems::VolumeCurveProvider>>,
     mut strategy: impl Strategy,
     mut stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
     latency_model: Option<LatencyModel>,
@@ -84,7 +93,24 @@ pub async fn run_event_loop(
         .collect();
 
     let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances);
-    let mut matching_engine = MatchingEngine::new(config.cost_model, config.queue_position_factor);
+    // `std::sync::Mutex` (not `tokio::sync::Mutex`) because the Task-15
+    // `MatchingEngineChildOrderSink` adapter takes that exact type, and
+    // every access below is a short synchronous critical section that
+    // never holds the guard across an `.await`.
+    let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(
+        config.cost_model,
+        config.queue_position_factor,
+    )));
+    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
+        crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+    );
+    let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+        child_order_sink,
+        venue_scorer,
+        HashMap::new(),
+        volume_curve_provider,
+    ));
+    let mut open_parent_orders: HashMap<ParentOrderId, ParentOrderStatus> = HashMap::new();
     let mut overall_tracker = PerformanceTracker::new(config.risk_free_return);
     let mut per_symbol_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
     let mut per_venue_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
@@ -116,9 +142,16 @@ pub async fn run_event_loop(
         let timestamp = event_timestamp(&event);
         clock.wait_for_next_event(timestamp).await;
 
+        ems.on_market_event(&event)
+            .await
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("ems.on_market_event failed: {error}"),
+            })?;
+        refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+
         match &event {
             MarketEvent::Depth(update) => {
-                matching_engine.on_depth_update(update);
+                lock_engine(&matching_engine).on_depth_update(update);
             }
             MarketEvent::Trade(trade) => {
                 if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
@@ -126,7 +159,7 @@ pub async fn run_event_loop(
                 {
                     last_prices.insert(base.clone(), trade.price);
                 }
-                let fill_results = matching_engine.on_trade_event(trade, timestamp);
+                let fill_results = lock_engine(&matching_engine).on_trade_event(trade, timestamp);
                 for (order_id, fills) in fill_results {
                     apply_fills(
                         &mut ledger,
@@ -170,6 +203,7 @@ pub async fn run_event_loop(
             positions: ledger.positions(),
             balances: ledger.balances(),
             open_orders: &open_orders,
+            open_parent_orders: &open_parent_orders,
             now: timestamp,
         };
         let intents = strategy.on_market_event(&event, &ctx);
@@ -192,14 +226,35 @@ pub async fn run_event_loop(
                 latency_model.apply().await;
             }
 
+            if let Some(execution_algo) = intent.execution_algo {
+                let request = apexes_ems::AlgoOrderRequest {
+                    symbol: intent.symbol.clone(),
+                    venue: intent.venue,
+                    side: intent.side,
+                    quantity: intent.quantity,
+                    execution_algo,
+                    routing: intent.routing,
+                };
+                match ems.submit_algo_order(request).await {
+                    Ok(parent_id) => {
+                        open_parent_orders
+                            .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, symbol = %intent.symbol, "algo order submission failed");
+                    }
+                }
+                continue;
+            }
+
             let submit_result = match intent.order_type {
-                OrderType::Market => matching_engine
+                OrderType::Market => lock_engine(&matching_engine)
                     .submit_market_order(&intent, timestamp)
                     .map(|(order, fills)| (order, Some(fills))),
-                OrderType::Limit => matching_engine
+                OrderType::Limit => lock_engine(&matching_engine)
                     .submit_limit_order(&intent, timestamp)
                     .map(|order| (order, None)),
-                OrderType::Stop | OrderType::StopLimit => matching_engine
+                OrderType::Stop | OrderType::StopLimit => lock_engine(&matching_engine)
                     .submit_stop_order(&intent, timestamp)
                     .map(|order| (order, None)),
             };
@@ -292,5 +347,40 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Depth(depth) => depth.timestamp,
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
+    }
+}
+
+/// Locks the shared `MatchingEngine`, recovering from poisoning by
+/// taking the inner value (the codebase's standard poison-recovery
+/// pattern -- a panicking holder must not permanently wedge the
+/// backtest). Never held across an `.await` (all `MatchingEngine`
+/// methods are synchronous).
+fn lock_engine(engine: &Arc<Mutex<MatchingEngine>>) -> std::sync::MutexGuard<'_, MatchingEngine> {
+    engine.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Refreshes `open_parent_orders` by querying `ems.parent_order_status`
+/// for every `ParentOrderId` already tracked. `Ems` has no "list all
+/// parent order IDs" method (deliberately out of scope, per the design
+/// spec) -- new parent orders are added to the map at the point
+/// `submit_algo_order` succeeds (see the call site above), not
+/// discovered here.
+async fn refresh_open_parent_orders(
+    ems: &dyn Ems,
+    open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+) {
+    let ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
+    for id in ids {
+        match ems.parent_order_status(id).await {
+            Ok(Some(status)) => {
+                open_parent_orders.insert(id, status);
+            }
+            Ok(None) => {
+                open_parent_orders.remove(&id);
+            }
+            Err(error) => {
+                tracing::warn!(?error, parent_id = ?id, "failed to refresh parent order status");
+            }
+        }
     }
 }

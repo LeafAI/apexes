@@ -11,9 +11,11 @@ use std::sync::Arc;
 use apexes_backtest::{PerformanceSummary, PerformanceTracker, PortfolioLedger};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent, Venue};
+use apexes_ems::Ems;
+use apexes_ems::postgres::{OrderManagerChildOrderSink, PostgresEms};
 use apexes_oms::{ExchangeUpdate, OrderManager};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{Strategy, StrategyContext};
+use apexes_strategy::{ParentOrderId, ParentOrderStatus, Strategy, StrategyContext, VenueScorer};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
@@ -27,6 +29,12 @@ pub struct LiveTradingConfig {
     /// `exchange_updates` stream -- catches anything a WS disconnect
     /// window might have missed.
     pub reconcile_interval: Duration,
+    /// PostgreSQL connection URL for `PostgresEms`'s own `parent_orders`/
+    /// `parent_order_children` tables -- typically the SAME database
+    /// `OrderManager`'s own `OrderStore` uses, but passed independently
+    /// since `run_live_trading` only receives an already-constructed
+    /// `OrderManager`, not a reusable connection pool.
+    pub ems_postgres_url: String,
 }
 
 pub struct LiveTradingReport {
@@ -61,7 +69,7 @@ pub async fn run_live_trading(
     config: LiveTradingConfig,
     registry: &Registry,
     mut strategy: impl Strategy,
-    mut order_manager: OrderManager,
+    order_manager: OrderManager,
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin,
     mut stop_signal: oneshot::Receiver<()>,
 ) -> Result<LiveTradingReport, ApexesError> {
@@ -76,6 +84,36 @@ pub async fn run_live_trading(
         .map_err(|error| ApexesError::InvalidBacktestConfig {
             reason: format!("registry lookup for CompositeRiskChecker failed: {error}"),
         })?;
+    let venue_scorer = registry
+        .try_one::<Arc<dyn VenueScorer>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VenueScorer failed: {error}"),
+        })?
+        .unwrap_or_else(|| Arc::new(apexes_strategy::PriceAndFeeScorer));
+    let volume_curve_provider = registry
+        .try_one::<Arc<dyn apexes_ems::VolumeCurveProvider>>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
+        })?;
+    // `tokio::sync::Mutex` (matching `OrderManagerChildOrderSink`'s
+    // expected type): every critical section below awaits
+    // `OrderManager`'s async methods while holding the guard, so a
+    // `std::sync::Mutex` would be wrong here.
+    let order_manager = Arc::new(tokio::sync::Mutex::new(order_manager));
+    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> =
+        Arc::new(OrderManagerChildOrderSink::new(Arc::clone(&order_manager)));
+    let ems: Arc<dyn Ems> = PostgresEms::new(
+        &config.ems_postgres_url,
+        child_order_sink,
+        venue_scorer,
+        HashMap::new(),
+        volume_curve_provider,
+    )
+    .await
+    .map_err(|error| ApexesError::InvalidBacktestConfig {
+        reason: format!("failed to construct PostgresEms: {error}"),
+    })?;
+    let mut open_parent_orders: HashMap<ParentOrderId, ParentOrderStatus> = HashMap::new();
 
     let mut market_events = subscribe_all_venues(registry, &config.instruments).await?;
 
@@ -121,12 +159,19 @@ pub async fn run_live_trading(
 
                 update_last_price(&event, &instruments_by_symbol, &mut last_prices);
 
+                if let Err(error) = ems.on_market_event(&event).await {
+                    tracing::warn!(?error, "ems.on_market_event failed");
+                }
+                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+
                 handle_market_event(
                     &event,
                     &mut strategy,
                     &risk_checker,
-                    &mut order_manager,
+                    &order_manager,
                     &ledger,
+                    &ems,
+                    &mut open_parent_orders,
                 ).await;
 
                 let equity = ledger.equity(&last_prices)?;
@@ -136,6 +181,8 @@ pub async fn run_live_trading(
             update = exchange_updates.next() => {
                 let Some(update) = update else { continue };
                 match order_manager
+                    .lock()
+                    .await
                     .apply_exchange_update(update.client_order_id, update.exchange_order_id, update.status)
                     .await
                 {
@@ -150,7 +197,7 @@ pub async fn run_live_trading(
             }
 
             _ = reconcile_timer.tick() => {
-                match order_manager.reconcile().await {
+                match order_manager.lock().await.reconcile().await {
                     Ok(changes) => {
                         let mut any_fills = false;
                         for (order_id, new_fills) in changes {
@@ -182,16 +229,25 @@ async fn handle_market_event(
     event: &MarketEvent,
     strategy: &mut impl Strategy,
     risk_checker: &Option<Arc<CompositeRiskChecker>>,
-    order_manager: &mut OrderManager,
+    order_manager: &Arc<tokio::sync::Mutex<OrderManager>>,
     ledger: &PortfolioLedger,
+    ems: &Arc<dyn Ems>,
+    open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
 ) {
+    // The guard must be bound to a named local (not a temporary
+    // expression inside the `StrategyContext` literal) so the
+    // `&HashMap<OrderId, Order>` `open_orders()` returns can borrow
+    // from it for the context's whole lifetime.
+    let open_orders_guard = order_manager.lock().await;
     let ctx = StrategyContext {
         positions: ledger.positions(),
         balances: ledger.balances(),
-        open_orders: order_manager.open_orders(),
+        open_orders: open_orders_guard.open_orders(),
+        open_parent_orders,
         now: event_timestamp(event),
     };
     let intents = strategy.on_market_event(event, &ctx);
+    drop(open_orders_guard);
 
     for intent in intents {
         if let Some(checker) = risk_checker
@@ -199,7 +255,7 @@ async fn handle_market_event(
                 &intent,
                 ledger.positions(),
                 ledger.balances(),
-                order_manager.open_orders(),
+                order_manager.lock().await.open_orders(),
                 event_timestamp(event),
             )
         {
@@ -207,7 +263,29 @@ async fn handle_market_event(
             continue;
         }
 
+        if let Some(execution_algo) = intent.execution_algo {
+            let request = apexes_ems::AlgoOrderRequest {
+                symbol: intent.symbol.clone(),
+                venue: intent.venue,
+                side: intent.side,
+                quantity: intent.quantity,
+                execution_algo,
+                routing: intent.routing,
+            };
+            match ems.submit_algo_order(request).await {
+                Ok(parent_id) => {
+                    open_parent_orders
+                        .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
+                }
+                Err(error) => {
+                    tracing::warn!(?error, symbol = %intent.symbol, "algo order submission failed");
+                }
+            }
+            continue;
+        }
+
         let symbol = intent.symbol.clone();
+        let mut order_manager = order_manager.lock().await;
         match order_manager
             .submit_order(intent, ledger.positions(), ledger.balances())
             .await
@@ -282,6 +360,33 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Depth(depth) => depth.timestamp,
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
+    }
+}
+
+/// Refreshes `open_parent_orders` by querying `ems.parent_order_status`
+/// for every `ParentOrderId` already tracked. Identical logic to
+/// `apexes_backtest::event_loop`'s private copy, duplicated here since
+/// this crate cannot import a private function from another crate.
+/// `Ems` has no "list all parent order IDs" method (deliberately out of
+/// scope, per the design spec) -- new parent orders are added to the
+/// map at the point `submit_algo_order` succeeds, not discovered here.
+async fn refresh_open_parent_orders(
+    ems: &dyn Ems,
+    open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+) {
+    let ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
+    for id in ids {
+        match ems.parent_order_status(id).await {
+            Ok(Some(status)) => {
+                open_parent_orders.insert(id, status);
+            }
+            Ok(None) => {
+                open_parent_orders.remove(&id);
+            }
+            Err(error) => {
+                tracing::warn!(?error, parent_id = ?id, "failed to refresh parent order status");
+            }
+        }
     }
 }
 

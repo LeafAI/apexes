@@ -202,6 +202,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-backtest",
  "apexes-core",
+ "apexes-ems",
  "apexes-oms",
  "apexes-risk",
  "apexes-strategy",
@@ -276,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-backtest",
  "apexes-core",
+ "apexes-ems",
  "apexes-market-data",
  "apexes-risk",
  "apexes-strategy",
