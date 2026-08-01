@@ -405,7 +405,13 @@ impl SchedulingDeps {
         let venue = parse_venue(&row.venue)?;
         let side = parse_side(&row.side)?;
 
-        let child_order_id = self
+        // `_fills` is deliberately discarded here: this sink is always
+        // `OrderManagerChildOrderSink`, which returns an empty `Vec` by
+        // design -- PostgresEms's crash-recoverable fill-tracking
+        // happens entirely through `OrderManager`'s own persisted
+        // state (`apply_exchange_update`/`reconcile()`), not through
+        // this return value.
+        let (child_order_id, _fills) = self
             .sink
             .submit_child_order(ChildOrderIntent {
                 symbol: row.symbol.clone(),
@@ -569,16 +575,24 @@ impl Ems for PostgresEms {
         Ok(())
     }
 
-    async fn on_market_event(&self, event: &MarketEvent) -> Result<(), EmsError> {
+    async fn on_market_event(
+        &self,
+        event: &MarketEvent,
+    ) -> Result<Vec<apexes_core::Fill>, EmsError> {
         // TWAP/VWAP/Iceberg are paced by their own background tasks
         // (spawned in submit_algo_order/recover_scheduling_parent_orders),
         // independent of this call -- only POV reacts here, since POV is
         // inherently trade-driven regardless of virtual vs. real clock
-        // (see this module's docs).
+        // (see this module's docs). This implementation never returns
+        // any fills here (see this trait method's own doc comment on
+        // `Ems` for why: `PostgresEms`'s `ChildOrderSink` is always
+        // `OrderManagerChildOrderSink`, whose fills surface later via
+        // `OrderManager::apply_exchange_update`/`reconcile()`, not
+        // synchronously here).
         if let MarketEvent::Trade(trade) = event {
             self.process_pov_on_trade(trade).await?;
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 

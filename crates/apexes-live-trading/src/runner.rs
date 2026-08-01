@@ -159,8 +159,14 @@ pub async fn run_live_trading(
 
                 update_last_price(&event, &instruments_by_symbol, &mut last_prices);
 
-                if let Err(error) = ems.on_market_event(&event).await {
-                    tracing::warn!(?error, "ems.on_market_event failed");
+                match ems.on_market_event(&event).await {
+                    Ok(ems_fills) if !ems_fills.is_empty() => {
+                        apply_new_fills(&mut ledger, &mut tracker, &mut risk_checker, &mut all_fills, ems_fills);
+                        let equity = ledger.equity(&last_prices)?;
+                        tracker.record_equity_point(chrono::Utc::now(), equity);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(?error, "ems.on_market_event failed"),
                 }
                 refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
 

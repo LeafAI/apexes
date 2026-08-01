@@ -18,6 +18,12 @@
 //! `PortfolioLedger`-shaped dependency (a potential dependency cycle,
 //! since `apexes-backtest` defines `PortfolioLedger`) or restructuring
 //! `ChildOrderSink`'s signature; out of scope here.
+//!
+//! `submit_child_order` always returns an EMPTY `Vec<Fill>` alongside
+//! the `OrderId`: `OrderManager::submit_order` never fills
+//! synchronously -- those fills surface later through the caller's own
+//! `OrderManager::apply_exchange_update`/`reconcile()` handling, same
+//! as any other live order.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +49,10 @@ impl OrderManagerChildOrderSink {
 
 #[async_trait]
 impl ChildOrderSink for OrderManagerChildOrderSink {
-    async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
         let order_intent = OrderIntent {
             symbol: intent.symbol,
             venue: intent.venue,
@@ -60,13 +69,19 @@ impl ChildOrderSink for OrderManagerChildOrderSink {
         let empty_balances: HashMap<String, rust_decimal::Decimal> = HashMap::new();
 
         let mut order_manager = self.order_manager.lock().await;
-        order_manager
+        let order_id = order_manager
             .submit_order(order_intent, &empty_positions, &empty_balances)
             .await
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
                 reason: error.to_string(),
-            })
+            })?;
+        // OrderManager's own fills arrive later via
+        // apply_exchange_update/reconcile(), never synchronously from
+        // submit_order -- always an empty Vec here, by design (see
+        // this module's doc comment for why this is correct, not
+        // a shortcut).
+        Ok((order_id, Vec::new()))
     }
 
     async fn cancel_child_order(&self, order_id: OrderId) -> Result<(), EmsError> {

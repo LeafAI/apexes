@@ -142,11 +142,35 @@ pub async fn run_event_loop(
         let timestamp = event_timestamp(&event);
         clock.wait_for_next_event(timestamp).await;
 
-        ems.on_market_event(&event)
-            .await
-            .map_err(|error| ApexesError::InvalidBacktestConfig {
+        let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
+            ApexesError::InvalidBacktestConfig {
                 reason: format!("ems.on_market_event failed: {error}"),
-            })?;
+            }
+        })?;
+        if !ems_fills.is_empty() {
+            apply_fills(
+                &mut ledger,
+                &mut overall_tracker,
+                &mut per_symbol_trackers,
+                &mut per_venue_trackers,
+                &mut all_fills,
+                &ems_fills,
+                config.risk_free_return,
+            )?;
+            if let Some(checker) = &mut risk_checker {
+                for fill in &ems_fills {
+                    if let Err(violations) =
+                        checker.on_fill(fill, ledger.positions(), ledger.balances())
+                    {
+                        tracing::warn!(
+                            ?violations,
+                            symbol = %fill.symbol,
+                            "in-trade risk monitor flagged a violation"
+                        );
+                    }
+                }
+            }
+        }
         refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
 
         match &event {

@@ -305,3 +305,147 @@ async fn triggered_buy_stop_fill_reaches_report_trades_and_ledger() {
         "equity curve must record a non-initial equity point after the Stop triggers"
     );
 }
+
+/// Submits ONE TWAP parent order (single slice) the first time it sees
+/// any event, then does nothing else.
+struct TwapOnceStrategy {
+    has_submitted: bool,
+}
+
+impl Strategy for TwapOnceStrategy {
+    fn on_market_event(&mut self, event: &MarketEvent, _ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if self.has_submitted {
+            return vec![];
+        }
+        if let MarketEvent::Depth(update) = event {
+            self.has_submitted = true;
+            return vec![OrderIntent {
+                symbol: update.symbol.clone(),
+                venue: update.venue,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(1),
+                price: None,
+                stop_price: None,
+                execution_algo: Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                    duration: std::time::Duration::from_secs(10),
+                    slices: 1,
+                }),
+                routing: OrderRouting::Fixed,
+            }];
+        }
+        vec![]
+    }
+}
+
+/// Regression guard for the Task-17 follow-up finding (fixed in Task
+/// 17b): `MatchingEngineChildOrderSink::submit_child_order` used to
+/// DISCARD the `Vec<Fill>` the matching engine returned for an EMS
+/// child order, so a strategy using `execution_algo` saw correct
+/// order-book price impact but the ledger/equity-curve/`report.trades`
+/// silently missed every child-order fill. This test runs a full
+/// backtest whose only order is a single-slice TWAP (its one child
+/// order fires on the first `ems.on_market_event` tick after
+/// submission, per `InMemoryEms`'s `next_slice_at: Utc::now()`
+/// semantics) and asserts BOTH that `report.trades` contains the child
+/// order's fill AND that the equity curve reflects it -- without the
+/// fix, both assertions fail (zero trades, flat equity).
+///
+/// NOTE on timestamps: `InMemoryEms` schedules the first TWAP slice at
+/// REAL `Utc::now()` (submission wall-clock time), and
+/// `on_market_event` compares that against each event's timestamp --
+/// so these events must be timestamped at/after the real current time,
+/// not at a fixed historical date.
+#[tokio::test]
+async fn full_backtest_with_execution_algo_applies_child_order_fills_to_the_ledger_and_report() {
+    let t0 = Utc::now();
+    let t1 = t0 + chrono::Duration::seconds(1);
+
+    let events = vec![
+        // Seed the book: 10 units of ask liquidity at 65000. The
+        // strategy submits its single-slice TWAP parent order while
+        // processing this event.
+        MarketEvent::Depth(DepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: dec!(65000),
+                quantity: dec!(10),
+            }],
+            sequence: Some(1),
+            is_snapshot: true,
+            timestamp: t0,
+        }),
+        // Second event: its `ems.on_market_event` call finds the TWAP
+        // slice due and submits the child Market order, which fills
+        // immediately against the seeded book.
+        MarketEvent::Depth(DepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: dec!(65000),
+                quantity: dec!(10),
+            }],
+            sequence: Some(2),
+            is_snapshot: false,
+            timestamp: t1,
+        }),
+    ];
+    let market_data = InMemoryMarketDataSource::new(events);
+
+    let mut initial_balances = HashMap::new();
+    initial_balances.insert("USDT".to_string(), dec!(100000));
+
+    let config = BacktestConfig {
+        instruments: vec![btc_usdt_instrument()],
+        date_range: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+            ..NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
+        initial_balances,
+        cost_model: CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        },
+        speed: ReplaySpeed::AsFastAsPossible,
+        queue_position_factor: dec!(0.0),
+        risk_free_return: dec!(0),
+    };
+    let strategy = TwapOnceStrategy {
+        has_submitted: false,
+    };
+
+    let registry = apexes_core::registry::Registry::new();
+    let report = run_backtest(config, &registry, market_data, strategy)
+        .await
+        .unwrap();
+
+    // (1) report.trades MUST contain the EMS child order's fill (the
+    // single TWAP slice's full 1-unit quantity, filled at the 65000 ask).
+    assert_eq!(
+        report.trades.len(),
+        1,
+        "EMS child-order fill must appear in report.trades"
+    );
+    let fill = &report.trades[0];
+    assert_eq!(fill.symbol, "BTCUSDT");
+    assert_eq!(fill.side, Side::Buy);
+    assert_eq!(fill.quantity, dec!(1));
+    assert_eq!(fill.price, dec!(65000));
+    assert_eq!(report.per_symbol["BTCUSDT"].trade_count, 1);
+
+    // (2) The ledger/equity MUST reflect the fill: the run spent
+    // 1 * 65000 = 65000 USDT buying 1 BTC. The discarded-fill bug
+    // would instead report a flat 100000 (zero ledger effect).
+    assert!(
+        report
+            .equity_curve
+            .iter()
+            .any(|(_, equity)| *equity != dec!(100000)),
+        "equity curve must reflect the EMS child-order fill, not the untouched initial balance"
+    );
+}

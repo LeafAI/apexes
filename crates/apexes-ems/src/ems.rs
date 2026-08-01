@@ -3,7 +3,7 @@
 //! (backtest/paper) and [`crate::postgres::PostgresEms`] (live
 //! trading) -- see this crate's `lib.rs` docs.
 
-use apexes_core::{MarketEvent, Side, Venue};
+use apexes_core::{Fill, MarketEvent, Side, Venue};
 use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -46,14 +46,25 @@ pub trait Ems: Send + Sync {
     async fn cancel_parent_order(&self, id: ParentOrderId) -> Result<(), EmsError>;
 
     /// Notifies this `Ems` of a new `MarketEvent` observed by the
-    /// caller's event loop. `InMemoryEms` uses this event's timestamp
-    /// to drive virtual-clock-paced scheduling (TWAP/VWAP/Iceberg) and
-    /// `MarketEvent::Trade.quantity` to drive POV participation.
+    /// caller's event loop, returning every `Fill` that happened
+    /// synchronously as a result of any child-order slice submitted
+    /// during this call (aggregated across every parent order this
+    /// call advanced, in submission order) -- callers apply these
+    /// exactly like any other `Fill`s (ledger/tracker/report), the
+    /// same way they already apply direct-strategy order fills.
+    /// `InMemoryEms` uses this event's timestamp to drive
+    /// virtual-clock-paced scheduling (TWAP/VWAP/Iceberg) and
+    /// `MarketEvent::Trade.quantity` to drive POV participation, and
+    /// returns real fills from its `MatchingEngineChildOrderSink`.
     /// `PostgresEms` ignores everything except `MarketEvent::Trade`
     /// (used for its own POV scheduling only -- TWAP/VWAP/Iceberg are
     /// paced by real background timers there, independent of this
-    /// call). Callers (Task 17) call this once per event, for every
-    /// event, regardless of whether any parent orders are currently
-    /// scheduling.
-    async fn on_market_event(&self, event: &MarketEvent) -> Result<(), EmsError>;
+    /// call) and always returns an empty `Vec` -- its `ChildOrderSink`
+    /// (`OrderManagerChildOrderSink`) never fills synchronously; those
+    /// fills surface later through the caller's own
+    /// `OrderManager::apply_exchange_update`/`reconcile()` handling,
+    /// same as any other live order. Callers (Task 17) call this once
+    /// per event, for every event, regardless of whether any parent
+    /// orders are currently scheduling.
+    async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError>;
 }

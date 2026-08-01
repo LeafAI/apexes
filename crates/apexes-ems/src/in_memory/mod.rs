@@ -12,7 +12,7 @@ mod state;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use apexes_core::{AssetClass, MarketEvent};
+use apexes_core::{AssetClass, Fill, MarketEvent};
 use apexes_strategy::{ParentOrderId, ParentOrderStatus, VenueMarketState, VenueScorer};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -74,7 +74,10 @@ impl InMemoryEms {
 
     /// Submits one child-order slice of `quantity` for `allocation`'s
     /// `asset_class` -- shared by every algorithm's slice-submission
-    /// logic (TWAP, Iceberg, POV, and VWAP).
+    /// logic (TWAP, Iceberg, POV, and VWAP). Returns the child order's
+    /// `OrderId` and any fills that happened synchronously at
+    /// submission (propagated from the sink, see
+    /// `ChildOrderSink::submit_child_order`).
     async fn submit_slice(
         &self,
         parent_id: ParentOrderId,
@@ -83,7 +86,7 @@ impl InMemoryEms {
         side: apexes_core::Side,
         asset_class: AssetClass,
         quantity: Decimal,
-    ) -> Result<apexes_core::OrderId, EmsError> {
+    ) -> Result<(apexes_core::OrderId, Vec<Fill>), EmsError> {
         self.sink
             .submit_child_order(ChildOrderIntent {
                 symbol: symbol.to_string(),
@@ -102,15 +105,17 @@ impl InMemoryEms {
     /// Submits one TWAP slice for `parent_id` (whichever venue
     /// allocation(s) it has) and advances that parent's `next_slice_at`/
     /// `slices_remaining`, marking it `Completed` once no slices remain.
+    /// Returns every fill produced synchronously by this call's slice
+    /// submissions, in submission order.
     async fn submit_due_twap_slice(
         &self,
         parent_id: ParentOrderId,
         now: DateTime<Utc>,
-    ) -> Result<(), EmsError> {
+    ) -> Result<Vec<Fill>, EmsError> {
         let (symbol, venue, side, slice_quantity, slice_interval, allocation_quantities) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             let SchedulingState::Twap {
                 slice_quantity,
@@ -118,7 +123,7 @@ impl InMemoryEms {
                 ..
             } = &state.scheduling
             else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             (
                 state.request.symbol.clone(),
@@ -134,6 +139,7 @@ impl InMemoryEms {
             )
         };
 
+        let mut fills = Vec::new();
         let total_quantity: Decimal = allocation_quantities.iter().map(|(_, q)| *q).sum();
         if !total_quantity.is_zero() {
             // Split a TWAP slice proportionally across every venue
@@ -146,7 +152,7 @@ impl InMemoryEms {
                 if this_venue_slice.is_zero() {
                     continue;
                 }
-                let child_id = self
+                let (child_id, slice_fills) = self
                     .submit_slice(
                         parent_id,
                         &symbol,
@@ -156,6 +162,7 @@ impl InMemoryEms {
                         this_venue_slice,
                     )
                     .await?;
+                fills.extend(slice_fills);
 
                 let mut parent_orders =
                     self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
@@ -188,7 +195,7 @@ impl InMemoryEms {
             }
         }
 
-        Ok(())
+        Ok(fills)
     }
 
     /// Records `parent_id` as `Failed { reason }` with no allocations
@@ -224,7 +231,9 @@ impl InMemoryEms {
     /// remains for that allocation) submits the next `visible_qty`
     /// slice. Marks the parent `Completed` once every allocation has
     /// fully submitted its total quantity AND has no resting child left.
-    async fn process_iceberg_parents(&self) -> Result<(), EmsError> {
+    /// Returns every fill produced synchronously by this call's slice
+    /// submissions, in submission order.
+    async fn process_iceberg_parents(&self) -> Result<Vec<Fill>, EmsError> {
         let candidates: Vec<ParentOrderId> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
@@ -237,20 +246,24 @@ impl InMemoryEms {
                 .collect()
         };
 
+        let mut fills = Vec::new();
         for parent_id in candidates {
-            self.process_one_iceberg_parent(parent_id).await?;
+            fills.extend(self.process_one_iceberg_parent(parent_id).await?);
         }
-        Ok(())
+        Ok(fills)
     }
 
-    async fn process_one_iceberg_parent(&self, parent_id: ParentOrderId) -> Result<(), EmsError> {
+    async fn process_one_iceberg_parent(
+        &self,
+        parent_id: ParentOrderId,
+    ) -> Result<Vec<Fill>, EmsError> {
         let (symbol, venue, side, visible_qty, allocations) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             let SchedulingState::Iceberg { visible_qty } = &state.scheduling else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             (
                 state.request.symbol.clone(),
@@ -261,9 +274,10 @@ impl InMemoryEms {
             )
         };
 
+        let mut fills = Vec::new();
         let mut all_done = true;
         for asset_class in allocations {
-            let done = self
+            let (done, allocation_fills) = self
                 .refill_iceberg_allocation(
                     parent_id,
                     &symbol,
@@ -273,6 +287,7 @@ impl InMemoryEms {
                     visible_qty,
                 )
                 .await?;
+            fills.extend(allocation_fills);
             all_done &= done;
         }
 
@@ -282,11 +297,13 @@ impl InMemoryEms {
                 state.status = ParentOrderStatus::Completed;
             }
         }
-        Ok(())
+        Ok(fills)
     }
 
-    /// Returns `true` if this allocation is fully done (all quantity
-    /// submitted and no resting child left).
+    /// Returns `(true, fills)` if this allocation is fully done (all
+    /// quantity submitted and no resting child left); `fills` is every
+    /// fill produced synchronously by this call's slice submission (if
+    /// any).
     async fn refill_iceberg_allocation(
         &self,
         parent_id: ParentOrderId,
@@ -295,7 +312,7 @@ impl InMemoryEms {
         side: apexes_core::Side,
         asset_class: AssetClass,
         visible_qty: Decimal,
-    ) -> Result<bool, EmsError> {
+    ) -> Result<(bool, Vec<Fill>), EmsError> {
         let resting_child = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders[&parent_id]
@@ -316,7 +333,7 @@ impl InMemoryEms {
                 )
             );
             if !terminal {
-                return Ok(false);
+                return Ok((false, Vec::new()));
             }
             let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(state) = parent_orders.get_mut(&parent_id)
@@ -339,11 +356,11 @@ impl InMemoryEms {
                 .unwrap_or((Decimal::ZERO, Decimal::ZERO))
         };
         if remaining.is_zero() {
-            return Ok(true);
+            return Ok((true, Vec::new()));
         }
 
         let slice_quantity = visible_qty.min(remaining);
-        let child_id = self
+        let (child_id, slice_fills) = self
             .submit_slice(parent_id, symbol, venue, side, asset_class, slice_quantity)
             .await?;
 
@@ -357,7 +374,7 @@ impl InMemoryEms {
             allocation.submitted_quantity += slice_quantity;
             allocation.current_resting_child = Some(child_id);
         }
-        Ok(false)
+        Ok((false, slice_fills))
     }
 
     /// For every `Scheduling` parent order using `Pov` pacing whose
@@ -366,8 +383,12 @@ impl InMemoryEms {
     /// allocation's own remaining quantity, split proportionally across
     /// allocations the same way TWAP's slice-splitting works) and marks
     /// the parent `Completed` once every allocation's full quantity has
-    /// been submitted.
-    async fn process_pov_parents(&self, trade: &apexes_core::TradeEvent) -> Result<(), EmsError> {
+    /// been submitted. Returns every fill produced synchronously by
+    /// this call's slice submissions, in submission order.
+    async fn process_pov_parents(
+        &self,
+        trade: &apexes_core::TradeEvent,
+    ) -> Result<Vec<Fill>, EmsError> {
         let candidates: Vec<(ParentOrderId, Decimal)> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
@@ -386,23 +407,26 @@ impl InMemoryEms {
                 .collect()
         };
 
+        let mut fills = Vec::new();
         for (parent_id, participation_rate) in candidates {
             let target_quantity = trade.quantity * participation_rate;
-            self.submit_pov_increment(parent_id, target_quantity)
-                .await?;
+            fills.extend(
+                self.submit_pov_increment(parent_id, target_quantity)
+                    .await?,
+            );
         }
-        Ok(())
+        Ok(fills)
     }
 
     async fn submit_pov_increment(
         &self,
         parent_id: ParentOrderId,
         target_quantity: Decimal,
-    ) -> Result<(), EmsError> {
+    ) -> Result<Vec<Fill>, EmsError> {
         let (symbol, venue, side, allocations) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             (
                 state.request.symbol.clone(),
@@ -412,6 +436,7 @@ impl InMemoryEms {
             )
         };
 
+        let mut fills = Vec::new();
         let mut remaining_to_submit = target_quantity;
         for asset_class in allocations {
             if remaining_to_submit.is_zero() {
@@ -430,9 +455,10 @@ impl InMemoryEms {
             if slice.is_zero() {
                 continue;
             }
-            let _child_id = self
+            let (_child_id, slice_fills) = self
                 .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
                 .await?;
+            fills.extend(slice_fills);
             remaining_to_submit -= slice;
 
             let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
@@ -455,7 +481,7 @@ impl InMemoryEms {
         {
             state.status = ParentOrderStatus::Completed;
         }
-        Ok(())
+        Ok(fills)
     }
 
     /// For every `Scheduling` parent order using `Vwap` pacing, computes
@@ -465,8 +491,9 @@ impl InMemoryEms {
     /// `target_fraction * request.quantity` (split proportionally
     /// across allocations, same as TWAP/POV). Marks `Completed` once
     /// the curve's final fraction (`1.0`) has been reached AND fully
-    /// submitted.
-    async fn process_vwap_parents(&self, now: DateTime<Utc>) -> Result<(), EmsError> {
+    /// submitted. Returns every fill produced synchronously by this
+    /// call's slice submissions, in submission order.
+    async fn process_vwap_parents(&self, now: DateTime<Utc>) -> Result<Vec<Fill>, EmsError> {
         let candidates: Vec<(ParentOrderId, Decimal)> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
@@ -488,29 +515,32 @@ impl InMemoryEms {
                 .collect()
         };
 
+        let mut fills = Vec::new();
         for (parent_id, target_fraction) in candidates {
-            self.submit_vwap_increment(parent_id, target_fraction)
-                .await?;
+            fills.extend(
+                self.submit_vwap_increment(parent_id, target_fraction)
+                    .await?,
+            );
         }
-        Ok(())
+        Ok(fills)
     }
 
     async fn submit_vwap_increment(
         &self,
         parent_id: ParentOrderId,
         target_fraction: Decimal,
-    ) -> Result<(), EmsError> {
+    ) -> Result<Vec<Fill>, EmsError> {
         let (symbol, venue, side, total_quantity, already_submitted_fraction, allocations) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             let SchedulingState::Vwap {
                 last_target_fraction_submitted,
                 ..
             } = &state.scheduling
             else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             (
                 state.request.symbol.clone(),
@@ -523,10 +553,11 @@ impl InMemoryEms {
         };
 
         if target_fraction <= already_submitted_fraction {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut increment = total_quantity * (target_fraction - already_submitted_fraction);
 
+        let mut fills = Vec::new();
         for asset_class in allocations {
             if increment.is_zero() {
                 break;
@@ -544,9 +575,10 @@ impl InMemoryEms {
             if slice.is_zero() {
                 continue;
             }
-            let _child_id = self
+            let (_child_id, slice_fills) = self
                 .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
                 .await?;
+            fills.extend(slice_fills);
             increment -= slice;
 
             let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
@@ -578,7 +610,7 @@ impl InMemoryEms {
                 state.status = ParentOrderStatus::Completed;
             }
         }
-        Ok(())
+        Ok(fills)
     }
 }
 
@@ -696,7 +728,7 @@ impl Ems for InMemoryEms {
         Ok(())
     }
 
-    async fn on_market_event(&self, event: &MarketEvent) -> Result<(), EmsError> {
+    async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError> {
         if let MarketEvent::Depth(update) = event {
             let mut tracker = self.market_state.lock().unwrap_or_else(|p| p.into_inner());
             for asset_class in [AssetClass::Spot, AssetClass::Perpetual] {
@@ -720,17 +752,18 @@ impl Ems for InMemoryEms {
                 .collect()
         };
 
+        let mut all_fills = Vec::new();
         for parent_id in due {
-            self.submit_due_twap_slice(parent_id, now).await?;
+            all_fills.extend(self.submit_due_twap_slice(parent_id, now).await?);
         }
 
-        self.process_iceberg_parents().await?;
-        self.process_vwap_parents(now).await?;
+        all_fills.extend(self.process_iceberg_parents().await?);
+        all_fills.extend(self.process_vwap_parents(now).await?);
         if let MarketEvent::Trade(trade) = event {
-            self.process_pov_parents(trade).await?;
+            all_fills.extend(self.process_pov_parents(trade).await?);
         }
 
-        Ok(())
+        Ok(all_fills)
     }
 }
 
@@ -787,21 +820,37 @@ mod tests {
 
     struct RecordingSink {
         submitted: StdMutex<Vec<ChildOrderIntent>>,
+        /// Fills returned (a clone of the whole Vec) from every
+        /// `submit_child_order` call -- empty by default; set via
+        /// `new_with_fills` for tests exercising the fill pass-through
+        /// path from sink -> `on_market_event`'s return value.
+        fills_to_return: Vec<Fill>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self {
                 submitted: StdMutex::new(Vec::new()),
+                fills_to_return: Vec::new(),
+            }
+        }
+
+        fn new_with_fills(fills_to_return: Vec<Fill>) -> Self {
+            Self {
+                submitted: StdMutex::new(Vec::new()),
+                fills_to_return,
             }
         }
     }
 
     #[async_trait]
     impl ChildOrderSink for RecordingSink {
-        async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+        async fn submit_child_order(
+            &self,
+            intent: ChildOrderIntent,
+        ) -> Result<(OrderId, Vec<Fill>), EmsError> {
             self.submitted.lock().unwrap().push(intent);
-            Ok(OrderId(Uuid::new_v4()))
+            Ok((OrderId(Uuid::new_v4()), self.fills_to_return.clone()))
         }
 
         async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {
@@ -864,6 +913,41 @@ mod tests {
             ems.parent_order_status(parent_id).await.unwrap(),
             Some(ParentOrderStatus::Scheduling)
         );
+    }
+
+    #[tokio::test]
+    async fn twap_slice_fills_are_returned_from_on_market_event() {
+        let synthetic_fill = Fill {
+            id: apexes_core::FillId(Uuid::new_v4()),
+            order_id: OrderId(Uuid::new_v4()),
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            price: dec!(65010),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: Some("USDT".to_string()),
+            filled_at: Utc::now(),
+        };
+        let sink = Arc::new(RecordingSink::new_with_fills(vec![synthetic_fill]));
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+        ems.submit_algo_order(sample_request()).await.unwrap();
+
+        // The first TWAP slice is due immediately (see
+        // twap_submits_one_slice_immediately_on_submission) -- the fills
+        // the sink returns for that slice must come back out of
+        // on_market_event's own return value, not be discarded.
+        let fills = ems.on_market_event(&depth_event(Utc::now())).await.unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].symbol, "BTCUSDT");
+        assert_eq!(fills[0].quantity, dec!(1));
+        assert_eq!(fills[0].price, dec!(65010));
     }
 
     #[tokio::test]
@@ -964,12 +1048,15 @@ mod tests {
 
     #[async_trait]
     impl ChildOrderSink for SteppableSink {
-        async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+        async fn submit_child_order(
+            &self,
+            intent: ChildOrderIntent,
+        ) -> Result<(OrderId, Vec<Fill>), EmsError> {
             self.submitted.lock().unwrap().push(intent);
             let n = self.next_id.fetch_add(1, Ordering::SeqCst);
             let id = OrderId(Uuid::from_u128(n as u128 + 1));
             *self.last_id.lock().unwrap() = Some(id);
-            Ok(id)
+            Ok((id, Vec::new()))
         }
 
         async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {

@@ -36,9 +36,12 @@ impl RecordingSink {
 
 #[async_trait]
 impl ChildOrderSink for RecordingSink {
-    async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
         self.submitted.lock().await.push(intent);
-        Ok(OrderId(uuid::Uuid::new_v4()))
+        Ok((OrderId(uuid::Uuid::new_v4()), Vec::new()))
     }
 
     async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {

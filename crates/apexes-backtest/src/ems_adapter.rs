@@ -36,7 +36,10 @@ impl MatchingEngineChildOrderSink {
 
 #[async_trait]
 impl ChildOrderSink for MatchingEngineChildOrderSink {
-    async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError> {
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
         let order_intent = OrderIntent {
             symbol: intent.symbol,
             venue: intent.venue,
@@ -50,13 +53,13 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             routing: apexes_strategy::OrderRouting::Fixed,
         };
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-        let (order, _fills) = engine
+        let (order, fills) = engine
             .submit_market_order(&order_intent, Utc::now())
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
                 reason: error.to_string(),
             })?;
-        Ok(order.id)
+        Ok((order.id, fills))
     }
 
     async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {
@@ -129,7 +132,7 @@ mod tests {
         let engine = engine_with_book();
         let sink = MatchingEngineChildOrderSink::new(Arc::clone(&engine));
 
-        let order_id = sink
+        let (order_id, fills) = sink
             .submit_child_order(ChildOrderIntent {
                 symbol: "BTCUSDT".to_string(),
                 venue: Venue::Binance,
@@ -141,6 +144,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(order_id, OrderId(uuid::Uuid::nil()));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, dec!(1));
     }
 
     #[tokio::test]

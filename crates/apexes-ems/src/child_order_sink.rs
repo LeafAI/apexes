@@ -12,7 +12,7 @@
 //! there too -- `apexes-ems` depends directly on `apexes-oms`, so no
 //! cycle exists on that side.
 
-use apexes_core::{AssetClass, Order, OrderId, Side, Venue};
+use apexes_core::{AssetClass, Fill, Order, OrderId, Side, Venue};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
@@ -35,8 +35,17 @@ pub struct ChildOrderIntent {
 #[async_trait]
 pub trait ChildOrderSink: Send + Sync {
     /// Submits `intent` for immediate execution, returning the
-    /// resulting `OrderId`.
-    async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError>;
+    /// resulting `OrderId` and any `Fill`s that happened synchronously
+    /// as part of submission (e.g. a Market order against a live local
+    /// order book fills immediately; an order routed through a real
+    /// broker/exchange gateway does NOT, and returns an empty `Vec` --
+    /// its fills, if any, arrive later through that sink's own
+    /// separate fill-reporting mechanism, e.g. `apexes_oms::OrderManager`'s
+    /// `apply_exchange_update`/`reconcile()`).
+    async fn submit_child_order(
+        &self,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError>;
 
     /// Cancels a previously-submitted child order, if still active.
     /// Implementations should treat cancelling an already-terminal
