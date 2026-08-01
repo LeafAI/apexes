@@ -5,6 +5,7 @@
 //! regardless of how many individual risk rules are configured.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use apexes_core::{Fill, Order, OrderId};
 use apexes_strategy::{OrderIntent, Position};
@@ -15,10 +16,19 @@ use crate::error::RiskViolation;
 use crate::in_trade::InTradeMonitor;
 use crate::pre_trade::PreTradeCheck;
 
+/// Both fields are `Mutex`-wrapped so `check`/`on_fill` can take `&self`
+/// (not `&mut self`) -- required for `CompositeRiskChecker` to be
+/// storable as `Arc<CompositeRiskChecker>` in
+/// `apexes_core::registry::Registry` (sub-project #9's registry
+/// retrofit), since `Arc` only ever grants shared (`&T`) access.
+/// `in_trade_monitors` genuinely needs this (`InTradeMonitor::on_fill`
+/// requires `&mut self` on each individual monitor); `pre_trade_checks`
+/// is Mutex-wrapped too for consistency even though `PreTradeCheck::
+/// check` already takes `&self` and needs no mutation here.
 #[derive(Default)]
 pub struct CompositeRiskChecker {
-    pre_trade_checks: Vec<Box<dyn PreTradeCheck>>,
-    in_trade_monitors: Vec<Box<dyn InTradeMonitor>>,
+    pre_trade_checks: Mutex<Vec<Box<dyn PreTradeCheck>>>,
+    in_trade_monitors: Mutex<Vec<Box<dyn InTradeMonitor>>>,
 }
 
 impl CompositeRiskChecker {
@@ -26,13 +36,19 @@ impl CompositeRiskChecker {
         Self::default()
     }
 
-    pub fn with_pre_trade_check(mut self, check: Box<dyn PreTradeCheck>) -> Self {
-        self.pre_trade_checks.push(check);
+    pub fn with_pre_trade_check(self, check: Box<dyn PreTradeCheck>) -> Self {
+        self.pre_trade_checks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(check);
         self
     }
 
-    pub fn with_in_trade_monitor(mut self, monitor: Box<dyn InTradeMonitor>) -> Self {
-        self.in_trade_monitors.push(monitor);
+    pub fn with_in_trade_monitor(self, monitor: Box<dyn InTradeMonitor>) -> Self {
+        self.in_trade_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(monitor);
         self
     }
 
@@ -47,8 +63,11 @@ impl CompositeRiskChecker {
         open_orders: &HashMap<OrderId, Order>,
         now: DateTime<Utc>,
     ) -> Result<(), Vec<RiskViolation>> {
-        let violations: Vec<RiskViolation> = self
+        let checks = self
             .pre_trade_checks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let violations: Vec<RiskViolation> = checks
             .iter()
             .filter_map(|checker| {
                 checker
@@ -68,13 +87,16 @@ impl CompositeRiskChecker {
     /// Runs every registered `InTradeMonitor`'s `on_fill`, collecting
     /// every violation from every monitor into one combined `Vec`.
     pub fn on_fill(
-        &mut self,
+        &self,
         fill: &Fill,
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<(), Vec<RiskViolation>> {
-        let violations: Vec<RiskViolation> = self
+        let mut monitors = self
             .in_trade_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let violations: Vec<RiskViolation> = monitors
             .iter_mut()
             .filter_map(|monitor| monitor.on_fill(fill, positions, balances).err())
             .flatten()
@@ -245,7 +267,7 @@ mod tests {
 
     #[test]
     fn on_fill_aggregates_violations_from_multiple_monitors() {
-        let mut composite = CompositeRiskChecker::new()
+        let composite = CompositeRiskChecker::new()
             .with_in_trade_monitor(Box::new(AlwaysRejectInTrade(
                 RiskViolation::EquityFloorBreached {
                     actual: dec!(0),
@@ -275,7 +297,7 @@ mod tests {
         });
         let (pre_trade_adapter, in_trade_adapter) = breaker.split();
 
-        let mut composite = CompositeRiskChecker::new()
+        let composite = CompositeRiskChecker::new()
             .with_pre_trade_check(Box::new(pre_trade_adapter))
             .with_in_trade_monitor(Box::new(in_trade_adapter));
 

@@ -10,8 +10,8 @@
 //! day), since neither figure is derivable from the `positions`/
 //! `balances` snapshot `check` receives.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use apexes_core::{Order, OrderId, Side};
 use apexes_strategy::{OrderIntent, Position};
@@ -62,12 +62,15 @@ pub struct LimitChecker {
     /// Interior-mutable daily counters: `check` takes `&self` per the
     /// `PreTradeCheck` trait signature, but tracking "how many trades
     /// happened today" inherently requires mutation on every check
-    /// call. `RefCell` keeps the public API `&self` (matching every
-    /// other stateless-looking `PreTradeCheck` impl) while still
-    /// allowing this one field to mutate internally -- single-threaded
-    /// backtest/paper/live event loops call `check` sequentially, never
-    /// concurrently, so this is sound without needing `Mutex`.
-    daily_state: RefCell<DailyState>,
+    /// call. `Mutex` (rather than `RefCell`) is required so
+    /// `LimitChecker` is `Sync` -- needed to store `Arc<dyn
+    /// PreTradeCheck>`/`Arc<CompositeRiskChecker>` in
+    /// `apexes_core::registry::Registry`, which requires `Send + Sync`
+    /// (sub-project #9's registry retrofit). Real callers still only
+    /// ever call `check` sequentially (never concurrently), so lock
+    /// contention is not a practical concern -- this is purely a
+    /// `Sync`-trait-bound requirement, not a genuine concurrency need.
+    daily_state: Mutex<DailyState>,
 }
 
 struct DailyState {
@@ -80,7 +83,7 @@ impl LimitChecker {
     pub fn new(limits: RiskLimits) -> Self {
         Self {
             limits,
-            daily_state: RefCell::new(DailyState {
+            daily_state: Mutex::new(DailyState {
                 day: None,
                 trade_count: 0,
                 traded_volume: Decimal::ZERO,
@@ -109,7 +112,10 @@ impl PreTradeCheck for LimitChecker {
         let today = now.date_naive();
 
         {
-            let mut state = self.daily_state.borrow_mut();
+            let mut state = self
+                .daily_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.day != Some(today) {
                 state.day = Some(today);
                 state.trade_count = 0;
@@ -173,7 +179,10 @@ impl PreTradeCheck for LimitChecker {
         }
 
         {
-            let state = self.daily_state.borrow();
+            let state = self
+                .daily_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(max_count) = self.limits.max_daily_trade_count
                 && state.trade_count + 1 > max_count
             {
@@ -195,7 +204,10 @@ impl PreTradeCheck for LimitChecker {
         }
 
         if violations.is_empty() {
-            let mut state = self.daily_state.borrow_mut();
+            let mut state = self
+                .daily_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.trade_count += 1;
             state.traded_volume += intent.quantity;
             Ok(())

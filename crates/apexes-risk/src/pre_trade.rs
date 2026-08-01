@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::error::RiskViolation;
 
-pub trait PreTradeCheck: Send {
+pub trait PreTradeCheck: Send + Sync {
     /// Returns `Ok(())` if `intent` passes this check, or
     /// `Err(violations)` with every rule this single check instance
     /// found violated (a single `PreTradeCheck` implementation may
