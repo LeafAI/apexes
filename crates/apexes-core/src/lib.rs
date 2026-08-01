@@ -10,6 +10,7 @@ pub mod fill;
 pub mod instrument;
 pub mod market_data;
 pub mod order;
+pub mod registry;
 
 pub use error::ApexesError;
 pub use fill::{Fill, FillId};
