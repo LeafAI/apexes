@@ -64,6 +64,22 @@ pub enum OrderType {
     StopLimit,
 }
 
+/// Which margin allocation model a leveraged position uses. `Isolated`:
+/// the position has its own dedicated margin allocation -- liquidation
+/// only risks that position. `Cross`: the position shares the whole
+/// account's net value (see `apexes_strategy`'s `PortfolioLedger::
+/// margin_status` design) as its margin pool. Defined here (not in
+/// `apexes-strategy`, where `Position`/`OrderIntent` live) specifically
+/// because `Order` (this file) needs to carry it, and `apexes-strategy`
+/// already depends on `apexes-core` -- the reverse dependency direction
+/// would cycle. `apexes-strategy` re-exports this type via `pub use
+/// apexes_core::MarginMode;`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MarginMode {
+    Isolated,
+    Cross,
+}
+
 /// An order to buy or sell a quantity of an instrument at a venue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
@@ -79,6 +95,17 @@ pub struct Order {
     pub price: Option<Decimal>,
     /// Trigger price. `None` for Market/Limit orders; `Some` for Stop/StopLimit orders.
     pub stop_price: Option<Decimal>,
+    /// `None`: spot order (today's behavior, unchanged). `Some(leverage)`:
+    /// this order opens/adds to a leveraged perpetual position at this
+    /// leverage. Set by `OrderManager::submit_order` (`apexes-oms`) from
+    /// the originating `OrderIntent.leverage`, so `ExecutionGateway`
+    /// implementations (e.g. `BinanceExecutionGateway`) can see it and
+    /// set the exchange-side leverage/margin-mode before submitting.
+    pub leverage: Option<Decimal>,
+    /// Only meaningful when `leverage.is_some()`; `None` is treated as
+    /// `MarginMode::Isolated` by convention (matching
+    /// `OrderIntent.margin_mode`'s own default).
+    pub margin_mode: Option<MarginMode>,
     pub filled_quantity: Decimal,
     pub status: OrderStatus,
     pub created_at: DateTime<Utc>,
@@ -197,6 +224,8 @@ mod tests {
             quantity: rust_decimal_macros::dec!(1.5),
             price: Some(rust_decimal_macros::dec!(65000)),
             stop_price: None,
+            leverage: None,
+            margin_mode: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -221,6 +250,8 @@ mod tests {
             quantity: rust_decimal_macros::dec!(10),
             price: None,
             stop_price: None,
+            leverage: None,
+            margin_mode: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -244,6 +275,8 @@ mod tests {
             quantity: rust_decimal_macros::dec!(1.0),
             price: None,
             stop_price: Some(rust_decimal_macros::dec!(60000)),
+            leverage: None,
+            margin_mode: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -270,6 +303,8 @@ mod tests {
             quantity: rust_decimal_macros::dec!(1.0),
             price: Some(rust_decimal_macros::dec!(65500)),
             stop_price: Some(rust_decimal_macros::dec!(65450)),
+            leverage: None,
+            margin_mode: None,
             filled_quantity: rust_decimal_macros::dec!(0),
             status: OrderStatus::New,
             created_at: now,
@@ -280,5 +315,14 @@ mod tests {
         assert_eq!(order, round_tripped);
         assert_eq!(order.price, Some(rust_decimal_macros::dec!(65500)));
         assert_eq!(order.stop_price, Some(rust_decimal_macros::dec!(65450)));
+    }
+
+    #[test]
+    fn margin_mode_serde_round_trip() {
+        for mode in [MarginMode::Isolated, MarginMode::Cross] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let round_tripped: MarginMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, round_tripped);
+        }
     }
 }

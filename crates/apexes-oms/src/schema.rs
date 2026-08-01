@@ -112,6 +112,14 @@ impl TryFrom<OrderRow> for Order {
             quantity: row.quantity,
             price: row.price,
             stop_price: row.stop_price,
+            // The `orders` table has no leverage/margin_mode columns yet
+            // (no task in the margin-monitoring plan adds them), so
+            // orders rehydrated from Postgres always read back as spot
+            // (`None`). Persisting these would require a schema
+            // migration; flagged for a future task if leveraged orders
+            // must survive a live-trading restart via OMS recovery.
+            leverage: None,
+            margin_mode: None,
             filled_quantity: row.filled_quantity,
             status: parse_order_status(&row.status)?,
             created_at: row.created_at,
@@ -253,6 +261,8 @@ mod tests {
             quantity: dec!(1.5),
             price: Some(dec!(65000)),
             stop_price: None,
+            leverage: None,
+            margin_mode: None,
             filled_quantity: dec!(0.5),
             status: OrderStatus::PartiallyFilled,
             created_at: Utc::now(),

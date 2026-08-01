@@ -182,6 +182,8 @@ mod tests {
                 quantity: dec!(1),
                 price: Some(dec!(65000)),
                 stop_price: None,
+                leverage: None,
+                margin_mode: None,
                 filled_quantity: dec!(0),
                 status: OrderStatus::New,
                 created_at: chrono::Utc::now(),

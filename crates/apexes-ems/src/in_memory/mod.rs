@@ -1080,6 +1080,8 @@ mod tests {
                 quantity: dec!(1),
                 price: None,
                 stop_price: None,
+                leverage: None,
+                margin_mode: None,
                 filled_quantity: dec!(1),
                 status,
                 created_at: Utc::now(),

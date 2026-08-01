@@ -267,6 +267,11 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: None,
             stop_price: None,
+            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
+            // fields yet -- Task 2 adds them and must replace these with
+            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
+            leverage: None,
+            margin_mode: None,
             filled_quantity,
             status,
             created_at: now,
@@ -317,6 +322,11 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: Some(limit_price),
             stop_price: None,
+            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
+            // fields yet -- Task 2 adds them and must replace these with
+            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
+            leverage: None,
+            margin_mode: None,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,
@@ -406,6 +416,11 @@ impl MatchingEngine {
             quantity: intent.quantity,
             price: intent.price,
             stop_price: Some(stop_price),
+            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
+            // fields yet -- Task 2 adds them and must replace these with
+            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
+            leverage: None,
+            margin_mode: None,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,

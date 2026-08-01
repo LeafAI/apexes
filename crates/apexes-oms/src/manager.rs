@@ -109,6 +109,11 @@ impl OrderManager {
             quantity: intent.quantity,
             price: intent.price,
             stop_price: intent.stop_price,
+            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
+            // fields yet -- Task 8 replaces these with
+            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
+            leverage: None,
+            margin_mode: None,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,

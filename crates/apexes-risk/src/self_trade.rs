@@ -136,6 +136,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(price),
             stop_price: None,
+            leverage: None,
+            margin_mode: None,
             filled_quantity: dec!(0),
             status: OrderStatus::New,
             created_at: now(),
