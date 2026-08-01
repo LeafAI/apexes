@@ -10,4 +10,7 @@ pub mod error;
 pub mod strategy;
 
 pub use error::StrategyError;
-pub use strategy::{OrderIntent, Position, Strategy, StrategyContext};
+pub use strategy::{
+    ExecutionAlgoSpec, OrderIntent, OrderRouting, ParentOrderId, ParentOrderStatus, Position,
+    Strategy, StrategyContext,
+};

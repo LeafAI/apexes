@@ -21,7 +21,7 @@ use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_oms::{
     ExchangeUpdate, ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore,
 };
-use apexes_strategy::{OrderIntent, Strategy, StrategyContext};
+use apexes_strategy::{OrderIntent, OrderRouting, Strategy, StrategyContext};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures::StreamExt;
@@ -101,6 +101,8 @@ impl Strategy for BuyOnceStrategy {
                 quantity: dec!(1),
                 price: None,
                 stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
             }];
         }
         vec![]
@@ -227,6 +229,8 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
                 quantity: dec!(1),
                 price: None,
                 stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
             },
             &HashMap::new(),
             &HashMap::new(),

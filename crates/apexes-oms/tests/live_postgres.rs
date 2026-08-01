@@ -13,7 +13,7 @@ use std::sync::Arc;
 use apexes_core::registry::Registry;
 use apexes_core::{AssetClass, OrderStatus, OrderType, Side, Venue};
 use apexes_oms::{ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore};
-use apexes_strategy::OrderIntent;
+use apexes_strategy::{OrderIntent, OrderRouting};
 use rust_decimal_macros::dec;
 
 const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
@@ -28,6 +28,8 @@ fn sample_intent() -> OrderIntent {
         quantity: dec!(1),
         price: None,
         stop_price: None,
+        execution_algo: None,
+        routing: OrderRouting::Fixed,
     }
 }
 

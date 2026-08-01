@@ -777,6 +777,8 @@ mod tests {
             quantity,
             price: None,
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         }
     }
 
@@ -889,6 +891,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         let (order, fills) = engine.submit_market_order(&intent, Utc::now()).unwrap();
 
@@ -961,6 +965,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(64000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
 
         let order = engine.submit_limit_order(&intent, Utc::now()).unwrap();
@@ -992,6 +998,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(65000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         let order = engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1028,6 +1036,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(64000)), // limit below market
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1072,6 +1082,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(65000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
         // volume_ahead_required = 10 * 1.0 = 10
@@ -1114,6 +1126,8 @@ mod tests {
             quantity: dec!(5),
             price: Some(dec!(65000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1153,6 +1167,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(65000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1175,6 +1191,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(65000)),
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_limit_order(&intent, Utc::now()).unwrap();
 
@@ -1198,6 +1216,8 @@ mod tests {
                 quantity,
                 price: Some(dec!(65000)),
                 stop_price: None,
+                execution_algo: None,
+                routing: apexes_strategy::OrderRouting::Fixed,
             };
 
             let result = engine.submit_limit_order(&intent, Utc::now());
@@ -1223,6 +1243,8 @@ mod tests {
                 quantity,
                 price: None,
                 stop_price: None,
+                execution_algo: None,
+                routing: apexes_strategy::OrderRouting::Fixed,
             };
 
             let result = engine.submit_market_order(&intent, Utc::now());
@@ -1246,6 +1268,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: Some(dec!(66000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
 
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
@@ -1266,6 +1290,8 @@ mod tests {
             quantity: dec!(1),
             price: None, // missing -- should be rejected
             stop_price: Some(dec!(66000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
 
         let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1285,6 +1311,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
 
         let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1316,6 +1344,8 @@ mod tests {
                 quantity,
                 price: None,
                 stop_price: Some(dec!(66000)),
+                execution_algo: None,
+                routing: apexes_strategy::OrderRouting::Fixed,
             };
 
             let result = engine.submit_stop_order(&intent, Utc::now());
@@ -1348,6 +1378,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: Some(dec!(66000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1381,6 +1413,8 @@ mod tests {
                     quantity: dec!(4),
                     price: None,
                     stop_price: None,
+                    execution_algo: None,
+                    routing: apexes_strategy::OrderRouting::Fixed,
                 },
                 Utc::now(),
             )
@@ -1400,6 +1434,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: Some(dec!(66000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1419,6 +1455,8 @@ mod tests {
                     quantity: dec!(1),
                     price: None,
                     stop_price: None,
+                    execution_algo: None,
+                    routing: apexes_strategy::OrderRouting::Fixed,
                 },
                 Utc::now(),
             )
@@ -1447,6 +1485,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: Some(dec!(64000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         let order = engine.submit_stop_order(&intent, Utc::now()).unwrap();
 
@@ -1475,6 +1515,8 @@ mod tests {
                     quantity: dec!(4),
                     price: None,
                     stop_price: None,
+                    execution_algo: None,
+                    routing: apexes_strategy::OrderRouting::Fixed,
                 },
                 Utc::now(),
             )
@@ -1503,6 +1545,8 @@ mod tests {
             quantity: dec!(1),
             price: Some(dec!(66050)), // limit price once triggered
             stop_price: Some(dec!(66000)),
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         };
         engine.submit_stop_order(&intent, Utc::now()).unwrap();
 

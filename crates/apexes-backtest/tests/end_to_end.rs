@@ -3,8 +3,8 @@
 //! default `cargo test`, no `--ignored` needed).
 
 use apexes_backtest::{
-    BacktestConfig, CostModel, FlatFeeSchedule, InMemoryMarketDataSource, OrderIntent, ReplaySpeed,
-    Strategy, StrategyContext, run_backtest,
+    BacktestConfig, CostModel, FlatFeeSchedule, InMemoryMarketDataSource, OrderIntent,
+    OrderRouting, ReplaySpeed, Strategy, StrategyContext, run_backtest,
 };
 use apexes_core::{
     AssetClass, DepthUpdate, Instrument, MarketEvent, MarketType, OrderType, PriceLevel, Side,
@@ -36,6 +36,8 @@ impl Strategy for BuyOnceStrategy {
                 quantity: dec!(0.1),
                 price: None,
                 stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
             }];
         }
         vec![]
@@ -177,6 +179,8 @@ impl Strategy for BuyStopOnceStrategy {
                 quantity: dec!(0.1),
                 price: None,
                 stop_price: Some(dec!(66000)),
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
             }];
         }
         vec![]

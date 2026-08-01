@@ -234,6 +234,8 @@ mod tests {
             quantity: dec!(1),
             price: None,
             stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
         }
     }
 

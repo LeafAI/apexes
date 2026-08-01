@@ -386,6 +386,8 @@ pub fn order_intents_from_drift_value(value: DriftValue) -> Result<Vec<OrderInte
                 quantity,
                 price,
                 stop_price,
+                execution_algo: None,
+                routing: crate::strategy::OrderRouting::Fixed,
             })
         })
         .collect()

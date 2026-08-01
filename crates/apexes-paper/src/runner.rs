@@ -80,7 +80,7 @@ pub async fn run_paper_trading(
 mod tests {
     use super::*;
     use apexes_backtest::cost_model::FlatFeeSchedule;
-    use apexes_backtest::{OrderIntent, Strategy, StrategyContext};
+    use apexes_backtest::{OrderIntent, OrderRouting, Strategy, StrategyContext};
     use apexes_core::{
         AssetClass, DepthUpdate, MarketEvent, MarketType, OrderType, PriceLevel, Side, TradeEvent,
         Venue,
@@ -180,6 +180,8 @@ mod tests {
                     quantity: dec!(1),
                     price: None,
                     stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
                 }];
             }
             vec![]

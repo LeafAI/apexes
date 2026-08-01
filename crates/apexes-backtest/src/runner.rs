@@ -86,7 +86,7 @@ mod tests {
     use apexes_core::{
         AssetClass, DepthUpdate, MarketType, OrderType, PriceLevel, Side, TradeEvent, Venue,
     };
-    use apexes_strategy::{OrderIntent, StrategyContext};
+    use apexes_strategy::{OrderIntent, OrderRouting, StrategyContext};
     use chrono::{Duration, TimeZone, Utc};
     use rust_decimal_macros::dec;
 
@@ -111,6 +111,8 @@ mod tests {
                     quantity: dec!(1),
                     price: None,
                     stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
                 }];
             }
             Vec::new()

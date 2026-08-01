@@ -10,7 +10,7 @@ use apexes_core::{
     AssetClass, DepthUpdate, Instrument, MarketEvent, MarketType, PriceLevel, TradeEvent, Venue,
 };
 use apexes_risk::{CompositeRiskChecker, ListMode, SymbolVenueList};
-use apexes_strategy::{OrderIntent, Strategy, StrategyContext};
+use apexes_strategy::{OrderIntent, OrderRouting, Strategy, StrategyContext};
 use chrono::{TimeZone, Utc};
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
@@ -103,6 +103,8 @@ impl Strategy for BuyOnceStrategy {
             quantity: dec!(1),
             price: None,
             stop_price: None,
+            execution_algo: None,
+            routing: OrderRouting::Fixed,
         }]
     }
 }

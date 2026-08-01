@@ -42,7 +42,7 @@ pub mod performance;
 pub mod report;
 pub mod runner;
 
-pub use apexes_strategy::{OrderIntent, Position, Strategy, StrategyContext};
+pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
 pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,

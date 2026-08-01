@@ -2,6 +2,8 @@ use apexes_core::{AssetClass, Order, OrderId, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::time::Duration;
+use uuid::Uuid;
 
 /// The shared strategy interface implemented by both the backtest engine
 /// (`apexes-backtest`) and all future live-trading sub-projects (#6 Paper
@@ -45,6 +47,75 @@ pub struct StrategyContext<'a> {
     pub now: DateTime<Utc>,
 }
 
+/// How an `OrderIntent` should be routed across venues of the same
+/// underlying symbol (e.g. Spot vs. Perpetual on the same exchange).
+/// See `docs/superpowers/specs/2026-08-01-apexes-ems-design.md` §五.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderRouting {
+    /// Existing behavior: submit strictly to `OrderIntent.asset_class`,
+    /// no routing decision made.
+    Fixed,
+    /// Smart order routing: a `VenueScorer` picks the single
+    /// highest-scoring candidate venue for the WHOLE order quantity.
+    RouteToBest,
+    /// Cross-market splitting: a `VenueScorer`'s normalized scores
+    /// determine what fraction of the order quantity goes to each
+    /// listed candidate venue. Weights are never caller-specified --
+    /// they always come from the scorer.
+    Split(Vec<AssetClass>),
+}
+
+/// How an EMS-managed parent order should be paced. `None` on
+/// `OrderIntent.execution_algo` means immediate submission (today's
+/// behavior, unchanged); `Some(spec)` means the EMS slices/paces
+/// submission per `spec`. See design spec §五.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionAlgoSpec {
+    /// Splits `quantity` into `slices` equal child orders, one
+    /// submitted every `duration / slices`.
+    Twap { duration: Duration, slices: u32 },
+    /// Paces child-order submission against a historical intraday
+    /// volume curve (`apexes_storage::intraday_volume_curve`,
+    /// `lookback_days` calendar days). Fails the whole parent order
+    /// (`ParentOrderStatus::Failed`) if fewer than `lookback_days` of
+    /// history exist -- never silently degrades to a uniform-time
+    /// assumption.
+    Vwap {
+        duration: Duration,
+        lookback_days: u32,
+    },
+    /// Keeps at most `visible_qty` resting on the book at any time,
+    /// refilling as each visible slice is exhausted, until the full
+    /// quantity is submitted.
+    Iceberg { visible_qty: Decimal },
+    /// Submits `trade.quantity * participation_rate` (capped at the
+    /// remaining unsent quantity) on every observed
+    /// `MarketEvent::Trade` for the symbol.
+    Pov { participation_rate: Decimal },
+}
+
+/// Identifies an EMS-managed parent (algorithmic execution) order,
+/// distinct from any individual child `OrderId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParentOrderId(pub Uuid);
+
+/// Aggregate lifecycle state of a parent order, computed by an `Ems`
+/// implementation across all of its child orders.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParentOrderStatus {
+    /// Still actively submitting child orders per its `ExecutionAlgoSpec`.
+    Scheduling,
+    /// The full quantity has been submitted and every child order has
+    /// reached a terminal state.
+    Completed,
+    /// Cancelled before completion; no further child orders will be
+    /// submitted for it.
+    Cancelled,
+    /// Could not proceed (e.g. `Vwap` with insufficient historical
+    /// data) -- no child orders were submitted at all.
+    Failed { reason: String },
+}
+
 /// An order a `Strategy` wants to place, returned from
 /// `on_market_event`. Distinct from `apexes_core::Order` (which represents
 /// an order already accepted into the system with an assigned `OrderId`
@@ -63,6 +134,16 @@ pub struct OrderIntent {
     pub price: Option<Decimal>,
     /// Trigger price (`Stop`, `StopLimit` only).
     pub stop_price: Option<Decimal>,
+    /// `None`: submit immediately (today's behavior). `Some(spec)`: an
+    /// EMS slices/paces submission per `spec` instead of submitting
+    /// this intent directly.
+    pub execution_algo: Option<ExecutionAlgoSpec>,
+    /// How this intent should be routed across venues.
+    /// `OrderRouting::Fixed` (the default a strategy should use unless
+    /// it explicitly wants SOR/splitting) preserves today's behavior
+    /// exactly: submit to `asset_class` as specified, no routing
+    /// decision made.
+    pub routing: OrderRouting,
 }
 
 /// A net position in a single symbol.
@@ -104,6 +185,8 @@ mod tests {
                 quantity: dec!(1),
                 price: None,
                 stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
             }]
         }
     }
