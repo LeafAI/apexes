@@ -9,8 +9,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use apexes_core::registry::Registry;
 use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus};
-use apexes_risk::PreTradeCheck;
+use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{OrderIntent, Position};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -23,7 +24,7 @@ use crate::store::OrderStore;
 pub struct OrderManager {
     store: OrderStore,
     gateway: Arc<dyn ExecutionGateway>,
-    risk_checker: Option<Box<dyn PreTradeCheck>>,
+    risk_checker: Option<Arc<CompositeRiskChecker>>,
     open_orders: HashMap<OrderId, Order>,
 }
 
@@ -32,12 +33,18 @@ impl OrderManager {
     /// `store.get_open_orders()` -- the "recover in-flight order state
     /// after a process restart" half of reconnect reconciliation;
     /// `reconcile()` is the other half (comparing that recovered state
-    /// against the exchange's current truth).
-    pub async fn new(
-        store: OrderStore,
-        gateway: Arc<dyn ExecutionGateway>,
-        risk_checker: Option<Box<dyn PreTradeCheck>>,
-    ) -> Result<Self, OmsError> {
+    /// against the exchange's current truth). `gateway` (exactly one
+    /// `Arc<dyn ExecutionGateway>`) is looked up via `registry.one()` --
+    /// a missing or ambiguous (2+) registration is a hard error, since
+    /// an `OrderManager` cannot function without exactly one gateway.
+    /// `risk_checker` (`Arc<CompositeRiskChecker>`) is looked up via
+    /// `registry.try_one()` -- absent is valid and means "no risk
+    /// checking configured", matching this method's previous `None`
+    /// parameter semantics exactly.
+    pub async fn new(store: OrderStore, registry: &Registry) -> Result<Self, OmsError> {
+        let gateway = registry.one::<Arc<dyn ExecutionGateway>>()?;
+        let risk_checker = registry.try_one::<Arc<CompositeRiskChecker>>()?;
+
         let open_orders_vec = store.get_open_orders().await?;
         let open_orders = open_orders_vec
             .into_iter()
@@ -473,12 +480,30 @@ mod tests {
     use super::*;
     use crate::mock_gateway::MockExecutionGateway;
     use apexes_core::{AssetClass, OrderType, Side, Venue};
-    use apexes_risk::RiskViolation;
+    use apexes_risk::{PreTradeCheck, RiskViolation};
     use chrono::DateTime;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
     const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
+
+    /// Production code uses the process-wide global `Registry`
+    /// (`apexes_core::registry::global()`); this crate's tests each
+    /// construct their OWN isolated `Registry::new()` instead. This is
+    /// required, not just a style preference: each test needs its own
+    /// fresh `MockExecutionGateway` registered so it can inspect that
+    /// specific instance's exchange state afterward -- a shared global
+    /// registry would mean only the first test to register ever "wins"
+    /// (later `register_or_skip` calls silently no-op, so later tests
+    /// would observe the FIRST test's stale gateway instead of their
+    /// own), breaking test isolation regardless of `--test-threads`.
+    fn registry_with_gateway(gateway: Arc<dyn ExecutionGateway>) -> Registry {
+        let registry = Registry::new();
+        registry
+            .register::<Arc<dyn ExecutionGateway>, ()>((), gateway)
+            .unwrap();
+        registry
+    }
 
     /// Wraps a `PreTradeCheck` that always rejects, for testing
     /// `submit_order`'s risk-check-failure path without depending on
@@ -536,7 +561,8 @@ mod tests {
     async fn fresh_manager(gateway: Arc<dyn ExecutionGateway>) -> OrderManager {
         let store = OrderStore::new(POSTGRES_URL).await.unwrap();
         clean_db(&store).await;
-        OrderManager::new(store, gateway, None).await.unwrap()
+        let registry = registry_with_gateway(gateway);
+        OrderManager::new(store, &registry).await.unwrap()
     }
 
     #[tokio::test]
@@ -545,9 +571,16 @@ mod tests {
         let store = OrderStore::new(POSTGRES_URL).await.unwrap();
         clean_db(&store).await;
         let gateway = Arc::new(MockExecutionGateway::new());
-        let mut manager = OrderManager::new(store, gateway, Some(Box::new(AlwaysRejectCheck)))
-            .await
+        let registry = registry_with_gateway(gateway);
+        registry
+            .register::<Arc<CompositeRiskChecker>, ()>(
+                (),
+                Arc::new(
+                    CompositeRiskChecker::new().with_pre_trade_check(Box::new(AlwaysRejectCheck)),
+                ),
+            )
             .unwrap();
+        let mut manager = OrderManager::new(store, &registry).await.unwrap();
 
         let result = manager
             .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())

@@ -36,6 +36,9 @@ pub enum OmsError {
         "order {order_id:?} has no known exchange_order_id yet (submission outcome was Uncertain) -- wait for reconcile() to resolve it before cancelling"
     )]
     ExchangeOrderIdUnknown { order_id: OrderId },
+
+    #[error("registry lookup failed: {0}")]
+    RegistryLookupFailed(#[from] apexes_core::registry::RegistryError),
 }
 
 impl From<sqlx::Error> for OmsError {

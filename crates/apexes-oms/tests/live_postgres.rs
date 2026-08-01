@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use apexes_core::registry::Registry;
 use apexes_core::{AssetClass, OrderStatus, OrderType, Side, Venue};
 use apexes_oms::{ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore};
 use apexes_strategy::OrderIntent;
@@ -48,20 +49,31 @@ async fn clean_db() {
 #[ignore]
 async fn order_manager_recovers_open_orders_after_simulated_restart_and_reconciles() {
     clean_db().await;
+    // Keep a concrete `Arc<MockExecutionGateway>` (`gateway`) for
+    // test-only inspection (`set_exchange_state`), and register a
+    // second `Arc` handle to the SAME underlying instance, upcast to
+    // `Arc<dyn ExecutionGateway>`, in the registry -- both `Arc`s point
+    // at the same allocation, so mutating through `gateway` is visible
+    // through whatever `OrderManager` resolves via the registry.
     let gateway = Arc::new(MockExecutionGateway::new());
+    // One Registry instance shared across both simulated "process
+    // instances" below, since both need to resolve to the SAME
+    // underlying gateway (simulating that the exchange connection
+    // itself survives the restart, only the local process doesn't).
+    let registry = Registry::new();
+    registry
+        .register::<Arc<dyn ExecutionGateway>, ()>(
+            (),
+            Arc::clone(&gateway) as Arc<dyn ExecutionGateway>,
+        )
+        .unwrap();
 
     // "Process instance 1": submit an order, then drop the manager
     // (simulating a crash/restart) without cancelling or otherwise
     // cleaning up.
     let order_id = {
         let store = OrderStore::new(POSTGRES_URL).await.unwrap();
-        let mut manager = OrderManager::new(
-            store,
-            Arc::clone(&gateway) as Arc<dyn ExecutionGateway>,
-            None,
-        )
-        .await
-        .unwrap();
+        let mut manager = OrderManager::new(store, &registry).await.unwrap();
         let order_id = manager
             .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
             .await
@@ -81,13 +93,7 @@ async fn order_manager_recovers_open_orders_after_simulated_restart_and_reconcil
     // PostgreSQL database must recover the order as open (from
     // persisted state) before any reconcile() call.
     let store = OrderStore::new(POSTGRES_URL).await.unwrap();
-    let mut manager = OrderManager::new(
-        store,
-        Arc::clone(&gateway) as Arc<dyn ExecutionGateway>,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut manager = OrderManager::new(store, &registry).await.unwrap();
     assert_eq!(
         manager.open_orders().get(&order_id).unwrap().status,
         OrderStatus::New,
