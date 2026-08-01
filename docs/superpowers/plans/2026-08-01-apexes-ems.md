@@ -2548,7 +2548,7 @@ git commit -S -s -m "feat(apexes-strategy): add VenueScorer trait + PriceAndFeeS
 - Modify: `Cargo.toml` (workspace root)
 
 **Interfaces:**
-- Consumes: `apexes_core::{AssetClass, Order, OrderId, Venue}`, `apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus, Side}` (Task 10), `apexes_core::registry::Registry` (Phase 1).
+- Consumes: `apexes_core::{AssetClass, Order, OrderId, Side, Venue}`, `apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus}` (Task 10), `apexes_core::registry::Registry` (Phase 1). NOTE (verified during Task 12's implementation): `Side` lives in `apexes_core`, NOT re-exported from `apexes_strategy` -- import it from `apexes_core`, not `apexes_strategy`.
 - Produces: `apexes_ems::error::EmsError`; `apexes_ems::child_order_sink::ChildOrderSink` (`#[async_trait] pub trait ChildOrderSink: Send + Sync { async fn submit_child_order(&self, intent: ChildOrderIntent) -> Result<OrderId, EmsError>; async fn cancel_child_order(&self, order_id: OrderId) -> Result<(), EmsError>; async fn order_status(&self, order_id: OrderId) -> Result<Option<Order>, EmsError>; }`, `ChildOrderIntent { symbol, venue, asset_class, side, quantity }`); `apexes_ems::ems::{Ems, AlgoOrderRequest}` (`#[async_trait] pub trait Ems: Send + Sync { async fn submit_algo_order(&self, request: AlgoOrderRequest) -> Result<ParentOrderId, EmsError>; async fn parent_order_status(&self, id: ParentOrderId) -> Result<Option<ParentOrderStatus>, EmsError>; async fn cancel_parent_order(&self, id: ParentOrderId) -> Result<(), EmsError>; async fn on_market_event(&self, event: &MarketEvent) -> Result<(), EmsError>; }`, `AlgoOrderRequest { symbol: String, venue: Venue, side: Side, quantity: Decimal, execution_algo: ExecutionAlgoSpec, routing: OrderRouting }`).
 
 **Design note on `Ems::on_market_event`:** the design spec originally proposed `advance_virtual_clock(timestamp: DateTime<Utc>)`, carrying only a timestamp. Verified during this plan's own drafting that this is insufficient for the POV algorithm (`ExecutionAlgoSpec::Pov`), which must react to each `MarketEvent::Trade`'s actual `quantity` (`trade.quantity * participation_rate`), not just elapsed time -- a timestamp alone cannot carry that. Corrected design: `Ems::on_market_event(&self, event: &MarketEvent)` takes the full event. `InMemoryEms` (Task 13) extracts the event's timestamp for virtual-clock-driven algorithms (TWAP/VWAP/Iceberg's periodic-check logic) and reacts to `MarketEvent::Trade.quantity` for POV; `PostgresEms` (Task 16) implements this method as a no-op for TWAP/VWAP/Iceberg (which it paces via real `tokio::time::sleep`/`interval` in an independent background task, per the design spec's "PostgresEms uses real wall-clock timers" decision) but DOES use `MarketEvent::Trade` for its own POV scheduling, since POV is inherently event-driven regardless of virtual vs. real clock.
@@ -2747,8 +2747,8 @@ pub trait ChildOrderSink: Send + Sync {
 //! (backtest/paper) and [`crate::postgres::PostgresEms`] (live
 //! trading) -- see this crate's `lib.rs` docs.
 
-use apexes_core::{MarketEvent, Venue};
-use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus, Side};
+use apexes_core::{MarketEvent, Side, Venue};
+use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
@@ -5282,8 +5282,8 @@ pub use order_manager_sink::OrderManagerChildOrderSink;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apexes_core::{AssetClass, MarketEvent, Venue};
-use apexes_strategy::{ParentOrderId, ParentOrderStatus, Side, VenueMarketState, VenueScorer};
+use apexes_core::{AssetClass, MarketEvent, Side, Venue};
+use apexes_strategy::{ParentOrderId, ParentOrderStatus, VenueMarketState, VenueScorer};
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
