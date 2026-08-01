@@ -1,5 +1,5 @@
 use crate::instrument::Venue;
-use crate::order::{OrderId, Side};
+use crate::order::{MarginMode, OrderId, Side};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,15 @@ pub struct Fill {
     pub fee: Decimal,
     pub fee_currency: Option<String>,
     pub filled_at: DateTime<Utc>,
+    /// `None`: spot fill (today's behavior, unchanged). `Some(leverage)`:
+    /// this fill opens/adds to or reduces/closes a leveraged perpetual
+    /// position at this leverage -- copied from the originating
+    /// `Order.leverage` by whatever constructs this `Fill`
+    /// (`MatchingEngine::submit_market_order` et al., in backtest/paper;
+    /// `apexes-oms`'s exchange-fill ingestion, in live trading).
+    pub leverage: Option<Decimal>,
+    /// Only meaningful when `leverage.is_some()`.
+    pub margin_mode: Option<MarginMode>,
 }
 
 #[cfg(test)]
@@ -41,6 +50,8 @@ mod tests {
             fee: dec!(3.25),
             fee_currency: Some("USDT".to_string()),
             filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
         };
         let json = serde_json::to_string(&fill).unwrap();
         let round_tripped: Fill = serde_json::from_str(&json).unwrap();

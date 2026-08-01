@@ -1,4 +1,4 @@
-use apexes_core::{ApexesError, Fill, Instrument, Side};
+use apexes_core::{ApexesError, Fill, Instrument, MarginMode, Side};
 use apexes_strategy::Position;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -46,7 +46,15 @@ impl PortfolioLedger {
     /// All balance checks are validated BEFORE any mutation is applied, so
     /// this method is atomic: on `Err`, the ledger is left completely
     /// unchanged (no partial debit/credit).
+    ///
+    /// A fill with `leverage: Some(..)` takes the leveraged (perpetual
+    /// futures) accounting path instead (`apply_leveraged_fill`) -- the
+    /// spot-accounting body below is completely untouched by it.
     pub fn apply_fill(&mut self, fill: &Fill) -> Result<(), ApexesError> {
+        if fill.leverage.is_some() {
+            return self.apply_leveraged_fill(fill);
+        }
+
         let instrument = self.instruments.get(&fill.symbol).ok_or_else(|| {
             ApexesError::InvalidBacktestConfig {
                 reason: format!("no Instrument registered for symbol {}", fill.symbol),
@@ -111,6 +119,216 @@ impl PortfolioLedger {
         }
 
         self.update_position(fill);
+
+        Ok(())
+    }
+
+    /// Leveraged (perpetual futures) fill accounting -- cash-settled,
+    /// never credits/debits the literal base-asset quantity. Branches on
+    /// whether `fill` is same-direction (opening/adding to the existing
+    /// position) or opposite-direction (reducing/closing/flipping it),
+    /// mirroring `update_position`'s existing `same_direction` check
+    /// exactly. Called only from `apply_fill` when `fill.leverage.is_some()`.
+    fn apply_leveraged_fill(&mut self, fill: &Fill) -> Result<(), ApexesError> {
+        let instrument = self.instruments.get(&fill.symbol).ok_or_else(|| {
+            ApexesError::InvalidBacktestConfig {
+                reason: format!("no Instrument registered for symbol {}", fill.symbol),
+            }
+        })?;
+        let quote = instrument.quote_currency.clone().ok_or_else(|| {
+            ApexesError::InvalidBacktestConfig {
+                reason: format!("Instrument {} has no quote_currency", fill.symbol),
+            }
+        })?;
+        // `apply_fill` only dispatches here when `fill.leverage.is_some()`;
+        // the `unwrap_or` is a defensive default, never actually taken.
+        let leverage = fill.leverage.unwrap_or(Decimal::ONE);
+        let margin_mode = fill.margin_mode.unwrap_or(MarginMode::Isolated);
+
+        // Fee is always debited from the quote balance immediately,
+        // regardless of opening/closing (matches real exchanges: fees
+        // are never "reserved", they're paid on the spot).
+        let fee_currency = fill.fee_currency.clone().unwrap_or_else(|| quote.clone());
+        let fee_available = self
+            .balances
+            .get(&fee_currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        if fee_available < fill.fee {
+            return Err(ApexesError::InsufficientBalance {
+                asset: fee_currency,
+                required: fill.fee,
+                available: fee_available,
+            });
+        }
+
+        let existing_quantity = self
+            .positions
+            .get(&fill.symbol)
+            .map(|p| p.quantity)
+            .unwrap_or(Decimal::ZERO);
+        let signed_fill_quantity = match fill.side {
+            Side::Buy => fill.quantity,
+            Side::Sell => -fill.quantity,
+        };
+        let same_direction = existing_quantity.is_zero()
+            || (existing_quantity.is_sign_positive() == signed_fill_quantity.is_sign_positive());
+
+        if same_direction {
+            self.open_leveraged(fill, &quote, &fee_currency, leverage, margin_mode)
+        } else {
+            self.close_leveraged(fill, &quote, &fee_currency, leverage, margin_mode)
+        }
+    }
+
+    /// Opening/adding side of `apply_leveraged_fill`: reserves THIS fill's
+    /// own incremental margin contribution (`quantity * price / leverage`),
+    /// added to `Position.allocated_margin` -- never recomputes the whole
+    /// position's margin against a new average entry price, matching how
+    /// real exchanges (including Binance) accumulate margin per-trade.
+    fn open_leveraged(
+        &mut self,
+        fill: &Fill,
+        quote: &str,
+        fee_currency: &str,
+        leverage: Decimal,
+        margin_mode: MarginMode,
+    ) -> Result<(), ApexesError> {
+        let this_fill_margin = fill.quantity * fill.price / leverage;
+        let quote_available = self.balances.get(quote).copied().unwrap_or(Decimal::ZERO);
+        if quote_available < this_fill_margin + fill.fee {
+            return Err(ApexesError::InsufficientBalance {
+                asset: quote.to_string(),
+                required: this_fill_margin + fill.fee,
+                available: quote_available,
+            });
+        }
+        self.credit(fee_currency, -fill.fee);
+        self.credit(quote, -this_fill_margin);
+
+        let position = self
+            .positions
+            .entry(fill.symbol.clone())
+            .or_insert(Position {
+                symbol: fill.symbol.clone(),
+                quantity: Decimal::ZERO,
+                average_entry_price: Decimal::ZERO,
+                leverage: Some(leverage),
+                margin_mode: Some(margin_mode),
+                allocated_margin: Decimal::ZERO,
+            });
+        let signed_fill_quantity = match fill.side {
+            Side::Buy => fill.quantity,
+            Side::Sell => -fill.quantity,
+        };
+        let existing_value = position.quantity.abs() * position.average_entry_price;
+        let new_value = fill.quantity * fill.price;
+        let new_quantity = position.quantity + signed_fill_quantity;
+        if !new_quantity.is_zero() {
+            position.average_entry_price = (existing_value + new_value) / new_quantity.abs();
+        }
+        position.quantity = new_quantity;
+        position.allocated_margin += this_fill_margin;
+        position.leverage = Some(leverage);
+        position.margin_mode = Some(margin_mode);
+
+        Ok(())
+    }
+
+    /// Reducing/closing/flipping side of `apply_leveraged_fill`: releases
+    /// the closing portion's proportional share of `allocated_margin` and
+    /// settles its realized PnL in the SAME direction as the position
+    /// (long profits when price rises). If this fill's quantity exceeds
+    /// the current position's quantity, the excess FLIPS the position --
+    /// treated as a brand-new opening fill at `fill.price`, using THIS
+    /// fill's own leverage/margin_mode (the position's old leverage no
+    /// longer applies to the new, opposite-direction exposure).
+    fn close_leveraged(
+        &mut self,
+        fill: &Fill,
+        quote: &str,
+        fee_currency: &str,
+        leverage: Decimal,
+        margin_mode: MarginMode,
+    ) -> Result<(), ApexesError> {
+        let Some(position) = self.positions.get(&fill.symbol).cloned() else {
+            return Err(ApexesError::InvalidBacktestConfig {
+                reason: format!(
+                    "cannot reduce a leveraged position that doesn't exist for {}",
+                    fill.symbol
+                ),
+            });
+        };
+
+        let closing_quantity = fill.quantity.min(position.quantity.abs());
+        let flip_quantity = fill.quantity - closing_quantity; // > 0 only if this fill flips past zero
+
+        // Settle the closing portion: release its proportional share of
+        // allocated_margin and realize its PnL.
+        let margin_released = if position.quantity.is_zero() {
+            Decimal::ZERO
+        } else {
+            position.allocated_margin * (closing_quantity / position.quantity.abs())
+        };
+        let realized_pnl = if position.quantity.is_sign_positive() {
+            (fill.price - position.average_entry_price) * closing_quantity
+        } else {
+            (position.average_entry_price - fill.price) * closing_quantity
+        };
+
+        // Build the post-close position as a pure computation -- no
+        // mutation yet.
+        let mut updated_position = position.clone();
+        updated_position.allocated_margin -= margin_released;
+        updated_position.quantity -= match fill.side {
+            Side::Buy => -closing_quantity,
+            Side::Sell => closing_quantity,
+        };
+
+        let mut flip_margin = Decimal::ZERO;
+        if flip_quantity > Decimal::ZERO {
+            // The flip remainder is a fresh opening fill -- its margin
+            // requirement is validated against the PROJECTED quote balance
+            // after the closing portion's credits (fee debit + released
+            // margin + realized PnL), so the just-released margin and PnL
+            // are available to fund it (a full close + flip at a higher
+            // effective leverage otherwise fails spuriously) -- but checked
+            // BEFORE any of those credits are actually applied, so a failed
+            // check leaves the ledger completely unchanged.
+            flip_margin = flip_quantity * fill.price / leverage;
+            let fee_on_quote = if fee_currency == quote {
+                fill.fee
+            } else {
+                Decimal::ZERO
+            };
+            let projected_quote = self.balances.get(quote).copied().unwrap_or(Decimal::ZERO)
+                - fee_on_quote
+                + margin_released
+                + realized_pnl;
+            if projected_quote < flip_margin {
+                return Err(ApexesError::InsufficientBalance {
+                    asset: quote.to_string(),
+                    required: flip_margin,
+                    available: projected_quote,
+                });
+            }
+            updated_position.quantity = match fill.side {
+                Side::Buy => flip_quantity,
+                Side::Sell => -flip_quantity,
+            };
+            updated_position.average_entry_price = fill.price;
+            updated_position.allocated_margin = flip_margin;
+            updated_position.leverage = Some(leverage);
+            updated_position.margin_mode = Some(margin_mode);
+        }
+
+        // All validation passed -- apply every mutation together.
+        self.credit(fee_currency, -fill.fee);
+        self.credit(quote, margin_released + realized_pnl);
+        if flip_quantity > Decimal::ZERO {
+            self.credit(quote, -flip_margin);
+        }
+        self.positions.insert(fill.symbol.clone(), updated_position);
 
         Ok(())
     }
@@ -226,6 +444,8 @@ mod tests {
             fee,
             fee_currency: None,
             filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -371,5 +591,202 @@ mod tests {
         let equity = ledger.equity(&mark_prices).unwrap();
         // USDT: 10000 - 6500 = 3500; BTC: 0.1 * 65000 = 6500; total = 10000
         assert_eq!(equity, dec!(10000));
+    }
+
+    fn leveraged_fill_for_symbol(
+        symbol: &str,
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        leverage: Decimal,
+    ) -> Fill {
+        Fill {
+            id: FillId(Uuid::new_v4()),
+            order_id: OrderId(Uuid::new_v4()),
+            symbol: symbol.to_string(),
+            venue: Venue::Binance,
+            side,
+            price,
+            quantity,
+            fee: Decimal::ZERO,
+            fee_currency: None,
+            filled_at: Utc::now(),
+            leverage: Some(leverage),
+            margin_mode: Some(MarginMode::Isolated),
+        }
+    }
+
+    #[test]
+    fn leveraged_buy_reserves_incremental_margin_not_full_notional() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+
+        // margin = notional/leverage = 60000/10 = 6000 -- NOT the full 60000.
+        assert_eq!(*ledger.balances().get("USDT").unwrap(), dec!(4000));
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.allocated_margin, dec!(6000));
+        assert_eq!(position.leverage, Some(dec!(10)));
+        // Crucially: leveraged fills must NEVER credit the literal base
+        // asset (unlike spot) -- there is no real BTC custody here.
+        assert!(
+            ledger.balances().get("BTC").is_none()
+                || ledger.balances().get("BTC") == Some(&Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn leveraged_add_accumulates_margin_incrementally() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(62000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+
+        // 30000/10 + 31000/10 = 3000 + 3100 = 6100 -- accumulated, not recomputed.
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.allocated_margin, dec!(6100));
+        assert_eq!(position.quantity, dec!(1));
+    }
+
+    #[test]
+    fn leveraged_partial_close_releases_proportional_margin_and_realizes_pnl() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // margin=6000, balance now 4000.
+
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(65000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+        // Closing half: releases 3000 margin, realizes (65000-60000)*0.5 = 2500 profit.
+        // New balance: 4000 + 3000 + 2500 = 9500.
+        assert_eq!(*ledger.balances().get("USDT").unwrap(), dec!(9500));
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.quantity, dec!(0.5));
+        assert_eq!(position.allocated_margin, dec!(3000));
+    }
+
+    #[test]
+    fn leveraged_flip_closes_old_side_and_opens_new_side_at_flip_fills_own_leverage() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // Sell 1.5 -- closes the 1 long AND opens a 0.5 short, at 5x leverage this time.
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(60000),
+                dec!(1.5),
+                dec!(5),
+            ))
+            .unwrap();
+
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.quantity, dec!(-0.5));
+        assert_eq!(position.average_entry_price, dec!(60000));
+        // New margin for the flipped 0.5 short at 5x: 0.5*60000/5 = 6000.
+        assert_eq!(position.allocated_margin, dec!(6000));
+        assert_eq!(position.leverage, Some(dec!(5)));
+    }
+
+    #[test]
+    fn leveraged_flip_with_insufficient_margin_leaves_ledger_completely_unchanged() {
+        // Atomicity regression guard for `close_leveraged`: a flip whose
+        // margin requirement is insufficient even AFTER accounting for the
+        // closing portion's credits must return Err with NO partial
+        // mutation -- balances must not reflect the (never-completed) close
+        // and the position map must still hold the OLD pre-close position.
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // margin=6000 reserved, quote balance now 4000.
+
+        let balances_before = ledger.balances().clone();
+        let positions_before = ledger.positions().clone();
+
+        // Sell 2 @60000 at 2x: closes the 1 long (would release 6000
+        // margin, zero PnL) and flips into a 1 short requiring
+        // 1*60000/2 = 30000 margin -- but the projected quote balance
+        // after the close credits is only 4000 + 6000 = 10000.
+        let result = ledger.apply_fill(&leveraged_fill_for_symbol(
+            "BTCUSDT",
+            Side::Sell,
+            dec!(60000),
+            dec!(2),
+            dec!(2),
+        ));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
+
+        // Byte-for-byte unchanged: no fee debit, no margin release, no
+        // PnL credit, no position mutation.
+        assert_eq!(ledger.balances(), &balances_before);
+        assert_eq!(ledger.positions(), &positions_before);
+    }
+
+    #[test]
+    fn spot_fills_are_completely_unaffected_by_leveraged_accounting_path() {
+        // Regression guard: confirms apply_fill's spot branch (fill.leverage
+        // is None) is byte-for-byte the pre-existing behavior, exercised
+        // via the EXISTING buy_fill_debits_quote_credits_base test's
+        // assertions replayed here for extra confidence after this task's
+        // refactor.
+        let mut ledger = ledger_with_10k_usdt();
+        let fill = sample_fill(Side::Buy, dec!(65000), dec!(0.1), dec!(6.5));
+        ledger.apply_fill(&fill).unwrap();
+        assert_eq!(*ledger.balances().get("USDT").unwrap(), dec!(3493.5));
+        assert_eq!(*ledger.balances().get("BTC").unwrap(), dec!(0.1));
     }
 }

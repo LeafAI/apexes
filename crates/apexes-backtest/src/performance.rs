@@ -250,6 +250,8 @@ mod tests {
             fee: dec!(0),
             fee_currency: None,
             filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
         }
     }
 

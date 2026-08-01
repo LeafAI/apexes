@@ -929,6 +929,8 @@ mod tests {
             fee: dec!(0),
             fee_currency: Some("USDT".to_string()),
             filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
         };
         let sink = Arc::new(RecordingSink::new_with_fills(vec![synthetic_fill]));
         let ems = InMemoryEms::new(

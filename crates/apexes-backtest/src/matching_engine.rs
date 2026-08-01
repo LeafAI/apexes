@@ -228,6 +228,8 @@ impl MatchingEngine {
                 fee,
                 fee_currency: None,
                 filled_at: now,
+                leverage: intent.leverage,
+                margin_mode: intent.margin_mode,
             });
 
             remaining -= fill_quantity;
@@ -555,6 +557,8 @@ impl MatchingEngine {
                 fee,
                 fee_currency: None,
                 filled_at: now,
+                leverage: resting.order.leverage,
+                margin_mode: resting.order.margin_mode,
             };
 
             resting.remaining_quantity -= fill_quantity;

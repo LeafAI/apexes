@@ -294,6 +294,14 @@ impl OrderManager {
                             fee: exchange_fill.fee,
                             fee_currency: exchange_fill.fee_currency.clone(),
                             filled_at: exchange_fill.filled_at,
+                            // Binance's fill/trade responses don't repeat an
+                            // order's leverage, so thread it from the order
+                            // snapshot instead -- without this, a leveraged
+                            // position opened via run_live_trading would
+                            // silently degrade to spot accounting the moment
+                            // its fills came back from the exchange.
+                            leverage: order_snapshot.leverage,
+                            margin_mode: order_snapshot.margin_mode,
                         };
                         let inserted = self
                             .store
@@ -484,7 +492,7 @@ impl OrderManager {
 mod tests {
     use super::*;
     use crate::mock_gateway::MockExecutionGateway;
-    use apexes_core::{AssetClass, OrderType, Side, Venue};
+    use apexes_core::{AssetClass, MarginMode, OrderType, Side, Venue};
     use apexes_risk::{PreTradeCheck, RiskViolation};
     use chrono::DateTime;
     use rust_decimal_macros::dec;
@@ -857,5 +865,39 @@ mod tests {
         assert!(changed_again.is_empty());
         let persisted_fills_again = manager.store.get_fills_for_order(order_id).await.unwrap();
         assert_eq!(persisted_fills_again.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn reconcile_threads_leverage_and_margin_mode_from_order_onto_constructed_fills() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let mut intent = sample_intent();
+        intent.leverage = Some(dec!(10));
+        intent.margin_mode = Some(MarginMode::Isolated);
+        let order_id = manager
+            .submit_order(intent, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        gateway.set_exchange_state(order_id, OrderStatus::Filled);
+        gateway.set_fills_for_order(
+            order_id,
+            vec![crate::gateway::ExchangeFill {
+                exchange_trade_id: "T1".to_string(),
+                price: dec!(65000),
+                quantity: dec!(1),
+                fee: dec!(1.5),
+                fee_currency: Some("USDT".to_string()),
+                filled_at: Utc::now(),
+            }],
+        );
+
+        let changed = manager.reconcile().await.unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].1.len(), 1);
+        assert_eq!(changed[0].1[0].leverage, Some(dec!(10)));
+        assert_eq!(changed[0].1[0].margin_mode, Some(MarginMode::Isolated));
     }
 }

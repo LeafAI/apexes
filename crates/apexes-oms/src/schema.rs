@@ -176,6 +176,13 @@ impl TryFrom<FillRow> for Fill {
             fee: row.fee,
             fee_currency: row.fee_currency,
             filled_at: row.filled_at,
+            // The `fills` table has no leverage/margin_mode columns (Task
+            // 8b adds them to `orders` but NOT to `fills`: a historical
+            // fill's leverage tag is only needed for audit/reporting, out
+            // of this plan's scope), so fills rehydrated from Postgres
+            // always read back as spot (`None`).
+            leverage: None,
+            margin_mode: None,
         })
     }
 }
@@ -315,6 +322,8 @@ mod tests {
             fee: dec!(1.2),
             fee_currency: Some("USDT".to_string()),
             filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
         }
     }
 

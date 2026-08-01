@@ -194,6 +194,8 @@ mod tests {
             fee: dec!(0),
             fee_currency: None,
             filled_at: now(),
+            leverage: None,
+            margin_mode: None,
         }
     }
 
