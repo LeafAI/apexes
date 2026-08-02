@@ -10,18 +10,24 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use apexes_backtest::CostModel;
+use apexes_backtest::cost_model::FlatFeeSchedule;
 use apexes_core::registry::Registry;
 use apexes_core::{
-    AssetClass, DepthUpdate, Instrument, MarketDataProvider, MarketEvent, MarketType, OrderType,
-    PriceLevel, Side, TradeEvent, Venue,
+    AssetClass, DepthUpdate, Instrument, MarketDataProvider, MarketEvent, MarketType, Order,
+    OrderId, OrderStatus, OrderType, PriceLevel, Side, TradeEvent, Venue,
 };
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_oms::{
-    ExchangeUpdate, ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore,
+    ExchangeFill, ExchangeUpdate, ExecutionGateway, GatewayOutcome, MockExecutionGateway,
+    OrderManager, OrderStore,
 };
-use apexes_strategy::{OrderIntent, OrderRouting, Strategy, StrategyContext};
+use apexes_strategy::{
+    MarginMode, MarginTier, MarginTierTable, OrderIntent, OrderRouting, Strategy, StrategyContext,
+};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures::StreamExt;
@@ -159,6 +165,16 @@ fn base_config() -> LiveTradingConfig {
     LiveTradingConfig {
         instruments: vec![btc_usdt_instrument()],
         initial_balances,
+        // Live trading never simulates fees itself; `cost_model` exists
+        // only for `funding_rate_bps` (disabled here).
+        cost_model: CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        },
+        margin_tiers: HashMap::new(),
         risk_free_return: dec!(0),
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),
@@ -205,9 +221,6 @@ async fn strategy_order_is_submitted_and_a_push_update_produces_a_fill() {
 #[tokio::test]
 #[ignore]
 async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
-    use apexes_core::OrderStatus;
-    use apexes_oms::ExchangeFill;
-
     clean_db().await;
     let gateway = Arc::new(MockExecutionGateway::new());
     let provider: Arc<dyn MarketDataProvider> = Arc::new(MockMarketDataProvider {
@@ -291,4 +304,199 @@ async fn exchange_update_push_produces_a_fill_applied_to_the_ledger() {
 
     assert_eq!(report.trades.len(), 1);
     assert_eq!(report.trades[0].quantity, dec!(1));
+}
+
+/// Wraps `MockExecutionGateway`, counting every `submit_order` call so
+/// the monitor-only liquidation test below can prove `run_live_trading`
+/// never turns a liquidation-threshold breach into an order submission
+/// (it must only log loudly, leaving real liquidation to the exchange).
+struct CountingGateway {
+    inner: MockExecutionGateway,
+    submit_count: AtomicUsize,
+}
+
+#[async_trait]
+impl ExecutionGateway for CountingGateway {
+    async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+        self.submit_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.submit_order(order).await
+    }
+
+    async fn cancel_order(&self, order: &Order) -> GatewayOutcome {
+        self.inner.cancel_order(order).await
+    }
+
+    async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String> {
+        self.inner.query_order_status(order).await
+    }
+
+    async fn query_all_open_orders(
+        &self,
+        asset_class: AssetClass,
+    ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
+        self.inner.query_all_open_orders(asset_class).await
+    }
+
+    async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {
+        self.inner.query_fills_for_order(order).await
+    }
+}
+
+/// MONITOR-ONLY proof: seeds a 10x leveraged isolated long, then sends
+/// a mark-price update far below its liquidation threshold. Even with
+/// `check_liquidations` firing on that tick, the gateway must see ZERO
+/// additional order submissions -- live trading only logs the breach.
+#[tokio::test]
+#[ignore]
+async fn liquidation_breach_is_logged_but_never_submits_an_order() {
+    use apexes_core::MarkPriceUpdate;
+
+    clean_db().await;
+
+    let gateway = Arc::new(CountingGateway {
+        inner: MockExecutionGateway::new(),
+        submit_count: AtomicUsize::new(0),
+    });
+
+    // A provider whose single mark-price update arrives 100ms in, so
+    // the exchange-update branch is guaranteed to have applied the
+    // leveraged fill (and thus created the position) first; the stream
+    // then stays open so the loop survives until the stop signal.
+    struct DelayedMarkPriceProvider;
+
+    #[async_trait]
+    impl MarketDataProvider for DelayedMarkPriceProvider {
+        async fn subscribe(
+            &self,
+            _instruments: &[Instrument],
+        ) -> Result<BoxStream<'static, MarketEvent>, apexes_core::ApexesError> {
+            let event = MarketEvent::MarkPrice(MarkPriceUpdate {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                mark_price: dec!(50),
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            });
+            Ok(Box::pin(
+                futures::stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    event
+                })
+                .chain(futures::stream::pending()),
+            ))
+        }
+    }
+
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(DelayedMarkPriceProvider);
+    let registry = registry_with(gateway.clone() as Arc<dyn ExecutionGateway>, provider);
+
+    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+    let mut order_manager = OrderManager::new(store, &registry).await.unwrap();
+
+    // Seed a 10x leveraged isolated long (1 BTC @ 100) directly through
+    // the OrderManager; its fill arrives via the exchange-updates
+    // stream below, so the ledger holds a real leveraged position by
+    // the time the mark-price event is processed.
+    let order_id = order_manager
+        .submit_order(
+            OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Perpetual,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(1),
+                price: None,
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: Some(dec!(10)),
+                margin_mode: Some(MarginMode::Isolated),
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    gateway.inner.set_fills_for_order(
+        order_id,
+        vec![ExchangeFill {
+            exchange_trade_id: "T1".to_string(),
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: Utc::now(),
+        }],
+    );
+    let exchange_order_id = order_manager
+        .open_orders()
+        .get(&order_id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+
+    let exchange_updates = futures::stream::iter(vec![ExchangeUpdate {
+        client_order_id: order_id,
+        exchange_order_id,
+        status: OrderStatus::Filled,
+    }])
+    .chain(futures::stream::pending());
+
+    let (tx, rx_stop) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = tx.send(());
+    });
+
+    // At mark 50 the position's margin ratio is (10 - 50) / (50 *
+    // 0.005) = -160 -- deep past the 1.0 liquidation threshold.
+    let mut margin_tiers = HashMap::new();
+    margin_tiers.insert(
+        "BTCUSDT".to_string(),
+        MarginTierTable {
+            tiers: vec![MarginTier {
+                notional_floor: dec!(0),
+                max_leverage: dec!(10),
+                maintenance_margin_rate: dec!(0.005),
+                maintenance_amount: dec!(0),
+            }],
+        },
+    );
+    let config = LiveTradingConfig {
+        instruments: vec![
+            Instrument::new(
+                "BTCUSDT",
+                MarketType::Crypto,
+                Venue::Binance,
+                AssetClass::Perpetual,
+                Some("BTC".to_string()),
+                Some("USDT".to_string()),
+                dec!(0.01),
+                dec!(0.0001),
+                dec!(1),
+            )
+            .unwrap(),
+        ],
+        margin_tiers,
+        ..base_config()
+    };
+
+    let report = run_live_trading(
+        config,
+        &registry,
+        BuyOnceStrategy { bought: true }, // emits no intents
+        order_manager,
+        exchange_updates,
+        rx_stop,
+    )
+    .await
+    .unwrap();
+
+    // The seeded order's fill was applied to the ledger...
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].leverage, Some(dec!(10)));
+    // ...and the seeded order remains the ONLY submission the gateway
+    // ever saw: the liquidation breach on the mark-price event was
+    // logged (tracing::error!), never turned into an order.
+    assert_eq!(gateway.submit_count.load(Ordering::SeqCst), 1);
 }

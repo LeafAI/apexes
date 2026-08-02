@@ -8,14 +8,17 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use apexes_backtest::{PerformanceSummary, PerformanceTracker, PortfolioLedger};
+use apexes_backtest::{CostModel, PerformanceSummary, PerformanceTracker, PortfolioLedger};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent, Venue};
 use apexes_ems::Ems;
 use apexes_ems::postgres::{OrderManagerChildOrderSink, PostgresEms};
 use apexes_oms::{ExchangeUpdate, OrderManager};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{ParentOrderId, ParentOrderStatus, Strategy, StrategyContext, VenueScorer};
+use apexes_strategy::{
+    MarginTierTable, ParentOrderId, ParentOrderStatus, PositionMarginStatus, Strategy,
+    StrategyContext, VenueScorer,
+};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
@@ -23,6 +26,19 @@ use tokio::sync::oneshot;
 pub struct LiveTradingConfig {
     pub instruments: Vec<Instrument>,
     pub initial_balances: HashMap<String, Decimal>,
+    /// Live trading does not simulate fills/fees itself (real fills
+    /// arrive via the exchange push/reconcile paths); this field exists
+    /// purely for its `funding_rate_bps`, which the local ledger's
+    /// periodic `apply_funding_payments` pass needs to keep its equity
+    /// curve consistent with the funding the exchange actually charged
+    /// (matching backtest/paper's accounting convention). Set
+    /// `funding_rate_bps: None` to disable funding settlement.
+    pub cost_model: CostModel,
+    /// Per-symbol tiered maintenance-margin tables, used by the local
+    /// ledger's `margin_status`/`check_liquidations` monitor-only
+    /// passes (live trading NEVER auto-liquidates -- see the margin
+    /// block in `run_live_trading`'s market-event branch).
+    pub margin_tiers: HashMap<String, MarginTierTable>,
     pub risk_free_return: Decimal,
     /// Fallback polling interval for `OrderManager::reconcile()`,
     /// running alongside (not instead of) the push-based
@@ -141,6 +157,12 @@ pub async fn run_live_trading(
     let mut tracker = PerformanceTracker::new(config.risk_free_return);
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut last_prices: HashMap<String, Decimal> = HashMap::new();
+    // Mark prices keyed by BASE CURRENCY (e.g. "BTC"), mirroring
+    // `last_prices`'s convention: every `PortfolioLedger` margin method
+    // looks prices up by the instrument's base currency, not the
+    // trading-pair symbol.
+    let mut mark_prices: HashMap<String, Decimal> = HashMap::new();
+    let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut reconcile_timer = tokio::time::interval(config.reconcile_interval);
     let mut recorded_initial_equity = false;
 
@@ -157,7 +179,7 @@ pub async fn run_live_trading(
                     recorded_initial_equity = true;
                 }
 
-                update_last_price(&event, &instruments_by_symbol, &mut last_prices);
+                update_prices(&event, &instruments_by_symbol, &mut last_prices, &mut mark_prices);
 
                 match ems.on_market_event(&event).await {
                     Ok(ems_fills) if !ems_fills.is_empty() => {
@@ -170,6 +192,45 @@ pub async fn run_live_trading(
                 }
                 refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
 
+                // Funding settlement: once per crossed Binance-aligned
+                // 8-hour UTC boundary (00:00/08:00/16:00), mirroring
+                // `run_event_loop`'s convention. Live trading's own
+                // funding settlement is informational/local-ledger-only
+                // -- the REAL funding charge already happened on the
+                // exchange itself; this keeps our local ledger's equity
+                // curve consistent with what the exchange actually
+                // charged, matching backtest/paper's accounting
+                // convention for comparability, not because this ledger
+                // is authoritative for real funds.
+                let current_funding_boundary = last_funding_boundary(event_timestamp(&event));
+                if last_funding_settlement != Some(current_funding_boundary) {
+                    ledger.apply_funding_payments(&mark_prices, &config.cost_model)?;
+                    last_funding_settlement = Some(current_funding_boundary);
+                }
+
+                let margin_status = ledger.margin_status(&mark_prices, &config.margin_tiers);
+                if let Some(checker) = &risk_checker
+                    && let Err(violations) = checker.on_tick(&margin_status)
+                {
+                    tracing::warn!(?violations, "position monitor flagged a margin violation (live)");
+                }
+
+                // MONITOR-ONLY: never submit a liquidation order in
+                // live trading -- only log loudly and rely on
+                // MarginMonitor's PreTradeCheck (wired via
+                // CompositeRiskChecker above) to block new orders for
+                // the affected symbol. Real liquidation is the
+                // exchange's own responsibility; this local ledger has
+                // no authority to force-close a real position.
+                for symbol in ledger.check_liquidations(&mark_prices, &config.margin_tiers) {
+                    tracing::error!(
+                        symbol = %symbol,
+                        "LIVE TRADING: position margin ratio has breached the liquidation threshold -- \
+                         this system will NOT auto-liquidate; the exchange's own liquidation engine may \
+                         act independently. New orders for this symbol are blocked via MarginMonitor."
+                    );
+                }
+
                 handle_market_event(
                     &event,
                     &mut strategy,
@@ -178,6 +239,7 @@ pub async fn run_live_trading(
                     &ledger,
                     &ems,
                     &mut open_parent_orders,
+                    &margin_status,
                 ).await;
 
                 let equity = ledger.equity(&last_prices)?;
@@ -231,6 +293,7 @@ pub async fn run_live_trading(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_market_event(
     event: &MarketEvent,
     strategy: &mut impl Strategy,
@@ -239,21 +302,19 @@ async fn handle_market_event(
     ledger: &PortfolioLedger,
     ems: &Arc<dyn Ems>,
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+    margin_status: &HashMap<String, PositionMarginStatus>,
 ) {
     // The guard must be bound to a named local (not a temporary
     // expression inside the `StrategyContext` literal) so the
     // `&HashMap<OrderId, Order>` `open_orders()` returns can borrow
     // from it for the context's whole lifetime.
     let open_orders_guard = order_manager.lock().await;
-    // `margin_status` is an empty map for now -- Task 7 of the
-    // margin/leverage plan wires real live-trading margin status (and
-    // the never-auto-liquidate live policy) into `run_live_trading`.
     let ctx = StrategyContext {
         positions: ledger.positions(),
         balances: ledger.balances(),
         open_orders: open_orders_guard.open_orders(),
         open_parent_orders,
-        margin_status: &HashMap::new(),
+        margin_status,
         now: event_timestamp(event),
     };
     let intents = strategy.on_market_event(event, &ctx);
@@ -337,30 +398,57 @@ fn apply_new_fills(
     all_fills.extend(new_fills);
 }
 
-/// Updates `last_prices` (the mark-price map `PortfolioLedger::equity`
-/// needs to value non-quote-currency balances) from a market event,
-/// mirroring `apexes_backtest::event_loop::run_event_loop`'s handling
-/// of `MarketEvent::Trade` -- extended here to also use `Tick`'s
-/// midpoint, since a live venue's own price feed is the source of
-/// truth for mark prices (not just trade prints) and Tick events are a
-/// primary data source for many venues.
-fn update_last_price(
+/// Updates `last_prices` (the price map `PortfolioLedger::equity`
+/// needs to value non-quote-currency balances) and `mark_prices` (the
+/// map every `PortfolioLedger` margin method -- `margin_status`,
+/// `check_liquidations`, `apply_funding_payments` -- looks prices up
+/// in) from a market event. Both maps are keyed by BASE CURRENCY (e.g.
+/// "BTC"), resolved through `instruments_by_symbol`, NOT by the
+/// trading-pair symbol. Mirrors
+/// `apexes_backtest::event_loop::run_event_loop`'s handling of
+/// `MarketEvent::Trade`/`MarkPrice` -- extended here to also use
+/// `Tick`'s midpoint for `last_prices`, since a live venue's own price
+/// feed is the source of truth for mark prices (not just trade prints)
+/// and Tick events are a primary data source for many venues.
+fn update_prices(
     event: &MarketEvent,
     instruments_by_symbol: &HashMap<String, Instrument>,
     last_prices: &mut HashMap<String, Decimal>,
+    mark_prices: &mut HashMap<String, Decimal>,
 ) {
-    let (symbol, price) = match event {
-        MarketEvent::Trade(trade) => (&trade.symbol, trade.price),
+    let (symbol, price, target) = match event {
+        MarketEvent::Trade(trade) => (&trade.symbol, trade.price, last_prices),
         MarketEvent::Tick(tick) => (
             &tick.symbol,
             (tick.bid_price + tick.ask_price) / Decimal::TWO,
+            last_prices,
         ),
+        MarketEvent::MarkPrice(mark_price) => {
+            (&mark_price.symbol, mark_price.mark_price, mark_prices)
+        }
         _ => return,
     };
     if let Some(instrument) = instruments_by_symbol.get(symbol)
         && let Some(base) = &instrument.base_currency
     {
-        last_prices.insert(base.clone(), price);
+        target.insert(base.clone(), price);
+    }
+}
+
+/// Returns the most recent Binance-aligned 8-hour UTC boundary
+/// (00:00/08:00/16:00) at or before `timestamp`. Identical logic to
+/// `apexes_backtest::event_loop`'s private copy, duplicated here since
+/// this crate cannot import a private function from another crate.
+fn last_funding_boundary(
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    let hour_bucket = (timestamp.hour() / 8) * 8;
+    match timestamp.date_naive().and_hms_opt(hour_bucket, 0, 0) {
+        Some(boundary) => boundary.and_utc(),
+        // Unreachable for hour_bucket in {0, 8, 16}; fall back to the
+        // timestamp itself (still monotone) rather than panic.
+        None => timestamp,
     }
 }
 
@@ -443,4 +531,134 @@ async fn subscribe_all_venues(
     }
 
     Ok(futures::stream::select_all(streams))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexes_core::{AssetClass, MarkPriceUpdate, MarketType, Tick, TradeEvent};
+    use chrono::TimeZone;
+    use rust_decimal_macros::dec;
+
+    fn btc_usdt_instrument(asset_class: AssetClass) -> Instrument {
+        Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            asset_class,
+            Some("BTC".to_string()),
+            Some("USDT".to_string()),
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap()
+    }
+
+    fn instruments_by_symbol(asset_class: AssetClass) -> HashMap<String, Instrument> {
+        HashMap::from([("BTCUSDT".to_string(), btc_usdt_instrument(asset_class))])
+    }
+
+    #[test]
+    fn last_funding_boundary_buckets_into_8_hour_windows() {
+        // 00:00/08:00/16:00 UTC boundaries; anything in between rounds
+        // DOWN to the most recent boundary.
+        let cases = [
+            ((2026, 1, 1, 0, 0, 0), (2026, 1, 1, 0, 0, 0)),
+            ((2026, 1, 1, 7, 59, 59), (2026, 1, 1, 0, 0, 0)),
+            ((2026, 1, 1, 8, 0, 0), (2026, 1, 1, 8, 0, 0)),
+            ((2026, 1, 1, 9, 30, 0), (2026, 1, 1, 8, 0, 0)),
+            ((2026, 1, 1, 16, 0, 0), (2026, 1, 1, 16, 0, 0)),
+            ((2026, 1, 1, 23, 59, 59), (2026, 1, 1, 16, 0, 0)),
+        ];
+        for ((iy, im, id, ih, imin, is), (ey, em, ed, eh, emin, es)) in cases {
+            let input = chrono::Utc
+                .with_ymd_and_hms(iy, im, id, ih, imin, is)
+                .unwrap();
+            let expected = chrono::Utc
+                .with_ymd_and_hms(ey, em, ed, eh, emin, es)
+                .unwrap();
+            assert_eq!(last_funding_boundary(input), expected, "input {input}");
+        }
+    }
+
+    #[test]
+    fn update_prices_keys_mark_price_by_base_currency_not_symbol() {
+        let instruments = instruments_by_symbol(AssetClass::Perpetual);
+        let mut last_prices = HashMap::new();
+        let mut mark_prices = HashMap::new();
+        let event = MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(50000),
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        });
+
+        update_prices(&event, &instruments, &mut last_prices, &mut mark_prices);
+
+        // Every PortfolioLedger margin method looks prices up by BASE
+        // currency -- a "BTCUSDT" key would be silently never-found.
+        assert_eq!(mark_prices.get("BTC"), Some(&dec!(50000)));
+        assert!(!mark_prices.contains_key("BTCUSDT"));
+        // MarkPrice events feed mark_prices only, not last_prices
+        // (mirroring run_event_loop's Trade/MarkPrice split).
+        assert!(last_prices.is_empty());
+    }
+
+    #[test]
+    fn update_prices_trade_and_tick_feed_last_prices_by_base_currency() {
+        let instruments = instruments_by_symbol(AssetClass::Spot);
+        let mut last_prices = HashMap::new();
+        let mut mark_prices = HashMap::new();
+        let timestamp = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        update_prices(
+            &MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                price: dec!(100),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp,
+            }),
+            &instruments,
+            &mut last_prices,
+            &mut mark_prices,
+        );
+        update_prices(
+            &MarketEvent::Tick(Tick {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                bid_price: dec!(98),
+                ask_price: dec!(104),
+                bid_size: dec!(1),
+                ask_size: dec!(1),
+                timestamp,
+            }),
+            &instruments,
+            &mut last_prices,
+            &mut mark_prices,
+        );
+
+        assert_eq!(last_prices.get("BTC"), Some(&dec!(101))); // tick midpoint
+        assert!(mark_prices.is_empty());
+    }
+
+    #[test]
+    fn update_prices_ignores_unknown_symbols() {
+        let instruments = instruments_by_symbol(AssetClass::Perpetual);
+        let mut last_prices = HashMap::new();
+        let mut mark_prices = HashMap::new();
+        let event = MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "ETHUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(3000),
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        });
+
+        update_prices(&event, &instruments, &mut last_prices, &mut mark_prices);
+
+        assert!(mark_prices.is_empty());
+    }
 }
