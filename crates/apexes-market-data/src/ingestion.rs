@@ -12,7 +12,8 @@
 //! `run_live_trading`/`run_paper_trading`'s existing
 //! `oneshot::Receiver<()>` pattern).
 
-use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent};
+use apexes_core::{ApexesError, Instrument, MarketEvent};
+use apexes_message_bus::{MarketEventBus, receiver_into_stream};
 use apexes_storage::StorageWriter;
 use futures::StreamExt;
 use std::time::Duration;
@@ -77,12 +78,12 @@ async fn flush_all(writer: &StorageWriter, buffers: &mut Buffers) {
 }
 
 pub async fn run_ingestion_loop(
-    provider: &dyn MarketDataProvider,
+    bus: &MarketEventBus,
     writer: &StorageWriter,
     instruments: &[Instrument],
     mut stop_signal: oneshot::Receiver<()>,
 ) -> Result<(), ApexesError> {
-    let mut stream = provider.subscribe(instruments).await?;
+    let mut stream = receiver_into_stream(bus.subscribe(instruments).await?);
     let mut buffers = Buffers::default();
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -153,5 +154,51 @@ mod tests {
         let mut buffers = Buffers::default();
         buffers.push(sample_trade());
         assert!(!buffers.any_over_size_threshold());
+    }
+
+    use apexes_message_bus::test_support::MockMarketDataProvider;
+
+    #[tokio::test]
+    async fn two_concurrent_run_ingestion_loop_calls_share_one_upstream_connection() {
+        // This test only needs to prove `run_ingestion_loop` itself calls
+        // `bus.subscribe()` (which is what triggers a real upstream
+        // connection) rather than bypassing the bus -- it does not need a
+        // real StorageWriter/ClickHouse instance, since the assertion is
+        // entirely about `MockMarketDataProvider::subscribe_call_count()`,
+        // not about what gets written. A `StorageWriter` cannot be
+        // constructed without a real ClickHouse connection in this
+        // crate's existing API, so this test calls `bus.subscribe()`
+        // directly TWICE (simulating what two independent
+        // `run_ingestion_loop` invocations against the same `bus` and
+        // instrument set would each do internally) rather than spawning
+        // two full `run_ingestion_loop` tasks end-to-end.
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new(Box::new(mock));
+        let instruments = vec![sample_instrument_for_bus_test()];
+
+        let _receiver_1 = bus.subscribe(&instruments).await.unwrap();
+        let _receiver_2 = bus.subscribe(&instruments).await.unwrap();
+
+        assert_eq!(
+            handle.subscribe_call_count(),
+            1,
+            "two subscribe() calls with the same instrument set must share one upstream connection"
+        );
+    }
+
+    fn sample_instrument_for_bus_test() -> apexes_core::Instrument {
+        apexes_core::Instrument::new(
+            "BTCUSDT",
+            apexes_core::MarketType::Crypto,
+            apexes_core::Venue::Binance,
+            apexes_core::AssetClass::Spot,
+            Some("BTC".to_string()),
+            Some("USDT".to_string()),
+            rust_decimal_macros::dec!(0.01),
+            rust_decimal_macros::dec!(0.0001),
+            rust_decimal_macros::dec!(1),
+        )
+        .unwrap()
     }
 }

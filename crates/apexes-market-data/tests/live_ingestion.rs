@@ -8,6 +8,7 @@
 use apexes_core::{AssetClass, Instrument, MarketType, Venue};
 use apexes_market_data::BinanceMarketDataProvider;
 use apexes_market_data::ingestion::run_ingestion_loop;
+use apexes_message_bus::MarketEventBus;
 use apexes_storage::{EventType, StorageReader, StorageWriter};
 use rust_decimal_macros::dec;
 use std::time::Duration;
@@ -18,6 +19,7 @@ const CLICKHOUSE_URL: &str = "http://localhost:8123";
 #[ignore]
 async fn ingests_real_binance_trades_into_clickhouse() {
     let provider = BinanceMarketDataProvider::new();
+    let bus = MarketEventBus::new(Box::new(provider));
     let writer = StorageWriter::new(CLICKHOUSE_URL)
         .await
         .expect("StorageWriter::new should succeed with ClickHouse running locally");
@@ -39,9 +41,10 @@ async fn ingests_real_binance_trades_into_clickhouse() {
     .unwrap();
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    let ingestion_handle = tokio::spawn(async move {
-        run_ingestion_loop(&provider, &writer, &[instrument], stop_rx).await
-    });
+    let ingestion_handle =
+        tokio::spawn(
+            async move { run_ingestion_loop(&bus, &writer, &[instrument], stop_rx).await },
+        );
 
     // Let ingestion run long enough to accumulate at least one trade
     // and cross the 5-second flush interval.
