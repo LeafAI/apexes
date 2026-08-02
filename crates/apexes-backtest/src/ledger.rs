@@ -1,6 +1,6 @@
 use crate::cost_model::CostModel;
 use apexes_core::{ApexesError, Fill, Instrument, MarginMode, Side};
-use apexes_strategy::Position;
+use apexes_strategy::{MarginTierTable, Position, PositionMarginStatus};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -419,6 +419,223 @@ impl PortfolioLedger {
             total += balance * price;
         }
         Ok(total)
+    }
+
+    /// Computes the real-time margin state of every currently-open
+    /// leveraged position. Spot positions (`leverage: None`) are
+    /// skipped entirely (they never appear in the returned map --
+    /// margin doesn't apply to them, there is no sentinel entry).
+    ///
+    /// Isolated positions get a precise `margin_ratio`: the position's
+    /// own effective margin (its reserved `allocated_margin` PLUS its
+    /// unrealized PnL at the current mark price -- matching how real
+    /// exchanges mark an isolated position's margin balance to market)
+    /// divided by that position's maintenance margin requirement (per
+    /// its `MarginTierTable` bracket for its current notional). They
+    /// also get a precise `liquidation_price`: the mark price at which
+    /// `margin_ratio` would hit exactly `1.0`, solved algebraically
+    /// (see `isolated_liquidation_price`).
+    ///
+    /// Cross positions get an ACCOUNT-LEVEL `margin_ratio` (this
+    /// account's total equity, via `self.equity(mark_prices)`, divided
+    /// by the SUM of every cross position's maintenance margin
+    /// requirement) -- the same value for every cross position this
+    /// account holds, since they all share one pool. `liquidation_price`
+    /// is always `None` for cross positions (see `PositionMarginStatus`'s
+    /// own doc comment for why a single position's liquidation price
+    /// isn't a well-defined concept under cross margin).
+    pub fn margin_status(
+        &self,
+        mark_prices: &HashMap<String, Decimal>,
+        margin_tiers: &HashMap<String, MarginTierTable>,
+    ) -> HashMap<String, PositionMarginStatus> {
+        let mut result = HashMap::new();
+
+        // First pass: compute the account-wide cross-margin maintenance
+        // requirement total, needed before we can compute any
+        // individual cross position's margin_ratio.
+        let mut cross_maintenance_total = Decimal::ZERO;
+        for (symbol, position) in &self.positions {
+            if position.leverage.is_none() || position.quantity.is_zero() {
+                continue;
+            }
+            if position.margin_mode != Some(MarginMode::Cross) {
+                continue;
+            }
+            if let Some(maintenance) =
+                self.maintenance_requirement(symbol, position, mark_prices, margin_tiers)
+            {
+                cross_maintenance_total += maintenance;
+            }
+        }
+        let account_equity = self.equity(mark_prices).unwrap_or(Decimal::ZERO);
+        let cross_margin_ratio = if cross_maintenance_total.is_zero() {
+            None
+        } else {
+            Some(account_equity / cross_maintenance_total)
+        };
+
+        for (symbol, position) in &self.positions {
+            if position.leverage.is_none() || position.quantity.is_zero() {
+                continue;
+            }
+            let Some(margin_mode) = position.margin_mode else {
+                continue;
+            };
+
+            let status = match margin_mode {
+                MarginMode::Isolated => {
+                    let mark_price = self.mark_price_for_position(symbol, mark_prices);
+                    let maintenance =
+                        self.maintenance_requirement(symbol, position, mark_prices, margin_tiers);
+                    // `allocated_margin` is a REAL, incrementally-
+                    // accumulated field on `Position` (maintained by
+                    // `PortfolioLedger::apply_leveraged_fill`, Task 2b)
+                    // -- read it directly here rather than recomputing
+                    // `notional / leverage` from scratch. Recomputing
+                    // would be WRONG whenever a position has been
+                    // partially closed or added to at a different price
+                    // than its current average entry price, since real
+                    // exchanges (and Task 2b's accounting) never
+                    // "re-margin" a position's already-reserved margin
+                    // just because its average entry price changed.
+                    //
+                    // The effective margin balance of an isolated
+                    // position is its reserved margin PLUS its
+                    // unrealized PnL at the current mark price: adverse
+                    // price moves erode the margin balance in real time
+                    // (this is what makes `check_liquidations` able to
+                    // fire at all -- without the PnL term the ratio
+                    // would only ever drift with notional, backwards).
+                    let unrealized_pnl = if position.quantity.is_sign_positive() {
+                        (mark_price - position.average_entry_price) * position.quantity
+                    } else {
+                        (position.average_entry_price - mark_price) * position.quantity.abs()
+                    };
+                    let effective_margin = position.allocated_margin + unrealized_pnl;
+                    let margin_ratio = maintenance
+                        .filter(|m| !m.is_zero())
+                        .map(|m| effective_margin / m);
+                    let liquidation_price =
+                        self.isolated_liquidation_price(position, margin_tiers.get(symbol));
+                    PositionMarginStatus {
+                        margin_ratio,
+                        liquidation_price,
+                    }
+                }
+                MarginMode::Cross => PositionMarginStatus {
+                    margin_ratio: cross_margin_ratio,
+                    liquidation_price: None,
+                },
+            };
+            result.insert(symbol.clone(), status);
+        }
+
+        result
+    }
+
+    /// Returns this position's maintenance margin requirement (notional
+    /// times the tier's `maintenance_margin_rate`, minus the tier's
+    /// `maintenance_amount`, per its `MarginTierTable` bracket for its
+    /// current notional), or `None` if no tier table is configured for
+    /// this symbol.
+    fn maintenance_requirement(
+        &self,
+        symbol: &str,
+        position: &apexes_strategy::Position,
+        mark_prices: &HashMap<String, Decimal>,
+        margin_tiers: &HashMap<String, MarginTierTable>,
+    ) -> Option<Decimal> {
+        let mark_price = self.mark_price_for_position(symbol, mark_prices);
+        let notional = position.quantity.abs() * mark_price;
+        let tier = margin_tiers.get(symbol)?.tier_for_notional(notional)?;
+        Some(notional * tier.maintenance_margin_rate - tier.maintenance_amount)
+    }
+
+    /// Resolves the mark price to use for `symbol`'s notional/margin
+    /// calculations: looks up `mark_prices` by the symbol's own base
+    /// currency (matching `equity`'s existing convention), falling back
+    /// to the position's `average_entry_price` if no mark price is
+    /// available (a conservative approximation, not a silent zero).
+    fn mark_price_for_position(
+        &self,
+        symbol: &str,
+        mark_prices: &HashMap<String, Decimal>,
+    ) -> Decimal {
+        self.instruments
+            .get(symbol)
+            .and_then(|instrument| instrument.base_currency.as_ref())
+            .and_then(|base| mark_prices.get(base))
+            .copied()
+            .unwrap_or_else(|| {
+                self.positions
+                    .get(symbol)
+                    .map(|p| p.average_entry_price)
+                    .unwrap_or(Decimal::ONE)
+            })
+    }
+
+    /// Solves for the mark price at which an isolated position's
+    /// `margin_ratio` would equal exactly `1.0` -- i.e. the price `p`
+    /// where `allocated_margin + unrealized_pnl(p) == maintenance(p)`,
+    /// with `maintenance(p) = |q| * p * rate - amount` for the
+    /// position's current tier.
+    ///
+    /// Long (`q > 0`, entry `e`, reserved margin `M`, tier rate `r`,
+    /// tier amount `A`):
+    ///   M + q*(p - e) = q*p*r - A   =>   p = (q*e - M - A) / (q*(1 - r))
+    /// Short (`Q = |q|`):
+    ///   M + Q*(e - p) = Q*p*r - A   =>   p = (Q*e + M + A) / (Q*(1 + r))
+    ///
+    /// Since `maintenance` itself depends on notional (and therefore on
+    /// price), this uses the CURRENT tier's rate as a linear
+    /// approximation (an accepted simplification -- see this plan's own
+    /// non-goals: not a perfectly tier-boundary-aware iterative solve).
+    fn isolated_liquidation_price(
+        &self,
+        position: &apexes_strategy::Position,
+        tier_table: Option<&MarginTierTable>,
+    ) -> Option<Decimal> {
+        let tier_table = tier_table?;
+        let quantity = position.quantity.abs();
+        if quantity.is_zero() {
+            return None;
+        }
+        let entry_notional = quantity * position.average_entry_price;
+        let tier = tier_table.tier_for_notional(entry_notional)?;
+        let rate = tier.maintenance_margin_rate;
+        let amount = tier.maintenance_amount;
+        let margin = position.allocated_margin;
+        if position.quantity.is_sign_positive() {
+            let denominator = quantity * (Decimal::ONE - rate);
+            if denominator.is_zero() {
+                return None;
+            }
+            Some((entry_notional - margin - amount) / denominator)
+        } else {
+            let denominator = quantity * (Decimal::ONE + rate);
+            Some((entry_notional + margin + amount) / denominator)
+        }
+    }
+
+    /// Returns every symbol whose current `margin_status` has
+    /// `margin_ratio <= 1.0` (maintenance margin requirement can no
+    /// longer be met by the allocated/pooled margin) -- these positions
+    /// must be force-closed. Callers (`run_event_loop`, backtest/paper
+    /// only -- `run_live_trading` calls this too but never force-closes,
+    /// see Task 7) submit one market order per returned symbol.
+    pub fn check_liquidations(
+        &self,
+        mark_prices: &HashMap<String, Decimal>,
+        margin_tiers: &HashMap<String, MarginTierTable>,
+    ) -> Vec<String> {
+        self.margin_status(mark_prices, margin_tiers)
+            .into_iter()
+            .filter_map(|(symbol, status)| {
+                let ratio = status.margin_ratio?;
+                (ratio <= Decimal::ONE).then_some(symbol)
+            })
+            .collect()
     }
 
     /// Adjusts `asset`'s balance by `amount` (positive to credit, negative
@@ -984,5 +1201,312 @@ mod tests {
         let usdt_after = *ledger.balances().get("USDT").unwrap();
 
         assert_eq!(usdt_before, usdt_after);
+    }
+
+    fn sample_margin_tiers() -> HashMap<String, apexes_strategy::MarginTierTable> {
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "BTCUSDT".to_string(),
+            apexes_strategy::MarginTierTable {
+                tiers: vec![apexes_strategy::MarginTier {
+                    notional_floor: dec!(0),
+                    max_leverage: dec!(20),
+                    maintenance_margin_rate: dec!(0.05),
+                    maintenance_amount: dec!(0),
+                }],
+            },
+        );
+        tiers
+    }
+
+    #[test]
+    fn margin_status_returns_none_ratio_for_spot_positions() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
+        // Spot position -- leverage stays None.
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &sample_margin_tiers());
+
+        assert!(
+            !status.contains_key("BTCUSDT"),
+            "spot positions must not appear in margin_status's output at all"
+        );
+    }
+
+    #[test]
+    fn margin_status_computes_isolated_margin_ratio_and_liquidation_price() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &sample_margin_tiers());
+
+        let position_status = status.get("BTCUSDT").unwrap();
+        // allocated_margin = notional/leverage = 60000/10 = 6000 (set by
+        // apply_fill's leveraged-accounting branch, Task 2b)
+        // maintenance = notional * 0.05 - 0 = 3000
+        // effective margin = 6000 + 0 unrealized PnL (mark == entry)
+        // margin_ratio = 6000 / 3000 = 2.0
+        assert_eq!(position_status.margin_ratio, Some(dec!(2)));
+        assert!(position_status.liquidation_price.is_some());
+    }
+
+    #[test]
+    fn margin_status_returns_none_liquidation_price_for_cross_positions() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.1),
+                dec!(5),
+            ))
+            .unwrap();
+        // apply_leveraged_fill (Task 2b) always sets margin_mode from
+        // the fill; override it to Cross here since
+        // leveraged_fill_for_symbol's helper defaults to Isolated.
+        ledger.positions.get_mut("BTCUSDT").unwrap().margin_mode =
+            Some(apexes_strategy::MarginMode::Cross);
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &sample_margin_tiers());
+
+        let position_status = status.get("BTCUSDT").unwrap();
+        assert_eq!(position_status.liquidation_price, None);
+        assert!(position_status.margin_ratio.is_some());
+    }
+
+    #[test]
+    fn check_liquidations_flags_a_position_whose_margin_ratio_has_collapsed() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(20),
+            ))
+            .unwrap();
+        // very high leverage (20x) -- thin margin, easy to breach below.
+
+        // Mark price crashes far below entry -- with 20x leverage this
+        // should have already breached maintenance margin.
+        // allocated = 60000/20 = 3000; unrealized PnL at 45000 =
+        // (45000-60000)*1 = -15000; effective margin = -12000;
+        // maintenance = 45000*0.05 = 2250; ratio = -5.33 <= 1.0.
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(45000));
+        let triggered = ledger.check_liquidations(&mark_prices, &sample_margin_tiers());
+
+        assert!(triggered.contains(&"BTCUSDT".to_string()));
+    }
+
+    #[test]
+    fn check_liquidations_does_not_flag_a_healthy_position() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.1),
+                dec!(2),
+            ))
+            .unwrap();
+        // low leverage (2x) -- healthy margin.
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000)); // unchanged from entry
+        let triggered = ledger.check_liquidations(&mark_prices, &sample_margin_tiers());
+
+        assert!(!triggered.contains(&"BTCUSDT".to_string()));
+    }
+
+    /// Asserts that `liquidation_price` actually satisfies the defining
+    /// invariant: at that price, effective margin (allocated + unrealized
+    /// PnL) equals the maintenance requirement (|q|*p*rate - amount).
+    /// This is a STRONGER check than the brief's `is_some()` -- an
+    /// algebraically wrong formula would still return `Some(..)`.
+    fn assert_liquidation_price_invariant(
+        liquidation_price: Decimal,
+        quantity_abs: Decimal,
+        is_long: bool,
+        entry_price: Decimal,
+        allocated_margin: Decimal,
+        rate: Decimal,
+        amount: Decimal,
+    ) {
+        let unrealized = if is_long {
+            (liquidation_price - entry_price) * quantity_abs
+        } else {
+            (entry_price - liquidation_price) * quantity_abs
+        };
+        let effective_margin = allocated_margin + unrealized;
+        let maintenance = quantity_abs * liquidation_price * rate - amount;
+        let diff = (effective_margin - maintenance).abs();
+        assert!(
+            diff < dec!(0.01),
+            "liquidation_price {liquidation_price} does not satisfy margin==maintenance: \
+             effective margin {effective_margin} vs maintenance {maintenance}"
+        );
+    }
+
+    #[test]
+    fn isolated_liquidation_price_long_satisfies_margin_invariant() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // allocated = 60000/10 = 6000; expected p = (1*60000 - 6000 - 0) / (1*(1-0.05))
+        //           = 54000/0.95 = 56842.105...
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &sample_margin_tiers());
+
+        let p = status.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+        assert!(
+            p < dec!(60000),
+            "a long's liquidation price must be BELOW entry"
+        );
+        assert_liquidation_price_invariant(
+            p,
+            dec!(1),
+            true,
+            dec!(60000),
+            dec!(6000),
+            dec!(0.05),
+            dec!(0),
+        );
+    }
+
+    #[test]
+    fn isolated_liquidation_price_short_satisfies_margin_invariant() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // allocated = 6000; expected p = (1*60000 + 6000 + 0) / (1*(1+0.05))
+        //           = 66000/1.05 = 62857.142...
+        // (Note the short denominator is 1 + rate, NOT 1 - rate.)
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &sample_margin_tiers());
+
+        let p = status.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+        assert!(
+            p > dec!(60000),
+            "a short's liquidation price must be ABOVE entry"
+        );
+        assert_liquidation_price_invariant(
+            p,
+            dec!(1),
+            false,
+            dec!(60000),
+            dec!(6000),
+            dec!(0.05),
+            dec!(0),
+        );
+    }
+
+    #[test]
+    fn isolated_liquidation_price_accounts_for_maintenance_amount_term() {
+        // A nonzero tier maintenance_amount must REDUCE the maintenance
+        // requirement, pushing a long's liquidation price FURTHER below
+        // entry (more buffer), not closer to it.
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            "BTCUSDT".to_string(),
+            apexes_strategy::MarginTierTable {
+                tiers: vec![apexes_strategy::MarginTier {
+                    notional_floor: dec!(0),
+                    max_leverage: dec!(20),
+                    maintenance_margin_rate: dec!(0.05),
+                    maintenance_amount: dec!(250),
+                }],
+            },
+        );
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // expected p = (1*60000 - 6000 - 250) / (1*(1-0.05))
+        //            = 53750/0.95 = 56578.947...
+        // (lower than the amount=0 case's 56842.105 -- more buffer).
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let status = ledger.margin_status(&mark_prices, &tiers);
+
+        let p = status.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+        assert_liquidation_price_invariant(
+            p,
+            dec!(1),
+            true,
+            dec!(60000),
+            dec!(6000),
+            dec!(0.05),
+            dec!(250),
+        );
+    }
+
+    #[test]
+    fn margin_status_omits_leveraged_position_without_tier_table_from_ratio_but_keeps_it_out_of_liquidations()
+     {
+        // No tier table configured for the symbol: maintenance is None,
+        // so margin_ratio is None and check_liquidations cannot flag it
+        // (a missing config must never silently force-close a position).
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(20),
+            ))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(45000));
+        let status = ledger.margin_status(&mark_prices, &HashMap::new());
+        assert_eq!(status.get("BTCUSDT").unwrap().margin_ratio, None);
+        let triggered = ledger.check_liquidations(&mark_prices, &HashMap::new());
+        assert!(triggered.is_empty());
     }
 }
