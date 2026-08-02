@@ -1,0 +1,22 @@
+[package]
+name = "apexes-account"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-backtest = { path = "../apexes-backtest" }
+apexes-paper = { path = "../apexes-paper" }
+apexes-gateway-binance = { path = "../apexes-gateway-binance" }
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+rust_decimal_macros = "1.40"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }
