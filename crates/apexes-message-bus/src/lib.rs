@@ -16,4 +16,4 @@
 pub mod bus;
 pub mod test_support;
 
-pub use bus::MarketEventBus;
+pub use bus::{MarketEventBus, receiver_into_stream};

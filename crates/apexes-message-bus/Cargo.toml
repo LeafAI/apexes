@@ -10,7 +10,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }

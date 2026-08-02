@@ -205,6 +205,39 @@ impl MarketEventBus {
     }
 }
 
+/// Adapts a `tokio::sync::broadcast::Receiver<MarketEvent>` (as
+/// returned by `MarketEventBus::subscribe`/`subscribe_downsampled`)
+/// into a `Stream<Item = MarketEvent> + Unpin`, so it can be passed
+/// anywhere this project's existing code expects a plain `MarketEvent`
+/// stream (e.g. `apexes_backtest::event_loop::run_event_loop`). A
+/// `Lagged(n)` error (a slow consumer that fell behind) is caught,
+/// logged via `tracing::warn!` with the lag count, and skipped --
+/// matching `MarketEventBus`'s own established lagged-receiver
+/// handling convention (log and continue, never panic, never
+/// silently stop). `Closed` (the sender side was dropped) ends the
+/// adapted stream cleanly, matching a real upstream disconnection.
+pub fn receiver_into_stream(
+    receiver: broadcast::Receiver<MarketEvent>,
+) -> impl futures::Stream<Item = MarketEvent> + Unpin {
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    Box::pin(
+        BroadcastStream::new(receiver).filter_map(|item| async move {
+            match item {
+                Ok(event) => Some(event),
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "receiver_into_stream: receiver lagged, some events skipped"
+                    );
+                    None
+                }
+            }
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +494,47 @@ mod tests {
                     next,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
                 )
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_into_stream_yields_events_in_order() {
+        let (sender, receiver) = broadcast::channel::<MarketEvent>(16);
+        let mut stream = receiver_into_stream(receiver);
+
+        sender.send(sample_trade_event("BTCUSDT")).unwrap();
+        sender.send(sample_trade_event("ETHUSDT")).unwrap();
+        drop(sender);
+
+        let first = stream.next().await.unwrap();
+        let second = stream.next().await.unwrap();
+        match (first, second) {
+            (MarketEvent::Trade(a), MarketEvent::Trade(b)) => {
+                assert_eq!(a.symbol, "BTCUSDT");
+                assert_eq!(b.symbol, "ETHUSDT");
+            }
+            other => panic!("expected two Trade events, got {other:?}"),
+        }
+        // Sender was dropped -- the stream must end cleanly, not hang.
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receiver_into_stream_skips_lagged_items_without_ending_the_stream() {
+        // Small capacity so it's easy to force a lag.
+        let (sender, receiver) = broadcast::channel::<MarketEvent>(2);
+        let mut stream = receiver_into_stream(receiver);
+
+        for i in 0..10u32 {
+            let _ = sender.send(sample_trade_event(&format!("SYMBOL{i}")));
+        }
+        // The adapted stream must still yield SOMETHING (the lag is
+        // logged and skipped, not surfaced as a stream-ending error) --
+        // it must not immediately return None because of the lag.
+        let next = stream.next().await;
+        assert!(
+            next.is_some(),
+            "a lagged receiver must not end the adapted stream"
         );
     }
 }
