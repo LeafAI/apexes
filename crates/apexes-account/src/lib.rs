@@ -11,5 +11,5 @@ pub mod reconciliation;
 
 pub use account::Account;
 pub use apexes_core::{FundMovement, FundMovementStatus, WalletId};
-pub use fx_rate::FxRateProvider;
+pub use fx_rate::{FxRateProvider, StaticFxRateProvider};
 pub use reconciliation::{ReconciliationDiscrepancy, ReconciliationTolerance};
