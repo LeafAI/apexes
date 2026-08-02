@@ -1,8 +1,11 @@
 //! [`BinanceExecutionGateway`]: implements `apexes_oms::ExecutionGateway`
 //! against real Binance Spot and USDS-M Perpetual Futures REST APIs.
 
-use apexes_core::{AssetClass, MarginMode, Order, OrderId, OrderStatus};
+use apexes_core::{
+    AssetClass, FundMovement, FundMovementStatus, MarginMode, Order, OrderId, OrderStatus, WalletId,
+};
 use apexes_oms::{ExchangeFill, ExecutionGateway, GatewayOutcome};
+use apexes_strategy::Position;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -176,6 +179,228 @@ impl BinanceExecutionGateway {
     }
 }
 
+impl BinanceExecutionGateway {
+    /// Queries real Spot (`GET /api/v3/account`) and USDS-M Futures
+    /// (`GET /fapi/v2/balance`) balances, merging both wallets into a
+    /// single asset-symbol -> total-quantity map (matching
+    /// `PortfolioLedger::balances`'s "one map, not split by wallet"
+    /// convention). Spot's `free`+`locked` are summed (both are
+    /// genuinely-held balance, just some of it reserved by open
+    /// orders); the same asset present in both wallets is summed
+    /// across them.
+    pub async fn account_balances(&self) -> Result<HashMap<String, Decimal>, String> {
+        let mut totals: HashMap<String, Decimal> = HashMap::new();
+
+        let (status, body) = self
+            .rest
+            .signed_request("GET", ApiFamily::Spot, "/api/v3/account", "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("account_balances (spot): HTTP {status}: {body}"));
+        }
+        let spot: SpotAccountResponse = serde_json::from_str(&body).map_err(|error| {
+            format!("account_balances (spot): parse error: {error}; body={body}")
+        })?;
+        for entry in spot.balances {
+            *totals.entry(entry.asset).or_insert(Decimal::ZERO) += entry.free + entry.locked;
+        }
+
+        let (status, body) = self
+            .rest
+            .signed_request("GET", ApiFamily::Futures, "/fapi/v2/balance", "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("account_balances (futures): HTTP {status}: {body}"));
+        }
+        let futures: Vec<FuturesBalanceEntry> = serde_json::from_str(&body).map_err(|error| {
+            format!("account_balances (futures): parse error: {error}; body={body}")
+        })?;
+        for entry in futures {
+            *totals.entry(entry.asset).or_insert(Decimal::ZERO) += entry.balance;
+        }
+
+        Ok(totals)
+    }
+
+    /// Queries real USDS-M Futures positions (`GET
+    /// /fapi/v2/positionRisk`), mapping each non-zero entry to
+    /// `apexes_strategy::Position`. Zero-quantity entries (a symbol
+    /// Binance always reports even with no open position) are omitted
+    /// entirely -- matching `PortfolioLedger::positions()`'s convention
+    /// of only containing symbols with an actual net position.
+    pub async fn account_positions(&self) -> Result<HashMap<String, Position>, String> {
+        let (status, body) = self
+            .rest
+            .signed_request("GET", ApiFamily::Futures, "/fapi/v2/positionRisk", "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("account_positions: HTTP {status}: {body}"));
+        }
+        let entries: Vec<PositionRiskEntry> = serde_json::from_str(&body)
+            .map_err(|error| format!("account_positions: parse error: {error}; body={body}"))?;
+
+        let mut positions = HashMap::new();
+        for entry in entries {
+            if entry.position_amt.is_zero() {
+                continue;
+            }
+            let margin_mode = if entry.margin_type == "isolated" {
+                MarginMode::Isolated
+            } else {
+                MarginMode::Cross
+            };
+            positions.insert(
+                entry.symbol.clone(),
+                Position {
+                    symbol: entry.symbol,
+                    quantity: entry.position_amt,
+                    average_entry_price: entry.entry_price,
+                    leverage: Some(entry.leverage),
+                    margin_mode: Some(margin_mode),
+                    allocated_margin: entry.isolated_margin,
+                },
+            );
+        }
+        Ok(positions)
+    }
+
+    fn wallet_transfer_type(from: WalletId, to: WalletId) -> Result<&'static str, String> {
+        match (from, to) {
+            (WalletId::Spot, WalletId::UsdsFutures) => Ok("MAIN_UMFUTURE"),
+            (WalletId::UsdsFutures, WalletId::Spot) => Ok("UMFUTURE_MAIN"),
+            (WalletId::Spot, WalletId::Spot) | (WalletId::UsdsFutures, WalletId::UsdsFutures) => {
+                Err("internal_transfer: from_wallet and to_wallet must differ".to_string())
+            }
+        }
+    }
+
+    /// Real wallet-to-wallet transfer (`POST /sapi/v1/asset/transfer`)
+    /// within the SAME Binance account -- e.g. Spot <-> USDS-M
+    /// Futures. Never transfers funds out of the account (no
+    /// withdrawal support -- see this crate's design constraints).
+    pub async fn internal_transfer(
+        &self,
+        from_wallet: WalletId,
+        to_wallet: WalletId,
+        asset: &str,
+        amount: Decimal,
+    ) -> Result<(), String> {
+        let transfer_type = Self::wallet_transfer_type(from_wallet, to_wallet)?;
+        let params = format!("type={transfer_type}&asset={asset}&amount={amount}");
+        let (status, body) = self
+            .rest
+            .signed_request("POST", ApiFamily::Spot, "/sapi/v1/asset/transfer", &params)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("internal_transfer: HTTP {status}: {body}"));
+        }
+        Ok(())
+    }
+
+    /// Maps Binance's deposit-status integer codes to
+    /// `FundMovementStatus`. Per Binance's documented deposit status
+    /// codes: `0` = pending, `1` = success (completed), `6` = credited
+    /// but the underlying blockchain transaction is unconfirmed
+    /// (treated as `Pending` here -- not yet safely spendable);
+    /// anything else maps to `Failed` (conservative default -- an
+    /// unrecognized code should never silently read as `Completed`).
+    fn deposit_status(code: i32) -> FundMovementStatus {
+        match code {
+            1 => FundMovementStatus::Completed,
+            0 | 6 => FundMovementStatus::Pending,
+            _ => FundMovementStatus::Failed,
+        }
+    }
+
+    /// Maps Binance's withdrawal-status integer codes to
+    /// `FundMovementStatus`. Per Binance's documented withdrawal status
+    /// codes: `6` = completed; `0`/`1`/`2`/`4`/`5` = various in-flight
+    /// states (all `Pending`); `3` = rejected, `7` = cancelled -- both
+    /// `Failed` (did not result in a successful withdrawal).
+    fn withdrawal_status(code: i32) -> FundMovementStatus {
+        match code {
+            6 => FundMovementStatus::Completed,
+            3 | 7 => FundMovementStatus::Failed,
+            _ => FundMovementStatus::Pending,
+        }
+    }
+
+    /// Read-only query of real deposit history (`GET
+    /// /sapi/v1/capital/deposit/hisrec`). This crate never implements
+    /// deposit/withdrawal INITIATION -- only history queries, per this
+    /// plan's explicit scope constraint.
+    pub async fn deposit_history(&self) -> Result<Vec<FundMovement>, String> {
+        let (status, body) = self
+            .rest
+            .signed_request(
+                "GET",
+                ApiFamily::Spot,
+                "/sapi/v1/capital/deposit/hisrec",
+                "",
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("deposit_history: HTTP {status}: {body}"));
+        }
+        let entries: Vec<DepositHistoryEntry> = serde_json::from_str(&body)
+            .map_err(|error| format!("deposit_history: parse error: {error}; body={body}"))?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| FundMovement {
+                asset: entry.coin,
+                amount: entry.amount,
+                status: Self::deposit_status(entry.status),
+                timestamp: Utc
+                    .timestamp_millis_opt(entry.insert_time)
+                    .single()
+                    .unwrap_or_else(Utc::now),
+                exchange_tx_id: entry.id,
+            })
+            .collect())
+    }
+
+    /// Read-only query of real withdrawal history (`GET
+    /// /sapi/v1/capital/withdraw/history`). Binance reports
+    /// `applyTime` as a `"YYYY-MM-DD HH:MM:SS"` string (UTC) for this
+    /// endpoint (unlike deposit history's millisecond epoch) --
+    /// parsed accordingly; an unparseable timestamp falls back to
+    /// `Utc::now()` rather than failing the whole call (matching
+    /// `deposit_history`'s same fallback for a symmetrical, deliberately
+    /// forgiving parsing policy on this best-effort historical field).
+    pub async fn withdrawal_history(&self) -> Result<Vec<FundMovement>, String> {
+        let (status, body) = self
+            .rest
+            .signed_request(
+                "GET",
+                ApiFamily::Spot,
+                "/sapi/v1/capital/withdraw/history",
+                "",
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(format!("withdrawal_history: HTTP {status}: {body}"));
+        }
+        let entries: Vec<WithdrawHistoryEntry> = serde_json::from_str(&body)
+            .map_err(|error| format!("withdrawal_history: parse error: {error}; body={body}"))?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                let timestamp =
+                    chrono::NaiveDateTime::parse_from_str(&entry.apply_time, "%Y-%m-%d %H:%M:%S")
+                        .map(|naive| naive.and_utc())
+                        .unwrap_or_else(|_| Utc::now());
+                FundMovement {
+                    asset: entry.coin,
+                    amount: entry.amount,
+                    status: Self::withdrawal_status(entry.status),
+                    timestamp,
+                    exchange_tx_id: entry.id,
+                }
+            })
+            .collect())
+    }
+}
+
 /// Binance's order-response JSON shape (both submit and cancel
 /// responses share this shape for the fields this gateway needs).
 #[derive(Debug, Deserialize)]
@@ -206,6 +431,71 @@ struct TradeEntry {
     #[serde(rename = "commissionAsset")]
     commission_asset: Option<String>,
     time: i64,
+}
+
+/// Binance's Spot account response shape (`GET /api/v3/account`), only
+/// the fields this gateway needs.
+#[derive(Debug, Deserialize)]
+struct SpotAccountResponse {
+    balances: Vec<SpotBalanceEntry>,
+}
+
+/// One entry of `SpotAccountResponse::balances`.
+#[derive(Debug, Deserialize)]
+struct SpotBalanceEntry {
+    asset: String,
+    free: Decimal,
+    locked: Decimal,
+}
+
+/// One entry of the USDS-M Futures balance list (`GET /fapi/v2/balance`).
+#[derive(Debug, Deserialize)]
+struct FuturesBalanceEntry {
+    asset: String,
+    balance: Decimal,
+}
+
+/// One entry of the USDS-M Futures position-risk list (`GET
+/// /fapi/v2/positionRisk`), only the fields this gateway needs.
+#[derive(Debug, Deserialize)]
+struct PositionRiskEntry {
+    symbol: String,
+    #[serde(rename = "positionAmt")]
+    position_amt: Decimal,
+    #[serde(rename = "entryPrice")]
+    entry_price: Decimal,
+    leverage: Decimal,
+    #[serde(rename = "marginType")]
+    margin_type: String,
+    #[serde(rename = "isolatedMargin")]
+    isolated_margin: Decimal,
+}
+
+/// One entry of the deposit-history list (`GET
+/// /sapi/v1/capital/deposit/hisrec`), only the fields this gateway needs.
+#[derive(Debug, Deserialize)]
+struct DepositHistoryEntry {
+    id: String,
+    amount: Decimal,
+    coin: String,
+    status: i32,
+    #[serde(rename = "insertTime")]
+    insert_time: i64,
+}
+
+/// One entry of the withdrawal-history list (`GET
+/// /sapi/v1/capital/withdraw/history`), only the fields this gateway
+/// needs. Binance reports `applyTime` as a `"YYYY-MM-DD HH:MM:SS"`
+/// string (UTC) for this endpoint, unlike deposit history's millisecond
+/// epoch -- hence `String`, parsed separately in `withdrawal_history`.
+#[derive(Debug, Deserialize)]
+struct WithdrawHistoryEntry {
+    id: String,
+    amount: Decimal,
+    coin: String,
+    status: i32,
+    #[serde(rename = "applyTime")]
+    apply_time: String,
 }
 
 fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 apexes-core = { path = "../apexes-core" }
 apexes-oms = { path = "../apexes-oms" }
+apexes-strategy = { path = "../apexes-strategy" }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 hmac = { workspace = true }

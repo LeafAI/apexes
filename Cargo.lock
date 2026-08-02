@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-core",
  "apexes-oms",
+ "apexes-strategy",
  "async-trait",
  "chrono",
  "futures",
