@@ -117,6 +117,81 @@ impl MarketEventBus {
             }
         }
     }
+
+    /// A bucket key identifying one independently-downsampled stream:
+    /// symbol, venue, and the `MarketEvent` variant discriminant (so a
+    /// `Tick` and a `Trade` for the same symbol/venue are sampled
+    /// independently, never overwriting each other's "last event").
+    fn downsample_bucket_key(
+        event: &MarketEvent,
+    ) -> (
+        String,
+        apexes_core::Venue,
+        std::mem::Discriminant<MarketEvent>,
+    ) {
+        let (symbol, venue) = match event {
+            MarketEvent::Tick(t) => (t.symbol.clone(), t.venue),
+            MarketEvent::Depth(d) => (d.symbol.clone(), d.venue),
+            MarketEvent::Bar(b) => (b.symbol.clone(), b.venue),
+            MarketEvent::Trade(t) => (t.symbol.clone(), t.venue),
+            MarketEvent::MarkPrice(m) => (m.symbol.clone(), m.venue),
+        };
+        (symbol, venue, std::mem::discriminant(event))
+    }
+
+    pub async fn subscribe_downsampled(
+        &self,
+        instruments: &[Instrument],
+        interval: std::time::Duration,
+    ) -> Result<broadcast::Receiver<MarketEvent>, ApexesError> {
+        let mut raw_receiver = self.subscribe(instruments).await?;
+        let (downsampled_sender, downsampled_receiver) = broadcast::channel(self.capacity);
+
+        tokio::spawn(async move {
+            let mut latest_per_bucket: std::collections::HashMap<
+                (
+                    String,
+                    apexes_core::Venue,
+                    std::mem::Discriminant<MarketEvent>,
+                ),
+                MarketEvent,
+            > = std::collections::HashMap::new();
+            let mut window_timer = tokio::time::interval(interval);
+            window_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    event = raw_receiver.recv() => {
+                        match event {
+                            Ok(event) => {
+                                let key = Self::downsample_bucket_key(&event);
+                                latest_per_bucket.insert(key, event);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    skipped,
+                                    "MarketEventBus::subscribe_downsampled: raw receiver lagged, some events skipped"
+                                );
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                tracing::info!(
+                                    "MarketEventBus::subscribe_downsampled: upstream broadcast closed, forwarding task exiting"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    _ = window_timer.tick() => {
+                        for (_, event) in latest_per_bucket.drain() {
+                            let _ = downsampled_sender.send(event);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(downsampled_receiver)
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +325,79 @@ mod tests {
         let event_1 = receiver_1.recv().await.unwrap();
         let event_2 = receiver_2.recv().await.unwrap();
         assert_eq!(event_1, event_2);
+    }
+
+    fn sample_tick_event(symbol: &str, bid_price: rust_decimal::Decimal) -> MarketEvent {
+        apexes_core::MarketEvent::Tick(apexes_core::Tick {
+            symbol: symbol.to_string(),
+            venue: Venue::Binance,
+            bid_price,
+            bid_size: dec!(1),
+            ask_price: bid_price + dec!(1),
+            ask_size: dec!(1),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_downsampled_forwards_only_the_last_event_per_window() {
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new(Box::new(mock));
+        let instruments = vec![sample_instrument()];
+
+        let mut downsampled = bus
+            .subscribe_downsampled(&instruments, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        // Three ticks arrive within the same window; only the last
+        // (bid_price = dec!(3)) should be forwarded once the window elapses.
+        handle.push_event(sample_tick_event("BTCUSDT", dec!(1)));
+        tokio::task::yield_now().await;
+        handle.push_event(sample_tick_event("BTCUSDT", dec!(2)));
+        tokio::task::yield_now().await;
+        handle.push_event(sample_tick_event("BTCUSDT", dec!(3)));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let forwarded = downsampled.recv().await.unwrap();
+        match forwarded {
+            MarketEvent::Tick(tick) => assert_eq!(tick.bid_price, dec!(3)),
+            other => panic!("expected a Tick event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_downsampled_keeps_separate_windows_per_symbol() {
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new(Box::new(mock));
+        let instruments = vec![sample_instrument(), sample_instrument_2()];
+
+        let mut downsampled = bus
+            .subscribe_downsampled(&instruments, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        handle.push_event(sample_tick_event("BTCUSDT", dec!(100)));
+        tokio::task::yield_now().await;
+        handle.push_event(sample_tick_event("ETHUSDT", dec!(200)));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let mut seen_symbols = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let forwarded = downsampled.recv().await.unwrap();
+            if let MarketEvent::Tick(tick) = forwarded {
+                seen_symbols.insert(tick.symbol);
+            }
+        }
+        assert!(seen_symbols.contains("BTCUSDT"));
+        assert!(seen_symbols.contains("ETHUSDT"));
     }
 }
