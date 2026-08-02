@@ -8,7 +8,9 @@
 //! for the full scope rationale.
 
 pub mod config;
+pub mod gateway;
 pub mod types;
 
 pub use config::XtpGatewayConfig;
+pub use gateway::XtpExecutionGateway;
 pub use types::{XtpMarket, XtpOrderInsertRequest, XtpPriceType, XtpSide};
