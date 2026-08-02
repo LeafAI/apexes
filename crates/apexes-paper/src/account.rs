@@ -34,6 +34,10 @@ impl<'a> PaperAccount<'a> {
         self.ledger.positions().clone()
     }
 
+    pub fn realized_pnl_snapshot(&self) -> HashMap<String, Decimal> {
+        self.ledger.realized_pnl().clone()
+    }
+
     /// Computes current equity using `mark_prices` (asset symbol -> price
     /// in quote terms), the same convention as
     /// `PortfolioLedger::equity`.
@@ -86,6 +90,16 @@ mod tests {
         let ledger = ledger_with_usdt_balance(dec!(1000));
         let account = PaperAccount::new(&ledger);
         assert!(account.positions_snapshot().is_empty());
+    }
+
+    #[test]
+    fn realized_pnl_snapshot_matches_ledger_realized_pnl() {
+        let ledger = ledger_with_usdt_balance(dec!(1000));
+        let account = PaperAccount::new(&ledger);
+        assert_eq!(
+            account.realized_pnl_snapshot(),
+            ledger.realized_pnl().clone()
+        );
     }
 
     #[test]
