@@ -109,11 +109,8 @@ impl OrderManager {
             quantity: intent.quantity,
             price: intent.price,
             stop_price: intent.stop_price,
-            // TEMPORARY (Task 1): OrderIntent does not have leverage/margin_mode
-            // fields yet -- Task 8 replaces these with
-            // `leverage: intent.leverage, margin_mode: intent.margin_mode,`.
-            leverage: None,
-            margin_mode: None,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
             filled_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             created_at: now,
@@ -621,6 +618,25 @@ mod tests {
         let order = manager.open_orders().get(&order_id).unwrap();
         assert!(order.exchange_order_id.is_some());
         assert_eq!(order.status, OrderStatus::New);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn submit_order_threads_leverage_and_margin_mode_onto_constructed_order() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+        let mut intent = sample_intent();
+        intent.leverage = Some(dec!(10));
+        intent.margin_mode = Some(MarginMode::Isolated);
+
+        let order_id = manager
+            .submit_order(intent, &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+
+        let order = manager.open_orders().get(&order_id).unwrap();
+        assert_eq!(order.leverage, Some(dec!(10)));
+        assert_eq!(order.margin_mode, Some(MarginMode::Isolated));
     }
 
     #[tokio::test]
