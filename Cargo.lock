@@ -350,6 +350,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-message-bus"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "apexes-oms"
 version = "0.1.0"
 dependencies = [
