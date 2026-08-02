@@ -8,15 +8,16 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use apexes_core::{Fill, Order, OrderId};
-use apexes_strategy::{OrderIntent, Position};
+use apexes_strategy::{OrderIntent, Position, PositionMarginStatus};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::error::RiskViolation;
 use crate::in_trade::InTradeMonitor;
+use crate::position_monitor::PositionMonitor;
 use crate::pre_trade::PreTradeCheck;
 
-/// Both fields are `Mutex`-wrapped so `check`/`on_fill` can take `&self`
+/// All fields are `Mutex`-wrapped so `check`/`on_fill`/`on_tick` can take `&self`
 /// (not `&mut self`) -- required for `CompositeRiskChecker` to be
 /// storable as `Arc<CompositeRiskChecker>` in
 /// `apexes_core::registry::Registry` (sub-project #9's registry
@@ -29,6 +30,7 @@ use crate::pre_trade::PreTradeCheck;
 pub struct CompositeRiskChecker {
     pre_trade_checks: Mutex<Vec<Box<dyn PreTradeCheck>>>,
     in_trade_monitors: Mutex<Vec<Box<dyn InTradeMonitor>>>,
+    position_monitors: Mutex<Vec<Box<dyn PositionMonitor>>>,
 }
 
 impl CompositeRiskChecker {
@@ -46,6 +48,14 @@ impl CompositeRiskChecker {
 
     pub fn with_in_trade_monitor(self, monitor: Box<dyn InTradeMonitor>) -> Self {
         self.in_trade_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(monitor);
+        self
+    }
+
+    pub fn with_position_monitor(self, monitor: Box<dyn PositionMonitor>) -> Self {
+        self.position_monitors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(monitor);
@@ -108,6 +118,31 @@ impl CompositeRiskChecker {
             Err(violations)
         }
     }
+
+    /// Runs every registered `PositionMonitor::on_tick`, collecting
+    /// every violation from every monitor into one combined result.
+    /// Called once per event-loop tick, independent of fills (see
+    /// `PositionMonitor`'s own doc comment for why).
+    pub fn on_tick(
+        &self,
+        margin_status: &HashMap<String, PositionMarginStatus>,
+    ) -> Result<(), Vec<RiskViolation>> {
+        let mut monitors = self
+            .position_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let violations: Vec<RiskViolation> = monitors
+            .iter_mut()
+            .filter_map(|monitor| monitor.on_tick(margin_status).err())
+            .flatten()
+            .collect();
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +191,17 @@ mod tests {
             _fill: &Fill,
             _positions: &HashMap<String, Position>,
             _balances: &HashMap<String, Decimal>,
+        ) -> Result<(), Vec<RiskViolation>> {
+            Err(vec![self.0.clone()])
+        }
+    }
+
+    struct AlwaysRejectPositionMonitor(RiskViolation);
+
+    impl PositionMonitor for AlwaysRejectPositionMonitor {
+        fn on_tick(
+            &mut self,
+            _margin_status: &HashMap<String, PositionMarginStatus>,
         ) -> Result<(), Vec<RiskViolation>> {
             Err(vec![self.0.clone()])
         }
@@ -288,6 +334,28 @@ mod tests {
                 },
             )));
         let result = composite.on_fill(&sample_fill(), &HashMap::new(), &HashMap::new());
+        let violations = result.expect_err("expected both monitors' violations");
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn on_tick_aggregates_violations_from_multiple_monitors() {
+        let composite = CompositeRiskChecker::new()
+            .with_position_monitor(Box::new(AlwaysRejectPositionMonitor(
+                RiskViolation::MarginRatioBreached {
+                    symbol: "BTCUSDT".to_string(),
+                    ratio: dec!(1.2),
+                    threshold: dec!(1.5),
+                },
+            )))
+            .with_position_monitor(Box::new(AlwaysRejectPositionMonitor(
+                RiskViolation::MarginRatioBreached {
+                    symbol: "ETHUSDT".to_string(),
+                    ratio: dec!(1.3),
+                    threshold: dec!(1.5),
+                },
+            )));
+        let result = composite.on_tick(&HashMap::new());
         let violations = result.expect_err("expected both monitors' violations");
         assert_eq!(violations.len(), 2);
     }

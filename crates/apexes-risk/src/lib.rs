@@ -11,6 +11,8 @@ pub mod error;
 pub mod in_trade;
 pub mod limits;
 pub mod lists;
+pub mod margin_monitor;
+pub mod position_monitor;
 pub mod pre_trade;
 pub mod self_trade;
 
@@ -22,5 +24,9 @@ pub use error::{CircuitBreakerScope, RiskViolation};
 pub use in_trade::InTradeMonitor;
 pub use limits::{LimitChecker, RiskLimits};
 pub use lists::{ListMode, SymbolVenueList};
+pub use margin_monitor::{
+    MarginMonitor, MarginMonitorPositionAdapter, MarginMonitorPreTradeAdapter,
+};
+pub use position_monitor::PositionMonitor;
 pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;

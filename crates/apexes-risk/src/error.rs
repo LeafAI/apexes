@@ -56,6 +56,13 @@ pub enum RiskViolation {
 
     #[error("circuit breaker is open for {scope:?}; new orders are rejected until it resets")]
     CircuitBreakerOpen { scope: CircuitBreakerScope },
+
+    #[error("margin ratio for {symbol} is {ratio} (at or below the warning threshold {threshold})")]
+    MarginRatioBreached {
+        symbol: String,
+        ratio: Decimal,
+        threshold: Decimal,
+    },
 }
 
 /// Which granularity a [`crate::circuit_breaker::CircuitBreaker`] trip

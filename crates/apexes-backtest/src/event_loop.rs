@@ -255,14 +255,10 @@ pub async fn run_event_loop(
         }
 
         let margin_status = ledger.margin_status(&mark_prices, &config.margin_tiers);
-        if let Some(checker) = &risk_checker {
-            // TEMPORARY until Task 6 adds CompositeRiskChecker::on_tick --
-            // this shim always reports no violation; Task 6 replaces this
-            // call with `checker.on_tick(&margin_status)` and deletes the
-            // `on_tick_shim` helper below.
-            if let Err(violations) = on_tick_shim(checker, &margin_status) {
-                tracing::warn!(?violations, "position monitor flagged a margin violation");
-            }
+        if let Some(checker) = &risk_checker
+            && let Err(violations) = checker.on_tick(&margin_status)
+        {
+            tracing::warn!(?violations, "position monitor flagged a margin violation");
         }
 
         // Auto-liquidation (backtest/paper only -- live trading NEVER
@@ -493,15 +489,6 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
         MarketEvent::Trade(trade) => trade.timestamp,
         MarketEvent::MarkPrice(mark_price) => mark_price.timestamp,
     }
-}
-
-// TEMPORARY until Task 6 adds CompositeRiskChecker::on_tick -- delete
-// this shim and use `checker.on_tick(...)` directly once Task 6 lands.
-fn on_tick_shim(
-    _checker: &CompositeRiskChecker,
-    _margin_status: &HashMap<String, apexes_strategy::PositionMarginStatus>,
-) -> Result<(), Vec<apexes_risk::RiskViolation>> {
-    Ok(())
 }
 
 /// Locks the shared `MatchingEngine`, recovering from poisoning by
