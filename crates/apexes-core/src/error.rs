@@ -48,6 +48,9 @@ pub enum ApexesError {
 
     #[error("order rejected: {reason}")]
     OrderRejected { reason: String },
+
+    #[error("operation not supported in this environment: {reason}")]
+    UnsupportedForEnvironment { reason: String },
 }
 
 #[cfg(test)]
@@ -123,6 +126,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "inconsistent leverage for isolated position on BTCUSDT: existing 10, requested 5"
+        );
+    }
+
+    #[test]
+    fn unsupported_for_environment_display() {
+        let err = ApexesError::UnsupportedForEnvironment {
+            reason: "backtest ledgers have no real wallets to transfer between".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "operation not supported in this environment: backtest ledgers have no real wallets to transfer between"
         );
     }
 
