@@ -63,6 +63,19 @@ pub enum RiskViolation {
         ratio: Decimal,
         threshold: Decimal,
     },
+
+    #[error(
+        "market conditions for {symbol} have breached the de-risking threshold (reduce_fraction={reduce_fraction})"
+    )]
+    MarketConditionBreached {
+        symbol: String,
+        reduce_fraction: Decimal,
+    },
+
+    #[error(
+        "account-wide market conditions have breached the de-risking threshold (reduce_fraction={reduce_fraction})"
+    )]
+    AccountWideMarketConditionBreached { reduce_fraction: Decimal },
 }
 
 /// Which granularity a [`crate::circuit_breaker::CircuitBreaker`] trip

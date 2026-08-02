@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 
 use crate::error::RiskViolation;
 use crate::in_trade::InTradeMonitor;
+use crate::market_condition_monitor::MarketConditionEventMonitor;
 use crate::position_monitor::PositionMonitor;
 use crate::pre_trade::PreTradeCheck;
 
@@ -31,6 +32,7 @@ pub struct CompositeRiskChecker {
     pre_trade_checks: Mutex<Vec<Box<dyn PreTradeCheck>>>,
     in_trade_monitors: Mutex<Vec<Box<dyn InTradeMonitor>>>,
     position_monitors: Mutex<Vec<Box<dyn PositionMonitor>>>,
+    market_condition_monitors: Mutex<Vec<Box<dyn MarketConditionEventMonitor>>>,
 }
 
 impl CompositeRiskChecker {
@@ -56,6 +58,17 @@ impl CompositeRiskChecker {
 
     pub fn with_position_monitor(self, monitor: Box<dyn PositionMonitor>) -> Self {
         self.position_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(monitor);
+        self
+    }
+
+    pub fn with_market_condition_monitor(
+        self,
+        monitor: Box<dyn MarketConditionEventMonitor>,
+    ) -> Self {
+        self.market_condition_monitors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(monitor);
@@ -134,6 +147,32 @@ impl CompositeRiskChecker {
         let violations: Vec<RiskViolation> = monitors
             .iter_mut()
             .filter_map(|monitor| monitor.on_tick(margin_status).err())
+            .flatten()
+            .collect();
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// Runs every registered `MarketConditionEventMonitor::on_market_event`,
+    /// collecting every violation from every monitor into one combined
+    /// result. Called once per event-loop event (not once per tick like
+    /// `on_tick`, since market-condition detection needs the raw event
+    /// stream, not a derived per-tick snapshot).
+    pub fn on_market_event(
+        &self,
+        event: &apexes_core::MarketEvent,
+    ) -> Result<(), Vec<RiskViolation>> {
+        let mut monitors = self
+            .market_condition_monitors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let violations: Vec<RiskViolation> = monitors
+            .iter_mut()
+            .filter_map(|monitor| monitor.on_market_event(event).err())
             .flatten()
             .collect();
 
@@ -415,5 +454,45 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    struct AlwaysRejectMarketCondition(RiskViolation);
+
+    impl MarketConditionEventMonitor for AlwaysRejectMarketCondition {
+        fn on_market_event(
+            &mut self,
+            _event: &apexes_core::MarketEvent,
+        ) -> Result<(), Vec<RiskViolation>> {
+            Err(vec![self.0.clone()])
+        }
+    }
+
+    #[test]
+    fn on_market_event_aggregates_violations_from_multiple_monitors() {
+        let composite = CompositeRiskChecker::new()
+            .with_market_condition_monitor(Box::new(AlwaysRejectMarketCondition(
+                RiskViolation::MarketConditionBreached {
+                    symbol: "BTCUSDT".to_string(),
+                    reduce_fraction: dec!(0.5),
+                },
+            )))
+            .with_market_condition_monitor(Box::new(AlwaysRejectMarketCondition(
+                RiskViolation::AccountWideMarketConditionBreached {
+                    reduce_fraction: dec!(0.3),
+                },
+            )));
+
+        let event = apexes_core::MarketEvent::Trade(apexes_core::TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(100),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+
+        let result = composite.on_market_event(&event);
+        assert_eq!(result.unwrap_err().len(), 2);
     }
 }

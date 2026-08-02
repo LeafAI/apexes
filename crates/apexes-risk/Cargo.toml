@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 apexes-core = { path = "../apexes-core" }
+apexes-indicators = { path = "../apexes-indicators" }
 apexes-strategy = { path = "../apexes-strategy" }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }

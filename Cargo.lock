@@ -300,6 +300,7 @@ name = "apexes-risk"
 version = "0.1.0"
 dependencies = [
  "apexes-core",
+ "apexes-indicators",
  "apexes-strategy",
  "chrono",
  "rust_decimal",
