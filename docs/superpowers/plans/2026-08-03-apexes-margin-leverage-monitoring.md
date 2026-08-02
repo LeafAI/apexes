@@ -1740,11 +1740,20 @@ Inside `run_event_loop`'s body, after the existing `last_prices` map is initiali
     fn last_funding_boundary(timestamp: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
         use chrono::Timelike;
         let hour_bucket = (timestamp.hour() / 8) * 8;
-        timestamp
-            .date_naive()
-            .and_hms_opt(hour_bucket, 0, 0)
-            .unwrap()
-            .and_utc()
+        // PLAN CORRECTION (found during implementation): the original
+        // draft used a bare `.unwrap()` here, which this project's
+        // Global Constraints forbid in production code even though
+        // `hour_bucket` is always one of {0, 8, 16} and therefore
+        // always a valid hour -- `and_hms_opt` can theoretically be
+        // `None` in principle (e.g. leap-second edge cases some chrono
+        // versions model), so handle it without panicking: fall back
+        // to `timestamp` itself (still monotone with respect to
+        // `last_funding_settlement`'s `!=` comparison, and practically
+        // unreachable for these three hour values).
+        match timestamp.date_naive().and_hms_opt(hour_bucket, 0, 0) {
+            Some(naive) => naive.and_utc(),
+            None => timestamp,
+        }
     }
 ```
 
@@ -1752,16 +1761,50 @@ Inside the main loop's `match &event { ... }` block, add a new arm (alongside th
 
 ```rust
             MarketEvent::MarkPrice(update) => {
-                mark_prices.insert(update.symbol.clone(), update.mark_price);
+                // PLAN CORRECTION (found during this task's own
+                // implementation -- the original draft below keyed by
+                // `update.symbol` (the trading pair, e.g. "BTCUSDT"),
+                // which silently breaks every PortfolioLedger margin
+                // method (`margin_status`, `check_liquidations`,
+                // `apply_funding_payments`, `mark_price_for_position`),
+                // ALL of which look mark prices up by the instrument's
+                // BASE CURRENCY (e.g. "BTC"), mirroring this same
+                // function's pre-existing `last_prices` convention
+                // (Task 14). Keying by pair symbol would make every
+                // margin lookup silently miss, falling back to
+                // `average_entry_price` forever -- nothing would ever
+                // be flagged for liquidation. Do NOT implement the
+                // pair-symbol version below; look up the instrument's
+                // `base_currency` first, exactly like the existing
+                // Trade arm does for `last_prices`.
+                if let Some(instrument) = instruments_by_symbol.get(&update.symbol)
+                    && let Some(base) = &instrument.base_currency
+                {
+                    mark_prices.insert(base.clone(), update.mark_price);
+                }
             }
 ```
 
-Immediately after the existing `refresh_open_parent_orders(...).await;` call (before the `StrategyContext` is constructed), add the funding-settlement and margin-status/liquidation logic:
+Immediately after the existing `refresh_open_parent_orders(...).await;` call (before the `StrategyContext` is constructed), add the funding-settlement and margin-status/liquidation logic. **PLAN CORRECTION on placement (found during implementation):** placing this block strictly after `refresh_open_parent_orders` but BEFORE the `match &event { ... }` arm above runs would make a `MarkPrice` event's effect lag by one full tick (the mark price wouldn't be in `mark_prices` yet when this block reads it on the SAME tick it arrived). Place this block AFTER the `match &event { ... }` block instead (i.e., after every event-type arm, including the new `MarketEvent::MarkPrice` arm above, has already run for this tick), immediately before `StrategyContext` construction -- this keeps mark prices current for the tick they arrive on, matching the design's intent that a liquidation-triggering mark price acts immediately, not one tick late:
 
 ```rust
         let current_funding_boundary = last_funding_boundary(timestamp);
         if last_funding_settlement != Some(current_funding_boundary) {
-            ledger.apply_funding_payments(&mark_prices, &config.cost_model)?;
+            // PLAN CORRECTION (found during implementation): the
+            // original draft passed `&config.cost_model` here, but by
+            // this point in `run_event_loop`, `config.cost_model` (or
+            // the whole `config`) has already been moved into
+            // `MatchingEngine::new` during setup, and `CostModel` is
+            // NOT `Clone` (it holds a `Box<dyn FeeSchedule>`) -- this
+            // literally does not compile. Add a small read-only
+            // `MatchingEngine::cost_model(&self) -> &CostModel`
+            // accessor (in `matching_engine.rs`) and call
+            // `lock_engine(&matching_engine).cost_model()` instead --
+            // it hands `apply_funding_payments` the SAME `CostModel`
+            // instance the engine already owns (funding settlement
+            // only reads `funding_rate_bps` from it).
+            ledger
+                .apply_funding_payments(&mark_prices, lock_engine(&matching_engine).cost_model())?;
             last_funding_settlement = Some(current_funding_boundary);
         }
 
@@ -1798,8 +1841,24 @@ Immediately after the existing `refresh_open_parent_orders(...).await;` call (be
                 stop_price: None,
                 execution_algo: None,
                 routing: apexes_strategy::OrderRouting::Fixed,
-                leverage: None,
-                margin_mode: None,
+                // PLAN CORRECTION (found during this task's own
+                // implementation -- a REAL BUG, not a style choice):
+                // the original draft set `leverage: None, margin_mode:
+                // None` here. `PortfolioLedger::apply_fill` dispatches
+                // purely on `fill.leverage.is_some()` (Task 2b) -- a
+                // `leverage: None` closing fill for a LEVERAGED position
+                // takes the SPOT accounting path, which for a Sell
+                // tries to debit a base-asset (e.g. BTC) balance a
+                // leveraged perpetual account never actually holds,
+                // returning `Err(InsufficientBalance)`. Propagated by
+                // `apply_fills(..)?`, this means the ENTIRE BACKTEST
+                // ERRORS OUT instead of liquidating the position -- the
+                // opposite of this task's purpose. The closing fill
+                // must carry the position's OWN leverage/margin_mode so
+                // `apply_fill` takes the `close_leveraged` branch,
+                // which correctly releases margin and realizes PnL.
+                leverage: position.leverage,
+                margin_mode: position.margin_mode,
             };
             match lock_engine(&matching_engine).submit_market_order(&liquidation_intent, timestamp) {
                 Ok((order, fills)) => {
