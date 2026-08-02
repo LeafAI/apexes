@@ -1,3 +1,4 @@
+use crate::margin_tier::PositionMarginStatus;
 use apexes_core::{AssetClass, MarginMode, Order, OrderId, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -51,6 +52,15 @@ pub struct StrategyContext<'a> {
     /// empty. See `docs/superpowers/specs/2026-08-01-apexes-ems-design.md`
     /// §五's integration-points section.
     pub open_parent_orders: &'a HashMap<ParentOrderId, ParentOrderStatus>,
+    /// Real-time margin state of every currently-open leveraged
+    /// position (spot positions never appear here), computed
+    /// identically across backtest/paper/live via
+    /// `PortfolioLedger::margin_status` -- a strategy can use this to
+    /// proactively de-risk BEFORE an actual liquidation is triggered
+    /// (backtest/paper auto-liquidate at `margin_ratio <= 1.0`; live
+    /// trading never auto-liquidates but blocks new orders for the
+    /// affected symbol via `apexes-risk::MarginMonitor`).
+    pub margin_status: &'a HashMap<String, PositionMarginStatus>,
     /// Current simulated (backtest) or real (live) time.
     pub now: DateTime<Utc>,
 }
@@ -240,6 +250,7 @@ mod tests {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &open_parent_orders,
+            margin_status: &HashMap::new(),
             now: Utc::now(),
         };
         let event = MarketEvent::Trade(apexes_core::TradeEvent {
@@ -284,6 +295,7 @@ mod tests {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &open_parent_orders,
+            margin_status: &HashMap::new(),
             now,
         };
 

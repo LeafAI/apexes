@@ -61,6 +61,7 @@ fn always_buy_returns_one_buy_intent() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = sample_trade_event();
@@ -85,6 +86,7 @@ fn uses_math_binding_computes_average_and_buys() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = sample_trade_event();
@@ -120,6 +122,7 @@ fn uses_ctx_position_skips_when_already_long() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now: Utc::now(),
         };
         let event = sample_trade_event();
@@ -145,6 +148,7 @@ fn uses_ctx_position_buys_when_flat_and_no_open_orders() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = sample_trade_event();
@@ -187,6 +191,7 @@ fn runtime_error_script_returns_empty_vec_not_panic() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = sample_trade_event();
@@ -211,6 +216,7 @@ fn uses_indicators_sma_stays_flat_during_warmup_then_buys() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
 
@@ -274,6 +280,7 @@ fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = MarketEvent::Trade(TradeEvent {
@@ -304,6 +311,7 @@ fn uses_signals_produces_no_order_during_indicator_warmup() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
         let event = MarketEvent::Trade(TradeEvent {
@@ -337,6 +345,7 @@ fn uses_signals_produces_rebalance_order_once_warm() {
             balances: &balances,
             open_orders: &open_orders,
             open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
             now,
         };
 

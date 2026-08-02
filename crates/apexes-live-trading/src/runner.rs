@@ -245,11 +245,15 @@ async fn handle_market_event(
     // `&HashMap<OrderId, Order>` `open_orders()` returns can borrow
     // from it for the context's whole lifetime.
     let open_orders_guard = order_manager.lock().await;
+    // `margin_status` is an empty map for now -- Task 7 of the
+    // margin/leverage plan wires real live-trading margin status (and
+    // the never-auto-liquidate live policy) into `run_live_trading`.
     let ctx = StrategyContext {
         positions: ledger.positions(),
         balances: ledger.balances(),
         open_orders: open_orders_guard.open_orders(),
         open_parent_orders,
+        margin_status: &HashMap::new(),
         now: event_timestamp(event),
     };
     let intents = strategy.on_market_event(event, &ctx);

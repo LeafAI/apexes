@@ -27,6 +27,7 @@ pub mod cost_model;
 
 pub mod event_loop;
 pub mod latency;
+pub mod mark_price_source;
 
 // Populated in Task 7.
 pub mod ledger;
@@ -52,6 +53,7 @@ pub use cost_model::{
 pub use error::ApexesError;
 pub use latency::LatencyModel;
 pub use ledger::PortfolioLedger;
+pub use mark_price_source::StorageReaderMarkPriceProvider;
 pub use market_data_source::{
     HistoricalMarketDataSource, InMemoryMarketDataSource, StorageMarketDataSource,
 };

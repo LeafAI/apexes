@@ -74,6 +74,7 @@ pub async fn run_paper_trading(
         queue_position_factor: config.queue_position_factor,
         risk_free_return: config.risk_free_return,
         risk_checker,
+        margin_tiers: HashMap::new(),
     };
 
     run_event_loop(
