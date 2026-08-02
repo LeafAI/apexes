@@ -11,6 +11,13 @@ pub struct PortfolioLedger {
     instruments: HashMap<String, Instrument>,
     balances: HashMap<String, Decimal>,
     positions: HashMap<String, Position>,
+    /// Per-symbol accumulated realized profit/loss. Spot reductions
+    /// (`update_position`'s reduce/flip branch) and leveraged closes
+    /// (`close_leveraged`) both write into this map; opening/adding to
+    /// a position never does (there is no realized PnL to book until
+    /// quantity is reduced). See `docs/superpowers/specs/2026-08-02-apexes-account-design.md`
+    /// §五 for the full design rationale.
+    realized_pnl: HashMap<String, Decimal>,
 }
 
 impl PortfolioLedger {
@@ -27,6 +34,7 @@ impl PortfolioLedger {
             instruments,
             balances: initial_balances,
             positions: HashMap::new(),
+            realized_pnl: HashMap::new(),
         }
     }
 
@@ -36,6 +44,10 @@ impl PortfolioLedger {
 
     pub fn positions(&self) -> &HashMap<String, Position> {
         &self.positions
+    }
+
+    pub fn realized_pnl(&self) -> &HashMap<String, Decimal> {
+        &self.realized_pnl
     }
 
     /// Applies a `Fill` to the ledger: debits/credits the base and quote
@@ -419,6 +431,17 @@ impl PortfolioLedger {
         if flip_quantity > Decimal::ZERO {
             self.credit(quote, -flip_margin);
         }
+        // Accumulate the closing portion's realized PnL into the new field.
+        // Placed here (with the other mutations, AFTER the flip-margin
+        // validation above) rather than next to the local `realized_pnl`
+        // computation so a rejected flip leaves the ledger -- including this
+        // field -- completely unchanged, preserving `apply_fill`'s atomicity
+        // contract (the brief's proposed placement next to the computation
+        // would book PnL for a fill that was never accepted).
+        *self
+            .realized_pnl
+            .entry(fill.symbol.clone())
+            .or_insert(Decimal::ZERO) += realized_pnl;
         self.positions.insert(fill.symbol.clone(), updated_position);
 
         Ok(())
@@ -720,6 +743,30 @@ impl PortfolioLedger {
             Side::Sell => -fill.quantity,
         };
 
+        let existing = self.positions.get(&fill.symbol).cloned();
+        let (existing_quantity, existing_average_entry_price) = existing
+            .as_ref()
+            .map(|p| (p.quantity, p.average_entry_price))
+            .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+
+        let same_direction = existing_quantity.is_zero()
+            || (existing_quantity.is_sign_positive() == signed_quantity.is_sign_positive());
+
+        if !same_direction && !existing_quantity.is_zero() {
+            let closing_quantity = existing_quantity.abs().min(signed_quantity.abs());
+            if !closing_quantity.is_zero() {
+                let realized = if existing_quantity.is_sign_positive() {
+                    (fill.price - existing_average_entry_price) * closing_quantity
+                } else {
+                    (existing_average_entry_price - fill.price) * closing_quantity
+                };
+                *self
+                    .realized_pnl
+                    .entry(fill.symbol.clone())
+                    .or_insert(Decimal::ZERO) += realized;
+            }
+        }
+
         let position = self
             .positions
             .entry(fill.symbol.clone())
@@ -732,11 +779,7 @@ impl PortfolioLedger {
                 allocated_margin: Decimal::ZERO,
             });
 
-        let same_direction = position.quantity.is_zero()
-            || (position.quantity.is_sign_positive() == signed_quantity.is_sign_positive());
-
         if same_direction {
-            // Increasing (or opening) a position: volume-weighted average entry price.
             let existing_value = position.quantity.abs() * position.average_entry_price;
             let new_value = signed_quantity.abs() * fill.price;
             let new_quantity = position.quantity + signed_quantity;
@@ -745,9 +788,6 @@ impl PortfolioLedger {
             }
             position.quantity = new_quantity;
         } else {
-            // Reducing or flipping a position: average entry price unchanged
-            // for the reduced portion; if flipping past zero, the new
-            // position's entry price is this fill's price.
             let new_quantity = position.quantity + signed_quantity;
             if position.quantity.abs() >= signed_quantity.abs() {
                 position.quantity = new_quantity;
@@ -1050,6 +1090,208 @@ mod tests {
         let position = ledger.positions().get("BTCUSDT").unwrap();
         assert_eq!(position.quantity, dec!(0.5));
         assert_eq!(position.allocated_margin, dec!(3000));
+    }
+
+    #[test]
+    fn realized_pnl_starts_empty() {
+        let ledger = ledger_with_10k_usdt();
+        assert!(ledger.realized_pnl().is_empty());
+    }
+
+    #[test]
+    fn spot_partial_sell_realizes_pnl_against_average_entry_price() {
+        // NOTE: custom 20000 USDT starting balance -- the brief's original
+        // 10k-USDT-only setup could never fund the 0.2 BTC @ 60000 = 12000
+        // opening buy (apply_fill atomically rejects it with
+        // InsufficientBalance), mirroring the same fix documented in
+        // `position_flips_sign_and_resets_entry_price_on_full_reversal`'s
+        // NOTE. Fill quantities and asserted PnL values are unchanged.
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(20000));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.2), dec!(0)))
+            .unwrap();
+        // Sell half at a higher price: realizes (65000-60000)*0.1 = 500 profit.
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        assert_eq!(*ledger.realized_pnl().get("BTCUSDT").unwrap(), dec!(500));
+        // Position still open (0.1 left) -- quantity/average_entry_price
+        // are unaffected by this new field.
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.quantity, dec!(0.1));
+        assert_eq!(position.average_entry_price, dec!(60000));
+    }
+
+    #[test]
+    fn spot_short_side_realized_pnl_sign_is_reversed() {
+        // Start with a base-asset balance so a short-then-cover sequence
+        // is representable (this ledger models net spot position, not a
+        // literal borrow -- selling first requires an existing balance,
+        // matching `position_flips_sign_and_resets_entry_price_on_full_reversal`'s
+        // existing setup pattern).
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+        initial_balances.insert("BTC".to_string(), dec!(1));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
+
+        // Sell 0.2 at 65000 (opens a "short" relative to the flat position
+        // this ledger tracks -- quantity goes negative).
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.2), dec!(0)))
+            .unwrap();
+        // Buy back 0.1 at 60000: price fell, so covering a short realizes
+        // a profit of (65000-60000)*0.1 = 500 (reversed sign vs. a long).
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        assert_eq!(*ledger.realized_pnl().get("BTCUSDT").unwrap(), dec!(500));
+    }
+
+    #[test]
+    fn spot_opening_and_adding_does_not_write_realized_pnl() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.05), dec!(0)))
+            .unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(70000), dec!(0.05), dec!(0)))
+            .unwrap();
+
+        assert!(ledger.realized_pnl().get("BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn realized_pnl_accumulates_across_multiple_partial_closes() {
+        // NOTE: custom 20000 USDT starting balance -- the brief's original
+        // 10k-USDT-only setup could never fund the 0.3 BTC @ 60000 = 18000
+        // opening buy (see `spot_partial_sell_realizes_pnl_against_average_entry_price`'s
+        // NOTE). Fill quantities and asserted PnL values are unchanged.
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(20000));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.3), dec!(0)))
+            .unwrap();
+        // First partial close: (65000-60000)*0.1 = 500.
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.1), dec!(0)))
+            .unwrap();
+        // Second partial close: (70000-60000)*0.1 = 1000.
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(70000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        // Accumulated, not overwritten: 500 + 1000 = 1500.
+        assert_eq!(*ledger.realized_pnl().get("BTCUSDT").unwrap(), dec!(1500));
+    }
+
+    #[test]
+    fn leveraged_partial_close_writes_realized_pnl_field() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(65000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+
+        // Same (65000-60000)*0.5 = 2500 the existing balance-based test
+        // (`leveraged_partial_close_releases_proportional_margin_and_realizes_pnl`)
+        // already asserts shows up in the credited balance -- now also
+        // asserted directly against the new field.
+        assert_eq!(*ledger.realized_pnl().get("BTCUSDT").unwrap(), dec!(2500));
+    }
+
+    #[test]
+    fn leveraged_open_and_add_does_not_write_realized_pnl() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(62000),
+                dec!(0.5),
+                dec!(10),
+            ))
+            .unwrap();
+
+        assert!(ledger.realized_pnl().get("BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn rejected_leveraged_flip_does_not_write_realized_pnl() {
+        // Atomicity regression guard for `close_leveraged`: the new
+        // realized_pnl accumulation must live in the final mutation block
+        // (after the flip-margin validation), so a flip whose margin
+        // requirement is insufficient returns Err with the ledger -- including
+        // the new realized_pnl field -- completely unchanged. A fill that was
+        // rejected must never book realized PnL.
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // margin=6000 reserved, quote balance now 4000.
+
+        // Sell 2 @65000 at 2x: closes the 1 long (would release 6000 margin
+        // and realize (65000-60000)*1 = 5000) and flips into a 1 short
+        // requiring 1*65000/2 = 32500 margin -- but the projected quote
+        // balance after the close credits is only 4000 + 6000 + 5000 = 15000.
+        let result = ledger.apply_fill(&leveraged_fill_for_symbol(
+            "BTCUSDT",
+            Side::Sell,
+            dec!(65000),
+            dec!(2),
+            dec!(2),
+        ));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
+
+        // Byte-for-byte unchanged: no fee debit, no margin release, no PnL
+        // credit, no position mutation, and NO realized PnL booked.
+        assert_eq!(*ledger.balances().get("USDT").unwrap(), dec!(4000));
+        assert!(ledger.realized_pnl().is_empty());
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.quantity, dec!(1));
+        assert_eq!(position.allocated_margin, dec!(6000));
     }
 
     #[test]
