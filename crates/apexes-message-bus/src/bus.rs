@@ -400,4 +400,43 @@ mod tests {
         assert!(seen_symbols.contains("BTCUSDT"));
         assert!(seen_symbols.contains("ETHUSDT"));
     }
+
+    #[tokio::test]
+    async fn a_slow_receiver_falling_behind_does_not_panic_the_consumer() {
+        // A small capacity so it's easy to make a receiver "lag" (fall far
+        // enough behind that the broadcast channel drops old messages for
+        // it) without needing to send an enormous number of events.
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new_with_capacity(Box::new(mock), 2);
+        let instruments = vec![sample_instrument()];
+
+        let mut slow_receiver = bus.subscribe(&instruments).await.unwrap();
+
+        // Send more events than the channel's capacity while `slow_receiver`
+        // never polls -- this guarantees it falls behind.
+        for i in 0..10u32 {
+            handle.push_event(sample_trade_event(&format!("SYMBOL{i}")));
+            tokio::task::yield_now().await;
+        }
+
+        // The receiver's next `recv()` must surface as `Err(Lagged(_))`,
+        // not a panic and not a silently-stuck future.
+        let result = slow_receiver.recv().await;
+        assert!(matches!(
+            result,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+
+        // After the Lagged error, the receiver can keep reading -- it is
+        // not permanently broken.
+        let next = slow_receiver.recv().await;
+        assert!(
+            next.is_ok()
+                || matches!(
+                    next,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                )
+        );
+    }
 }
