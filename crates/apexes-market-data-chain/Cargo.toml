@@ -15,7 +15,9 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "net", "time"] }
+rust_decimal_macros = "1.40"

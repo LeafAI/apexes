@@ -11,7 +11,9 @@
 //! for the full scope rationale.
 
 pub mod config;
+pub mod dex_provider;
 pub mod eth_rpc_provider;
 
 pub use config::EthRpcConfig;
+pub use dex_provider::DexMarketDataProvider;
 pub use eth_rpc_provider::{EthLog, EthRpcProvider};
