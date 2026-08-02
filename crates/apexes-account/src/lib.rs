@@ -8,10 +8,12 @@
 pub mod account;
 pub mod fx_rate;
 pub mod ledger_impl;
+pub mod live_account;
 pub mod paper_impl;
 pub mod reconciliation;
 
 pub use account::Account;
 pub use apexes_core::{FundMovement, FundMovementStatus, WalletId};
 pub use fx_rate::{FxRateProvider, StaticFxRateProvider};
+pub use live_account::LiveAccount;
 pub use reconciliation::{ReconciliationDiscrepancy, ReconciliationTolerance};
