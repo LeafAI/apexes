@@ -289,6 +289,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-market-data-chain"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "async-trait",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "apexes-oms"
 version = "0.1.0"
 dependencies = [
