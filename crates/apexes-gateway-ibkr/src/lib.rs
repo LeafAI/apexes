@@ -10,6 +10,8 @@
 //! for the full scope rationale.
 
 pub mod config;
+pub mod gateway;
 pub mod protocol;
 
 pub use config::IbkrGatewayConfig;
+pub use gateway::IbkrExecutionGateway;

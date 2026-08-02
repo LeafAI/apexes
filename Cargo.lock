@@ -214,6 +214,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "rust_decimal",
  "rust_decimal_macros",
  "tokio",
  "tracing",
