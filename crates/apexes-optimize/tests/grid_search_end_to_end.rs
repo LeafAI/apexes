@@ -152,6 +152,7 @@ impl Evaluator for DriftScriptEvaluator {
             speed: ReplaySpeed::AsFastAsPossible,
             queue_position_factor: dec!(0.0),
             risk_free_return: dec!(0),
+            margin_tiers: HashMap::new(),
         };
         let market_data_events = market_data.events().await.map_err(|e| e.to_string())?;
 

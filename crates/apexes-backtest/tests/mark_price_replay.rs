@@ -71,6 +71,7 @@ async fn backtest_replays_a_mark_price_event_without_error() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
 
     let registry = apexes_core::registry::Registry::new();

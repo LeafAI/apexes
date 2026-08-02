@@ -13,7 +13,7 @@ use apexes_backtest::{BacktestReport, CostModel, LatencyModel, ReplaySpeed};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{Strategy, VenueScorer};
+use apexes_strategy::{MarginTierTable, Strategy, VenueScorer};
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
@@ -24,6 +24,10 @@ pub struct PaperTradingConfig {
     pub queue_position_factor: Decimal,
     pub risk_free_return: Decimal,
     pub latency_model: LatencyModel,
+    /// Per-symbol tiered maintenance-margin tables driving margin
+    /// monitoring and auto-liquidation. Empty map (the default for
+    /// every pre-existing spot-only caller) is a silent no-op.
+    pub margin_tiers: HashMap<String, MarginTierTable>,
 }
 
 /// Runs paper trading: subscribes to `provider` for `config.instruments`,
@@ -74,7 +78,7 @@ pub async fn run_paper_trading(
         queue_position_factor: config.queue_position_factor,
         risk_free_return: config.risk_free_return,
         risk_checker,
-        margin_tiers: HashMap::new(),
+        margin_tiers: config.margin_tiers,
     };
 
     run_event_loop(
@@ -214,6 +218,7 @@ mod tests {
             queue_position_factor: dec!(0.0),
             risk_free_return: dec!(0),
             latency_model: LatencyModel::None,
+            margin_tiers: HashMap::new(),
         }
     }
 

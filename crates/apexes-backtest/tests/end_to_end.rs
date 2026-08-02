@@ -110,6 +110,7 @@ async fn full_backtest_produces_a_report_with_the_expected_trade() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
@@ -148,6 +149,7 @@ async fn backtest_with_no_events_produces_an_empty_report_without_erroring() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
     let strategy = BuyOnceStrategy { has_bought: false };
 
@@ -264,6 +266,7 @@ async fn triggered_buy_stop_fill_reaches_report_trades_and_ledger() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
     let strategy = BuyStopOnceStrategy { has_placed: false };
 
@@ -421,6 +424,7 @@ async fn full_backtest_with_execution_algo_applies_child_order_fills_to_the_ledg
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
     let strategy = TwapOnceStrategy {
         has_submitted: false,
@@ -548,6 +552,7 @@ async fn full_backtest_with_iceberg_execution_algo_completes_all_slices() {
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
+        margin_tiers: HashMap::new(),
     };
     let strategy = IcebergOnceStrategy {
         has_submitted: false,

@@ -6,7 +6,7 @@ use crate::report::BacktestReport;
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{Strategy, VenueScorer};
+use apexes_strategy::{MarginTierTable, Strategy, VenueScorer};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -33,6 +33,12 @@ pub struct BacktestConfig {
     /// (design spec §8, matching `barter::statistic::metric`'s
     /// `calculate` signatures).
     pub risk_free_return: Decimal,
+    /// Per-symbol tiered maintenance-margin tables driving margin
+    /// monitoring and auto-liquidation (design spec §margin/leverage
+    /// monitoring). Empty map (the default for every pre-existing
+    /// spot-only caller) is a silent no-op: no margin status, no
+    /// liquidation.
+    pub margin_tiers: HashMap<String, MarginTierTable>,
 }
 
 /// Runs a full backtest: replays `market_data` in chronological order
@@ -84,7 +90,7 @@ pub async fn run_backtest(
         queue_position_factor: config.queue_position_factor,
         risk_free_return: config.risk_free_return,
         risk_checker,
-        margin_tiers: HashMap::new(),
+        margin_tiers: config.margin_tiers,
     };
 
     run_event_loop(
@@ -226,6 +232,7 @@ mod tests {
             speed: ReplaySpeed::AsFastAsPossible,
             queue_position_factor: dec!(0.5),
             risk_free_return: Decimal::ZERO,
+            margin_tiers: HashMap::new(),
         };
 
         let registry = Registry::new();
