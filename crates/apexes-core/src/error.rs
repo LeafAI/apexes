@@ -37,6 +37,15 @@ pub enum ApexesError {
     #[error("invalid backtest config: {reason}")]
     InvalidBacktestConfig { reason: String },
 
+    #[error(
+        "inconsistent leverage for isolated position on {symbol}: existing {existing}, requested {requested}"
+    )]
+    InconsistentLeverageForIsolatedPosition {
+        symbol: String,
+        existing: rust_decimal::Decimal,
+        requested: rust_decimal::Decimal,
+    },
+
     #[error("order rejected: {reason}")]
     OrderRejected { reason: String },
 }
@@ -101,6 +110,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid backtest config: missing initial balance for traded asset BTC"
+        );
+    }
+
+    #[test]
+    fn inconsistent_leverage_for_isolated_position_display() {
+        let err = ApexesError::InconsistentLeverageForIsolatedPosition {
+            symbol: "BTCUSDT".to_string(),
+            existing: rust_decimal_macros::dec!(10),
+            requested: rust_decimal_macros::dec!(5),
+        };
+        assert_eq!(
+            err.to_string(),
+            "inconsistent leverage for isolated position on BTCUSDT: existing 10, requested 5"
         );
     }
 

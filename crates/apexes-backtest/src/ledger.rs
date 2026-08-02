@@ -256,6 +256,13 @@ impl PortfolioLedger {
     /// added to `Position.allocated_margin` -- never recomputes the whole
     /// position's margin against a new average entry price, matching how
     /// real exchanges (including Binance) accumulate margin per-trade.
+    ///
+    /// Design-spec invariant: adding to an EXISTING Isolated position at a
+    /// different leverage than the position's current leverage is rejected
+    /// (`InconsistentLeverageForIsolatedPosition`) BEFORE any mutation --
+    /// same-direction adds must keep the position's leverage uniform.
+    /// Cross-margin positions are exempt (cross leverage is an order-level
+    /// parameter, not required to be uniform across the account).
     fn open_leveraged(
         &mut self,
         fill: &Fill,
@@ -264,6 +271,20 @@ impl PortfolioLedger {
         leverage: Decimal,
         margin_mode: MarginMode,
     ) -> Result<(), ApexesError> {
+        if margin_mode == MarginMode::Isolated
+            && let Some(existing_position) = self.positions.get(&fill.symbol)
+            && !existing_position.quantity.is_zero()
+        {
+            let existing_leverage = existing_position.leverage.unwrap_or(Decimal::ONE);
+            if existing_leverage != leverage {
+                return Err(ApexesError::InconsistentLeverageForIsolatedPosition {
+                    symbol: fill.symbol.clone(),
+                    existing: existing_leverage,
+                    requested: leverage,
+                });
+            }
+        }
+
         let this_fill_margin = fill.quantity * fill.price / leverage;
         let quote_available = self.balances.get(quote).copied().unwrap_or(Decimal::ZERO);
         if quote_available < this_fill_margin + fill.fee {
@@ -1062,6 +1083,78 @@ mod tests {
         // PnL credit, no position mutation.
         assert_eq!(ledger.balances(), &balances_before);
         assert_eq!(ledger.positions(), &positions_before);
+    }
+
+    #[test]
+    fn isolated_add_at_different_leverage_is_rejected_and_leaves_ledger_completely_unchanged() {
+        // Design-spec invariant: a same-direction fill ADDING to an
+        // existing Isolated position must carry the SAME leverage as the
+        // position; a mismatch is rejected with
+        // `InconsistentLeverageForIsolatedPosition` BEFORE any mutation
+        // (atomicity, mirroring `close_leveraged`'s convention).
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+        // margin=6000 reserved, quote balance now 4000, leverage 10.
+
+        let balances_before = ledger.balances().clone();
+        let positions_before = ledger.positions().clone();
+
+        // Adding 0.5 more at 5x must be rejected: existing leverage is 10.
+        let result = ledger.apply_fill(&leveraged_fill_for_symbol(
+            "BTCUSDT",
+            Side::Buy,
+            dec!(62000),
+            dec!(0.5),
+            dec!(5),
+        ));
+        assert_eq!(
+            result,
+            Err(ApexesError::InconsistentLeverageForIsolatedPosition {
+                symbol: "BTCUSDT".to_string(),
+                existing: dec!(10),
+                requested: dec!(5),
+            })
+        );
+
+        // Byte-for-byte unchanged: no margin reservation, no position
+        // mutation (quantity/allocated_margin/leverage all as before).
+        assert_eq!(ledger.balances(), &balances_before);
+        assert_eq!(ledger.positions(), &positions_before);
+    }
+
+    #[test]
+    fn cross_add_at_different_leverage_is_allowed() {
+        // Cross-margin positions are exempt from the isolated-leverage
+        // consistency rule: cross leverage is an order-level parameter,
+        // not required to be uniform across the account.
+        let cross_fill = |side: Side, price: Decimal, quantity: Decimal, leverage: Decimal| Fill {
+            margin_mode: Some(MarginMode::Cross),
+            ..leveraged_fill_for_symbol("BTCUSDT", side, price, quantity, leverage)
+        };
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&cross_fill(Side::Buy, dec!(60000), dec!(1), dec!(10)))
+            .unwrap();
+        ledger
+            .apply_fill(&cross_fill(Side::Buy, dec!(62000), dec!(0.05), dec!(5)))
+            .unwrap();
+
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        assert_eq!(position.quantity, dec!(1.05));
+        // 60000/10 + 3100/5 = 6000 + 620 = 6620.
+        assert_eq!(position.allocated_margin, dec!(6620));
+        // The most recent fill's leverage/margin_mode wins (pre-existing
+        // behavior, unchanged by the Isolated-only check).
+        assert_eq!(position.leverage, Some(dec!(5)));
+        assert_eq!(position.margin_mode, Some(MarginMode::Cross));
     }
 
     #[test]
