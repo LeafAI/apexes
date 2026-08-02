@@ -8,8 +8,8 @@ use sqlx::PgPool;
 
 use crate::error::OmsError;
 use crate::schema::{
-    FILLS_ORDER_ID_INDEX_DDL, FILLS_TABLE_DDL, FillRow, ORDERS_EXCHANGE_ID_INDEX_DDL,
-    ORDERS_TABLE_DDL, OrderRow,
+    FILLS_ORDER_ID_INDEX_DDL, FILLS_TABLE_DDL, FillRow, ORDERS_ADD_LEVERAGE_COLUMNS_DDL,
+    ORDERS_EXCHANGE_ID_INDEX_DDL, ORDERS_TABLE_DDL, OrderRow,
 };
 
 pub struct OrderStore {
@@ -27,6 +27,9 @@ impl OrderStore {
             })?;
 
         sqlx::query(ORDERS_TABLE_DDL).execute(&pool).await?;
+        sqlx::query(ORDERS_ADD_LEVERAGE_COLUMNS_DDL)
+            .execute(&pool)
+            .await?;
         sqlx::query(ORDERS_EXCHANGE_ID_INDEX_DDL)
             .execute(&pool)
             .await?;
@@ -44,10 +47,12 @@ impl OrderStore {
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
         sqlx::query(
-            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, filled_quantity, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
+                leverage = EXCLUDED.leverage,
+                margin_mode = EXCLUDED.margin_mode,
                 filled_quantity = EXCLUDED.filled_quantity,
                 status = EXCLUDED.status,
                 updated_at = EXCLUDED.updated_at",
@@ -62,6 +67,8 @@ impl OrderStore {
         .bind(row.quantity)
         .bind(row.price)
         .bind(row.stop_price)
+        .bind(row.leverage)
+        .bind(&row.margin_mode)
         .bind(row.filled_quantity)
         .bind(&row.status)
         .bind(row.created_at)

@@ -3,7 +3,9 @@
 //! bidirectional `TryFrom` conversions), adapted for `sqlx`/PostgreSQL
 //! instead of the `clickhouse` client.
 
-use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus, OrderType, Side, Venue};
+use apexes_core::{
+    AssetClass, Fill, FillId, MarginMode, Order, OrderId, OrderStatus, OrderType, Side, Venue,
+};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -23,11 +25,27 @@ CREATE TABLE IF NOT EXISTS orders
     quantity            NUMERIC(38, 10) NOT NULL,
     price               NUMERIC(38, 10),
     stop_price          NUMERIC(38, 10),
+    leverage            NUMERIC(38, 10),
+    margin_mode         TEXT,
     filled_quantity     NUMERIC(38, 10) NOT NULL,
     status              TEXT NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL,
     updated_at          TIMESTAMPTZ NOT NULL
 )
+";
+
+// `CREATE TABLE IF NOT EXISTS` is a no-op when the table already exists,
+// so a database created by an older binary (before `leverage`/
+// `margin_mode` existed) will NOT gain these columns from
+// `ORDERS_TABLE_DDL` alone. `OrderStore::new` runs this `ALTER TABLE`
+// unconditionally right after `ORDERS_TABLE_DDL` so the migration is
+// idempotent for both fresh databases (where the columns already exist
+// and this is a harmless no-op) and pre-existing databases from before
+// this task (where it actually adds the columns).
+pub const ORDERS_ADD_LEVERAGE_COLUMNS_DDL: &str = "
+ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS leverage NUMERIC(38, 10),
+    ADD COLUMN IF NOT EXISTS margin_mode TEXT
 ";
 
 pub const ORDERS_EXCHANGE_ID_INDEX_DDL: &str = "
@@ -70,6 +88,8 @@ pub struct OrderRow {
     pub quantity: Decimal,
     pub price: Option<Decimal>,
     pub stop_price: Option<Decimal>,
+    pub leverage: Option<Decimal>,
+    pub margin_mode: Option<String>,
     pub filled_quantity: Decimal,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -89,6 +109,8 @@ impl From<&Order> for OrderRow {
             quantity: order.quantity,
             price: order.price,
             stop_price: order.stop_price,
+            leverage: order.leverage,
+            margin_mode: order.margin_mode.map(|m| format!("{:?}", m)),
             filled_quantity: order.filled_quantity,
             status: format!("{:?}", order.status),
             created_at: order.created_at,
@@ -112,14 +134,12 @@ impl TryFrom<OrderRow> for Order {
             quantity: row.quantity,
             price: row.price,
             stop_price: row.stop_price,
-            // The `orders` table has no leverage/margin_mode columns yet
-            // (no task in the margin-monitoring plan adds them), so
-            // orders rehydrated from Postgres always read back as spot
-            // (`None`). Persisting these would require a schema
-            // migration; flagged for a future task if leveraged orders
-            // must survive a live-trading restart via OMS recovery.
-            leverage: None,
-            margin_mode: None,
+            leverage: row.leverage,
+            margin_mode: row
+                .margin_mode
+                .as_deref()
+                .map(parse_margin_mode)
+                .transpose()?,
             filled_quantity: row.filled_quantity,
             status: parse_order_status(&row.status)?,
             created_at: row.created_at,
@@ -251,6 +271,16 @@ fn parse_order_status(value: &str) -> Result<OrderStatus, OmsError> {
     }
 }
 
+fn parse_margin_mode(value: &str) -> Result<MarginMode, OmsError> {
+    match value {
+        "Isolated" => Ok(MarginMode::Isolated),
+        "Cross" => Ok(MarginMode::Cross),
+        other => Err(OmsError::InvalidRow {
+            reason: format!("unknown margin_mode: {other}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +313,48 @@ mod tests {
         let row = OrderRow::from(&order);
         let back = Order::try_from(row).unwrap();
         assert_eq!(back, order);
+    }
+
+    #[test]
+    fn order_with_leverage_and_margin_mode_round_trips() {
+        let mut order = sample_order();
+        order.leverage = Some(dec!(10));
+        order.margin_mode = Some(MarginMode::Isolated);
+        let row = OrderRow::from(&order);
+        let back = Order::try_from(row).unwrap();
+        assert_eq!(back, order);
+    }
+
+    #[test]
+    fn order_with_cross_margin_mode_round_trips() {
+        let mut order = sample_order();
+        order.leverage = Some(dec!(3));
+        order.margin_mode = Some(MarginMode::Cross);
+        let row = OrderRow::from(&order);
+        let back = Order::try_from(row).unwrap();
+        assert_eq!(back.margin_mode, Some(MarginMode::Cross));
+    }
+
+    #[test]
+    fn order_with_none_leverage_and_margin_mode_round_trips() {
+        // sample_order() already has leverage: None, margin_mode: None --
+        // this is the existing spot-order path and must be unaffected.
+        let order = sample_order();
+        let row = OrderRow::from(&order);
+        let back = Order::try_from(row).unwrap();
+        assert_eq!(back.leverage, None);
+        assert_eq!(back.margin_mode, None);
+    }
+
+    #[test]
+    fn order_row_with_invalid_margin_mode_fails_to_convert() {
+        let mut order = sample_order();
+        order.leverage = Some(dec!(5));
+        order.margin_mode = Some(MarginMode::Isolated);
+        let mut row = OrderRow::from(&order);
+        row.margin_mode = Some("NotARealMarginMode".to_string());
+        let result = Order::try_from(row);
+        assert!(matches!(result, Err(OmsError::InvalidRow { .. })));
     }
 
     #[test]
