@@ -1083,11 +1083,14 @@ impl PortfolioLedger {
     /// skipped entirely (they never appear in the returned map --
     /// margin doesn't apply to them, there is no sentinel entry).
     ///
-    /// Isolated positions get a precise `margin_ratio` (position's own
-    /// margin / that position's maintenance margin requirement, per its
-    /// `MarginTierTable` bracket for its current notional) and a
-    /// precise `liquidation_price` (the mark price at which
-    /// `margin_ratio` would hit exactly `1.0`, solved algebraically).
+    /// Isolated positions get a precise `margin_ratio` ((position's
+    /// reserved `allocated_margin` PLUS its unrealized PnL at the
+    /// current mark price) / that position's maintenance margin
+    /// requirement, per its `MarginTierTable` bracket for its current
+    /// notional -- the PnL term is essential, see the correction note
+    /// on this method's actual implementation below) and a precise
+    /// `liquidation_price` (the mark price at which `margin_ratio`
+    /// would hit exactly `1.0`, solved algebraically).
     ///
     /// Cross positions get an ACCOUNT-LEVEL `margin_ratio` (this
     /// account's total equity, via `self.equity(mark_prices)`, divided
@@ -1137,9 +1140,8 @@ impl PortfolioLedger {
 
             let status = match margin_mode {
                 MarginMode::Isolated => {
-                    // PLAN AMENDMENT (post-Task-2b): `allocated_margin`
-                    // is now a REAL, incrementally-accumulated field on
-                    // `Position` (maintained by
+                    // `allocated_margin` is a REAL, incrementally-
+                    // accumulated field on `Position` (maintained by
                     // `PortfolioLedger::apply_leveraged_fill`, Task 2b)
                     // -- read it directly here rather than recomputing
                     // `notional / leverage` from scratch. Recomputing
@@ -1149,18 +1151,40 @@ impl PortfolioLedger {
                     // exchanges (and Task 2b's accounting) never
                     // "re-margin" a position's already-reserved margin
                     // just because its average entry price changed.
-                    let allocated_margin = position.allocated_margin;
+                    //
+                    // PLAN CORRECTION (found and fixed during this
+                    // task's own implementation -- the original draft
+                    // below was algebraically wrong and is preserved
+                    // only in this comment as a record of the mistake,
+                    // do NOT implement it): the original text computed
+                    // `margin_ratio = allocated_margin / maintenance`,
+                    // omitting unrealized PnL entirely. This is
+                    // provably wrong: it means margin_ratio only ever
+                    // moves with notional, never with adverse price
+                    // moves, so a collapsing position's ratio can
+                    // actually IMPROVE as the market moves against it
+                    // (maintenance shrinks as notional shrinks toward
+                    // zero, but a real position never gets safer by
+                    // losing money). The corrected formula folds in the
+                    // position's unrealized PnL at the current mark
+                    // price -- this is the same
+                    // `allocated_margin + unrealized_pnl(price) ==
+                    // maintenance(price)` invariant the liquidation-
+                    // price solver below is already built on, just
+                    // evaluated at the CURRENT price instead of solved
+                    // for the price where it equals exactly 1.0.
+                    let mark_price = self.mark_price_for_position(symbol, mark_prices);
+                    let unrealized_pnl = if position.quantity.is_sign_positive() {
+                        (mark_price - position.average_entry_price) * position.quantity
+                    } else {
+                        (position.average_entry_price - mark_price) * position.quantity.abs()
+                    };
+                    let effective_margin = position.allocated_margin + unrealized_pnl;
                     let margin_ratio = maintenance
                         .filter(|m| !m.is_zero())
-                        .map(|m| allocated_margin / m);
-                    let liquidation_price = maintenance.and_then(|maintenance_amount| {
-                        self.isolated_liquidation_price(
-                            position,
-                            allocated_margin,
-                            maintenance_amount,
-                            margin_tiers.get(symbol),
-                        )
-                    });
+                        .map(|m| effective_margin / m);
+                    let liquidation_price =
+                        self.isolated_liquidation_price(position, margin_tiers.get(symbol));
                     PositionMarginStatus {
                         margin_ratio,
                         liquidation_price,
@@ -1214,8 +1238,38 @@ impl PortfolioLedger {
     }
 
     /// Solves for the mark price at which an isolated position's
-    /// `margin_ratio` would equal exactly `1.0` -- i.e.
-    /// `allocated_margin + unrealized_pnl(price) == maintenance(price)`.
+    /// `margin_ratio` would equal exactly `1.0` -- i.e. the price `p`
+    /// where `allocated_margin + unrealized_pnl(p) == maintenance(p)`,
+    /// with `maintenance(p) = |q| * p * rate - amount` for the
+    /// position's current tier.
+    ///
+    /// Long (`q > 0`, entry `e`, reserved margin `M`, tier rate `r`,
+    /// tier amount `A`):
+    ///   `M + q*(p - e) = q*p*r - A`  =>  `p = (q*e - M - A) / (q*(1 - r))`
+    /// Short (`Q = |q|`):
+    ///   `M + Q*(e - p) = Q*p*r - A`  =>  `p = (Q*e + M + A) / (Q*(1 + r))`
+    ///
+    /// PLAN CORRECTION (found and fixed during this task's own
+    /// implementation -- see the sibling correction note in
+    /// `margin_status` above for the same root cause): the original
+    /// draft used `entry ∓ (allocated_margin - maintenance_amount) /
+    /// (quantity * (1 - rate))` for BOTH directions. This is wrong in
+    /// three independent ways, verified by solving the invariant above
+    /// with exact rational arithmetic (not floating point) and checking
+    /// it against itself: (1) the sign on the tier's `maintenance_amount`
+    /// term (`A`) was flipped; (2) a `quantity * entry * rate` term was
+    /// missing entirely (the original formula only solves a degenerate
+    /// case with no maintenance-rate scaling of notional); (3) the short
+    /// formula reused the long formula's `(1 - rate)` denominator
+    /// instead of the algebraically-required `(1 + rate)`. A worked
+    /// numeric example (entry=60000, quantity=1, margin=6000, rate=0.05,
+    /// amount=0): the original draft's long formula gives p=53684.21,
+    /// at which margin_balance=-315.79 while maintenance=2684.21 --
+    /// already deeply negative equity well BEFORE the price the formula
+    /// claims is the liquidation point. The corrected formula gives
+    /// p=56842.11, at which margin_balance=maintenance=2842.11 exactly,
+    /// satisfying the defining invariant.
+    ///
     /// Since `maintenance` itself depends on notional (and therefore on
     /// price), this uses the CURRENT tier's rate as a linear
     /// approximation (an accepted simplification -- see this plan's own
@@ -1223,30 +1277,27 @@ impl PortfolioLedger {
     fn isolated_liquidation_price(
         &self,
         position: &apexes_strategy::Position,
-        allocated_margin: Decimal,
-        _maintenance_at_current_price: Decimal,
         tier_table: Option<&MarginTierTable>,
     ) -> Option<Decimal> {
         let tier_table = tier_table?;
-        let current_notional = position.quantity.abs() * position.average_entry_price;
-        let tier = tier_table.tier_for_notional(current_notional)?;
-        // Long: liquidation_price = entry - (allocated_margin - maintenance_amount) / (quantity * (1 - maintenance_margin_rate))
-        // Short: liquidation_price = entry + (allocated_margin - maintenance_amount) / (quantity * (1 - maintenance_margin_rate))
-        // (Standard linear perpetual-futures liquidation-price formula,
-        // using this position's current tier's rate/amount.)
         let quantity = position.quantity.abs();
         if quantity.is_zero() {
             return None;
         }
-        let denominator = quantity * (Decimal::ONE - tier.maintenance_margin_rate);
-        if denominator.is_zero() {
-            return None;
-        }
-        let margin_buffer = (allocated_margin - tier.maintenance_amount) / denominator;
+        let entry_notional = quantity * position.average_entry_price;
+        let tier = tier_table.tier_for_notional(entry_notional)?;
+        let rate = tier.maintenance_margin_rate;
+        let amount = tier.maintenance_amount;
+        let margin = position.allocated_margin;
         if position.quantity.is_sign_positive() {
-            Some(position.average_entry_price - margin_buffer)
+            let denominator = quantity * (Decimal::ONE - rate);
+            if denominator.is_zero() {
+                return None;
+            }
+            Some((entry_notional - margin - amount) / denominator)
         } else {
-            Some(position.average_entry_price + margin_buffer)
+            let denominator = quantity * (Decimal::ONE + rate);
+            Some((entry_notional + margin + amount) / denominator)
         }
     }
 }
@@ -1340,7 +1391,13 @@ Add to `crates/apexes-backtest/src/ledger.rs`'s existing `#[cfg(test)] mod tests
         // allocated_margin = notional/leverage = 60000/10 = 6000 (set by
         // apply_fill's leveraged-accounting branch, Task 2b)
         // maintenance = notional * 0.05 - 0 = 3000
-        // margin_ratio = 6000 / 3000 = 2.0
+        // mark price (60000) == entry price, so unrealized_pnl = 0 and
+        // effective_margin == allocated_margin here -- this test does
+        // not by itself distinguish the corrected (PnL-inclusive)
+        // margin_ratio formula from a naive allocated-margin-only one;
+        // see check_liquidations_flags_a_position_whose_margin_ratio_has_collapsed
+        // below for the test that actually exercises the PnL term.
+        // margin_ratio = (6000 + 0) / 3000 = 2.0
         assert_eq!(position_status.margin_ratio, Some(dec!(2)));
         assert!(position_status.liquidation_price.is_some());
     }
@@ -1376,6 +1433,19 @@ Add to `crates/apexes-backtest/src/ledger.rs`'s existing `#[cfg(test)] mod tests
 
         // Mark price crashes far below entry -- with 20x leverage this
         // should have already breached maintenance margin.
+        //
+        // Worked numbers under the CORRECTED margin_ratio formula
+        // (allocated_margin + unrealized_pnl) / maintenance -- this is
+        // the test that actually distinguishes it from a naive
+        // allocated-margin-only ratio: allocated_margin = 60000/20 =
+        // 3000; at mark=45000, maintenance = 45000*0.05 = 2250 and
+        // unrealized_pnl = (45000-60000)*1 = -15000, so effective
+        // margin = 3000 + (-15000) = -12000, ratio = -12000/2250 =
+        // -5.33 <= 1 -- correctly flagged. Under the ORIGINAL (buggy)
+        // draft formula (allocated_margin / maintenance, no PnL term)
+        // this would have computed 3000/2250 = 1.333 > 1 and NOT been
+        // flagged -- the exact bug this task's implementation found
+        // and fixed; do not reintroduce a PnL-less ratio.
         let mut mark_prices = HashMap::new();
         mark_prices.insert("BTC".to_string(), dec!(45000));
         let triggered = ledger.check_liquidations(&mark_prices, &sample_margin_tiers());
@@ -1398,6 +1468,109 @@ Add to `crates/apexes-backtest/src/ledger.rs`'s existing `#[cfg(test)] mod tests
         assert!(!triggered.contains(&"BTCUSDT".to_string()));
     }
 ```
+
+**Additional tests found necessary during implementation (add these too, they pin the corrected liquidation-price formula against its own defining invariant rather than only asserting `is_some()`, which is not a strong enough check to have caught the original formula bug):**
+
+```rust
+    #[test]
+    fn isolated_liquidation_price_long_satisfies_margin_invariant() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol("BTCUSDT", Side::Buy, dec!(60000), dec!(1), dec!(10)))
+            .unwrap();
+        let status = ledger.margin_status(&HashMap::new(), &sample_margin_tiers());
+        let liquidation_price = status.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+
+        // At the returned liquidation_price, margin_balance must equal
+        // maintenance exactly: allocated_margin + (p - entry) * qty ==
+        // p * qty * rate - amount.
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        let margin_balance = position.allocated_margin
+            + (liquidation_price - position.average_entry_price) * position.quantity;
+        let maintenance = liquidation_price * position.quantity * dec!(0.05);
+        assert_eq!(margin_balance, maintenance);
+    }
+
+    #[test]
+    fn isolated_liquidation_price_short_satisfies_margin_invariant() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol("BTCUSDT", Side::Sell, dec!(60000), dec!(1), dec!(10)))
+            .unwrap();
+        let status = ledger.margin_status(&HashMap::new(), &sample_margin_tiers());
+        let liquidation_price = status.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+
+        let position = ledger.positions().get("BTCUSDT").unwrap();
+        let quantity_abs = position.quantity.abs();
+        let margin_balance = position.allocated_margin
+            + (position.average_entry_price - liquidation_price) * quantity_abs;
+        let maintenance = liquidation_price * quantity_abs * dec!(0.05);
+        assert_eq!(margin_balance, maintenance);
+    }
+
+    #[test]
+    fn isolated_liquidation_price_accounts_for_maintenance_amount_term() {
+        // A nonzero maintenance_amount must shift the liquidation price
+        // -- this specifically pins the sign of the `amount` (`A`) term,
+        // which the original buggy draft formula got backwards.
+        let mut tiers = sample_margin_tiers();
+        let zero_amount_tier = tiers.get("BTCUSDT").unwrap().clone();
+        let mut ledger_zero_amount = ledger_with_10k_usdt();
+        ledger_zero_amount
+            .apply_fill(&leveraged_fill_for_symbol("BTCUSDT", Side::Buy, dec!(60000), dec!(1), dec!(10)))
+            .unwrap();
+        let status_zero = ledger_zero_amount.margin_status(&HashMap::new(), &tiers);
+        let liquidation_price_zero_amount =
+            status_zero.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+
+        tiers.insert(
+            "BTCUSDT".to_string(),
+            apexes_strategy::MarginTierTable {
+                tiers: vec![apexes_strategy::MarginTier {
+                    maintenance_amount: dec!(100),
+                    ..zero_amount_tier.tiers[0]
+                }],
+            },
+        );
+        let mut ledger_with_amount = ledger_with_10k_usdt();
+        ledger_with_amount
+            .apply_fill(&leveraged_fill_for_symbol("BTCUSDT", Side::Buy, dec!(60000), dec!(1), dec!(10)))
+            .unwrap();
+        let status_with_amount = ledger_with_amount.margin_status(&HashMap::new(), &tiers);
+        let liquidation_price_with_amount =
+            status_with_amount.get("BTCUSDT").unwrap().liquidation_price.unwrap();
+
+        // A positive maintenance_amount reduces the maintenance
+        // requirement at any given price, so the position can tolerate
+        // a LOWER price before liquidating (long) -- liquidation_price
+        // must move further FROM entry (down), not toward it.
+        assert!(liquidation_price_with_amount < liquidation_price_zero_amount);
+    }
+
+    #[test]
+    fn margin_status_omits_leveraged_position_without_tier_table_from_ratio_but_keeps_it_out_of_liquidations() {
+        // A leveraged position for a symbol with no configured
+        // MarginTierTable must not be force-closed just because
+        // maintenance can't be computed -- missing config is a
+        // misconfiguration to fix, not a liquidation trigger.
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol("BTCUSDT", Side::Buy, dec!(60000), dec!(1), dec!(20)))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(45000));
+        let empty_tiers = HashMap::new();
+        let status = ledger.margin_status(&mark_prices, &empty_tiers);
+        assert_eq!(status.get("BTCUSDT").unwrap().margin_ratio, None);
+        assert_eq!(status.get("BTCUSDT").unwrap().liquidation_price, None);
+
+        let triggered = ledger.check_liquidations(&mark_prices, &empty_tiers);
+        assert!(!triggered.contains(&"BTCUSDT".to_string()));
+    }
+```
+
+**Known limitation, explicitly accepted (do not attempt to fix in this task -- flagged here for the final whole-branch review and for Tasks 5-7, which build on this method):** the cross-margin pool (`self.equity(mark_prices)`) sums balances only. It does not include (1) the unrealized PnL of any leveraged position (cross or isolated), or (2) the `allocated_margin` already reserved/debited from balances when positions were opened. This means: an adverse price move on a CROSS position does not deteriorate `cross_margin_ratio` except via the maintenance-requirement term (which shrinks with notional, same directional issue as the isolated bug above, just not fixed here since the binding constraint explicitly specifies reusing `equity()` verbatim); and the cross pool is understated by the sum of all reserved margins, biasing `cross_margin_ratio` conservatively low. A real-exchange cross-margin balance would be `equity + Σ allocated_margin + Σ unrealized_pnl` (summed over every position sharing that cross pool). If a future amendment wants this, it is a small addition to `margin_status`'s first pass (the `cross_maintenance_total` loop already visits every cross position and could accumulate this in the same pass) -- out of scope for Task 4 itself.
 
 - [ ] **Step 4: Run this crate's tests, clippy, fmt**
 
