@@ -3,11 +3,13 @@
 //! 1.2.2/1.2.3). All three real candidate sources (Hundsun UF2.0,
 //! XTP, Huaxin Qidian) are closed-source/paid with no public trial
 //! access -- see the design spec §3 for the full research trail. This
-//! module documents the real wire-format shape (cross-referencing
-//! `apexes-gateway-xtp`'s existing types where the shape genuinely
-//! overlaps) but never links a real SDK. Every method returns an
-//! explicit `Err` -- never a panic, never `unimplemented!()`, never a
-//! fabricated success.
+//! module is a pure placeholder: it does NOT define any real
+//! Level-2/call-auction wire-format types (unlike `apexes-gateway-xtp`,
+//! which does define real request-shape types for order placement) --
+//! there is no publicly documented wire format for any of these three
+//! sources to reference. Every method returns an explicit `Err` --
+//! never a panic, never `unimplemented!()`, never a fabricated
+//! success.
 
 use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent, Venue};
 use async_trait::async_trait;
