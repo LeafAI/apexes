@@ -85,7 +85,12 @@ impl DexMarketDataProvider {
     /// within `i128` range (a full `i256` type is not needed for any
     /// realistic token amount at any token's decimals), so this
     /// deliberately narrows rather than pulling in a full big-integer
-    /// dependency.
+    /// dependency. Both the positive and negative branches explicitly
+    /// check that the discarded high 16 bytes are pure sign-extension
+    /// (all `0x00` for positive, all `0xff` for negative) before
+    /// truncating -- an amount whose magnitude doesn't fit in `i128`
+    /// returns an explicit `Err` on EITHER sign, rather than silently
+    /// truncating/corrupting a value only on the positive side.
     #[allow(dead_code)]
     fn decode_i256_as_i128(word: &str) -> Result<i128, String> {
         let bytes = (0..word.len())
@@ -94,14 +99,20 @@ impl DexMarketDataProvider {
             .collect::<Result<Vec<u8>, _>>()
             .map_err(|error| format!("failed to parse hex word '{word}': {error}"))?;
         let is_negative = bytes[0] & 0x80 != 0;
-        // Take the low 16 bytes (128 bits) -- sufficient for any
-        // realistic token amount; the high-order bytes of a negative
-        // number are all 0xff (two's-complement sign extension) and of
-        // a positive number are all 0x00, so truncating to the low 16
-        // bytes preserves the value as long as it fits in i128.
+        let high_16_bytes = &bytes[0..16];
         let low_16_bytes: [u8; 16] = bytes[16..32]
             .try_into()
             .map_err(|_| "unexpected word length after hex decoding".to_string())?;
+        let expected_sign_extension_byte = if is_negative { 0xffu8 } else { 0x00u8 };
+        if high_16_bytes
+            .iter()
+            .any(|byte| *byte != expected_sign_extension_byte)
+        {
+            return Err(format!(
+                "Swap amount magnitude overflows i128 (sign={}, word='{word}')",
+                if is_negative { "negative" } else { "positive" }
+            ));
+        }
         if is_negative {
             Ok(i128::from_be_bytes(low_16_bytes))
         } else {
@@ -240,6 +251,27 @@ mod tests {
         log.data = "0x1234".to_string();
         let result = DexMarketDataProvider::decode_swap_amounts(&log);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_i256_as_i128_rejects_a_negative_magnitude_that_overflows_i128() {
+        // Two's-complement encoding of -(2^130) as a 256-bit word,
+        // independently verified via `python3 -c "print(format((-(2**130))
+        // % (2**256), '064x'))"`: 31 'f' bytes, then 'c', then 32 '0'
+        // bytes -- 64 hex characters total. -(2^130) is a value no
+        // realistic Uniswap Swap amount would ever take (bounded by real
+        // token supplies/decimals), but which the ABI encoding could in
+        // principle represent. Its high 16 bytes are NOT all 0xff (unlike
+        // a realistic negative amount, whose magnitude fits in i128), so
+        // this must be rejected rather than silently truncated to a wrong
+        // value.
+        let word = "fffffffffffffffffffffffffffffffc00000000000000000000000000000000";
+        assert_eq!(word.len(), 64, "sanity-check the literal is a full word");
+        let result = DexMarketDataProvider::decode_i256_as_i128(word);
+        assert!(
+            result.is_err(),
+            "a negative amount whose magnitude overflows i128 must return Err, not a silently truncated value"
+        );
     }
 
     #[tokio::test]
