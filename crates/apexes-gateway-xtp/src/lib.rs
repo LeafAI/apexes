@@ -9,8 +9,10 @@
 
 pub mod config;
 pub mod gateway;
+pub mod market_data;
 pub mod types;
 
 pub use config::XtpGatewayConfig;
 pub use gateway::XtpExecutionGateway;
+pub use market_data::XtpMarketDataProvider;
 pub use types::{XtpMarket, XtpOrderInsertRequest, XtpPriceType, XtpSide};
