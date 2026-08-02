@@ -67,6 +67,8 @@ fn twap_request() -> AlgoOrderRequest {
             slices: 4,
         },
         routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
     }
 }
 

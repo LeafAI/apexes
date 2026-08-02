@@ -41,6 +41,20 @@ pub struct InMemoryEms {
     market_state: Mutex<MarketStateTracker>,
 }
 
+/// The fixed per-slice attributes every algorithm's slice-submission
+/// path threads from a parent order's retained `AlgoOrderRequest` into
+/// each child `ChildOrderIntent` (see `submit_slice`). Grouped into one
+/// struct so `submit_slice`/`refill_iceberg_allocation` stay under the
+/// argument-count lint instead of growing a parameter per new field.
+struct SliceParams {
+    symbol: String,
+    venue: apexes_core::Venue,
+    side: apexes_core::Side,
+    asset_class: AssetClass,
+    leverage: Option<Decimal>,
+    margin_mode: Option<apexes_core::MarginMode>,
+}
+
 impl InMemoryEms {
     pub fn new(
         sink: Arc<dyn ChildOrderSink>,
@@ -72,28 +86,31 @@ impl InMemoryEms {
         }
     }
 
-    /// Submits one child-order slice of `quantity` for `allocation`'s
-    /// `asset_class` -- shared by every algorithm's slice-submission
-    /// logic (TWAP, Iceberg, POV, and VWAP). Returns the child order's
+    /// Submits one child-order slice of `quantity` per `params` --
+    /// shared by every algorithm's slice-submission logic (TWAP,
+    /// Iceberg, POV, and VWAP). `params.leverage`/`params.margin_mode`
+    /// are the parent order's own values (captured from its retained
+    /// `AlgoOrderRequest` at every call site), threaded onto the child
+    /// order unchanged so leveraged parent orders do not silently
+    /// degrade to spot accounting. Returns the child order's
     /// `OrderId` and any fills that happened synchronously at
     /// submission (propagated from the sink, see
     /// `ChildOrderSink::submit_child_order`).
     async fn submit_slice(
         &self,
         parent_id: ParentOrderId,
-        symbol: &str,
-        venue: apexes_core::Venue,
-        side: apexes_core::Side,
-        asset_class: AssetClass,
+        params: &SliceParams,
         quantity: Decimal,
     ) -> Result<(apexes_core::OrderId, Vec<Fill>), EmsError> {
         self.sink
             .submit_child_order(ChildOrderIntent {
-                symbol: symbol.to_string(),
-                venue,
-                asset_class,
-                side,
+                symbol: params.symbol.clone(),
+                venue: params.venue,
+                asset_class: params.asset_class,
+                side: params.side,
                 quantity,
+                leverage: params.leverage,
+                margin_mode: params.margin_mode,
             })
             .await
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
@@ -112,7 +129,16 @@ impl InMemoryEms {
         parent_id: ParentOrderId,
         now: DateTime<Utc>,
     ) -> Result<Vec<Fill>, EmsError> {
-        let (symbol, venue, side, slice_quantity, slice_interval, allocation_quantities) = {
+        let (
+            symbol,
+            venue,
+            side,
+            slice_quantity,
+            slice_interval,
+            allocation_quantities,
+            leverage,
+            margin_mode,
+        ) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
                 return Ok(Vec::new());
@@ -136,6 +162,8 @@ impl InMemoryEms {
                     .iter()
                     .map(|a| (a.asset_class, a.quantity))
                     .collect::<Vec<_>>(),
+                state.request.leverage,
+                state.request.margin_mode,
             )
         };
 
@@ -152,15 +180,16 @@ impl InMemoryEms {
                 if this_venue_slice.is_zero() {
                     continue;
                 }
+                let params = SliceParams {
+                    symbol: symbol.clone(),
+                    venue,
+                    side,
+                    asset_class,
+                    leverage,
+                    margin_mode,
+                };
                 let (child_id, slice_fills) = self
-                    .submit_slice(
-                        parent_id,
-                        &symbol,
-                        venue,
-                        side,
-                        asset_class,
-                        this_venue_slice,
-                    )
+                    .submit_slice(parent_id, &params, this_venue_slice)
                     .await?;
                 fills.extend(slice_fills);
 
@@ -257,7 +286,7 @@ impl InMemoryEms {
         &self,
         parent_id: ParentOrderId,
     ) -> Result<Vec<Fill>, EmsError> {
-        let (symbol, venue, side, visible_qty, allocations) = {
+        let (symbol, venue, side, visible_qty, allocations, leverage, margin_mode) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
                 return Ok(Vec::new());
@@ -271,21 +300,24 @@ impl InMemoryEms {
                 state.request.side,
                 *visible_qty,
                 state.clone_as_asset_classes(),
+                state.request.leverage,
+                state.request.margin_mode,
             )
         };
 
         let mut fills = Vec::new();
         let mut all_done = true;
         for asset_class in allocations {
+            let params = SliceParams {
+                symbol: symbol.clone(),
+                venue,
+                side,
+                asset_class,
+                leverage,
+                margin_mode,
+            };
             let (done, allocation_fills) = self
-                .refill_iceberg_allocation(
-                    parent_id,
-                    &symbol,
-                    venue,
-                    side,
-                    asset_class,
-                    visible_qty,
-                )
+                .refill_iceberg_allocation(parent_id, &params, visible_qty)
                 .await?;
             fills.extend(allocation_fills);
             all_done &= done;
@@ -307,10 +339,7 @@ impl InMemoryEms {
     async fn refill_iceberg_allocation(
         &self,
         parent_id: ParentOrderId,
-        symbol: &str,
-        venue: apexes_core::Venue,
-        side: apexes_core::Side,
-        asset_class: AssetClass,
+        params: &SliceParams,
         visible_qty: Decimal,
     ) -> Result<(bool, Vec<Fill>), EmsError> {
         let resting_child = {
@@ -318,7 +347,7 @@ impl InMemoryEms {
             parent_orders[&parent_id]
                 .allocations
                 .iter()
-                .find(|a| a.asset_class == asset_class)
+                .find(|a| a.asset_class == params.asset_class)
                 .and_then(|a| a.current_resting_child)
         };
 
@@ -340,7 +369,7 @@ impl InMemoryEms {
                 && let Some(allocation) = state
                     .allocations
                     .iter_mut()
-                    .find(|a| a.asset_class == asset_class)
+                    .find(|a| a.asset_class == params.asset_class)
             {
                 allocation.current_resting_child = None;
             }
@@ -351,7 +380,7 @@ impl InMemoryEms {
             parent_orders[&parent_id]
                 .allocations
                 .iter()
-                .find(|a| a.asset_class == asset_class)
+                .find(|a| a.asset_class == params.asset_class)
                 .map(|a| a.cloned_summary())
                 .unwrap_or((Decimal::ZERO, Decimal::ZERO))
         };
@@ -360,16 +389,14 @@ impl InMemoryEms {
         }
 
         let slice_quantity = visible_qty.min(remaining);
-        let (child_id, slice_fills) = self
-            .submit_slice(parent_id, symbol, venue, side, asset_class, slice_quantity)
-            .await?;
+        let (child_id, slice_fills) = self.submit_slice(parent_id, params, slice_quantity).await?;
 
         let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = parent_orders.get_mut(&parent_id)
             && let Some(allocation) = state
                 .allocations
                 .iter_mut()
-                .find(|a| a.asset_class == asset_class)
+                .find(|a| a.asset_class == params.asset_class)
         {
             allocation.submitted_quantity += slice_quantity;
             allocation.current_resting_child = Some(child_id);
@@ -423,7 +450,7 @@ impl InMemoryEms {
         parent_id: ParentOrderId,
         target_quantity: Decimal,
     ) -> Result<Vec<Fill>, EmsError> {
-        let (symbol, venue, side, allocations) = {
+        let (symbol, venue, side, allocations, leverage, margin_mode) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
                 return Ok(Vec::new());
@@ -433,6 +460,8 @@ impl InMemoryEms {
                 state.request.venue,
                 state.request.side,
                 state.clone_as_asset_classes(),
+                state.request.leverage,
+                state.request.margin_mode,
             )
         };
 
@@ -455,9 +484,15 @@ impl InMemoryEms {
             if slice.is_zero() {
                 continue;
             }
-            let (_child_id, slice_fills) = self
-                .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
-                .await?;
+            let params = SliceParams {
+                symbol: symbol.clone(),
+                venue,
+                side,
+                asset_class,
+                leverage,
+                margin_mode,
+            };
+            let (_child_id, slice_fills) = self.submit_slice(parent_id, &params, slice).await?;
             fills.extend(slice_fills);
             remaining_to_submit -= slice;
 
@@ -530,7 +565,16 @@ impl InMemoryEms {
         parent_id: ParentOrderId,
         target_fraction: Decimal,
     ) -> Result<Vec<Fill>, EmsError> {
-        let (symbol, venue, side, total_quantity, already_submitted_fraction, allocations) = {
+        let (
+            symbol,
+            venue,
+            side,
+            total_quantity,
+            already_submitted_fraction,
+            allocations,
+            leverage,
+            margin_mode,
+        ) = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = parent_orders.get(&parent_id) else {
                 return Ok(Vec::new());
@@ -549,6 +593,8 @@ impl InMemoryEms {
                 state.request.quantity,
                 *last_target_fraction_submitted,
                 state.clone_as_asset_classes(),
+                state.request.leverage,
+                state.request.margin_mode,
             )
         };
 
@@ -575,9 +621,15 @@ impl InMemoryEms {
             if slice.is_zero() {
                 continue;
             }
-            let (_child_id, slice_fills) = self
-                .submit_slice(parent_id, &symbol, venue, side, asset_class, slice)
-                .await?;
+            let params = SliceParams {
+                symbol: symbol.clone(),
+                venue,
+                side,
+                asset_class,
+                leverage,
+                margin_mode,
+            };
+            let (_child_id, slice_fills) = self.submit_slice(parent_id, &params, slice).await?;
             fills.extend(slice_fills);
             increment -= slice;
 
@@ -877,6 +929,8 @@ mod tests {
                 slices: 4,
             },
             routing: OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -1100,6 +1154,8 @@ mod tests {
             quantity,
             execution_algo: ExecutionAlgoSpec::Iceberg { visible_qty },
             routing: OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -1169,6 +1225,8 @@ mod tests {
             quantity: dec!(100),
             execution_algo: ExecutionAlgoSpec::Pov { participation_rate },
             routing: OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 
@@ -1248,6 +1306,8 @@ mod tests {
                 lookback_days: 5,
             },
             routing: OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
         }
     }
 

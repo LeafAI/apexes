@@ -12,7 +12,7 @@
 //! there too -- `apexes-ems` depends directly on `apexes-oms`, so no
 //! cycle exists on that side.
 
-use apexes_core::{AssetClass, Fill, Order, OrderId, Side, Venue};
+use apexes_core::{AssetClass, Fill, MarginMode, Order, OrderId, Side, Venue};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
@@ -30,6 +30,14 @@ pub struct ChildOrderIntent {
     pub asset_class: AssetClass,
     pub side: Side,
     pub quantity: Decimal,
+    /// `None`: spot child order (the behavior before this field
+    /// existed). `Some(leverage)`: this child order carries the parent
+    /// order's leverage, so its fills open/add to a leveraged
+    /// perpetual position instead of a spot position.
+    pub leverage: Option<Decimal>,
+    /// Only read when `leverage.is_some()`; `None` defaults to
+    /// `MarginMode::Isolated` downstream.
+    pub margin_mode: Option<MarginMode>,
 }
 
 #[async_trait]

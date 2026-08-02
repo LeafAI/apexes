@@ -3,7 +3,7 @@
 //! (backtest/paper) and [`crate::postgres::PostgresEms`] (live
 //! trading) -- see this crate's `lib.rs` docs.
 
-use apexes_core::{Fill, MarketEvent, Side, Venue};
+use apexes_core::{Fill, MarginMode, MarketEvent, Side, Venue};
 use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -21,6 +21,17 @@ pub struct AlgoOrderRequest {
     pub quantity: Decimal,
     pub execution_algo: ExecutionAlgoSpec,
     pub routing: OrderRouting,
+    /// `None`: spot parent order -- every child order is spot (the
+    /// behavior before this field existed). `Some(leverage)`: every
+    /// child order this parent is sliced into carries this leverage,
+    /// so the resulting child fills open/add to a leveraged perpetual
+    /// position instead of a spot position.
+    pub leverage: Option<Decimal>,
+    /// Only read when `leverage.is_some()`; `None` defaults to
+    /// `MarginMode::Isolated` downstream (the safer default -- an
+    /// isolated position's liquidation cannot cascade into other
+    /// positions).
+    pub margin_mode: Option<MarginMode>,
 }
 
 #[async_trait]

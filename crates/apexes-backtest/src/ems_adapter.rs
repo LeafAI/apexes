@@ -66,8 +66,8 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             stop_price: None,
             execution_algo: None,
             routing: apexes_strategy::OrderRouting::Fixed,
-            leverage: None,
-            margin_mode: None,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
         };
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         let (order, fills) = engine
@@ -187,6 +187,8 @@ mod tests {
                 asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 quantity: dec!(1),
+                leverage: None,
+                margin_mode: None,
             })
             .await
             .unwrap();
@@ -237,6 +239,8 @@ mod tests {
                 asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 quantity: dec!(1),
+                leverage: None,
+                margin_mode: None,
             })
             .await
             .unwrap();
@@ -271,6 +275,8 @@ mod tests {
                 asset_class: AssetClass::Spot,
                 side: Side::Buy,
                 quantity: dec!(1),
+                leverage: None,
+                margin_mode: None,
             })
             .await
             .unwrap();
@@ -281,5 +287,94 @@ mod tests {
             status.map(|order| order.status),
             Some(apexes_core::OrderStatus::Rejected)
         );
+    }
+
+    #[tokio::test]
+    async fn leveraged_algo_parent_order_produces_child_fills_carrying_leverage() {
+        // Regression test for the whole-branch-review HIGH finding:
+        // the EMS execution-algorithm path (TWAP/VWAP/Iceberg/POV) used
+        // to strip leverage/margin_mode entirely -- `AlgoOrderRequest`
+        // and `ChildOrderIntent` had no such fields, and both
+        // `ChildOrderSink` implementations hardcoded `None`, so a
+        // strategy submitting an `OrderIntent` with BOTH
+        // `execution_algo: Some(..)` AND `leverage: Some(..)` had every
+        // child fill silently spot-accounted. This test drives the REAL
+        // `InMemoryEms` TWAP scheduling path end-to-end (submit parent
+        // order -> on_market_event -> slice submission through
+        // `MatchingEngineChildOrderSink` against a real
+        // `MatchingEngine`) and asserts the resulting child fills carry
+        // the parent order's leverage/margin_mode.
+        let engine = engine_with_book();
+        let sink = MatchingEngineChildOrderSink::new(Arc::clone(&engine));
+        let ems = apexes_ems::InMemoryEms::new(
+            Arc::new(sink),
+            Arc::new(apexes_strategy::PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        );
+
+        let parent_id = apexes_ems::Ems::submit_algo_order(
+            &ems,
+            apexes_ems::AlgoOrderRequest {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                side: Side::Buy,
+                quantity: dec!(4),
+                execution_algo: apexes_strategy::ExecutionAlgoSpec::Twap {
+                    duration: std::time::Duration::from_secs(40),
+                    slices: 4,
+                },
+                routing: apexes_strategy::OrderRouting::Fixed,
+                leverage: Some(dec!(10)),
+                margin_mode: Some(apexes_core::MarginMode::Isolated),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The first TWAP slice is due at submission time (next_slice_at
+        // is set to Utc::now() by submit_algo_order) -- one
+        // on_market_event call at "now" submits it against the shared
+        // book, filling synchronously.
+        let fills = apexes_ems::Ems::on_market_event(
+            &ems,
+            &apexes_core::MarketEvent::Depth(DepthUpdate {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                bids: vec![PriceLevel {
+                    price: dec!(64990),
+                    quantity: dec!(10),
+                }],
+                asks: vec![PriceLevel {
+                    price: dec!(65010),
+                    quantity: dec!(10),
+                }],
+                sequence: None,
+                is_snapshot: false,
+                timestamp: Utc::now(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fills.len(),
+            1,
+            "the first TWAP slice must fill against the book"
+        );
+        assert_eq!(fills[0].quantity, dec!(1));
+        assert_eq!(
+            fills[0].leverage,
+            Some(dec!(10)),
+            "child fill must carry the parent order's leverage, not degrade to spot"
+        );
+        assert_eq!(
+            fills[0].margin_mode,
+            Some(apexes_core::MarginMode::Isolated)
+        );
+        let status = apexes_ems::Ems::parent_order_status(&ems, parent_id)
+            .await
+            .unwrap();
+        assert_eq!(status, Some(apexes_strategy::ParentOrderStatus::Scheduling));
     }
 }

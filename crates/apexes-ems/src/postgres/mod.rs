@@ -421,6 +421,19 @@ impl SchedulingDeps {
                 asset_class: AssetClass::Spot,
                 side,
                 quantity,
+                // Known limitation: the `parent_orders` table has no
+                // leverage/margin_mode columns, so `PostgresEms` cannot
+                // thread a leveraged parent order's values onto its
+                // child orders -- a `Some(leverage)` AlgoOrderRequest
+                // submitted here silently degrades to spot accounting,
+                // the same behavior as before those fields existed.
+                // Persisting them requires a schema change (new columns
+                // + INSERT/SELECT round-trip), out of scope for the
+                // margin-monitoring fix wave -- `InMemoryEms` (the
+                // backtest/paper path the regression coverage targets)
+                // threads them correctly.
+                leverage: None,
+                margin_mode: None,
             })
             .await?;
 
@@ -499,6 +512,20 @@ impl Ems for PostgresEms {
         &self,
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
+        if request.leverage.is_some() {
+            // Known limitation (see `submit_and_record_child`): the
+            // `parent_orders` table does not persist
+            // leverage/margin_mode, so this parent order's child orders
+            // will be spot-accounted. Warn loudly rather than silently
+            // degrade -- persisting them requires a schema change, out
+            // of scope for the margin-monitoring fix wave.
+            tracing::warn!(
+                symbol = %request.symbol,
+                leverage = %request.leverage.unwrap_or(Decimal::ZERO),
+                "PostgresEms: leveraged parent order received, but leverage/margin_mode \
+                 are not persisted to parent_orders -- child orders will be spot-accounted"
+            );
+        }
         let parent_id = ParentOrderId(Uuid::new_v4());
         let now = Utc::now();
         let algo_spec_json = serde_json::to_value(AlgoSpecJson::from(&request.execution_algo))

@@ -130,6 +130,8 @@ mod tests {
                 slices: 4,
             },
             routing,
+            leverage: None,
+            margin_mode: None,
         }
     }
 

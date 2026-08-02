@@ -359,6 +359,8 @@ pub async fn run_event_loop(
                     quantity: intent.quantity,
                     execution_algo,
                     routing: intent.routing,
+                    leverage: intent.leverage,
+                    margin_mode: intent.margin_mode,
                 };
                 match ems.submit_algo_order(request).await {
                     Ok(parent_id) => {
