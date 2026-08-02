@@ -30,6 +30,7 @@ fn venue_to_str(venue: Venue) -> &'static str {
         Venue::Binance => "binance",
         Venue::Okx => "okx",
         Venue::Coinbase => "coinbase",
+        Venue::EthereumMainnet => "ethereum_mainnet",
     }
 }
 

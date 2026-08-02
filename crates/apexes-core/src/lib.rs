@@ -6,6 +6,7 @@
 //! `OrderStatus` state machine.
 
 pub mod account;
+pub mod chain_data;
 pub mod error;
 pub mod fill;
 pub mod instrument;
@@ -14,6 +15,7 @@ pub mod order;
 pub mod registry;
 
 pub use account::{FundMovement, FundMovementStatus, WalletId};
+pub use chain_data::{ChainBlockHeader, ChainDataProvider, DexPool, PendingTransactionHash};
 pub use error::ApexesError;
 pub use fill::{Fill, FillId};
 pub use instrument::{AssetClass, Instrument, MarketType, Venue};

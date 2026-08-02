@@ -22,6 +22,7 @@ pub enum Venue {
     Binance,
     Okx,
     Coinbase,
+    EthereumMainnet,
 }
 
 impl Venue {
@@ -30,7 +31,9 @@ impl Venue {
             Venue::Sse | Venue::Szse => MarketType::AShare,
             Venue::Hkex => MarketType::HShare,
             Venue::Nasdaq | Venue::Nyse => MarketType::UsEquity,
-            Venue::Binance | Venue::Okx | Venue::Coinbase => MarketType::Crypto,
+            Venue::Binance | Venue::Okx | Venue::Coinbase | Venue::EthereumMainnet => {
+                MarketType::Crypto
+            }
         }
     }
 }
