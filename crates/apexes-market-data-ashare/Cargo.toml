@@ -1,0 +1,22 @@
+[package]
+name = "apexes-market-data-ashare"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+rust_decimal_macros = "1.40"
