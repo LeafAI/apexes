@@ -22,7 +22,7 @@ use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Order, OrderId, OrderType};
 use apexes_ems::Ems;
-use apexes_risk::CompositeRiskChecker;
+use apexes_risk::{CompositeRiskChecker, MarketConditionEventMonitor, PreTradeCheck};
 use apexes_strategy::{ParentOrderId, ParentOrderStatus, Strategy, StrategyContext, VenueScorer};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
@@ -138,6 +138,31 @@ pub async fn run_event_loop(
     let mut recorded_initial_equity = false;
     let mut risk_checker = config.risk_checker;
 
+    // Extreme-market circuit breaker (design spec
+    // `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`):
+    // `run_event_loop` constructs its OWN local `MarketConditionMonitor`
+    // from `config.market_condition_config` and splits it locally --
+    // deliberately NOT routed through the caller's
+    // `CompositeRiskChecker` registration lists, because
+    // `run_event_loop` also needs the `MarketConditionReadHandle`
+    // (for `on_equity_update`/`reduce_fractions`), which is not one of
+    // `CompositeRiskChecker`'s registered trait objects, and the
+    // checker arrives as an already-constructed `Arc` whose `with_*`
+    // builders consume `self` by value (not something this loop can
+    // extend at runtime). `include_spot` is captured BEFORE the config
+    // is moved out into `MarketConditionMonitor::new` (a partial move
+    // would otherwise make `config.market_condition_config` unusable
+    // for the `as_ref()` read at capture time).
+    let market_condition_include_spot = config
+        .market_condition_config
+        .as_ref()
+        .map(|c| c.include_spot)
+        .unwrap_or(false);
+    let mut market_condition_monitor = config
+        .market_condition_config
+        .map(apexes_risk::MarketConditionMonitor::new)
+        .map(apexes_risk::MarketConditionMonitor::split);
+
     loop {
         if let Some(signal) = stop_signal.as_mut() {
             match signal.try_recv() {
@@ -159,6 +184,18 @@ pub async fn run_event_loop(
 
         let timestamp = event_timestamp(&event);
         clock.wait_for_next_event(timestamp).await;
+
+        // Feed every event to the local `MarketConditionMonitor` (a
+        // no-op for events that don't match its configured
+        // `PriceSource`) so its per-symbol volatility/jump state -- and
+        // hence its de-risking fractions -- stay current. This must run
+        // BEFORE the de-risking block later in the same tick reads
+        // `reduce_fractions`.
+        if let Some((_, event_monitor, _)) = &mut market_condition_monitor
+            && let Err(violations) = event_monitor.on_market_event(&event)
+        {
+            tracing::warn!(?violations, "market condition monitor flagged a violation");
+        }
 
         let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
             ApexesError::InvalidBacktestConfig {
@@ -333,6 +370,76 @@ pub async fn run_event_loop(
             }
         }
 
+        // Extreme-market de-risking (backtest/paper only -- live
+        // trading defaults to monitor-only, see the plan's Task 5
+        // `auto_derisk_live` wiring in `run_live_trading`): every
+        // symbol `MarketConditionMonitor` has flagged gets a partial
+        // close proportional to its computed `reduce_fraction`,
+        // submitted as a market order through the `MatchingEngine`,
+        // applied as a normal fill.
+        if let Some((_, _, read_handle)) = &market_condition_monitor {
+            let equity_for_volatility = ledger.equity(&mark_prices).unwrap_or(Decimal::ZERO);
+            if let Err(violations) = read_handle.on_equity_update(equity_for_volatility) {
+                tracing::warn!(?violations, "account-wide market condition violation");
+            }
+
+            let open_symbols: Vec<String> = ledger.positions().keys().cloned().collect();
+            let reduce_fractions = read_handle.reduce_fractions(&open_symbols);
+            let de_risking_orders =
+                ledger.check_de_risking(&reduce_fractions, market_condition_include_spot);
+
+            for (symbol, side, quantity) in de_risking_orders {
+                let Some(position) = ledger.positions().get(&symbol).cloned() else {
+                    continue;
+                };
+                let de_risk_intent = apexes_strategy::OrderIntent {
+                    symbol: symbol.clone(),
+                    venue: instruments_by_symbol
+                        .get(&symbol)
+                        .map(|i| i.venue)
+                        .unwrap_or(apexes_core::Venue::Binance),
+                    asset_class: instruments_by_symbol
+                        .get(&symbol)
+                        .map(|i| i.asset_class)
+                        .unwrap_or(apexes_core::AssetClass::Perpetual),
+                    side,
+                    order_type: OrderType::Market,
+                    quantity,
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: apexes_strategy::OrderRouting::Fixed,
+                    // The closing fill must carry the position's OWN
+                    // leverage/margin_mode (same convention as the
+                    // auto-liquidation block above): `apply_fill`
+                    // dispatches on `fill.leverage.is_some()`, so a
+                    // spot position closes via the spot path and a
+                    // leveraged one via `close_leveraged`.
+                    leverage: position.leverage,
+                    margin_mode: position.margin_mode,
+                };
+                match lock_engine(&matching_engine).submit_market_order(&de_risk_intent, timestamp)
+                {
+                    Ok((order, fills)) => {
+                        tracing::warn!(symbol = %symbol, %quantity, "position partially closed (extreme market conditions)");
+                        open_orders.insert(order.id, order);
+                        apply_fills(
+                            &mut ledger,
+                            &mut overall_tracker,
+                            &mut per_symbol_trackers,
+                            &mut per_venue_trackers,
+                            &mut all_fills,
+                            &fills,
+                            config.risk_free_return,
+                        )?;
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, symbol = %symbol, "de-risking order submission failed");
+                    }
+                }
+            }
+        }
+
         let ctx = StrategyContext {
             positions: ledger.positions(),
             balances: ledger.balances(),
@@ -354,6 +461,18 @@ pub async fn run_event_loop(
                 )
             {
                 tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+                continue;
+            }
+            if let Some((pre_trade, _, _)) = &market_condition_monitor
+                && let Err(violations) = pre_trade.check(
+                    &intent,
+                    ledger.positions(),
+                    ledger.balances(),
+                    &open_orders,
+                    timestamp,
+                )
+            {
+                tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
                 continue;
             }
 
@@ -680,6 +799,40 @@ mod tests {
         }
     }
 
+    /// Opens a 1-BTC spot long on the first Trade event it sees, then
+    /// goes quiet -- the minimal strategy the market-condition wiring
+    /// tests drive (its position is what the monitor de-risks).
+    struct BuyOnceStrategy {
+        bought: bool,
+    }
+
+    impl Strategy for BuyOnceStrategy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if !self.bought && matches!(event, MarketEvent::Trade(_)) {
+                self.bought = true;
+                return vec![OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Perpetual,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
+                }];
+            }
+            Vec::new()
+        }
+    }
+
     fn event_loop_config(
         initial_usdt: Decimal,
         funding_rate_bps: Option<Decimal>,
@@ -905,5 +1058,92 @@ mod tests {
         // Spot fill only; the mark-price collapse liquidates nothing.
         assert_eq!(report.trades.len(), 1);
         assert_eq!(report.trades[0].side, Side::Buy);
+    }
+
+    /// Regression guard: `EventLoopConfig.market_condition_config: None`
+    /// must run byte-for-byte identically to the pre-this-plan
+    /// behavior. Runs a simple buy-once scenario (the same shape this
+    /// file's other pre-existing tests use) with
+    /// `market_condition_config` explicitly set to `None`, and asserts
+    /// exactly the same fill count a pre-this-plan run would have
+    /// produced -- if this task's changes to `run_event_loop` ever
+    /// start unconditionally touching ledger state when
+    /// `market_condition_monitor` is `None`, this test's exact-fill
+    /// assertion will catch it.
+    #[tokio::test]
+    async fn market_condition_config_none_does_not_change_existing_behavior() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(130), t0 + Duration::seconds(2)),
+        ];
+
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+
+        let config = EventLoopConfig {
+            instruments: vec![btcusdt_perpetual_instrument()],
+            initial_balances,
+            cost_model: zero_cost_model(None),
+            queue_position_factor: dec!(0.5),
+            risk_free_return: Decimal::ZERO,
+            risk_checker: None,
+            margin_tiers: HashMap::new(),
+            market_condition_config: None,
+        };
+
+        let report = run(config, events, BuyOnceStrategy { bought: false }).await;
+
+        // Exactly one fill (the strategy's opening buy) -- no
+        // de-risking activity, since market_condition_config is None
+        // (the 30% jump would trip the monitor if it were wired).
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].side, Side::Buy);
+    }
+
+    /// With `market_condition_config: Some(...)`, a price jump past
+    /// `jump_threshold_pct` must drive an automatic partial-close
+    /// market order through the `MatchingEngine` -- the strategy's
+    /// opening buy, then a de-risking sell on the jumped tick.
+    #[tokio::test]
+    async fn extreme_price_jump_triggers_a_partial_close_through_the_matching_engine() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            // A 30% jump -- well past the 10% threshold.
+            trade_event(dec!(130), t0 + Duration::seconds(2)),
+        ];
+
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+
+        let config = EventLoopConfig {
+            instruments: vec![btcusdt_perpetual_instrument()],
+            initial_balances,
+            cost_model: zero_cost_model(None),
+            queue_position_factor: dec!(0.5),
+            risk_free_return: Decimal::ZERO,
+            risk_checker: None,
+            margin_tiers: HashMap::new(),
+            market_condition_config: Some(apexes_risk::MarketConditionConfig {
+                volatility_threshold: dec!(1000000), // effectively disabled, isolate the jump signal
+                jump_threshold_pct: dec!(0.10),
+                sensitivity: dec!(1),
+                volatility_window: 20,
+                price_source: apexes_risk::PriceSource::Trade,
+                account_equity_volatility_threshold: None,
+                include_spot: true, // this test uses a SPOT buy-once strategy
+            }),
+        };
+
+        let report = run(config, events, BuyOnceStrategy { bought: false }).await;
+
+        // Expect 2 fills: the strategy's opening buy, then a de-risking
+        // sell triggered by the 30% jump (fraction 1.0, full close).
+        assert_eq!(report.trades.len(), 2);
+        assert_eq!(report.trades[0].side, Side::Buy);
+        assert_eq!(report.trades[1].side, Side::Sell);
     }
 }
