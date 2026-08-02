@@ -10,7 +10,6 @@ apexes-oms = { path = "../apexes-oms" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "io-util"] }
-tracing = { workspace = true }
 
 [dev-dependencies]
 rust_decimal = { workspace = true }
