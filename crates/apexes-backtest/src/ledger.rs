@@ -1,3 +1,4 @@
+use crate::cost_model::CostModel;
 use apexes_core::{ApexesError, Fill, Instrument, MarginMode, Side};
 use apexes_strategy::Position;
 use rust_decimal::Decimal;
@@ -120,6 +121,75 @@ impl PortfolioLedger {
 
         self.update_position(fill);
 
+        Ok(())
+    }
+
+    /// Settles one funding payment for every currently-open leveraged
+    /// position (`Position.leverage.is_some()`), using `cost_model`'s
+    /// `funding_payment(notional)` (already existing, previously dead
+    /// code -- see `CostModel`'s own doc comment). Positive payment
+    /// debits the position holder's quote-currency balance (funding
+    /// paid); negative debits (i.e. credits) it (funding received).
+    /// Spot positions (`leverage: None`) are skipped entirely -- this
+    /// method is a no-op for spot-only backtests, matching the
+    /// pre-existing "funding_rate_bps: None disables funding entirely"
+    /// contract. Calling this when `cost_model.funding_rate_bps` is
+    /// `None` is also a safe no-op (via `funding_payment`'s existing
+    /// `None`-propagating behavior).
+    ///
+    /// Callers (`run_event_loop`) are responsible for deciding WHEN to
+    /// call this -- this method itself performs exactly one settlement
+    /// pass over all open leveraged positions each time it's called; it
+    /// does not track time or funding-interval scheduling itself.
+    pub fn apply_funding_payments(
+        &mut self,
+        mark_prices: &HashMap<String, Decimal>,
+        cost_model: &CostModel,
+    ) -> Result<(), ApexesError> {
+        // Collect (quote_currency, payment) pairs first so we don't hold
+        // an immutable borrow of self.positions while later mutably
+        // crediting self.balances.
+        let mut settlements = Vec::new();
+        for (symbol, position) in &self.positions {
+            if position.leverage.is_none() || position.quantity.is_zero() {
+                continue;
+            }
+            let instrument =
+                self.instruments
+                    .get(symbol)
+                    .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                        reason: format!("no Instrument registered for symbol {symbol}"),
+                    })?;
+            let quote = instrument.quote_currency.clone().ok_or_else(|| {
+                ApexesError::InvalidBacktestConfig {
+                    reason: format!("Instrument {symbol} has no quote_currency"),
+                }
+            })?;
+            let mark_price = instrument
+                .base_currency
+                .as_ref()
+                .and_then(|base| mark_prices.get(base))
+                .copied()
+                .unwrap_or(position.average_entry_price);
+            let notional = position.quantity.abs() * mark_price;
+            if let Some(payment) = cost_model.funding_payment(notional) {
+                // A long position paying funding debits its quote
+                // balance; a short position paying funding credits it
+                // (mirroring real exchanges' sign convention where
+                // funding flows from longs to shorts when the rate is
+                // positive, or the reverse when negative).
+                let signed_payment = if position.quantity.is_sign_positive() {
+                    payment
+                } else {
+                    -payment
+                };
+                settlements.push((quote, signed_payment));
+            }
+        }
+
+        for (quote, payment) in settlements {
+            self.credit(&quote, -payment);
+        }
         Ok(())
     }
 
@@ -412,6 +482,7 @@ impl PortfolioLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost_model::FlatFeeSchedule;
     use apexes_core::{AssetClass, FillId, MarketType, OrderId, Venue};
     use chrono::Utc;
     use rust_decimal_macros::dec;
@@ -788,5 +859,130 @@ mod tests {
         ledger.apply_fill(&fill).unwrap();
         assert_eq!(*ledger.balances().get("USDT").unwrap(), dec!(3493.5));
         assert_eq!(*ledger.balances().get("BTC").unwrap(), dec!(0.1));
+    }
+
+    fn cost_model_with_funding(funding_rate_bps: Decimal) -> CostModel {
+        CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: Some(funding_rate_bps),
+        }
+    }
+
+    #[test]
+    fn apply_funding_payments_debits_long_position_holder() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.1),
+                dec!(5),
+            ))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let cost_model = cost_model_with_funding(dec!(1)); // 0.01%
+
+        let usdt_before = *ledger.balances().get("USDT").unwrap();
+        ledger
+            .apply_funding_payments(&mark_prices, &cost_model)
+            .unwrap();
+        let usdt_after = *ledger.balances().get("USDT").unwrap();
+
+        // notional = 0.1 * 60000 = 6000; payment = 6000 * 0.0001 = 0.6
+        assert_eq!(usdt_before - usdt_after, dec!(0.6));
+    }
+
+    #[test]
+    fn apply_funding_payments_credits_short_position_holder() {
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+        initial_balances.insert("BTC".to_string(), dec!(1));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(60000),
+                dec!(0.1),
+                dec!(5),
+            ))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let cost_model = cost_model_with_funding(dec!(1));
+
+        let usdt_before = *ledger.balances().get("USDT").unwrap();
+        ledger
+            .apply_funding_payments(&mark_prices, &cost_model)
+            .unwrap();
+        let usdt_after = *ledger.balances().get("USDT").unwrap();
+
+        assert_eq!(usdt_after - usdt_before, dec!(0.6));
+    }
+
+    #[test]
+    fn apply_funding_payments_skips_spot_positions() {
+        let mut ledger = ledger_with_10k_usdt();
+        // A genuinely SPOT fill (sample_fill, not leveraged_fill_for_symbol
+        // -- fill.leverage stays None, so apply_fill's spot branch runs).
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let cost_model = cost_model_with_funding(dec!(1));
+
+        let usdt_before = *ledger.balances().get("USDT").unwrap();
+        ledger
+            .apply_funding_payments(&mark_prices, &cost_model)
+            .unwrap();
+        let usdt_after = *ledger.balances().get("USDT").unwrap();
+
+        assert_eq!(
+            usdt_before, usdt_after,
+            "spot positions must not be charged funding"
+        );
+    }
+
+    #[test]
+    fn apply_funding_payments_is_a_noop_when_funding_disabled() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(0.1),
+                dec!(5),
+            ))
+            .unwrap();
+
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert("BTC".to_string(), dec!(60000));
+        let cost_model = CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: dec!(0),
+                taker_bps: dec!(0),
+            }),
+            funding_rate_bps: None,
+        };
+
+        let usdt_before = *ledger.balances().get("USDT").unwrap();
+        ledger
+            .apply_funding_payments(&mark_prices, &cost_model)
+            .unwrap();
+        let usdt_after = *ledger.balances().get("USDT").unwrap();
+
+        assert_eq!(usdt_before, usdt_after);
     }
 }
