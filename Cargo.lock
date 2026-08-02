@@ -338,6 +338,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-market-data-usequity"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "async-trait",
+ "futures",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "tokio",
+]
+
+[[package]]
 name = "apexes-oms"
 version = "0.1.0"
 dependencies = [
