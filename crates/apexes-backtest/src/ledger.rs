@@ -659,6 +659,48 @@ impl PortfolioLedger {
             .collect()
     }
 
+    /// Returns every `(symbol, side, quantity)` a caller should submit
+    /// as a partial-close market order to de-risk in response to
+    /// extreme market conditions. `reduce_fractions` is read from
+    /// `apexes_risk::MarketConditionReadHandle::reduce_fractions`
+    /// (already resolved for account-wide triggers by that point --
+    /// this method itself has no concept of "account-wide", it only
+    /// sees a flat per-symbol map). `include_spot: false` skips
+    /// positions with `leverage: None`. Symbols with zero quantity, or
+    /// not present in `reduce_fractions`, are skipped entirely.
+    /// `quantity = position.quantity.abs() * reduce_fraction`; `side`
+    /// is inverted from the position's sign (long position ->
+    /// `Side::Sell` to reduce, short position -> `Side::Buy`),
+    /// matching `check_liquidations`'s caller-side convention exactly.
+    pub fn check_de_risking(
+        &self,
+        reduce_fractions: &HashMap<String, Decimal>,
+        include_spot: bool,
+    ) -> Vec<(String, Side, Decimal)> {
+        self.positions
+            .iter()
+            .filter_map(|(symbol, position)| {
+                if position.quantity.is_zero() {
+                    return None;
+                }
+                if !include_spot && position.leverage.is_none() {
+                    return None;
+                }
+                let fraction = reduce_fractions.get(symbol)?;
+                if fraction.is_zero() {
+                    return None;
+                }
+                let side = if position.quantity.is_sign_positive() {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                let quantity = position.quantity.abs() * fraction;
+                Some((symbol.clone(), side, quantity))
+            })
+            .collect()
+    }
+
     /// Adjusts `asset`'s balance by `amount` (positive to credit, negative
     /// to debit). Callers are responsible for validating sufficient
     /// balance BEFORE calling this for debits (see `apply_fill`'s
@@ -1601,5 +1643,97 @@ mod tests {
         assert_eq!(status.get("BTCUSDT").unwrap().margin_ratio, None);
         let triggered = ledger.check_liquidations(&mark_prices, &HashMap::new());
         assert!(triggered.is_empty());
+    }
+
+    #[test]
+    fn check_de_risking_returns_a_partial_close_for_a_flagged_leveraged_long() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+
+        let mut reduce_fractions = HashMap::new();
+        reduce_fractions.insert("BTCUSDT".to_string(), dec!(0.5));
+
+        let orders = ledger.check_de_risking(&reduce_fractions, false);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0], ("BTCUSDT".to_string(), Side::Sell, dec!(0.5)));
+    }
+
+    #[test]
+    fn check_de_risking_returns_a_partial_close_for_a_flagged_short() {
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+        let mut ledger = PortfolioLedger::new(instruments, initial_balances);
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Sell,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+
+        let mut reduce_fractions = HashMap::new();
+        reduce_fractions.insert("BTCUSDT".to_string(), dec!(0.25));
+
+        let orders = ledger.check_de_risking(&reduce_fractions, false);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0], ("BTCUSDT".to_string(), Side::Buy, dec!(0.25)));
+    }
+
+    #[test]
+    fn check_de_risking_skips_spot_positions_by_default() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        let mut reduce_fractions = HashMap::new();
+        reduce_fractions.insert("BTCUSDT".to_string(), dec!(0.5));
+
+        let orders = ledger.check_de_risking(&reduce_fractions, false);
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn check_de_risking_includes_spot_positions_when_configured() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(60000), dec!(0.1), dec!(0)))
+            .unwrap();
+
+        let mut reduce_fractions = HashMap::new();
+        reduce_fractions.insert("BTCUSDT".to_string(), dec!(0.5));
+
+        let orders = ledger.check_de_risking(&reduce_fractions, true);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0], ("BTCUSDT".to_string(), Side::Sell, dec!(0.05)));
+    }
+
+    #[test]
+    fn check_de_risking_skips_symbols_not_in_reduce_fractions() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(60000),
+                dec!(1),
+                dec!(10),
+            ))
+            .unwrap();
+
+        let orders = ledger.check_de_risking(&HashMap::new(), false);
+        assert!(orders.is_empty());
     }
 }
