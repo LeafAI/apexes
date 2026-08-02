@@ -7,14 +7,13 @@
 //! `docs/superpowers/specs/2026-08-02-apexes-account-design.md` §3.5.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use apexes_core::{ApexesError, FundMovement, WalletId};
 use apexes_gateway_binance::BinanceExecutionGateway;
 use apexes_strategy::Position;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use tokio::sync::RwLock;
 
 use crate::account::Account;
 use crate::fx_rate::FxRateProvider;
@@ -24,7 +23,15 @@ use crate::reconciliation::{ReconciliationDiscrepancy, ReconciliationTolerance};
 /// `Account` methods (`balances`/`positions`/`realized_pnl`/`equity`)
 /// read a local cache populated by `refresh()` -- NOT a fresh network
 /// call every time, matching `Account::balances`'s synchronous
-/// signature. `reconcile_against_exchange` always issues a fresh
+/// signature. The cache uses `std::sync::RwLock`: reads block briefly
+/// instead of silently returning an empty map under contention (a
+/// `tokio::sync::RwLock` `try_read()` fallback would let `equity()`
+/// return a wrong `0` and `reconcile_against_exchange` report spurious
+/// discrepancies during a race with `refresh()`). This is safe in async
+/// code because `refresh()` never holds a guard across an `.await`: the
+/// gateway calls are awaited first, then the two `.write()` calls happen
+/// on already-resolved values with no `.await` in between or after.
+/// `reconcile_against_exchange` always issues a fresh
 /// request (comparing against the cache, not refreshing it) -- the
 /// whole point of reconciliation is catching a STALE cache, so it must
 /// not silently refresh the cache first (that would make every
@@ -62,8 +69,14 @@ impl LiveAccount {
             }
         })?;
 
-        *self.cached_balances.write().await = balances;
-        *self.cached_positions.write().await = positions;
+        *self
+            .cached_balances
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = balances;
+        *self
+            .cached_positions
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = positions;
         Ok(())
     }
 }
@@ -72,16 +85,16 @@ impl LiveAccount {
 impl Account for LiveAccount {
     fn balances(&self) -> HashMap<String, Decimal> {
         self.cached_balances
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn positions(&self) -> HashMap<String, Position> {
         self.cached_positions
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn realized_pnl(&self) -> HashMap<String, Decimal> {
