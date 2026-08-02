@@ -158,6 +158,17 @@ impl MarketEventBus {
             > = std::collections::HashMap::new();
             let mut window_timer = tokio::time::interval(interval);
             window_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `tokio::time::interval`'s very first `tick()` resolves
+            // immediately (by design -- it does not wait a full `interval`
+            // before its first completion). Left unconsumed, that would let
+            // the very first loop iteration race an immediate premature
+            // "window elapsed" against the first incoming event, flushing
+            // whatever (if anything) had already landed in
+            // `latest_per_bucket` well before a real `interval` has passed.
+            // Consuming that first immediate tick up front means the first
+            // real window boundary is genuinely `interval` after this task
+            // starts, matching the documented per-window semantics.
+            window_timer.tick().await;
 
             loop {
                 tokio::select! {
@@ -200,6 +211,19 @@ mod tests {
     use crate::test_support::MockMarketDataProvider;
     use apexes_core::{AssetClass, Instrument, MarketType, Venue};
     use rust_decimal_macros::dec;
+
+    /// Yields repeatedly to let multi-hop spawned-task chains (e.g.
+    /// mock -> `subscribe`'s raw-stream-forwarding task -> broadcast ->
+    /// `subscribe_downsampled`'s bucketing task) fully drain before a
+    /// test proceeds. A single `yield_now` only guarantees one hop's
+    /// worth of scheduling progress, which made downsampling tests
+    /// flaky depending on scheduling order (confirmed via repeated
+    /// local runs) -- this settles every pending hop deterministically.
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
 
     fn sample_instrument() -> Instrument {
         Instrument::new(
@@ -354,14 +378,14 @@ mod tests {
         // Three ticks arrive within the same window; only the last
         // (bid_price = dec!(3)) should be forwarded once the window elapses.
         handle.push_event(sample_tick_event("BTCUSDT", dec!(1)));
-        tokio::task::yield_now().await;
+        settle().await;
         handle.push_event(sample_tick_event("BTCUSDT", dec!(2)));
-        tokio::task::yield_now().await;
+        settle().await;
         handle.push_event(sample_tick_event("BTCUSDT", dec!(3)));
-        tokio::task::yield_now().await;
+        settle().await;
 
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        settle().await;
 
         let forwarded = downsampled.recv().await.unwrap();
         match forwarded {
@@ -383,12 +407,12 @@ mod tests {
             .unwrap();
 
         handle.push_event(sample_tick_event("BTCUSDT", dec!(100)));
-        tokio::task::yield_now().await;
+        settle().await;
         handle.push_event(sample_tick_event("ETHUSDT", dec!(200)));
-        tokio::task::yield_now().await;
+        settle().await;
 
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        settle().await;
 
         let mut seen_symbols = std::collections::HashSet::new();
         for _ in 0..2 {
