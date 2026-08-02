@@ -11,6 +11,8 @@
 
 pub mod config;
 pub mod eastmoney_provider;
+pub mod level2;
 
 pub use config::EastmoneyConfig;
 pub use eastmoney_provider::{EastmoneyMarketDataProvider, EastmoneyQuote};
+pub use level2::Level2MarketDataProvider;
