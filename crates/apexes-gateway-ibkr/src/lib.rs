@@ -11,7 +11,9 @@
 
 pub mod config;
 pub mod gateway;
+pub mod market_data;
 pub mod protocol;
 
 pub use config::IbkrGatewayConfig;
 pub use gateway::IbkrExecutionGateway;
+pub use market_data::IbkrMarketDataProvider;
