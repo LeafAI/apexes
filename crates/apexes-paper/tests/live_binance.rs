@@ -66,6 +66,7 @@ async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
         risk_free_return: dec!(0),
         latency_model: LatencyModel::None,
         margin_tiers: HashMap::new(),
+        market_condition_config: None,
     };
 
     let (tx, rx) = oneshot::channel();

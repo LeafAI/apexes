@@ -175,6 +175,8 @@ fn base_config() -> LiveTradingConfig {
             funding_rate_bps: None,
         },
         margin_tiers: HashMap::new(),
+        market_condition_config: None,
+        auto_derisk_live: false,
         risk_free_return: dec!(0),
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),

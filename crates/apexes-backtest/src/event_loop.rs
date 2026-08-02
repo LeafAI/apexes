@@ -52,6 +52,16 @@ pub struct EventLoopConfig {
     /// table and produces no margin_ratio -- an intentional silent
     /// no-op for callers that never use `OrderIntent.leverage`).
     pub margin_tiers: HashMap<String, apexes_strategy::MarginTierTable>,
+    /// Extreme-market circuit breaker configuration (design spec
+    /// `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`).
+    /// `None` (the default for every pre-existing caller) is a silent
+    /// no-op: no volatility/jump detection, no de-risking. NOT YET
+    /// WIRED UP into `run_event_loop`'s logic in this task -- Task 4
+    /// does that; this task only makes the field exist and thread
+    /// through from the public config types, learning directly from
+    /// row 6.4's `margin_tiers` gap (see this plan's own Global
+    /// Constraints).
+    pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
 }
 
 /// Runs the shared event loop: consumes `events` in order through
@@ -685,6 +695,7 @@ mod tests {
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
             margin_tiers,
+            market_condition_config: None,
         }
     }
 

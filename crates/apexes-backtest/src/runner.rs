@@ -39,6 +39,10 @@ pub struct BacktestConfig {
     /// spot-only caller) is a silent no-op: no margin status, no
     /// liquidation.
     pub margin_tiers: HashMap<String, MarginTierTable>,
+    /// Extreme-market circuit breaker configuration. `None` (default)
+    /// disables it entirely -- see `EventLoopConfig.market_condition_config`'s
+    /// doc comment.
+    pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
 }
 
 /// Runs a full backtest: replays `market_data` in chronological order
@@ -91,6 +95,7 @@ pub async fn run_backtest(
         risk_free_return: config.risk_free_return,
         risk_checker,
         margin_tiers: config.margin_tiers,
+        market_condition_config: config.market_condition_config,
     };
 
     run_event_loop(
@@ -233,6 +238,7 @@ mod tests {
             queue_position_factor: dec!(0.5),
             risk_free_return: Decimal::ZERO,
             margin_tiers: HashMap::new(),
+            market_condition_config: None,
         };
 
         let registry = Registry::new();

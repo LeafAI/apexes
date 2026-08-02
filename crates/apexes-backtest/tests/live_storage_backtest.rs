@@ -94,6 +94,7 @@ async fn backtest_reads_real_data_from_clickhouse_via_storage_market_data_source
         queue_position_factor: dec!(0.0),
         risk_free_return: dec!(0),
         margin_tiers: HashMap::new(),
+        market_condition_config: None,
     };
 
     let registry = apexes_core::registry::Registry::new();

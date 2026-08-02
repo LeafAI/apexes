@@ -39,6 +39,20 @@ pub struct LiveTradingConfig {
     /// passes (live trading NEVER auto-liquidates -- see the margin
     /// block in `run_live_trading`'s market-event branch).
     pub margin_tiers: HashMap<String, MarginTierTable>,
+    /// Extreme-market circuit breaker configuration. `None` (default)
+    /// disables it entirely.
+    pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
+    /// Whether `run_live_trading` is allowed to automatically submit
+    /// de-risking (partial-close) orders when `market_condition_config`
+    /// detects extreme conditions. Defaults to `false` at every
+    /// existing call site (added by this task): monitor-only, matching
+    /// row 6.4's live-trading-never-auto-liquidates precedent. Set to
+    /// `true` to explicitly opt into live automatic partial closes --
+    /// this is a deliberate choice this plan's design spec calls out
+    /// as a real behavioral difference from margin-based liquidation
+    /// (row 6.4), which NEVER auto-executes in live trading regardless
+    /// of configuration.
+    pub auto_derisk_live: bool,
     pub risk_free_return: Decimal,
     /// Fallback polling interval for `OrderManager::reconcile()`,
     /// running alongside (not instead of) the push-based

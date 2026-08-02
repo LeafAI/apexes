@@ -150,6 +150,7 @@ async fn run_backtest_auto_liquidates_leveraged_position_when_margin_tiers_suppl
         queue_position_factor: dec!(0.5),
         risk_free_return: dec!(0),
         margin_tiers,
+        market_condition_config: None,
     };
 
     let registry = apexes_core::registry::Registry::new();
@@ -249,6 +250,7 @@ async fn run_backtest_with_empty_margin_tiers_never_liquidates() {
         queue_position_factor: dec!(0.5),
         risk_free_return: dec!(0),
         margin_tiers: HashMap::new(),
+        market_condition_config: None,
     };
 
     let registry = apexes_core::registry::Registry::new();

@@ -28,6 +28,9 @@ pub struct PaperTradingConfig {
     /// monitoring and auto-liquidation. Empty map (the default for
     /// every pre-existing spot-only caller) is a silent no-op.
     pub margin_tiers: HashMap<String, MarginTierTable>,
+    /// Extreme-market circuit breaker configuration. `None` (default)
+    /// disables it entirely.
+    pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
 }
 
 /// Runs paper trading: subscribes to `provider` for `config.instruments`,
@@ -79,6 +82,7 @@ pub async fn run_paper_trading(
         risk_free_return: config.risk_free_return,
         risk_checker,
         margin_tiers: config.margin_tiers,
+        market_condition_config: config.market_condition_config,
     };
 
     run_event_loop(
@@ -219,6 +223,7 @@ mod tests {
             risk_free_return: dec!(0),
             latency_model: LatencyModel::None,
             margin_tiers: HashMap::new(),
+            market_condition_config: None,
         }
     }
 
