@@ -1,0 +1,19 @@
+[package]
+name = "apexes-gateway-ibkr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-oms = { path = "../apexes-oms" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "io-util"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }

@@ -206,6 +206,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-gateway-ibkr"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-oms",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rust_decimal_macros",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "apexes-gateway-xtp"
 version = "0.1.0"
 dependencies = [
