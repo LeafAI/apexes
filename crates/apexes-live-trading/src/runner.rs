@@ -14,7 +14,10 @@ use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent
 use apexes_ems::Ems;
 use apexes_ems::postgres::{OrderManagerChildOrderSink, PostgresEms};
 use apexes_oms::{ExchangeUpdate, OrderManager};
-use apexes_risk::CompositeRiskChecker;
+use apexes_risk::{
+    CompositeRiskChecker, MarketConditionEventMonitor, MarketConditionPreTradeAdapter,
+    PreTradeCheck,
+};
 use apexes_strategy::{
     MarginTierTable, ParentOrderId, ParentOrderStatus, PositionMarginStatus, Strategy,
     StrategyContext, VenueScorer,
@@ -180,6 +183,33 @@ pub async fn run_live_trading(
     let mut reconcile_timer = tokio::time::interval(config.reconcile_interval);
     let mut recorded_initial_equity = false;
 
+    // Extreme-market circuit breaker (design spec
+    // `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`):
+    // `run_live_trading` constructs its OWN local `MarketConditionMonitor`
+    // from `config.market_condition_config` and splits it locally --
+    // deliberately NOT routed through the caller's
+    // `CompositeRiskChecker` registration lists, for the same reason
+    // `run_event_loop` does it this way: this loop also needs the
+    // `MarketConditionReadHandle` (for `on_equity_update`/
+    // `reduce_fractions`), which is not one of `CompositeRiskChecker`'s
+    // registered trait objects, and the checker arrives as an
+    // already-constructed `Arc` whose `with_*` builders consume `self`
+    // by value (not something this loop can extend at runtime).
+    // `include_spot` is captured BEFORE the config is moved out into
+    // `MarketConditionMonitor::new` (a partial move would otherwise
+    // make `config.market_condition_config` unusable for the `as_ref()`
+    // read at capture time).
+    let market_condition_include_spot = config
+        .market_condition_config
+        .as_ref()
+        .map(|c| c.include_spot)
+        .unwrap_or(false);
+    let auto_derisk_live = config.auto_derisk_live;
+    let mut market_condition_monitor = config
+        .market_condition_config
+        .map(apexes_risk::MarketConditionMonitor::new)
+        .map(apexes_risk::MarketConditionMonitor::split);
+
     loop {
         tokio::select! {
             _ = &mut stop_signal => break,
@@ -194,6 +224,18 @@ pub async fn run_live_trading(
                 }
 
                 update_prices(&event, &instruments_by_symbol, &mut last_prices, &mut mark_prices);
+
+                // Feed every event to the local `MarketConditionMonitor`
+                // (a no-op for events that don't match its configured
+                // `PriceSource`) so its per-symbol volatility/jump state
+                // -- and hence its de-risking fractions -- stay current.
+                // This must run BEFORE the de-risking block later in the
+                // same tick reads `reduce_fractions`.
+                if let Some((_, event_monitor, _)) = &mut market_condition_monitor
+                    && let Err(violations) = event_monitor.on_market_event(&event)
+                {
+                    tracing::warn!(?violations, "market condition monitor flagged a violation (live)");
+                }
 
                 match ems.on_market_event(&event).await {
                     Ok(ems_fills) if !ems_fills.is_empty() => {
@@ -245,6 +287,78 @@ pub async fn run_live_trading(
                     );
                 }
 
+                // Extreme-market de-risking: monitor-only by default
+                // (log + rely on MarketConditionMonitor's PreTradeCheck
+                // to block new orders for the affected symbol), matching
+                // row 6.4's live-trading-never-auto-liquidates
+                // precedent -- UNLESS `config.auto_derisk_live` was
+                // explicitly set to `true`, in which case this behaves
+                // like backtest/paper and actually submits the partial
+                // close through the exchange (via order_manager).
+                if let Some((_, _, read_handle)) = &market_condition_monitor {
+                    let equity_for_volatility = ledger.equity(&last_prices).unwrap_or(Decimal::ZERO);
+                    if let Err(violations) = read_handle.on_equity_update(equity_for_volatility) {
+                        tracing::warn!(?violations, "account-wide market condition violation (live)");
+                    }
+
+                    let open_symbols: Vec<String> = ledger.positions().keys().cloned().collect();
+                    let reduce_fractions = read_handle.reduce_fractions(&open_symbols);
+                    let de_risking_orders =
+                        ledger.check_de_risking(&reduce_fractions, market_condition_include_spot);
+
+                    for (symbol, side, quantity) in de_risking_orders {
+                        if !auto_derisk_live {
+                            tracing::error!(
+                                symbol = %symbol,
+                                %quantity,
+                                "LIVE TRADING: extreme market conditions detected -- \
+                                 auto_derisk_live is false, so this system will NOT \
+                                 automatically submit a de-risking order. New orders for \
+                                 this symbol are blocked via MarketConditionMonitor."
+                            );
+                            continue;
+                        }
+                        let Some(position) = ledger.positions().get(&symbol).cloned() else {
+                            continue;
+                        };
+                        let de_risk_intent = apexes_strategy::OrderIntent {
+                            symbol: symbol.clone(),
+                            venue: instruments_by_symbol
+                                .get(&symbol)
+                                .map(|i| i.venue)
+                                .unwrap_or(Venue::Binance),
+                            asset_class: instruments_by_symbol
+                                .get(&symbol)
+                                .map(|i| i.asset_class)
+                                .unwrap_or(apexes_core::AssetClass::Perpetual),
+                            side,
+                            order_type: apexes_core::OrderType::Market,
+                            quantity,
+                            price: None,
+                            stop_price: None,
+                            execution_algo: None,
+                            routing: apexes_strategy::OrderRouting::Fixed,
+                            leverage: position.leverage,
+                            margin_mode: position.margin_mode,
+                        };
+                        match order_manager.lock().await.submit_order(
+                            de_risk_intent,
+                            ledger.positions(),
+                            ledger.balances(),
+                        ).await {
+                            Ok(_order_id) => {
+                                tracing::warn!(symbol = %symbol, %quantity, "LIVE TRADING: de-risking order submitted (auto_derisk_live=true)");
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, symbol = %symbol, "LIVE TRADING: de-risking order submission failed");
+                            }
+                        }
+                    }
+                }
+
+                let market_condition_pre_trade = market_condition_monitor
+                    .as_ref()
+                    .map(|(pre_trade, _, _)| pre_trade);
                 handle_market_event(
                     &event,
                     &mut strategy,
@@ -254,6 +368,7 @@ pub async fn run_live_trading(
                     &ems,
                     &mut open_parent_orders,
                     &margin_status,
+                    market_condition_pre_trade,
                 ).await;
 
                 let equity = ledger.equity(&last_prices)?;
@@ -317,6 +432,7 @@ async fn handle_market_event(
     ems: &Arc<dyn Ems>,
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
     margin_status: &HashMap<String, PositionMarginStatus>,
+    market_condition_pre_trade: Option<&MarketConditionPreTradeAdapter>,
 ) {
     // The guard must be bound to a named local (not a temporary
     // expression inside the `StrategyContext` literal) so the
@@ -345,6 +461,23 @@ async fn handle_market_event(
             )
         {
             tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+            continue;
+        }
+
+        // Same gating via MarketConditionMonitor's PreTradeAdapter,
+        // mirroring `run_event_loop`'s per-intent check: a symbol
+        // (or the account) currently flagged for extreme conditions
+        // gets no new orders from the strategy.
+        if let Some(pre_trade) = market_condition_pre_trade
+            && let Err(violations) = pre_trade.check(
+                &intent,
+                ledger.positions(),
+                ledger.balances(),
+                order_manager.lock().await.open_orders(),
+                event_timestamp(event),
+            )
+        {
+            tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
             continue;
         }
 

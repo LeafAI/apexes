@@ -502,3 +502,213 @@ async fn liquidation_breach_is_logged_but_never_submits_an_order() {
     // logged (tracing::error!), never turned into an order.
     assert_eq!(gateway.submit_count.load(Ordering::SeqCst), 1);
 }
+
+/// A `MarketDataProvider` whose stream delivers one seed-position-
+/// enabling delay, then a sequence of `MarketEvent::Trade` prices for
+/// the same symbol (to drive `MarketConditionMonitor`'s jump
+/// detection), then stays open via `futures::stream::pending()`.
+struct DelayedPriceJumpProvider {
+    prices: Vec<rust_decimal::Decimal>,
+}
+
+#[async_trait]
+impl MarketDataProvider for DelayedPriceJumpProvider {
+    async fn subscribe(
+        &self,
+        _instruments: &[Instrument],
+    ) -> Result<BoxStream<'static, MarketEvent>, apexes_core::ApexesError> {
+        let prices = self.prices.clone();
+        let events =
+            futures::stream::iter(prices.into_iter().enumerate().map(|(i, price)| TradeEvent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                price,
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, i as u32, 0).unwrap(),
+            }))
+            .then(|trade| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                MarketEvent::Trade(trade)
+            });
+        Ok(Box::pin(events.chain(futures::stream::pending())))
+    }
+}
+
+fn seed_leveraged_long_config(auto_derisk_live: bool) -> LiveTradingConfig {
+    LiveTradingConfig {
+        instruments: vec![btc_usdt_instrument()],
+        market_condition_config: Some(apexes_risk::MarketConditionConfig {
+            volatility_threshold: dec!(1000000), // effectively disabled, isolate the jump signal
+            jump_threshold_pct: dec!(0.10),
+            sensitivity: dec!(1),
+            volatility_window: 20,
+            price_source: apexes_risk::PriceSource::Trade,
+            account_equity_volatility_threshold: None,
+            include_spot: false,
+        }),
+        auto_derisk_live,
+        ..base_config()
+    }
+}
+
+async fn seed_leveraged_long(
+    order_manager: &mut OrderManager,
+    gateway: &CountingGateway,
+) -> OrderId {
+    let order_id = order_manager
+        .submit_order(
+            OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Perpetual,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(1),
+                price: None,
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: Some(dec!(10)),
+                margin_mode: Some(MarginMode::Isolated),
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    gateway.inner.set_fills_for_order(
+        order_id,
+        vec![ExchangeFill {
+            exchange_trade_id: "T1".to_string(),
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: Utc::now(),
+        }],
+    );
+    order_id
+}
+
+/// MONITOR-ONLY-BY-DEFAULT proof: with `auto_derisk_live: false` (the
+/// default), a 35% trade-price jump past the configured 10% threshold
+/// must be logged (tracing::error!) and never turned into a de-risking
+/// order submission -- matching row 6.4's live-trading-never-auto-
+/// liquidates precedent. New orders for the affected symbol are
+/// blocked via MarketConditionMonitor's PreTradeCheck instead.
+#[tokio::test]
+#[ignore]
+async fn extreme_price_jump_is_logged_but_never_submits_an_order_by_default() {
+    clean_db().await;
+
+    let gateway = Arc::new(CountingGateway {
+        inner: MockExecutionGateway::new(),
+        submit_count: AtomicUsize::new(0),
+    });
+    // 100 -> 135 is a 35% jump, well past the 10% threshold configured
+    // in seed_leveraged_long_config.
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(DelayedPriceJumpProvider {
+        prices: vec![dec!(100), dec!(135)],
+    });
+    let registry = registry_with(gateway.clone() as Arc<dyn ExecutionGateway>, provider);
+
+    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+    let mut order_manager = OrderManager::new(store, &registry).await.unwrap();
+    let order_id = seed_leveraged_long(&mut order_manager, &gateway).await;
+    let exchange_order_id = order_manager
+        .open_orders()
+        .get(&order_id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    let exchange_updates = futures::stream::iter(vec![ExchangeUpdate {
+        client_order_id: order_id,
+        exchange_order_id,
+        status: OrderStatus::Filled,
+    }])
+    .chain(futures::stream::pending());
+
+    let (tx, rx_stop) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = tx.send(());
+    });
+
+    let report = run_live_trading(
+        seed_leveraged_long_config(false), // auto_derisk_live: false (default)
+        &registry,
+        BuyOnceStrategy { bought: true }, // emits no intents
+        order_manager,
+        exchange_updates,
+        rx_stop,
+    )
+    .await
+    .unwrap();
+
+    // The seeded order's fill was applied to the ledger...
+    assert_eq!(report.trades.len(), 1);
+    // ...and the seeded order remains the ONLY submission the gateway
+    // ever saw: the 35% price jump was logged (tracing::error!), never
+    // turned into a de-risking order submission.
+    assert_eq!(gateway.submit_count.load(Ordering::SeqCst), 1);
+}
+
+/// AUTO-DERISK opt-in proof: with `auto_derisk_live: true`, the same
+/// 35% jump IS acted on -- a de-risking partial-close (Sell 1 BTC at
+/// reduce_fraction 1.0) is submitted through the exchange gateway on
+/// top of the seeded order.
+#[tokio::test]
+#[ignore]
+async fn extreme_price_jump_submits_a_partial_close_when_auto_derisk_live_is_true() {
+    clean_db().await;
+
+    let gateway = Arc::new(CountingGateway {
+        inner: MockExecutionGateway::new(),
+        submit_count: AtomicUsize::new(0),
+    });
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(DelayedPriceJumpProvider {
+        prices: vec![dec!(100), dec!(135)],
+    });
+    let registry = registry_with(gateway.clone() as Arc<dyn ExecutionGateway>, provider);
+
+    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+    let mut order_manager = OrderManager::new(store, &registry).await.unwrap();
+    let order_id = seed_leveraged_long(&mut order_manager, &gateway).await;
+    let exchange_order_id = order_manager
+        .open_orders()
+        .get(&order_id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    let exchange_updates = futures::stream::iter(vec![ExchangeUpdate {
+        client_order_id: order_id,
+        exchange_order_id,
+        status: OrderStatus::Filled,
+    }])
+    .chain(futures::stream::pending());
+
+    let (tx, rx_stop) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = tx.send(());
+    });
+
+    let report = run_live_trading(
+        seed_leveraged_long_config(true), // auto_derisk_live: true
+        &registry,
+        BuyOnceStrategy { bought: true },
+        order_manager,
+        exchange_updates,
+        rx_stop,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.trades.len(), 1);
+    // The seed order PLUS a de-risking partial-close submission this
+    // time -- auto_derisk_live: true means the 35% jump is actually
+    // acted on.
+    assert_eq!(gateway.submit_count.load(Ordering::SeqCst), 2);
+}
