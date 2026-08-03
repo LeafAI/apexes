@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms", "crates/apexes-gateway-binance", "crates/apexes-gateway-xtp", "crates/apexes-gateway-ibkr", "crates/apexes-live-trading", "crates/apexes-ems", "crates/apexes-account", "crates/apexes-market-data-chain", "crates/apexes-market-data-ashare", "crates/apexes-market-data-hshare", "crates/apexes-market-data-usequity", "crates/apexes-message-bus", "crates/apexes-ui"]
+members = ["crates/apexes-core", "crates/apexes-cli", "crates/apexes-market-data", "crates/apexes-storage", "crates/apexes-backtest", "crates/apexes-strategy", "crates/apexes-indicators", "crates/apexes-optimize", "crates/apexes-strategy-registry", "crates/apexes-risk", "crates/apexes-paper", "crates/apexes-oms", "crates/apexes-gateway-binance", "crates/apexes-gateway-xtp", "crates/apexes-gateway-ibkr", "crates/apexes-live-trading", "crates/apexes-ems", "crates/apexes-account", "crates/apexes-market-data-chain", "crates/apexes-market-data-ashare", "crates/apexes-market-data-hshare", "crates/apexes-market-data-usequity", "crates/apexes-message-bus", "crates/apexes-ui", "crates/apexes-chart"]
 
 [workspace.package]
 edition = "2024"
@@ -36,3 +36,6 @@ tracing-subscriber = "0.3"
 eframe = "0.35"
 egui = "0.35"
 egui_kittest = { version = "0.35", features = ["eframe"] }
+egui-wgpu = "0.35"
+wgpu = "29.0"
+bytemuck = { version = "1.25", features = ["derive"] }
