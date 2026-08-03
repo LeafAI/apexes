@@ -45,6 +45,32 @@ impl ViewState {
         &self.visible_range
     }
 
+    /// Constructs a `ViewState` with an EXACT `visible_range`, no
+    /// `follow live` behavior implied (`user_adjusted: true`, so
+    /// `advance_if_following_live` is a permanent no-op). `pub(crate)`
+    /// and `#[cfg(test)]`-gated -- test-only, since `geometry.rs`'s
+    /// own tests (a sibling module, not `view_state`'s own
+    /// `#[cfg(test)]` block, so they cannot construct the `ViewState`
+    /// struct literal directly) need an exact, zero-floating-point-error
+    /// way to build a `ViewState` with a known range -- going through
+    /// `zoom`/`pan` (both `f32`-based) to approximate a target range
+    /// starting from `new_following_live()`'s real-`Utc::now()`-based
+    /// default was found to lose precision at epoch-second scale
+    /// (`f32`'s ~7 significant decimal digits cannot exactly represent
+    /// a ~10-digit Unix timestamp difference), causing rare,
+    /// wall-clock-time-dependent test flakiness where the constructed
+    /// range silently drifted a few dozen seconds off its intended
+    /// bounds. `#[cfg(test)]` (rather than always-available) because
+    /// no production code has any legitimate need to bypass
+    /// `new_following_live`'s real-time-anchored construction.
+    #[cfg(test)]
+    pub(crate) fn with_exact_range(visible_range: Range<DateTime<Utc>>) -> Self {
+        Self {
+            visible_range,
+            user_adjusted: true,
+        }
+    }
+
     /// If new data arrives at `new_data_time` and this `ViewState` is
     /// still in "follow live" mode (no manual zoom/pan yet), advances
     /// the visible range's right edge to `new_data_time` and shifts

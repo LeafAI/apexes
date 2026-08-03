@@ -280,29 +280,19 @@ mod tests {
     }
 
     fn state_with_range(start: i64, end: i64) -> ViewState {
-        // Constructed via new_following_live then adjusted, since
-        // ViewState's fields are private to this crate's view_state
-        // module (not pub outside it) -- geometry.rs's own tests
-        // build a real ViewState via pan/zoom from a known baseline
-        // rather than constructing the struct literal directly (that
-        // literal-construction shortcut is only available inside
-        // view_state.rs's own #[cfg(test)] module via `use super::*`).
-        let mut state = ViewState::new_following_live();
-        // Force a deterministic range: pan so that visible_range()
-        // becomes exactly [t(start), t(end)). new_following_live's
-        // own default window is DEFAULT_WINDOW_SECONDS (300s) wide,
-        // so first zoom to the target width, then pan to the target
-        // start.
-        let default_width = 300.0;
-        let target_width = (end - start) as f32;
-        state.zoom(0.0, 1.0 - target_width / default_width);
-        let current_start = state.visible_range().start;
-        let target_start = t(start);
-        let shift_seconds = (target_start - current_start).num_seconds() as f32;
-        let current_width =
-            (state.visible_range().end - state.visible_range().start).num_seconds() as f32;
-        state.pan(shift_seconds / current_width);
-        state
+        // Uses ViewState::with_exact_range (pub(crate)) rather than
+        // approximating the target range via zoom/pan starting from
+        // new_following_live()'s real-Utc::now()-based default: that
+        // zoom/pan approach lost precision at epoch-second scale
+        // (f32's ~7 significant decimal digits cannot exactly
+        // represent a ~10-digit Unix timestamp difference), causing
+        // rare, wall-clock-time-dependent test flakiness where the
+        // constructed range silently drifted a few dozen seconds off
+        // [t(start), t(end)) -- occasionally excluding this file's
+        // test bars/ticks entirely and producing an empty vertex
+        // list. with_exact_range has zero floating-point error since
+        // it stores the exact DateTime<Utc> bounds directly.
+        ViewState::with_exact_range(t(start)..t(end))
     }
 
     fn bar(
