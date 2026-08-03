@@ -12,6 +12,8 @@ path = "src/main.rs"
 apexes-core = { path = "../apexes-core" }
 apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-market-data = { path = "../apexes-market-data" }
+apexes-chart = { path = "../apexes-chart" }
+chrono = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 axum = { workspace = true, features = ["ws"] }
 tokio-tungstenite = { workspace = true }

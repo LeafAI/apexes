@@ -690,6 +690,7 @@ dependencies = [
 name = "apexes-ui"
 version = "0.1.0"
 dependencies = [
+ "apexes-chart",
  "apexes-core",
  "apexes-market-data",
  "apexes-message-bus",
