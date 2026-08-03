@@ -53,15 +53,26 @@ async fn a_trade_pushed_upstream_is_received_end_to_end_by_the_client() {
     let url = format!("ws://{addr}/ws");
     tokio::spawn(apexes_ui::client::run(url, tx, status_tx));
 
-    // Wait for the client to report Connected before pushing an
-    // event, so the mock provider's subscribe() has definitely been
-    // called (which only happens once the server's ws_handler runs).
+    // Wait for the client to report Connected, then poll the mock's
+    // subscribe_call_count until the server's ws_handler has actually
+    // called bus.subscribe(). Connected alone is NOT sufficient: it
+    // fires the moment the WebSocket handshake completes, while axum
+    // runs the on_upgrade callback (which performs the subscribe) on
+    // a separately-scheduled task afterward -- pushing an event
+    // before that subscribe lands would panic the mock.
     loop {
         status_rx.changed().await.unwrap();
         if *status_rx.borrow() == ConnectionStatus::Connected {
             break;
         }
     }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while handle.subscribe_call_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server should have subscribed to the bus within 5 seconds of the client connecting");
 
     handle.push_event(MarketEvent::Trade(TradeEvent {
         symbol: "BTCUSDT".to_string(),

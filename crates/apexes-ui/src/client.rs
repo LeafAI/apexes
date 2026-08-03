@@ -76,6 +76,9 @@ pub async fn run(
         match tokio_tungstenite::connect_async(&url).await {
             Ok((socket, _response)) => {
                 tracing::info!(%url, "apexes-ui client: connected");
+                // A watch::Sender::send error means the receiver (the
+                // egui app) was dropped -- benign; this task keeps
+                // running until the event channel `tx` also closes.
                 let _ = status.send(ConnectionStatus::Connected);
                 backoff.reset();
                 let (_write, mut read) = socket.split();
@@ -121,6 +124,8 @@ pub async fn run(
                 tracing::warn!(?error, "apexes-ui client: failed to connect, retrying");
             }
         }
+        // See the comment on the Connected send above: a failed send
+        // just means the UI side is gone.
         let _ = status.send(ConnectionStatus::Reconnecting);
         tokio::time::sleep(backoff.next_delay()).await;
     }

@@ -31,10 +31,13 @@ fn resolve_port(cli: &Cli) -> u16 {
     if let Some(port) = cli.port {
         return port;
     }
-    if let Ok(value) = std::env::var("APEXES_UI_PORT")
-        && let Ok(port) = value.parse::<u16>()
-    {
-        return port;
+    if let Ok(value) = std::env::var("APEXES_UI_PORT") {
+        match value.parse::<u16>() {
+            Ok(port) => return port,
+            Err(error) => {
+                tracing::warn!(%value, ?error, "apexes-ui: unparseable APEXES_UI_PORT, falling back to default port");
+            }
+        }
     }
     DEFAULT_PORT
 }
@@ -79,13 +82,39 @@ fn main() -> eframe::Result {
     let bus = Arc::new(MarketEventBus::new(Box::new(
         BinanceMarketDataProvider::new(),
     )));
+
+    // Design spec section 4.1: subscribe once at startup and hold the
+    // receiver for the life of the process, so the upstream Binance
+    // connection is established eagerly at startup (a subscribe
+    // failure exits the process with a clear error message rather
+    // than surfacing only when the first WebSocket client connects).
+    let _held_receiver = match runtime.block_on(bus.subscribe(&instruments)) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            eprintln!("apexes-ui: failed to subscribe to market data at startup: {error}");
+            std::process::exit(1);
+        }
+    };
+
     let app = apexes_ui::server::build_app(Arc::clone(&bus), instruments);
 
+    // Bind BEFORE spawning the server task and BEFORE opening the UI
+    // window: a panic inside a spawned tokio task only kills that
+    // task, not the process, so a bind failure raised there would
+    // leave the window up with the client stuck reconnecting forever
+    // against a port nothing listens on -- design spec section 7
+    // requires a bind failure to exit the process at startup with a
+    // clear error message.
+    let listener = match runtime.block_on(TcpListener::bind(("127.0.0.1", port))) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("apexes-ui: failed to bind 127.0.0.1:{port}: {error}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(port, "apexes-ui server: listening");
+
     runtime.spawn(async move {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .unwrap_or_else(|error| panic!("apexes-ui: failed to bind 127.0.0.1:{port}: {error}"));
-        tracing::info!(port, "apexes-ui server: listening");
         axum::serve(listener, app)
             .await
             .expect("apexes-ui server: axum::serve exited unexpectedly");
