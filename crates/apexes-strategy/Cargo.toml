@@ -8,12 +8,13 @@ license.workspace = true
 apexes-core = { path = "../apexes-core" }
 apexes-indicators = { path = "../apexes-indicators" }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
 drift-script-math = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
-tokio = { workspace = true }
-thiserror = { workspace = true }
+futures = { workspace = true }
 rust_decimal = { workspace = true }
-chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
