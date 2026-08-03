@@ -1,0 +1,29 @@
+[package]
+name = "apexes-ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apexes-ui"
+path = "src/main.rs"
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-message-bus = { path = "../apexes-message-bus" }
+apexes-market-data = { path = "../apexes-market-data" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+axum = { workspace = true, features = ["ws"] }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { workspace = true }
+rust_decimal_macros = "1.40"
+chrono = { workspace = true }
