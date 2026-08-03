@@ -409,6 +409,7 @@ dependencies = [
  "apexes-core",
  "apexes-ems",
  "apexes-market-data",
+ "apexes-message-bus",
  "apexes-risk",
  "apexes-strategy",
  "async-trait",

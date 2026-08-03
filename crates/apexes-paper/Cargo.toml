@@ -10,6 +10,7 @@ apexes-strategy = { path = "../apexes-strategy" }
 apexes-backtest = { path = "../apexes-backtest" }
 apexes-ems = { path = "../apexes-ems" }
 apexes-market-data = { path = "../apexes-market-data" }
+apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-risk = { path = "../apexes-risk" }
 tokio = { workspace = true, features = ["time", "sync"] }
 futures = { workspace = true }

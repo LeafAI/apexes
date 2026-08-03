@@ -11,9 +11,11 @@ use apexes_backtest::clock::BacktestClock;
 use apexes_backtest::event_loop::{EventLoopConfig, run_event_loop};
 use apexes_backtest::{BacktestReport, CostModel, LatencyModel, ReplaySpeed};
 use apexes_core::registry::Registry;
-use apexes_core::{ApexesError, Instrument, MarketDataProvider};
+use apexes_core::{ApexesError, Instrument};
+use apexes_message_bus::{MarketEventBus, receiver_into_stream};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{MarginTierTable, Strategy, VenueScorer};
+use futures::StreamExt;
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
@@ -44,13 +46,13 @@ pub struct PaperTradingConfig {
 /// an optional `CompositeRiskChecker` via
 /// `registry.try_one::<Arc<CompositeRiskChecker>>()` -- absent means no
 /// risk checking is performed, preserving this crate's pre-existing
-/// `None`-means-no-risk-checking behavior exactly. `provider` stays a
+/// `None`-means-no-risk-checking behavior exactly. `bus` stays a
 /// direct parameter (NOT a registry lookup) -- paper trading only ever
-/// needs one directly-supplied provider.
+/// needs one directly-supplied event bus.
 pub async fn run_paper_trading(
     config: PaperTradingConfig,
     registry: &Registry,
-    provider: &dyn MarketDataProvider,
+    bus: &MarketEventBus,
     strategy: impl Strategy,
     stop_signal: oneshot::Receiver<()>,
 ) -> Result<BacktestReport, ApexesError> {
@@ -71,7 +73,19 @@ pub async fn run_paper_trading(
             reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
         })?;
 
-    let event_stream = provider.subscribe(&config.instruments).await?;
+    // `run_event_loop` polls its own stop signal only at the top of each
+    // iteration, so a signal arriving while the loop is blocked on the
+    // never-ending bus stream would never be observed (the loop would hang
+    // after the mock provider's finite events are drained). Gating the
+    // stream with `take_until` instead makes the stop signal end the stream
+    // -- the loop's own exit path -- preserving the same "fires or its
+    // sender is dropped" semantics `run_event_loop` documents for its own
+    // `stop_signal` parameter (a dropped oneshot sender resolves the await).
+    let event_stream = receiver_into_stream(bus.subscribe(&config.instruments).await?).take_until(
+        Box::pin(async move {
+            let _ = stop_signal.await;
+        }),
+    );
     let clock = BacktestClock::new(ReplaySpeed::AsFastAsPossible);
 
     let event_loop_config = EventLoopConfig {
@@ -92,7 +106,7 @@ pub async fn run_paper_trading(
         venue_scorer,
         volume_curve_provider,
         strategy,
-        Some(stop_signal),
+        None,
         Some(config.latency_model),
     )
     .await
@@ -104,8 +118,8 @@ mod tests {
     use apexes_backtest::cost_model::FlatFeeSchedule;
     use apexes_backtest::{OrderIntent, OrderRouting, Strategy, StrategyContext};
     use apexes_core::{
-        AssetClass, DepthUpdate, MarketEvent, MarketType, OrderType, PriceLevel, Side, TradeEvent,
-        Venue,
+        AssetClass, DepthUpdate, MarketDataProvider, MarketEvent, MarketType, OrderType,
+        PriceLevel, Side, TradeEvent, Venue,
     };
     use apexes_risk::{CompositeRiskChecker, ListMode, SymbolVenueList};
     use async_trait::async_trait;
@@ -232,13 +246,22 @@ mod tests {
         let provider = MockMarketDataProvider {
             events: sample_events(),
         };
+        let bus = MarketEventBus::new(Box::new(provider));
         let registry = Registry::new();
-        let (_tx, rx) = oneshot::channel();
+        // MarketEventBus's broadcast stream does not end on its own even after the
+        // mock provider's underlying events are exhausted, because the bus holds
+        // its sender open for its whole lifetime -- so the loop needs the stop
+        // signal to exit.
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
 
         let report = run_paper_trading(
             base_config(),
             &registry,
-            &provider,
+            &bus,
             BuyOnceStrategy { bought: false },
             rx,
         )
@@ -253,16 +276,25 @@ mod tests {
         let provider = MockMarketDataProvider {
             events: sample_events(),
         };
+        let bus = MarketEventBus::new(Box::new(provider));
         let mut config = base_config();
         config.latency_model = LatencyModel::Fixed(Duration::from_millis(100));
         let registry = Registry::new();
-        let (_tx, rx) = oneshot::channel();
+        // MarketEventBus's broadcast stream does not end on its own even after the
+        // mock provider's underlying events are exhausted, because the bus holds
+        // its sender open for its whole lifetime -- so the loop needs the stop
+        // signal to exit. 300ms keeps the signal well past the 100ms fill latency.
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = tx.send(());
+        });
 
         let start = tokio::time::Instant::now();
         let report = run_paper_trading(
             config,
             &registry,
-            &provider,
+            &bus,
             BuyOnceStrategy { bought: false },
             rx,
         )
@@ -278,6 +310,7 @@ mod tests {
         let provider = MockMarketDataProvider {
             events: sample_events(),
         };
+        let bus = MarketEventBus::new(Box::new(provider));
         let mut blacklist = HashSet::new();
         blacklist.insert("BTCUSDT".to_string());
         let risk_checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(
@@ -288,12 +321,20 @@ mod tests {
             .register::<Arc<CompositeRiskChecker>, ()>((), Arc::new(risk_checker))
             .unwrap();
         let config = base_config();
-        let (_tx, rx) = oneshot::channel();
+        // MarketEventBus's broadcast stream does not end on its own even after the
+        // mock provider's underlying events are exhausted, because the bus holds
+        // its sender open for its whole lifetime -- so the loop needs the stop
+        // signal to exit.
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
 
         let report = run_paper_trading(
             config,
             &registry,
-            &provider,
+            &bus,
             BuyOnceStrategy { bought: false },
             rx,
         )
@@ -325,6 +366,7 @@ mod tests {
         let provider = MockMarketDataProvider {
             events: many_events,
         };
+        let bus = MarketEventBus::new(Box::new(provider));
         let (tx, rx) = oneshot::channel();
         tx.send(()).unwrap();
         let registry = Registry::new();
@@ -332,7 +374,7 @@ mod tests {
         let report = run_paper_trading(
             base_config(),
             &registry,
-            &provider,
+            &bus,
             BuyOnceStrategy { bought: false },
             rx,
         )
@@ -343,5 +385,41 @@ mod tests {
         // consuming any event, so the run produces no trades regardless
         // of how many events the mock provider could have delivered.
         assert!(report.trades.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_through_a_shared_bus_calls_the_upstream_provider_once() {
+        // Mirrors apexes-market-data's equivalent test: proves the
+        // integration point this task changed (bus.subscribe(...) inside
+        // run_paper_trading, from Step 2) shares one upstream connection
+        // across multiple subscribe() calls with the same instrument set.
+        let mock = apexes_message_bus::test_support::MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new(Box::new(mock));
+        let instruments = vec![sample_instrument_for_bus_test()];
+
+        let _receiver_1 = bus.subscribe(&instruments).await.unwrap();
+        let _receiver_2 = bus.subscribe(&instruments).await.unwrap();
+
+        assert_eq!(
+            handle.subscribe_call_count(),
+            1,
+            "two subscribe() calls with the same instrument set must share one upstream connection"
+        );
+    }
+
+    fn sample_instrument_for_bus_test() -> Instrument {
+        Instrument::new(
+            "BTCUSDT",
+            apexes_core::MarketType::Crypto,
+            apexes_core::Venue::Binance,
+            apexes_core::AssetClass::Spot,
+            Some("BTC".to_string()),
+            Some("USDT".to_string()),
+            rust_decimal_macros::dec!(0.01),
+            rust_decimal_macros::dec!(0.0001),
+            rust_decimal_macros::dec!(1),
+        )
+        .unwrap()
     }
 }

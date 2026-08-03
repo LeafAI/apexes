@@ -8,6 +8,7 @@ use apexes_backtest::cost_model::FlatFeeSchedule;
 use apexes_backtest::{CostModel, OrderIntent, Strategy, StrategyContext};
 use apexes_core::{AssetClass, Instrument, MarketEvent, MarketType, Venue};
 use apexes_market_data::BinanceMarketDataProvider;
+use apexes_message_bus::MarketEventBus;
 use apexes_paper::{LatencyModel, PaperTradingConfig, run_paper_trading};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -49,6 +50,7 @@ fn btc_usdt_instrument() -> Instrument {
 #[ignore]
 async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
     let provider = BinanceMarketDataProvider::new();
+    let bus = MarketEventBus::new(Box::new(provider));
     let mut initial_balances = HashMap::new();
     initial_balances.insert("USDT".to_string(), dec!(10000));
 
@@ -76,7 +78,7 @@ async fn run_paper_trading_against_real_binance_feed_for_a_few_seconds() {
     });
 
     let registry = apexes_core::registry::Registry::new();
-    let report = run_paper_trading(config, &registry, &provider, NoOpStrategy, rx)
+    let report = run_paper_trading(config, &registry, &bus, NoOpStrategy, rx)
         .await
         .expect("run_paper_trading should not error against a real Binance feed");
 
