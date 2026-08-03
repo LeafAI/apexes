@@ -17,10 +17,11 @@ use apexes_backtest::CostModel;
 use apexes_backtest::cost_model::FlatFeeSchedule;
 use apexes_core::registry::Registry;
 use apexes_core::{
-    AssetClass, DepthUpdate, Instrument, MarketDataProvider, MarketEvent, MarketType, Order,
-    OrderId, OrderStatus, OrderType, PriceLevel, Side, TradeEvent, Venue,
+    ApexesError, AssetClass, DepthUpdate, Instrument, MarketDataProvider, MarketEvent, MarketType,
+    Order, OrderId, OrderStatus, OrderType, PriceLevel, Side, TradeEvent, Venue,
 };
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
+use apexes_message_bus::MarketEventBus;
 use apexes_oms::{
     ExchangeFill, ExchangeUpdate, ExecutionGateway, GatewayOutcome, MockExecutionGateway,
     OrderManager, OrderStore,
@@ -48,10 +49,30 @@ fn registry_with(
     registry
         .register::<Arc<dyn ExecutionGateway>, ()>((), gateway)
         .unwrap();
+    let bus = Arc::new(MarketEventBus::new(Box::new(ArcProviderAdapter(provider))));
     registry
-        .register::<Arc<dyn MarketDataProvider>, Venue>(Venue::Binance, provider)
+        .register::<Arc<MarketEventBus>, Venue>(Venue::Binance, bus)
         .unwrap();
     registry
+}
+
+/// `Box<dyn MarketDataProvider>` is required by `MarketEventBus::new`,
+/// but every call site in this test file already holds an
+/// `Arc<dyn MarketDataProvider>` (constructed once and potentially
+/// shared across multiple assertions within one test). This thin
+/// wrapper lets an `Arc<dyn MarketDataProvider>` satisfy that `Box`
+/// requirement by delegating `subscribe` to the wrapped `Arc`,
+/// avoiding a forced clone-and-reconstruct at every call site.
+struct ArcProviderAdapter(Arc<dyn MarketDataProvider>);
+
+#[async_trait]
+impl MarketDataProvider for ArcProviderAdapter {
+    async fn subscribe(
+        &self,
+        instruments: &[Instrument],
+    ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
+        self.0.subscribe(instruments).await
+    }
 }
 
 const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
@@ -711,4 +732,49 @@ async fn extreme_price_jump_submits_a_partial_close_when_auto_derisk_live_is_tru
     // time -- auto_derisk_live: true means the 35% jump is actually
     // acted on.
     assert_eq!(gateway.submit_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn registering_a_market_event_bus_shares_one_upstream_connection() {
+    // Uses apexes_message_bus's own reusable mock directly (not this
+    // file's ArcProviderAdapter/registry_with helper), since this
+    // test's purpose is proving the connection-sharing property of
+    // MarketEventBus::subscribe itself when reached through this
+    // crate's own Registry-based lookup pattern -- constructing the
+    // Registry entry by hand here, matching subscribe_all_venues's
+    // own lookup key exactly (Arc<MarketEventBus>, Venue).
+    let mock = apexes_message_bus::test_support::MockMarketDataProvider::new();
+    let handle = mock.handle();
+    let bus = Arc::new(MarketEventBus::new(Box::new(mock)));
+
+    let registry = Registry::new();
+    registry
+        .register::<Arc<MarketEventBus>, Venue>(Venue::Binance, Arc::clone(&bus))
+        .unwrap();
+
+    let looked_up = registry.get::<Arc<MarketEventBus>, Venue>();
+    let looked_up_bus = looked_up.get(&Venue::Binance).unwrap();
+
+    let instrument = Instrument::new(
+        "BTCUSDT",
+        apexes_core::MarketType::Crypto,
+        Venue::Binance,
+        apexes_core::AssetClass::Spot,
+        Some("BTC".to_string()),
+        Some("USDT".to_string()),
+        dec!(0.01),
+        dec!(0.0001),
+        dec!(1),
+    )
+    .unwrap();
+    let instruments = vec![instrument];
+
+    let _receiver_1 = looked_up_bus.subscribe(&instruments).await.unwrap();
+    let _receiver_2 = looked_up_bus.subscribe(&instruments).await.unwrap();
+
+    assert_eq!(
+        handle.subscribe_call_count(),
+        1,
+        "two subscribe() calls through the same registered MarketEventBus must share one upstream connection"
+    );
 }

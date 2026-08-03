@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use apexes_backtest::{CostModel, PerformanceSummary, PerformanceTracker, PortfolioLedger};
 use apexes_core::registry::Registry;
-use apexes_core::{ApexesError, Fill, Instrument, MarketDataProvider, MarketEvent, Venue};
+use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Venue};
 use apexes_ems::Ems;
 use apexes_ems::postgres::{OrderManagerChildOrderSink, PostgresEms};
+use apexes_message_bus::{MarketEventBus, receiver_into_stream};
 use apexes_oms::{ExchangeUpdate, OrderManager};
 use apexes_risk::{
     CompositeRiskChecker, MarketConditionEventMonitor, MarketConditionPreTradeAdapter,
@@ -639,21 +640,22 @@ async fn refresh_open_parent_orders(
 }
 
 /// Groups `instruments` by `Venue`, looks up the one registered
-/// `Arc<dyn MarketDataProvider>` for each distinct venue involved
-/// (`registry.get::<Arc<dyn MarketDataProvider>, Venue>()`), subscribes
-/// each provider to its own subset of `instruments`, and merges all the
-/// resulting streams into one via `futures::stream::select_all` -- so
-/// the rest of `run_live_trading`'s event loop sees a single unified
-/// `MarketEvent` stream regardless of how many distinct venues
-/// `config.instruments` actually spans. Returns
-/// `Err(ApexesError::SubscriptionFailed)` if any involved venue has no
-/// registered provider.
+/// `Arc<MarketEventBus>` for each distinct venue involved
+/// (`registry.get::<Arc<MarketEventBus>, Venue>()`), subscribes each
+/// bus to its own subset of `instruments`, adapts each resulting
+/// `broadcast::Receiver` back into a `Stream<Item = MarketEvent>`
+/// via `receiver_into_stream`, and merges all the resulting streams
+/// into one via `futures::stream::select_all` -- so the rest of
+/// `run_live_trading`'s event loop sees a single unified `MarketEvent`
+/// stream regardless of how many distinct venues `config.instruments`
+/// actually spans. Returns `Err(ApexesError::SubscriptionFailed)` if
+/// any involved venue has no registered bus.
 async fn subscribe_all_venues(
     registry: &Registry,
     instruments: &[Instrument],
 ) -> Result<futures::stream::SelectAll<futures::stream::BoxStream<'static, MarketEvent>>, ApexesError>
 {
-    let providers = registry.get::<Arc<dyn MarketDataProvider>, Venue>();
+    let buses = registry.get::<Arc<MarketEventBus>, Venue>();
 
     let mut instruments_by_venue: HashMap<Venue, Vec<Instrument>> = HashMap::new();
     for instrument in instruments {
@@ -665,7 +667,7 @@ async fn subscribe_all_venues(
 
     let mut streams = Vec::new();
     for (venue, venue_instruments) in instruments_by_venue {
-        let provider = providers
+        let bus = buses
             .get(&venue)
             .ok_or_else(|| ApexesError::SubscriptionFailed {
                 symbol: venue_instruments
@@ -673,10 +675,12 @@ async fn subscribe_all_venues(
                     .map(|i| i.symbol.clone())
                     .unwrap_or_default(),
                 venue,
-                reason: "no MarketDataProvider registered for this venue".to_string(),
+                reason: "no MarketEventBus registered for this venue".to_string(),
                 source_detail: None,
             })?;
-        streams.push(provider.subscribe(&venue_instruments).await?);
+        let receiver = bus.subscribe(&venue_instruments).await?;
+        streams.push(Box::pin(receiver_into_stream(receiver))
+            as futures::stream::BoxStream<'static, MarketEvent>);
     }
 
     Ok(futures::stream::select_all(streams))

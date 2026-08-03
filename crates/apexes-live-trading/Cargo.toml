@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 apexes-core = { path = "../apexes-core" }
+apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-ems = { path = "../apexes-ems" }
 apexes-oms = { path = "../apexes-oms" }
 apexes-backtest = { path = "../apexes-backtest" }

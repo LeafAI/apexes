@@ -253,6 +253,7 @@ dependencies = [
  "apexes-backtest",
  "apexes-core",
  "apexes-ems",
+ "apexes-message-bus",
  "apexes-oms",
  "apexes-risk",
  "apexes-strategy",
