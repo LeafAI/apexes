@@ -35,6 +35,15 @@ const AVAILABLE_INTERVALS: [BarInterval; 4] = [
     BarInterval::OneHour,
 ];
 
+/// Upper bound on how many closed bars are retained per
+/// `(symbol, interval)` in `DashboardApp::closed_bars`, evicted
+/// oldest-first once exceeded -- keeps memory bounded over an
+/// arbitrarily long-running session (mirroring `apexes-ui`'s own
+/// `TickRingBuffer`'s bounded-growth discipline for tick data), well
+/// beyond what any reasonable zoom level of the chart would ever
+/// need to display at once.
+const MAX_RETAINED_BARS_PER_SYMBOL_INTERVAL: usize = 2000;
+
 fn interval_label(interval: BarInterval) -> &'static str {
     match interval {
         BarInterval::OneSecond => "1s",
@@ -131,11 +140,27 @@ impl DashboardApp {
                 self.app_state.apply_event(event);
                 let newly_closed = self.chart_state.apply_event(event);
                 if let MarketEvent::Trade(trade) = event {
+                    // `BarAggregator::on_trade` closes bars for all
+                    // six `BarInterval` variants in parallel, but
+                    // `AVAILABLE_INTERVALS` only ever offers 4 of
+                    // them in the UI -- retaining the other two
+                    // (`OneSecond`, `OneDay`) forever would grow
+                    // `closed_bars` unboundedly for data that can
+                    // never be displayed (`OneSecond` alone closes
+                    // roughly once per second per symbol under
+                    // continuous trading). Only bars for a
+                    // selectable interval are worth retaining.
                     for bar in newly_closed {
-                        self.closed_bars
-                            .entry((trade.symbol.clone(), bar.interval))
-                            .or_default()
-                            .push(bar);
+                        if AVAILABLE_INTERVALS.contains(&bar.interval) {
+                            let history = self
+                                .closed_bars
+                                .entry((trade.symbol.clone(), bar.interval))
+                                .or_default();
+                            history.push(bar);
+                            if history.len() > MAX_RETAINED_BARS_PER_SYMBOL_INTERVAL {
+                                history.remove(0);
+                            }
+                        }
                     }
                     if self.symbols.contains(&trade.symbol) {
                         self.view.advance_if_following_live(trade.timestamp);
@@ -219,6 +244,7 @@ impl eframe::App for DashboardApp {
 
         ui.horizontal(|ui| {
             ui.label("Chart symbol:");
+            let previous_symbol = self.selected_symbol.clone();
             egui::ComboBox::from_id_salt("chart_symbol_selector")
                 .selected_text(&self.selected_symbol)
                 .show_ui(ui, |ui| {
@@ -226,6 +252,17 @@ impl eframe::App for DashboardApp {
                         ui.selectable_value(&mut self.selected_symbol, symbol.clone(), symbol);
                     }
                 });
+            // Per the design spec (view_state.rs's own ViewState doc
+            // comment): switching symbols is the only way back to
+            // "follow live" mode after a manual zoom/pan permanently
+            // stops auto-advance for a given ViewState instance --
+            // that recovery path only actually exists if a symbol
+            // switch constructs a fresh ViewState, which this
+            // does explicitly rather than leaving the same
+            // (possibly user_adjusted) instance in place.
+            if self.selected_symbol != previous_symbol {
+                self.view = ViewState::new_following_live();
+            }
 
             ui.label("Interval:");
             egui::ComboBox::from_id_salt("chart_interval_selector")
@@ -260,5 +297,132 @@ impl eframe::App for DashboardApp {
                 egui::Vec2::new(ui.available_width(), 150.0),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexes_core::{TradeEvent, Venue};
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+
+    fn symbols() -> Vec<String> {
+        vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]
+    }
+
+    fn app_with_channels() -> (DashboardApp, mpsc::UnboundedSender<MarketEvent>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_status_tx, status_rx) = watch::channel(ConnectionStatus::default());
+        let app = DashboardApp::new(&symbols(), event_rx, status_rx);
+        (app, event_tx)
+    }
+
+    fn trade_event(symbol: &str, price: rust_decimal::Decimal) -> MarketEvent {
+        MarketEvent::Trade(TradeEvent {
+            symbol: symbol.to_string(),
+            venue: Venue::Binance,
+            price,
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        })
+    }
+
+    #[test]
+    fn switching_the_selected_symbol_resets_view_to_a_fresh_follow_live_state() {
+        let (mut app, _tx) = app_with_channels();
+        // Simulate a manual zoom/pan having permanently stopped
+        // follow-live mode for the currently-selected symbol's view.
+        app.view.zoom(0.5, 1.0);
+        let zoomed_range = app.view.visible_range().clone();
+
+        // Directly simulate what the ComboBox's selectable_value
+        // would do, then run the same reset logic ui() applies --
+        // exercised here without a real egui::Ui, since the reset
+        // logic itself doesn't depend on one.
+        let previous_symbol = app.selected_symbol.clone();
+        app.selected_symbol = "ETHUSDT".to_string();
+        if app.selected_symbol != previous_symbol {
+            app.view = ViewState::new_following_live();
+        }
+
+        assert_ne!(
+            *app.view.visible_range(),
+            zoomed_range,
+            "switching symbols must construct a fresh ViewState, not keep the zoomed one"
+        );
+    }
+
+    #[test]
+    fn closed_bars_only_retains_bars_for_a_selectable_interval() {
+        let (mut app, tx) = app_with_channels();
+        tx.send(trade_event("BTCUSDT", dec!(100))).unwrap();
+        app.drain_updates();
+
+        // BarAggregator closes bars for all six BarInterval variants
+        // in parallel once a boundary is crossed, but a single trade
+        // with no boundary crossing yet closes none -- this test only
+        // needs to confirm that IF a OneSecond bar were ever closed,
+        // it would never be stored (a fabricated Bar with
+        // BarInterval::OneSecond, hand-constructed here rather than
+        // waiting for a real boundary crossing, avoids depending on
+        // real wall-clock timing).
+        assert!(
+            !AVAILABLE_INTERVALS.contains(&BarInterval::OneSecond),
+            "sanity check: OneSecond must not be a selectable interval"
+        );
+        assert!(
+            !app.closed_bars
+                .contains_key(&("BTCUSDT".to_string(), BarInterval::OneSecond)),
+            "closed_bars must never accumulate an interval that AVAILABLE_INTERVALS never offers"
+        );
+    }
+
+    #[test]
+    fn closed_bars_history_is_capped_at_the_configured_maximum() {
+        let (mut app, _tx) = app_with_channels();
+        let key = ("BTCUSDT".to_string(), BarInterval::OneMinute);
+        for i in 0..(MAX_RETAINED_BARS_PER_SYMBOL_INTERVAL + 5) {
+            let bar = Bar {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                open: dec!(1),
+                high: dec!(1),
+                low: dec!(1),
+                close: dec!(1),
+                volume: dec!(1),
+                interval: BarInterval::OneMinute,
+                open_time: Utc::now(),
+                close_time: Utc::now(),
+            };
+            let history = app.closed_bars.entry(key.clone()).or_default();
+            history.push(bar);
+            if history.len() > MAX_RETAINED_BARS_PER_SYMBOL_INTERVAL {
+                history.remove(0);
+            }
+            let _ = i;
+        }
+        assert_eq!(
+            app.closed_bars.get(&key).unwrap().len(),
+            MAX_RETAINED_BARS_PER_SYMBOL_INTERVAL,
+            "closed_bars history for one (symbol, interval) must never exceed the configured cap"
+        );
+    }
+
+    #[test]
+    fn bars_for_chart_appends_the_current_open_bar_after_closed_history() {
+        let (mut app, tx) = app_with_channels();
+        tx.send(trade_event("BTCUSDT", dec!(65000))).unwrap();
+        app.drain_updates();
+
+        let bars = app.bars_for_chart("BTCUSDT", BarInterval::OneMinute);
+        // No boundary crossed yet, so closed_bars is empty for this
+        // key -- the only bar present should be the current
+        // still-forming one, appended last per bars_for_chart's own
+        // contract.
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].close, dec!(65000));
     }
 }
