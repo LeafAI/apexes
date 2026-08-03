@@ -176,6 +176,28 @@ impl BarAggregator {
 
         closed_bars
     }
+
+    /// Returns the still-forming (not yet closed) bar for `interval`,
+    /// if any trade has landed in the current bucket -- `None` if no
+    /// trade has arrived for this interval yet. Does not consume or
+    /// modify the open bucket; `on_trade` can still accumulate into
+    /// it afterward. Used by the K-line chart (sub-project #13b) to
+    /// show the currently-forming candle alongside closed ones,
+    /// rather than only ever showing history.
+    pub fn current_open_bar(&self, interval: BarInterval) -> Option<Bar> {
+        self.open_bars.get(&interval).map(|open_bar| Bar {
+            symbol: self.symbol.clone(),
+            venue: self.venue,
+            open: open_bar.open,
+            high: open_bar.high,
+            low: open_bar.low,
+            close: open_bar.close,
+            volume: open_bar.volume,
+            interval,
+            open_time: open_bar.open_time,
+            close_time: open_bar.close_time,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +324,56 @@ mod tests {
         assert!(!closed_intervals.contains(&BarInterval::FiveMinutes));
         assert!(!closed_intervals.contains(&BarInterval::OneHour));
         assert!(!closed_intervals.contains(&BarInterval::OneDay));
+    }
+
+    #[test]
+    fn current_open_bar_returns_none_before_any_trade() {
+        let agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        assert_eq!(agg.current_open_bar(BarInterval::OneMinute), None);
+    }
+
+    #[test]
+    fn current_open_bar_reflects_the_still_forming_bucket() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(0));
+        agg.on_trade(dec!(110), dec!(2), t(10));
+
+        let open_bar = agg
+            .current_open_bar(BarInterval::OneMinute)
+            .expect("a trade landed inside the [0,60) OneMinute bucket, which has not closed yet");
+
+        assert_eq!(open_bar.open, dec!(100));
+        assert_eq!(open_bar.high, dec!(110));
+        assert_eq!(open_bar.low, dec!(100));
+        assert_eq!(open_bar.close, dec!(110));
+        assert_eq!(open_bar.volume, dec!(3));
+        assert_eq!(open_bar.symbol, "BTCUSDT");
+        assert_eq!(open_bar.venue, Venue::Binance);
+        assert_eq!(open_bar.interval, BarInterval::OneMinute);
+    }
+
+    #[test]
+    fn current_open_bar_is_none_for_an_interval_with_no_trades_yet() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(0));
+        // OneDay's bucket exists (every interval accumulates in parallel per
+        // on_trade's own doc comment), so this asserts current_open_bar
+        // still correctly reports Some for it, not just OneMinute.
+        assert!(agg.current_open_bar(BarInterval::OneDay).is_some());
+    }
+
+    #[test]
+    fn current_open_bar_does_not_consume_the_open_bucket() {
+        // Calling current_open_bar must not close/remove the bucket --
+        // on_trade must still be able to accumulate into it afterward.
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(0));
+        let _ = agg.current_open_bar(BarInterval::OneMinute);
+        let _ = agg.current_open_bar(BarInterval::OneMinute);
+        agg.on_trade(dec!(120), dec!(1), t(10));
+
+        let open_bar = agg.current_open_bar(BarInterval::OneMinute).unwrap();
+        assert_eq!(open_bar.high, dec!(120));
+        assert_eq!(open_bar.volume, dec!(2));
     }
 }
