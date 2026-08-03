@@ -82,9 +82,18 @@ pub struct LiveTradingReport {
 /// `run_backtest`/`run_paper_trading`'s stop-signal semantics).
 ///
 /// Three concurrent event sources, selected via `tokio::select!`:
-/// 1. `market_data_provider`'s live `MarketEvent` stream ->
+/// 1. The merged `MarketEvent` stream `subscribe_all_venues` builds
+///    from each involved venue's registered `MarketEventBus` ->
 ///    `strategy.on_market_event` -> `risk_checker` (if configured) ->
 ///    `order_manager.submit_order` for each resulting `OrderIntent`.
+///    Note: because each `MarketEventBus` holds its broadcast sender
+///    open for its whole connected lifetime, this merged stream does
+///    NOT end merely because a real upstream provider's own connection
+///    dropped (only `MarketEventBus`'s internal forwarding task logs
+///    that) -- the `market_event = ... => { let Some(event) = ...
+///    else { break } }` branch below therefore currently only fires on
+///    a genuine bus-level disconnect (a dropped `MarketEventBus`), not
+///    a provider-level one.
 /// 2. `exchange_updates` (a real gateway's push stream, e.g. Binance
 ///    User Data Stream via `apexes-gateway-binance`) ->
 ///    `order_manager.apply_exchange_update` -> any returned `Fill`s

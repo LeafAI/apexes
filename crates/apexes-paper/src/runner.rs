@@ -35,12 +35,21 @@ pub struct PaperTradingConfig {
     pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
 }
 
-/// Runs paper trading: subscribes to `provider` for `config.instruments`,
+/// Runs paper trading: subscribes to `bus` for `config.instruments`,
 /// drives the shared event-loop core against the resulting live stream,
 /// applying `config.latency_model`'s delay before each `OrderIntent`
 /// that passes its `PreTradeCheck` reaches the matching engine. Exits
 /// gracefully (returning the `BacktestReport` accumulated so far, not an
-/// error) once `stop_signal` fires or its sender is dropped.
+/// error) once `stop_signal` fires or its sender is dropped -- the event
+/// stream itself is explicitly gated on `stop_signal` via `take_until`
+/// (see the comment at its construction site below) rather than relying
+/// on the stream ending on its own, since `MarketEventBus` holds its
+/// broadcast sender open for its whole connected lifetime and therefore
+/// does not end its stream merely because the real upstream provider's
+/// own connection dropped -- a provider-level disconnect during paper
+/// trading is currently only visible via a log line from
+/// `MarketEventBus`'s internal forwarding task, not by this function
+/// returning on its own.
 ///
 /// `registry` (sub-project #9's registry retrofit) is used to resolve
 /// an optional `CompositeRiskChecker` via
@@ -405,6 +414,63 @@ mod tests {
             handle.subscribe_call_count(),
             1,
             "two subscribe() calls with the same instrument set must share one upstream connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_run_paper_trading_calls_share_one_upstream_connection() {
+        // Stronger than `subscribe_through_a_shared_bus_calls_the_upstream_provider_once`
+        // above: that test calls `bus.subscribe()` directly rather than
+        // going through `run_paper_trading` itself. This test spawns TWO
+        // real `run_paper_trading` invocations concurrently against the
+        // same `&bus` and the same instrument set, and asserts the
+        // upstream mock's `subscribe()` was still only called once --
+        // genuinely exercising this consumer's own integration point
+        // end to end, not just the bus in isolation. Unlike the
+        // market-data crate's equivalent test, no real external service
+        // (ClickHouse) blocks doing this here, since `run_paper_trading`
+        // only needs an in-memory `Registry` and a mock provider.
+        let mock = apexes_message_bus::test_support::MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let bus = MarketEventBus::new(Box::new(mock));
+        let registry = Registry::new();
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx1.send(());
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx2.send(());
+        });
+
+        let (report1, report2) = tokio::join!(
+            run_paper_trading(
+                base_config(),
+                &registry,
+                &bus,
+                BuyOnceStrategy { bought: false },
+                rx1,
+            ),
+            run_paper_trading(
+                base_config(),
+                &registry,
+                &bus,
+                BuyOnceStrategy { bought: false },
+                rx2,
+            ),
+        );
+
+        report1.unwrap();
+        report2.unwrap();
+
+        assert_eq!(
+            handle.subscribe_call_count(),
+            1,
+            "two concurrent run_paper_trading calls against the same bus and instrument set \
+             must share one upstream connection"
         );
     }
 

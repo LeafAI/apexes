@@ -218,7 +218,18 @@ async fn strategy_order_is_submitted_and_a_push_update_produces_a_fill() {
     let store = OrderStore::new(POSTGRES_URL).await.unwrap();
     let order_manager = OrderManager::new(store, &registry).await.unwrap();
 
-    let (_tx, rx) = oneshot::channel();
+    // MarketEventBus's broadcast stream does not end on its own even
+    // after the mock provider's underlying events are exhausted (the
+    // bus holds its sender open for its whole lifetime), so unlike
+    // before this test's market-data source was wired through the
+    // bus, `market_events.next()` no longer returns `None` once the
+    // mock's finite events are drained -- the stop signal must be
+    // sent explicitly instead of relying on a dropped `_tx`.
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = tx.send(());
+    });
 
     // No exchange_updates in this run (empty stream) -- exercises only
     // the market-data -> submit_order path end to end.

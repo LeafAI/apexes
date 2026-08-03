@@ -1,16 +1,26 @@
 //! [`run_ingestion_loop`]: the project's first general-purpose
-//! live-market-data-to-ClickHouse ingestion path. Subscribes to
-//! `provider` for `instruments`, buffers incoming `MarketEvent`s by
-//! variant (`StorageWriter::write_batch` requires a homogeneous
-//! batch), and flushes each variant's buffer to `writer` whenever it
-//! reaches `MAX_BATCH_SIZE` events OR `FLUSH_INTERVAL` has elapsed
-//! since that variant's last flush, whichever comes first -- balances
-//! write latency (a low-volume symbol's data shouldn't wait
-//! indefinitely) against ClickHouse insert efficiency (one-row-at-a-time
-//! inserts are wasteful). Runs until `provider`'s stream ends or
-//! `stop_signal` fires (graceful-shutdown convention matching
-//! `run_live_trading`/`run_paper_trading`'s existing
-//! `oneshot::Receiver<()>` pattern).
+//! live-market-data-to-ClickHouse ingestion path. Subscribes to `bus`
+//! for `instruments`, buffers incoming `MarketEvent`s by variant
+//! (`StorageWriter::write_batch` requires a homogeneous batch), and
+//! flushes each variant's buffer to `writer` whenever it reaches
+//! `MAX_BATCH_SIZE` events OR `FLUSH_INTERVAL` has elapsed since that
+//! variant's last flush, whichever comes first -- balances write
+//! latency (a low-volume symbol's data shouldn't wait indefinitely)
+//! against ClickHouse insert efficiency (one-row-at-a-time inserts are
+//! wasteful). Runs until `stop_signal` fires, or the underlying
+//! `MarketEventBus`-adapted stream ends (via `receiver_into_stream`) --
+//! note that because `MarketEventBus` holds its broadcast sender open
+//! for its whole connected lifetime, that stream only ends if the
+//! `MarketEventBus` itself is dropped, NOT merely because the real
+//! upstream provider's own connection dropped (a provider-level
+//! disconnect is currently only visible via a
+//! `tracing::info!`/`tracing::warn!` log from `MarketEventBus`'s
+//! internal forwarding task, not by this loop returning) -- this
+//! differs from this function's pre-`MarketEventBus` behavior, where a
+//! provider stream ending always ended the loop too. Callers relying
+//! on upstream-disconnect-terminates-the-loop semantics should track
+//! this as a known gap (see the message-bus integration plan's final
+//! review) rather than assume it still holds.
 
 use apexes_core::{ApexesError, Instrument, MarketEvent};
 use apexes_message_bus::{MarketEventBus, receiver_into_stream};
@@ -159,19 +169,21 @@ mod tests {
     use apexes_message_bus::test_support::MockMarketDataProvider;
 
     #[tokio::test]
-    async fn two_concurrent_run_ingestion_loop_calls_share_one_upstream_connection() {
-        // This test only needs to prove `run_ingestion_loop` itself calls
-        // `bus.subscribe()` (which is what triggers a real upstream
-        // connection) rather than bypassing the bus -- it does not need a
-        // real StorageWriter/ClickHouse instance, since the assertion is
-        // entirely about `MockMarketDataProvider::subscribe_call_count()`,
-        // not about what gets written. A `StorageWriter` cannot be
+    async fn two_concurrent_bus_subscribes_share_one_upstream_connection() {
+        // This test proves the integration point `run_ingestion_loop`
+        // itself relies on -- `bus.subscribe()` (which is what triggers
+        // a real upstream connection) -- shares one upstream connection
+        // across concurrent callers, WITHOUT actually invoking
+        // `run_ingestion_loop` itself: a `StorageWriter` cannot be
         // constructed without a real ClickHouse connection in this
-        // crate's existing API, so this test calls `bus.subscribe()`
-        // directly TWICE (simulating what two independent
-        // `run_ingestion_loop` invocations against the same `bus` and
-        // instrument set would each do internally) rather than spawning
-        // two full `run_ingestion_loop` tasks end-to-end.
+        // crate's existing API, so a full end-to-end
+        // `run_ingestion_loop` invocation isn't possible here. This
+        // test therefore calls `bus.subscribe()` directly TWICE
+        // (simulating what two independent `run_ingestion_loop`
+        // invocations against the same `bus` and instrument set would
+        // each do internally) rather than spawning two full
+        // `run_ingestion_loop` tasks end-to-end -- the name reflects
+        // this: no `run_ingestion_loop` call occurs in this test.
         let mock = MockMarketDataProvider::new();
         let handle = mock.handle();
         let bus = MarketEventBus::new(Box::new(mock));
