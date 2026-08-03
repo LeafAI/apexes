@@ -315,6 +315,7 @@ dependencies = [
  "apexes-core",
  "bytemuck",
  "chrono",
+ "eframe",
  "egui",
  "egui-wgpu",
  "egui_kittest",

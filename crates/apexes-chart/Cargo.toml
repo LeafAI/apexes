@@ -14,5 +14,6 @@ chrono = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]
+eframe = { workspace = true }
 egui_kittest = { workspace = true, features = ["wgpu"] }
 rust_decimal_macros = "1.40"
