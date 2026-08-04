@@ -13,6 +13,10 @@
 //! temporary position/balance tracking, pending sub-project #11
 //! (account & fund management), which will supersede it.
 
+pub mod order_executor_adapter;
 pub mod runner;
 
+pub use order_executor_adapter::{
+    LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
+};
 pub use runner::{LiveTradingConfig, LiveTradingReport, run_live_trading};
