@@ -86,6 +86,8 @@ enum EngineError {
     Registry(#[from] apexes_core::registry::RegistryError),
     #[error("failed to construct OrderStore: {0}")]
     OrderStore(#[from] apexes_oms::OmsError),
+    #[error("failed to start Binance User Data Stream: {reason}")]
+    UserDataStream { reason: String },
     #[error("run_backtest/run_paper_trading/run_live_trading failed: {0}")]
     Run(#[from] ApexesError),
 }
@@ -462,9 +464,25 @@ async fn run_live_mode(
     } = live_params;
 
     let gateway_config = resolve_binance_credentials(&credentials_ref, |name| std::env::var(name))?;
-    let gateway: Arc<dyn ExecutionGateway> = Arc::new(
-        apexes_gateway_binance::BinanceExecutionGateway::new(gateway_config),
-    );
+    let binance_gateway = apexes_gateway_binance::BinanceExecutionGateway::new(gateway_config);
+
+    // `start_user_data_stream` is a method on the CONCRETE
+    // `BinanceExecutionGateway` type, not part of the `ExecutionGateway`
+    // trait, so it must be called BEFORE `binance_gateway` is erased
+    // into `Arc<dyn ExecutionGateway>` below. The returned
+    // `UserDataStreamHandle` must be kept alive for as long as the
+    // stream should keep running (dropping it aborts the underlying
+    // WebSocket/renewal tasks) -- bound to `_user_data_stream_handle`
+    // here so it stays alive across the whole `run_live_trading(...).await`
+    // call below, rather than being dropped at the end of this
+    // statement.
+    let (_user_data_stream_handle, exchange_updates) = binance_gateway
+        .start_user_data_stream()
+        .await
+        .map_err(|reason| EngineError::UserDataStream { reason })?;
+    let exchange_updates = Box::pin(exchange_updates);
+
+    let gateway: Arc<dyn ExecutionGateway> = Arc::new(binance_gateway);
     registry.register::<Arc<dyn ExecutionGateway>, ()>((), gateway)?;
 
     register_gateway_bus_for_all_venues(
@@ -494,7 +512,6 @@ async fn run_live_mode(
     // Same "no external stop signal wired up yet" note as `run_paper_mode`
     // -- Task 8 owns triggering graceful shutdown.
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    let exchange_updates = futures::stream::empty();
 
     run_live_trading(
         config,

@@ -171,7 +171,7 @@ impl BinanceExecutionGateway {
     ) -> Result<
         (
             crate::user_data_stream::UserDataStreamHandle,
-            impl futures::Stream<Item = apexes_oms::ExchangeUpdate>,
+            impl futures::Stream<Item = apexes_oms::ExchangeUpdate> + use<>,
         ),
         String,
     > {
