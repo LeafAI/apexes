@@ -156,15 +156,6 @@ impl MatchingEngine {
         }
     }
 
-    /// Read-only access to the engine's `CostModel` -- used by
-    /// `run_unified_event_loop`'s periodic funding-settlement pass, which needs
-    /// the same `funding_rate_bps` configuration the engine was built
-    /// with (`CostModel` is not `Clone`, and the engine owns the only
-    /// instance).
-    pub fn cost_model(&self) -> &CostModel {
-        &self.cost_model
-    }
-
     /// Updates the local order book for `update.symbol` from a new
     /// `DepthUpdate`. Must be called for every `MarketEvent::Depth` in
     /// chronological order before any fills against that symbol are

@@ -189,7 +189,30 @@ pub trait SupplementalFillSource: Send {
 
 ## 三、统一循环的整体结构
 
-新的 `run_unified_event_loop`（暂定名，具体位置见下）大致形状：
+> **实现落地后更新（Task 4/7 whole-branch review）**：下方伪代码是设计
+> 阶段的原始提案，与最终交付的 `run_unified_event_loop` 签名有两处
+> 已批准的偏差，均记录在实现计划 Task 4 的报告里：
+> 1. `UnifiedLoopConfig` 实际多了一个 `funding_rate_bps: Option<Decimal>`
+>    字段（不是完整 `CostModel`）——`PortfolioLedger::apply_funding_payments`
+>    需要一个 `&CostModel`，但完整 `CostModel`（含手续费模型）已经被
+>    隐藏在调用方自己构造的 `Arc<dyn OrderExecutor>` 背后不可达，循环
+>    内部用这一个字段现构造一个零手续费的最小 `CostModel` 仅用于资金
+>    费结算这一次调用，与直接持有完整 `CostModel` 在结果上可证明等价
+>    （`CostModel::funding_payment` 只读 `funding_rate_bps`，从不读
+>    `fee_schedule`）。
+> 2. `venue_scorer`/`volume_curve_provider` 两个参数被替换为单一
+>    `ems: Arc<dyn Ems>` 参数——具体 `ChildOrderSink`/`Ems` 后端是
+>    调用方特定的（回测/模拟盘用 `MatchingEngineChildOrderSink`+
+>    `InMemoryEms`；实盘用 `OrderManagerChildOrderSink`+`PostgresEms`），
+>    循环核心本身不需要知道路由细节，只需要一个已经构造好的 `Ems`
+>    handle；`venue_scorer`/`volume_curve_provider` 的 registry 查询
+>    留在各调用方自己内部完成。
+>
+> 下方伪代码保留原始设计意图不做修改（仍是理解"为什么长这个形状"的
+> 参考），实际签名以 `crates/apexes-backtest/src/unified_loop.rs`
+> 源码为准。
+
+原设计提案的 `run_unified_event_loop` 大致形状：
 
 ```rust
 pub struct UnifiedLoopConfig {
