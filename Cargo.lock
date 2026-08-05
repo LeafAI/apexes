@@ -521,17 +521,23 @@ name = "apexes-market-data-gateway"
 version = "0.1.0"
 dependencies = [
  "apexes-core",
+ "apexes-market-data",
  "apexes-message-bus",
  "apexes-storage",
  "async-trait",
+ "axum",
  "chrono",
+ "clap",
+ "core_affinity",
  "futures",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1727,6 +1733,17 @@ dependencies = [
  "bitflags 1.3.2",
  "core-foundation",
  "libc",
+]
+
+[[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
 ]
 
 [[package]]

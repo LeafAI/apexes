@@ -8,19 +8,29 @@ license.workspace = true
 name = "apexes_market_data_gateway"
 path = "src/lib.rs"
 
+[[bin]]
+name = "apexes-market-data-gateway"
+path = "src/main.rs"
+
 [dependencies]
 apexes-core = { path = "../apexes-core" }
+apexes-market-data = { path = "../apexes-market-data" }
+apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-storage = { path = "../apexes-storage" }
 async-trait = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 chrono = { workspace = true }
+clap = { workspace = true }
+core_affinity = { workspace = true }
 futures = { workspace = true }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time", "signal"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-apexes-message-bus = { path = "../apexes-message-bus" }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
-rust_decimal = { workspace = true }
+tokio-tungstenite = { workspace = true }
 rust_decimal_macros = "1.40"

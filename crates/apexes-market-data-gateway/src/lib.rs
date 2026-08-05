@@ -21,14 +21,19 @@
 //! and `persistence.rs` (async, non-blocking persistence via
 //! `apexes_storage::StorageWriter`), wired into `Gateway` via
 //! `attach_persistence`/`flush_persistence_aged` and into `connect`'s
-//! forwarding loop. The `main.rs`/CLI/`axum` wiring that turns this into
-//! a runnable process is part 3, a later task.
+//! forwarding loop. Part 3 (this addition) adds `server.rs` (the
+//! `axum` `GET /market` WebSocket endpoint, wiring replay + live
+//! forwarding) and `main.rs` (CLI, CPU affinity, PID file, startup
+//! sequence) -- see `main.rs`'s own doc comment for the PID file's
+//! authoritative format.
 
 pub mod gateway;
 pub mod persistence;
 pub mod protocol;
 pub mod replay;
+pub mod server;
 
 pub use gateway::Gateway;
 pub use persistence::PersistenceBuffer;
 pub use replay::replay_since;
+pub use server::build_app;
