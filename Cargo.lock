@@ -370,6 +370,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-engine"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-risk",
+ "apexes-strategy",
+ "apexes-strategy-loader",
+ "chrono",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "apexes-gateway-binance"
 version = "0.1.0"
 dependencies = [
@@ -647,6 +665,7 @@ dependencies = [
  "chrono",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde",
  "thiserror 2.0.19",
  "uuid",
 ]
@@ -680,6 +699,20 @@ dependencies = [
  "futures",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "apexes-strategy-loader"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-strategy",
+ "serde",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

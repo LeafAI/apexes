@@ -6,6 +6,7 @@
 //! for the full rationale.
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 /// Which `apexes_core::MarketEvent` variant's price field drives
 /// per-symbol volatility/jump detection. Only events matching the
@@ -14,7 +15,11 @@ use rust_decimal::Decimal;
 /// are silently ignored (not an error -- e.g. a `Tick`/`Depth`/`Bar`
 /// event arriving while `price_source: Trade` is configured is simply
 /// a no-op for this monitor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Derives `Serialize`/`Deserialize` (added additively) so
+/// `MarketConditionConfig` can be embedded directly in
+/// `apexes_engine::launch_config::LaunchConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PriceSource {
     /// `MarketEvent::Trade.price` -- the default, appropriate for spot
     /// instruments.
@@ -27,7 +32,7 @@ pub enum PriceSource {
 }
 
 /// Configuration for [`crate::market_condition_monitor::MarketConditionMonitor`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketConditionConfig {
     /// Absolute threshold for `apexes_indicators::RollingStdDev`'s
     /// output (same unit as price) -- a symbol's rolling volatility at

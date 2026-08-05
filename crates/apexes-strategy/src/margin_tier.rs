@@ -9,9 +9,15 @@
 //! configuration.
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 /// A single maintenance-margin bracket.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Derives `Serialize`/`Deserialize` so this type can be embedded
+/// directly in `apexes_engine::launch_config::LaunchConfig` (the JSON
+/// config `apexes-ui` hands to a spawned `apexes-engine` process) --
+/// added purely additively, no existing behavior changes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MarginTier {
     /// This tier applies at/above this notional value (inclusive).
     pub notional_floor: Decimal,
@@ -25,7 +31,7 @@ pub struct MarginTier {
 
 /// One symbol's complete tiered margin table, sorted ascending by
 /// `notional_floor`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarginTierTable {
     pub tiers: Vec<MarginTier>,
 }

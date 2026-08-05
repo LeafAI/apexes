@@ -1,0 +1,25 @@
+[package]
+name = "apexes-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apexes-engine"
+path = "src/main.rs"
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-risk = { path = "../apexes-risk" }
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-strategy-loader = { path = "../apexes-strategy-loader" }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"

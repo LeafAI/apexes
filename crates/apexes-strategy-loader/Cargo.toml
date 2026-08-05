@@ -1,0 +1,16 @@
+[package]
+name = "apexes-strategy-loader"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-strategy = { path = "../apexes-strategy" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+apexes-core = { path = "../apexes-core" }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }

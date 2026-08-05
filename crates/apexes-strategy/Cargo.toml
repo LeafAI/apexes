@@ -13,6 +13,7 @@ drift-script = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039
 drift-script-math = { git = "https://github.com/LeafAI/drift-dsl.git", rev = "14af039f01436e25984b493ad9b27c1d5bc16a21" }
 futures = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
