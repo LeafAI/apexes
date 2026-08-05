@@ -139,6 +139,7 @@ pub async fn run_paper_trading(
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
+        control: None,
     };
 
     run_unified_event_loop(

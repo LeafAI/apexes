@@ -31,6 +31,7 @@
 //! point.
 
 use crate::clock::BacktestClock;
+use crate::control::{ControlHandle, SessionSnapshot};
 use crate::cost_model::{CostModel, FlatFeeSchedule};
 use crate::latency::LatencyModel;
 use crate::ledger::PortfolioLedger;
@@ -102,6 +103,12 @@ pub struct UnifiedLoopConfig {
     /// `None` (the default for every pre-existing caller) is a silent
     /// no-op: no volatility/jump detection, no de-risking.
     pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
+    /// Live-tuning/monitoring control channel (design spec
+    /// `2026-08-05-apexes-13c-strategy-monitoring-tuning-design.md`
+    /// §5). `None` (the default for every pre-existing caller) is a
+    /// silent no-op: no command draining, no pause gating, no
+    /// snapshot pushes.
+    pub control: Option<ControlHandle>,
 }
 
 /// Runs the unified event loop: consumes `market_events` in order
@@ -181,6 +188,7 @@ pub async fn run_unified_event_loop(
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut recorded_initial_equity = false;
     let mut risk_checker = config.risk_checker;
+    let mut control = config.control;
 
     // Extreme-market circuit breaker (design spec
     // `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`):
@@ -531,7 +539,16 @@ pub async fn run_unified_event_loop(
                     margin_status: &margin_status,
                     now: timestamp,
                 };
-                let intents = strategy.on_market_event(&event, &ctx);
+                let intents = if control.as_ref().is_some_and(ControlHandle::is_paused) {
+                    // Paused: no new decisions this tick. Everything
+                    // BEFORE this point (funding settlement, margin
+                    // status, auto-liquidation, de-risking) already ran
+                    // unconditionally above and is unaffected by pause
+                    // state.
+                    Vec::new()
+                } else {
+                    strategy.on_market_event(&event, &ctx)
+                };
 
                 for intent in intents {
                     // Re-fetched per intent (not reusing `open_orders`
@@ -637,6 +654,32 @@ pub async fn run_unified_event_loop(
 
                 let equity = ledger.equity(&last_prices)?;
                 overall_tracker.record_equity_point(timestamp, equity);
+
+                if let Some(handle) = &mut control {
+                    let drain_result = handle.drain_commands(&mut strategy);
+                    if drain_result.stop_requested {
+                        break;
+                    }
+
+                    // Throttle check happens BEFORE constructing/cloning
+                    // the `SessionSnapshot` -- avoids a wasted
+                    // allocation on a snapshot that would just be
+                    // thrown away by `maybe_push_snapshot`'s own
+                    // (redundant, but harmless) throttle check.
+                    if handle.is_snapshot_due() {
+                        let snapshot = SessionSnapshot {
+                            positions: ledger.positions().clone(),
+                            balances: ledger.balances().clone(),
+                            equity,
+                            realized_pnl: ledger.realized_pnl().clone(),
+                            margin_status: margin_status.clone(),
+                            params: strategy.current_params(),
+                            paused: handle.is_paused(),
+                            timestamp,
+                        };
+                        handle.maybe_push_snapshot(snapshot);
+                    }
+                }
             }
 
             Some(fills) = supplemental_fill_stream.next() => {
@@ -846,6 +889,7 @@ pub type UnifiedLoopReport = BacktestReport;
 mod tests {
     use super::*;
     use crate::clock::ReplaySpeed;
+    use crate::control::SessionCommand;
     use crate::cost_model::FlatFeeSchedule;
     use crate::matching_engine::MatchingEngine;
     use crate::order_executor_adapter::{
@@ -858,6 +902,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use rust_decimal_macros::dec;
     use std::sync::Mutex;
+    use tokio::sync::mpsc;
 
     fn btcusdt_perpetual_instrument() -> Instrument {
         Instrument {
@@ -1038,6 +1083,7 @@ mod tests {
             risk_checker: None,
             margin_tiers,
             market_condition_config: None,
+            control: None,
         }
     }
 
@@ -1304,6 +1350,7 @@ mod tests {
             risk_checker: None,
             margin_tiers: HashMap::new(),
             market_condition_config: None,
+            control: None,
         };
 
         let report = run(
@@ -1354,6 +1401,7 @@ mod tests {
                 account_equity_volatility_threshold: None,
                 include_spot: true, // this test uses a SPOT buy-once strategy
             }),
+            control: None,
         };
 
         let report = run(
@@ -1369,5 +1417,241 @@ mod tests {
         assert_eq!(report.trades.len(), 2);
         assert_eq!(report.trades[0].side, Side::Buy);
         assert_eq!(report.trades[1].side, Side::Sell);
+    }
+
+    /// Buys 1 BTC spot on EVERY market event (not just once) -- used to
+    /// distinguish "strategy dispatch happened" from "strategy dispatch
+    /// was skipped because the session was paused".
+    struct AlwaysBuyStrategy;
+
+    impl Strategy for AlwaysBuyStrategy {
+        fn on_market_event(
+            &mut self,
+            _event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            vec![OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: apexes_core::Venue::Binance,
+                asset_class: AssetClass::Perpetual,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(0.01),
+                price: None,
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            }]
+        }
+    }
+
+    fn empty_session_snapshot() -> crate::control::SessionSnapshot {
+        crate::control::SessionSnapshot {
+            positions: HashMap::new(),
+            balances: HashMap::new(),
+            equity: Decimal::ZERO,
+            realized_pnl: HashMap::new(),
+            margin_status: HashMap::new(),
+            params: HashMap::new(),
+            paused: false,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// A `Pause` command sent before the loop starts must take effect
+    /// starting the tick AFTER it is drained (per `ControlHandle`'s
+    /// documented drain point at the END of each market-event tick):
+    /// the first tick still dispatches to the strategy normally, every
+    /// tick after the pause is drained produces no new intents/fills,
+    /// but `record_equity_point` keeps being called every tick
+    /// regardless (funding/margin/liquidation/de-risking are
+    /// unaffected by pause state).
+    #[tokio::test]
+    async fn paused_session_stops_producing_new_intents_but_keeps_updating_equity() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(100), t0 + Duration::seconds(2)),
+            trade_event(dec!(100), t0 + Duration::seconds(3)),
+            trade_event(dec!(100), t0 + Duration::seconds(4)),
+        ];
+        let num_events = events.len();
+
+        let (control_handle, command_tx, _snapshot_rx) = ControlHandle::new(
+            std::time::Duration::from_secs(3600),
+            empty_session_snapshot(),
+        );
+        // Queued before the loop starts -- drained at the end of the
+        // FIRST tick, so the first Trade event still dispatches
+        // normally and every Trade event after it is paused.
+        command_tx.send(SessionCommand::Pause).unwrap();
+
+        let config = unified_loop_config(dec!(10000), None, HashMap::new());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            ..config
+        };
+
+        let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
+
+        // Only the first (depth-snapshot) tick's buy went through --
+        // the Pause command drains at the end of that tick, so every
+        // subsequent Trade tick is paused and produces no new intents.
+        assert_eq!(report.trades.len(), 1);
+        // One equity point per event plus the initial pre-first-tick
+        // point -- proving equity kept recording every tick, paused or
+        // not.
+        assert_eq!(report.equity_curve.len(), num_events + 1);
+    }
+
+    /// A strategy that reads a hot-updatable `threshold` param (shared
+    /// via `Arc<Mutex<Decimal>>`, exposed through `current_params`/
+    /// `set_param`) and only buys when the observed trade price exceeds
+    /// it. On the FIRST Trade event it sees, it also sends a
+    /// `SetParam` command through `command_tx` (simulating an external
+    /// operator sending a live-tuning command mid-run) -- since
+    /// `ControlHandle::drain_commands` runs AFTER this dispatch each
+    /// tick, the command sent during THIS tick's dispatch is only
+    /// visible starting the NEXT tick's dispatch.
+    struct ThresholdBuyStrategy {
+        threshold: Arc<Mutex<Decimal>>,
+        command_tx: mpsc::UnboundedSender<SessionCommand>,
+        sent_command: bool,
+    }
+
+    impl Strategy for ThresholdBuyStrategy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            let MarketEvent::Trade(trade) = event else {
+                return Vec::new();
+            };
+            if !self.sent_command {
+                self.sent_command = true;
+                self.command_tx
+                    .send(SessionCommand::SetParam {
+                        name: "threshold".to_string(),
+                        value: dec!(50),
+                    })
+                    .expect("receiver still alive");
+            }
+            let threshold = *self.threshold.lock().unwrap_or_else(|p| p.into_inner());
+            if trade.price > threshold {
+                return vec![OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Perpetual,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(0.01),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
+                }];
+            }
+            Vec::new()
+        }
+
+        fn current_params(&self) -> HashMap<String, Decimal> {
+            let mut params = HashMap::new();
+            params.insert(
+                "threshold".to_string(),
+                *self.threshold.lock().unwrap_or_else(|p| p.into_inner()),
+            );
+            params
+        }
+
+        fn set_param(
+            &mut self,
+            name: &str,
+            value: Decimal,
+        ) -> Result<(), apexes_strategy::StrategyError> {
+            if name != "threshold" {
+                return Err(apexes_strategy::StrategyError::UnknownParam {
+                    name: name.to_string(),
+                });
+            }
+            *self.threshold.lock().unwrap_or_else(|p| p.into_inner()) = value;
+            Ok(())
+        }
+    }
+
+    /// A `SetParam` command sent DURING the first Trade tick's
+    /// dispatch is only drained AFTER that tick's dispatch, so that
+    /// same tick still observes the OLD threshold (no buy); the SECOND
+    /// Trade tick's dispatch observes the NEW threshold (buys).
+    #[tokio::test]
+    async fn set_param_command_changes_strategy_behavior_next_tick() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(100), t0 + Duration::seconds(2)),
+        ];
+
+        let (control_handle, command_tx, _snapshot_rx) = ControlHandle::new(
+            std::time::Duration::from_secs(3600),
+            empty_session_snapshot(),
+        );
+
+        let config = unified_loop_config(dec!(10000), None, HashMap::new());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            ..config
+        };
+
+        let report = run(
+            config,
+            zero_cost_model(None),
+            events,
+            ThresholdBuyStrategy {
+                threshold: Arc::new(Mutex::new(dec!(1000000))),
+                command_tx,
+                sent_command: false,
+            },
+        )
+        .await;
+
+        // The first Trade tick (threshold still 1_000_000) produced no
+        // buy; only the second Trade tick (threshold now 50) did.
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].side, Side::Buy);
+    }
+
+    /// Regression guard for this task itself: `control: None` (the
+    /// default at every pre-existing call site) must behave exactly
+    /// like the pre-this-task code -- a fixed, known-good numeric
+    /// outcome for the same buy-once scenario `unified_loop_config`'s
+    /// other consumers already exercise.
+    #[tokio::test]
+    async fn control_none_behaves_identically_to_before_this_task() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+        ];
+
+        let config = unified_loop_config(dec!(10000), None, HashMap::new());
+        assert!(config.control.is_none());
+
+        let report = run(
+            config,
+            zero_cost_model(None),
+            events,
+            BuyOnceStrategy { bought: false },
+        )
+        .await;
+
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].side, Side::Buy);
+        assert_eq!(report.trades[0].quantity, dec!(1));
     }
 }

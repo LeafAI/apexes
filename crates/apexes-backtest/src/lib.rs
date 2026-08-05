@@ -15,6 +15,8 @@
 
 pub mod error;
 
+pub mod control;
+
 pub mod ems_adapter;
 
 pub mod order_executor_adapter;
@@ -51,6 +53,7 @@ pub mod unified_loop;
 
 pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
+pub use control::{ControlHandle, SessionCommand, SessionSnapshot};
 pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
 };

@@ -14,7 +14,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 barter-data = { workspace = true }
 barter = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync"] }
 futures = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = "1.40"
