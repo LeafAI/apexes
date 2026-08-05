@@ -28,4 +28,7 @@ pub enum StrategyError {
 
     #[error("`on_market_event` is defined but is not a function")]
     EntryPointNotCallable,
+
+    #[error("unknown parameter: {name}")]
+    UnknownParam { name: String },
 }

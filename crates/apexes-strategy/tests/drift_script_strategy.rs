@@ -391,3 +391,108 @@ fn uses_signals_produces_rebalance_order_once_warm() {
         );
     });
 }
+
+#[test]
+fn top_level_param_call_does_not_hot_reload() {
+    with_runtime(|| {
+        // `x` is bound at the script's TOP LEVEL from `param("x", 1)`,
+        // which executes exactly once at construction time (before
+        // `set_param` is ever called). Calling `set_param("x", 99)`
+        // afterwards updates the shared `ParamStore`, but nothing in the
+        // script re-invokes `param(...)` on subsequent ticks -- the
+        // top-level `let x = ...` already captured the DriftValue
+        // produced by that one call. So `on_market_event`'s behavior
+        // (branching on `x > 50`) must stay pinned to the ORIGINAL value
+        // (1), never observing 99.
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("top_level_param.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now,
+        };
+        let event = sample_trade_event();
+
+        // Baseline: x == 1, 1 > 50 is false -> no orders.
+        assert_eq!(strategy.on_market_event(&event, &ctx).len(), 0);
+
+        strategy.set_param("x", dec!(99)).unwrap();
+
+        // Even though the store now holds 99, the top-level `let x`
+        // binding was already fixed at construction time -- behavior is
+        // UNCHANGED.
+        assert_eq!(
+            strategy.on_market_event(&event, &ctx).len(),
+            0,
+            "a top-level param() call must NOT hot-reload after set_param"
+        );
+    });
+}
+
+#[test]
+fn inside_on_market_event_param_call_does_hot_reload() {
+    with_runtime(|| {
+        // `hot_reloadable_param.drift` calls `param("threshold", 0.2)`
+        // INSIDE `on_market_event`'s body, so it re-reads the shared
+        // `ParamStore` on every call -- a `set_param` between two calls
+        // must change subsequent behavior.
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("hot_reloadable_param.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now,
+        };
+        // Price 65000, default threshold 0.2 -> 65000 > 0.2 -> buy.
+        let event = sample_trade_event();
+
+        let baseline = strategy.on_market_event(&event, &ctx);
+        assert_eq!(baseline.len(), 1, "baseline threshold 0.2 should buy");
+
+        // Raise the threshold above the event's price -- the very next
+        // call must observe the new value and stop buying.
+        strategy.set_param("threshold", dec!(1_000_000)).unwrap();
+
+        let after_update = strategy.on_market_event(&event, &ctx);
+        assert_eq!(
+            after_update.len(),
+            0,
+            "param() called inside on_market_event must hot-reload after set_param"
+        );
+    });
+}
+
+#[test]
+fn current_params_reflects_last_set_value() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("hot_reloadable_param.drift")).unwrap();
+
+        strategy.set_param("threshold", dec!(42)).unwrap();
+
+        let params = strategy.current_params();
+        assert_eq!(params.get("threshold"), Some(&dec!(42)));
+    });
+}
+
+#[test]
+fn set_param_on_unknown_name_still_succeeds() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("hot_reloadable_param.drift")).unwrap();
+
+        let result = strategy.set_param("never_declared_by_the_script", dec!(7));
+        assert!(result.is_ok());
+
+        let params = strategy.current_params();
+        assert_eq!(params.get("never_declared_by_the_script"), Some(&dec!(7)));
+    });
+}

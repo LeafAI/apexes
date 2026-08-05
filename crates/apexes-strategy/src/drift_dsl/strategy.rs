@@ -4,10 +4,14 @@
 //! compile cycle.
 
 use drift_script::{DriftValue, Interpreter, ScriptParser};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::drift_dsl::bindings::build_ctx_drift_value;
 use crate::drift_dsl::convert::{market_event_to_drift_value, order_intents_from_drift_value};
+use crate::drift_dsl::params::ParamStore;
 use crate::error::StrategyError;
 use crate::strategy::{OrderIntent, Strategy, StrategyContext};
 
@@ -17,9 +21,14 @@ use crate::strategy::{OrderIntent, Strategy, StrategyContext};
 /// ([`DriftScriptStrategy::from_file`]); `drift-script-math`'s `math.*`
 /// bindings are registered automatically, so scripts can use
 /// `math.mean()`/`math.stddev()`/etc. out of the box.
+///
+/// A script's `param(name, default)` calls read/write a shared
+/// [`ParamStore`] (`self.params`) -- see `crate::drift_dsl::params` for
+/// the full top-level-vs-inside-`on_market_event` hot-reload semantics.
 pub struct DriftScriptStrategy {
     interpreter: Interpreter,
     on_market_event_fn: DriftValue,
+    params: Arc<ParamStore>,
 }
 
 impl DriftScriptStrategy {
@@ -64,7 +73,8 @@ impl DriftScriptStrategy {
         drift_script_math::register_to(&interpreter);
         crate::drift_dsl::indicators::register_to(&interpreter);
         crate::drift_dsl::signals::register_to(&interpreter);
-        crate::drift_dsl::params::register_to(&interpreter, overrides);
+        let params = Arc::new(ParamStore::new(overrides));
+        crate::drift_dsl::params::register_to(&interpreter, Arc::clone(&params));
 
         let handle = tokio::runtime::Handle::current();
         handle
@@ -83,6 +93,7 @@ impl DriftScriptStrategy {
         Ok(Self {
             interpreter,
             on_market_event_fn,
+            params,
         })
     }
 }
@@ -120,5 +131,22 @@ impl Strategy for DriftScriptStrategy {
                 vec![]
             }
         }
+    }
+
+    fn current_params(&self) -> HashMap<String, Decimal> {
+        self.params.snapshot()
+    }
+
+    fn set_param(&mut self, name: &str, value: Decimal) -> Result<(), StrategyError> {
+        // A script that never calls `param(name, ...)` for this exact
+        // name has no way to know this name exists -- accept the write
+        // anyway (store it), since a FUTURE param(name, ...) call (e.g.
+        // the script gets edited and relaunched, or the name is simply
+        // not yet reached in execution order) would then see it.
+        // Returning UnknownParam here would require tracking "names
+        // this script has ever declared", which `ParamStore`
+        // intentionally does not do.
+        self.params.set(name.to_string(), value);
+        Ok(())
     }
 }

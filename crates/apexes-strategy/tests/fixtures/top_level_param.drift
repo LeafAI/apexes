@@ -1,0 +1,16 @@
+let x = param("x", 1);
+
+function on_market_event(event, ctx) {
+  if (x > 50) {
+    return [{
+      symbol: event.symbol,
+      venue: event.venue,
+      asset_class: "spot",
+      side: "buy",
+      order_type: "market",
+      quantity: 1,
+    }];
+  }
+
+  return [];
+}

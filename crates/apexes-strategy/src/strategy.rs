@@ -19,6 +19,28 @@ pub trait Strategy: Send {
         event: &apexes_core::MarketEvent,
         ctx: &StrategyContext,
     ) -> Vec<OrderIntent>;
+
+    /// Reads all currently-tunable parameter values, for monitoring/
+    /// snapshot display. Default: no tunable parameters (empty map) --
+    /// existing `Strategy` implementations need no changes to keep
+    /// compiling and behaving identically.
+    fn current_params(&self) -> HashMap<String, Decimal> {
+        HashMap::new()
+    }
+
+    /// Hot-updates one parameter by name. Default: a no-op that always
+    /// succeeds -- implementations that don't support tuning don't need
+    /// to override this. `Err(StrategyError::UnknownParam { name })`
+    /// signals "this strategy has no parameter by this name" (for a
+    /// caller, e.g. a UI, to surface as an error rather than silently
+    /// accepting an update that does nothing).
+    fn set_param(
+        &mut self,
+        _name: &str,
+        _value: Decimal,
+    ) -> Result<(), crate::error::StrategyError> {
+        Ok(())
+    }
 }
 
 /// Read-only view of current backtest/live state, passed to
@@ -301,5 +323,21 @@ mod tests {
 
         assert_eq!(ctx.positions.get("BTCUSDT").unwrap().quantity, dec!(2));
         assert_eq!(ctx.now, now);
+    }
+
+    #[test]
+    fn default_current_params_and_set_param_are_a_no_op_for_a_strategy_that_does_not_override_them()
+    {
+        // `AlwaysBuyOneUnit` (defined above) does not override either
+        // new trait method -- proving the defaults work for a caller
+        // that hasn't opted into tunable parameters at all.
+        let mut strategy = AlwaysBuyOneUnit {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+        };
+
+        assert!(strategy.current_params().is_empty());
+        assert!(strategy.set_param("anything", dec!(1)).is_ok());
+        assert!(strategy.current_params().is_empty());
     }
 }
