@@ -1021,7 +1021,8 @@ mod tests {
         let mut now = Utc::now();
         // 4 slices, 10s apart (40s / 4) -- advance virtual time in 10s
         // steps, calling on_market_event once per step, exactly as
-        // run_event_loop would for a sequence of real MarketEvents.
+        // the shared unified event loop would for a sequence of real
+        // MarketEvents.
         for _ in 0..4 {
             ems.on_market_event(&depth_event(now)).await.unwrap();
             now += chrono::Duration::seconds(10);

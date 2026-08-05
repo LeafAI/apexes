@@ -11,8 +11,9 @@ use rust_decimal::Decimal;
 use crate::error::EmsError;
 
 /// A request to schedule an algorithmically-paced "parent" order.
-/// Constructed by a caller (`run_event_loop`/`run_live_trading`, Task
-/// 17) from an `OrderIntent` whose `execution_algo` is `Some(..)`.
+/// Constructed by a caller (`apexes_backtest`'s shared unified event
+/// loop, driving `run_backtest`/`run_paper_trading`/`run_live_trading`,
+/// Task 17) from an `OrderIntent` whose `execution_algo` is `Some(..)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlgoOrderRequest {
     pub symbol: String,

@@ -9,11 +9,11 @@
 //! Backtest: `apexes_backtest` provides a `StorageReaderMarkPriceProvider`
 //! (defined there, not here or in `apexes-storage` -- see this plan's
 //! Global Constraints for why). Paper/live trading: no implementation
-//! of this trait is needed at all -- `run_event_loop`/`run_live_trading`
-//! already receive `MarketEvent::MarkPrice` directly and maintain a
-//! plain `HashMap<String, Decimal>` (mirroring the existing
-//! `last_prices` pattern), passed straight into `PortfolioLedger`'s
-//! margin methods without going through this trait.
+//! of this trait is needed at all -- `apexes_backtest`'s shared
+//! unified event loop already receives `MarketEvent::MarkPrice`
+//! directly and maintains a plain `HashMap<String, Decimal>` (mirroring
+//! the existing `last_prices` pattern), passed straight into
+//! `PortfolioLedger`'s margin methods without going through this trait.
 
 use apexes_core::{ApexesError, Venue};
 use async_trait::async_trait;

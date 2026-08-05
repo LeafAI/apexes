@@ -209,7 +209,7 @@ impl MarketEventBus {
 /// returned by `MarketEventBus::subscribe`/`subscribe_downsampled`)
 /// into a `Stream<Item = MarketEvent> + Unpin`, so it can be passed
 /// anywhere this project's existing code expects a plain `MarketEvent`
-/// stream (e.g. `apexes_backtest::event_loop::run_event_loop`). A
+/// stream (e.g. `apexes_backtest::unified_loop::run_unified_event_loop`). A
 /// `Lagged(n)` error (a slow consumer that fell behind) is caught,
 /// logged via `tracing::warn!` with the lag count, and skipped --
 /// matching `MarketEventBus`'s own established lagged-receiver

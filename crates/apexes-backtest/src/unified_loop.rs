@@ -1,14 +1,16 @@
 //! The single unified event-loop core (`run_unified_event_loop`) driving
 //! `run_backtest` (historical replay, `Vec<MarketEvent>` wrapped as a
 //! `Stream`), `apexes-paper`'s `run_paper_trading` (live
-//! `MarketDataProvider::subscribe()` stream), and -- once a later plan
-//! task re-points it -- `apexes-live-trading`'s `run_live_trading`.
+//! `MarketDataProvider::subscribe()` stream), and
+//! `apexes-live-trading`'s `run_live_trading` (live exchange
+//! push-updates + reconcile poll).
 //!
-//! This module replaces the former `crate::event_loop::run_event_loop`
-//! (same file, renamed: see design spec
-//! `2026-08-06-apexes-trading-loop-unification-design.md`). The logic is
-//! unchanged; only the MECHANISM by which orders reach an execution
-//! backend changed, from direct `MatchingEngine` method calls to the
+//! This module replaces a formerly per-crate-duplicated hand-written
+//! event loop (see design spec
+//! `2026-08-06-apexes-trading-loop-unification-design.md`). The core
+//! per-tick logic is unchanged from what each caller used to do
+//! directly; only the MECHANISM by which orders reach an execution
+//! backend changed, from direct backend-specific method calls to the
 //! three `apexes_strategy` traits:
 //!
 //! - [`OrderExecutor`] -- submits intents, reacts to market events with
@@ -212,9 +214,9 @@ pub async fn run_unified_event_loop(
     let mut supplemental_fill_stream = supplemental_fills.stream();
 
     loop {
-        // Polled at the top of each iteration, exactly as the former
-        // `run_event_loop` did -- NOT as a `tokio::select!` arm.
-        // `run_paper_trading` depends on this precise shape: it gates
+        // Polled at the top of each iteration -- NOT as a
+        // `tokio::select!` arm. Both `run_paper_trading` and
+        // `run_live_trading` depend on this precise shape: each gates
         // its own event stream with `take_until(stop_signal)` because
         // this loop only observes the signal here, and moving the check
         // into the `select!` below would change that documented

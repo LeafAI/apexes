@@ -321,8 +321,8 @@ impl OrderManager {
 
         // Keep `filled_quantity` in sync with the fills actually
         // recorded for this transition, mirroring
-        // `apexes_backtest::event_loop::run_event_loop`'s equivalent
-        // increment -- without this, `filled_quantity` would stay at
+        // `apexes_backtest::unified_loop::run_unified_event_loop`'s
+        // equivalent increment -- without this, `filled_quantity` would stay at
         // its `submit_order`-time value of zero for the entire life of
         // every live-traded order, even after Binance reports
         // PartiallyFilled/Filled, silently misrepresenting the

@@ -39,12 +39,13 @@ pub struct MatchingEngineOrderExecutor {
     /// Every order this executor has ever submitted, keyed by
     /// `OrderId`. `MatchingEngine` itself keeps no such lookup table
     /// (see `ems_adapter`'s `submitted` field for the same precedent),
-    /// so this adapter keeps its own -- taking over the role the
-    /// former `run_event_loop`'s local `open_orders: HashMap<OrderId, Order>`
-    /// played, including that it is NEVER pruned on terminal status (preserving
-    /// that exact, however unbounded, existing behavior is required by
-    /// this plan's behavior-preservation constraint, not a defect this
-    /// task is meant to fix).
+    /// so this adapter keeps its own -- taking over the role a
+    /// caller's own local `open_orders: HashMap<OrderId, Order>` map
+    /// used to play before this crate's event loop was unified. NEVER
+    /// pruned on terminal status (preserving that exact, however
+    /// unbounded, existing behavior is required by this plan's
+    /// behavior-preservation constraint, not a defect this task is
+    /// meant to fix).
     open_orders: Mutex<HashMap<OrderId, Order>>,
 }
 
