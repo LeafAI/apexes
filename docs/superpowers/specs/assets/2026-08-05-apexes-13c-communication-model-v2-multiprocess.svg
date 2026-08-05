@@ -1,0 +1,241 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1140" viewBox="0 0 1320 1140" font-family="Menlo, Consolas, monospace">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b3261e"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a7a3c"/>
+    </marker>
+  </defs>
+
+  <style>
+    .box-new { fill: #fff3cd; stroke: #b3261e; stroke-width: 1.5; stroke-dasharray: 5,3; }
+    .box-existing { fill: #eef4ff; stroke: #2b5ea8; stroke-width: 1.5; }
+    .box-mode { fill: #ffffff; stroke: #b3261e; stroke-width: 1.2; }
+    .box-gateway { fill: #e8f7ee; stroke: #1a7a3c; stroke-width: 1.5; }
+    .process { fill: none; stroke: #555; stroke-width: 2; }
+    .group { fill: none; stroke: #888; stroke-width: 1; stroke-dasharray: 4,3; }
+    .title { font-size: 13px; font-weight: bold; fill: #111; }
+    .proctitle { font-size: 12.5px; font-weight: bold; fill: #333; }
+    .sub { font-size: 10.5px; fill: #333; }
+    .label { font-size: 10px; fill: #444; }
+    .edge { stroke: #333; stroke-width: 1.4; fill: none; }
+    .edge-new { stroke: #b3261e; stroke-width: 1.4; fill: none; }
+    .edge-gateway { stroke: #1a7a3c; stroke-width: 1.4; fill: none; }
+    .legend-text { font-size: 11px; fill: #222; }
+    .warn { font-size: 11px; fill: #b3261e; font-weight: bold; }
+  </style>
+
+  <rect x="0" y="0" width="1320" height="1120" fill="#fafafa"/>
+  <text x="20" y="26" class="title" font-size="16">Apexes #13c v2: Multi-Process Communication Model (supersedes v1 in-process design)</text>
+  <text x="20" y="44" class="sub">existing (13a, blue solid) / new (13c, red dashed) / new gateway (row 8.3 min-viable, green solid) -- FOUR separate OS processes</text>
+
+  <!-- ============= Process 1: apexes-market-data-gateway ============= -->
+  <rect x="40" y="70" width="380" height="330" class="process" rx="8"/>
+  <text x="55" y="92" class="proctitle">Process: apexes-market-data-gateway (NEW, row 8.3 min-viable)</text>
+  <text x="55" y="106" class="label">one instance, shared by all engine processes + apexes-ui</text>
+
+  <rect x="55" y="118" width="350" height="60" class="box-gateway" rx="5"/>
+  <text x="65" y="138" class="sub">BinanceMarketDataProvider (real, existing)</text>
+  <text x="65" y="154" class="label">subscribes once to upstream exchange</text>
+  <text x="65" y="168" class="label">at process startup</text>
+
+  <rect x="55" y="188" width="350" height="70" class="box-gateway" rx="5"/>
+  <text x="65" y="208" class="sub">gateway.rs -- subscriber registry</text>
+  <text x="65" y="224" class="label">GET /market?replay_from=&lt;ts&gt; (WS)</text>
+  <text x="65" y="238" class="label">broadcasts MarketEvent JSON to N clients</text>
+  <text x="65" y="252" class="label">(one upstream conn, many downstream conns)</text>
+
+  <rect x="55" y="268" width="350" height="60" class="box-gateway" rx="5"/>
+  <text x="65" y="288" class="sub">replay.rs -- StorageReader.read_batch(..)</text>
+  <text x="65" y="304" class="label">per symbol x event_type, day-granularity range,</text>
+  <text x="65" y="318" class="label">merged by timestamp, replayed then live-switched</text>
+
+  <rect x="55" y="338" width="350" height="50" class="box-gateway" rx="5"/>
+  <text x="65" y="358" class="sub">async batched StorageWriter.write_batch(..)</text>
+  <text x="65" y="374" class="label">homogeneous batches, size/time-triggered flush</text>
+
+  <!-- pid file -->
+  <text x="115" y="414" class="label" fill="#1a7a3c">writes ~/.apexes/market-data-gateway.pid on startup</text>
+
+  <!-- ============= apexes-storage (existing, external to gateway box conceptually but drawn separate) ============= -->
+  <rect x="470" y="270" width="220" height="90" class="box-existing" rx="6"/>
+  <text x="485" y="293" class="sub">apexes-storage</text>
+  <text x="485" y="309" class="label">(existing, ClickHouse)</text>
+  <text x="485" y="325" class="label">StorageWriter / StorageReader</text>
+  <text x="485" y="341" class="label">reused as-is, no schema change</text>
+
+  <path d="M405,340 L470,340" class="edge-gateway" marker-end="url(#arrowGreen)" fill="none"/>
+  <text x="380" y="350" class="label" fill="#1a7a3c">write_batch (async)</text>
+  <path d="M470,320 L405,320" class="edge-gateway" marker-end="url(#arrowGreen)" fill="none"/>
+  <text x="380" y="310" class="label" fill="#1a7a3c">read_batch(replay)</text>
+
+  <!-- upstream exchange -->
+  <rect x="470" y="120" width="220" height="60" class="box-existing" rx="6"/>
+  <text x="485" y="143" class="sub">Binance (real upstream)</text>
+  <text x="485" y="159" class="label">exchange, outside this system</text>
+  <path d="M405,148 L470,148" class="edge-gateway" marker-end="url(#arrowGreen)" fill="none"/>
+  <text x="360" y="140" class="label" fill="#1a7a3c">real WS feed (existing)</text>
+
+  <!-- ============= Process 2: apexes-engine (one per session) ============= -->
+  <rect x="40" y="430" width="860" height="380" class="process" rx="8"/>
+  <text x="55" y="452" class="proctitle">Process: apexes-engine (NEW, ONE PER SESSION)</text>
+  <text x="55" y="466" class="label">optional CPU affinity via --cpu-cores (core_affinity crate)</text>
+
+  <text x="55" y="488" class="warn">main.rs picks exactly ONE, per LaunchConfig.mode:</text>
+
+  <rect x="55" y="498" width="160" height="70" class="box-mode" rx="5"/>
+  <text x="65" y="518" class="sub">run_backtest</text>
+  <text x="65" y="534" class="label">apexes-backtest</text>
+  <text x="65" y="548" class="label">(library fn, unchanged)</text>
+
+  <rect x="230" y="498" width="160" height="70" class="box-mode" rx="5"/>
+  <text x="240" y="518" class="sub">run_paper_trading</text>
+  <text x="240" y="534" class="label">apexes-paper</text>
+  <text x="240" y="548" class="label">(library fn, unchanged)</text>
+
+  <rect x="405" y="498" width="175" height="70" class="box-mode" rx="5"/>
+  <text x="415" y="518" class="sub">run_live_trading</text>
+  <text x="415" y="534" class="label">apexes-live-trading</text>
+  <text x="415" y="548" class="label">(library fn, unchanged)</text>
+
+  <path d="M135,574 L135,600" class="edge-new" marker-end="url(#arrowRed)"/>
+  <path d="M310,574 L310,600" class="edge-new" marker-end="url(#arrowRed)"/>
+  <path d="M492,574 L492,600" class="edge-new" marker-end="url(#arrowRed)"/>
+
+  <rect x="55" y="600" width="525" height="100" class="box-new" rx="5"/>
+  <text x="65" y="621" class="sub">ControlHandle (NEW) -- wired into UnifiedLoopConfig.control, all 3 modes identical</text>
+  <text x="75" y="640" class="label">watch OUT: SessionSnapshot, throttled to snapshot_min_interval (default 500ms)</text>
+  <text x="75" y="656" class="label">mpsc IN: SetParam(name,value) / Pause / Resume / Stop</text>
+  <text x="75" y="674" class="label">Pause: on_market_event skipped, but funding/margin/fills still processed</text>
+  <text x="75" y="690" class="label">Strategy::current_params() / set_param() -- new optional trait methods</text>
+
+  <rect x="55" y="712" width="525" height="60" class="box-new" rx="5"/>
+  <text x="65" y="733" class="sub">strategy_loader.rs</text>
+  <text x="75" y="750" class="label">DriftScript::from_file(path) OR compile-time Rust-native table lookup</text>
+  <text x="75" y="763" class="label">chosen by LaunchConfig.strategy_ref</text>
+
+  <rect x="55" y="782" width="525" height="16" class="box-gateway" rx="4"/>
+  <text x="65" y="793" class="label">subscribes to gateway's /market (NOT a direct Binance connection)</text>
+
+  <!-- gateway.rs subscriber registry -> engine's market subscription box -->
+  <path d="M55,228 L25,228 L25,790 L55,790" class="edge-gateway" marker-end="url(#arrowGreen)" fill="none"/>
+  <text x="20" y="411" class="label" fill="#1a7a3c">GET /market (WS)</text>
+
+  <!-- engine own WS server -->
+  <rect x="620" y="600" width="270" height="130" class="box-new" rx="6"/>
+  <text x="635" y="622" class="sub">axum WS server (per engine)</text>
+  <text x="645" y="642" class="label">/session/ws (bidirectional)</text>
+  <text x="645" y="658" class="label">SessionMessage::Snapshot { .. }</text>
+  <text x="645" y="674" class="label">SessionMessage::Command { .. }</text>
+  <text x="645" y="694" class="label">writes engine's own PID to a</text>
+  <text x="645" y="708" class="label">location apexes-ui recorded at spawn</text>
+
+  <path d="M580,650 L620,650" class="edge-new" marker-end="url(#arrowRed)"/>
+
+  <!-- ============= Process 3: apexes-ui ============= -->
+  <rect x="960" y="70" width="320" height="720" class="process" rx="8"/>
+  <text x="975" y="92" class="proctitle">Process: apexes-ui (thin client, no trading logic)</text>
+
+  <rect x="975" y="105" width="290" height="90" class="box-existing" rx="5"/>
+  <text x="985" y="126" class="sub">Server task (axum, existing 13a)</text>
+  <text x="995" y="144" class="label">/ws (existing) -- forwards from its own</text>
+  <text x="995" y="158" class="label">subscription to the gateway's /market</text>
+  <text x="995" y="172" class="label">(NOT its own upstream Binance conn)</text>
+
+  <path d="M975,193 L405,193" class="edge-gateway" marker-end="url(#arrowGreen)" fill="none"/>
+  <text x="720" y="180" class="label" fill="#1a7a3c">GET /market (WS,apexes-ui as a client too)</text>
+
+  <rect x="975" y="205" width="290" height="130" class="box-new" rx="5"/>
+  <text x="985" y="227" class="sub">Process supervisor (NEW)</text>
+  <text x="995" y="246" class="label">checks gateway PID file; spawns gateway</text>
+  <text x="995" y="260" class="label">via std::process::Command if not alive</text>
+  <text x="995" y="278" class="label">spawns one apexes-engine process per</text>
+  <text x="995" y="292" class="label">launch (records PID + /session/ws port)</text>
+  <text x="995" y="310" class="label">on repeated reconnect failure (5x, 500ms</text>
+  <text x="995" y="324" class="label">doubling/30s cap): re-spawn same LaunchConfig</text>
+
+  <path d="M975,230 L420,230" class="edge-new" marker-end="url(#arrowRed)" fill="none"/>
+  <text x="750" y="220" class="label" fill="#b3261e">spawn (Command) -- gateway, if needed</text>
+
+  <path d="M975,300 L870,300 L870,430" class="edge-new" marker-end="url(#arrowRed)" fill="none"/>
+  <text x="730" y="290" class="label" fill="#b3261e">spawn (Command) -- one engine per session</text>
+
+  <rect x="975" y="345" width="290" height="100" class="box-new" rx="5"/>
+  <text x="985" y="367" class="sub">Client task (extended 13c)</text>
+  <text x="995" y="386" class="label">consumes /session/ws: Snapshot in,</text>
+  <text x="995" y="400" class="label">Command out (SetParam/Pause/Resume/Stop)</text>
+  <text x="995" y="414" class="label">reconnect backoff: 500ms doubling / 30s cap</text>
+  <text x="995" y="428" class="label">(reused from existing 13a BackoffState)</text>
+
+  <path d="M890,665 L935,665 L935,420 L975,420" class="edge-new" marker-end="url(#arrowRed)" fill="none"/>
+  <text x="895" y="580" class="label" fill="#b3261e">/session/ws</text>
+  <text x="895" y="592" class="label" fill="#b3261e">(control + snapshot,</text>
+  <text x="895" y="604" class="label" fill="#b3261e">cross-process)</text>
+
+  <rect x="975" y="465" width="290" height="130" class="box-new" rx="5"/>
+  <text x="985" y="487" class="sub">egui/eframe: session launcher tab</text>
+  <text x="995" y="506" class="label">mode / strategy_ref / instruments /</text>
+  <text x="995" y="520" class="label">initial_balances / credentials_ref /</text>
+  <text x="995" y="534" class="label">cpu_cores picker</text>
+  <text x="995" y="554" class="label">strategy list source: local dir scan</text>
+  <text x="995" y="568" class="label">(*.drift) + compiled-in Rust-native table</text>
+  <text x="995" y="582" class="label">(NOT queried from any process -- see note)</text>
+
+  <rect x="975" y="605" width="290" height="150" class="box-new" rx="5"/>
+  <text x="985" y="627" class="sub">egui/eframe: monitoring/tuning tab</text>
+  <text x="995" y="646" class="label">positions / balances / equity /</text>
+  <text x="995" y="660" class="label">realized_pnl / margin_status table</text>
+  <text x="995" y="678" class="label">editable param table -&gt; SetParam</text>
+  <text x="995" y="696" class="label">Pause / Resume / Stop buttons</text>
+  <text x="995" y="716" class="label">existing market table + conn status</text>
+  <text x="995" y="734" class="label">(from /ws, unchanged from 13a)</text>
+
+  <path d="M1120,445 L1120,465" class="edge" marker-end="url(#arrow)"/>
+  <path d="M1120,595 L1120,605" class="edge-new" marker-end="url(#arrowRed)"/>
+
+  <text x="975" y="775" class="label" font-style="italic">Credentials: apexes-ui never sends credentials over the wire.</text>
+  <text x="985" y="789" class="label" font-style="italic">launch_config.credentials_ref is a name only; apexes-engine reads</text>
+  <text x="985" y="803" class="label" font-style="italic">the actual env vars / config file itself at its own startup.</text>
+
+  <!-- ============= Credentials source ============= -->
+  <rect x="40" y="860" width="470" height="90" class="box-new" rx="6"/>
+  <text x="55" y="882" class="title">Credentials (read by apexes-engine's own main.rs only)</text>
+  <text x="65" y="903" class="label">env vars / local config file, keyed by credentials_ref</text>
+  <text x="65" y="919" class="label">-&gt; BinanceGatewayConfig::new(..) at engine startup</text>
+  <text x="65" y="935" class="label">(gateway crates themselves never read env, per their own convention)</text>
+
+  <path d="M280,860 L280,800" class="edge-new" marker-end="url(#arrowRed)"/>
+
+  <!-- ============= Strategy sources ============= -->
+  <rect x="540" y="860" width="440" height="90" class="box-new" rx="6"/>
+  <text x="555" y="882" class="title">Strategy sources (scanned by both apexes-ui and apexes-engine)</text>
+  <text x="565" y="903" class="label">./strategies/*.drift -- filesystem, no registry process needed</text>
+  <text x="565" y="919" class="label">Rust-native table -- compile-time {name -&gt; fn() -&gt; Box&lt;dyn Strategy&gt;}</text>
+  <text x="565" y="935" class="label">duplicated logic in both binaries (or a small shared internal crate)</text>
+
+  <path d="M700,860 L700,752 L580,752" class="edge-new" marker-end="url(#arrowRed)" fill="none"/>
+
+  <!-- ============= Note box ============= -->
+  <rect x="40" y="970" width="1240" height="94" class="box-existing" rx="6"/>
+  <text x="55" y="992" class="title">Design note (v1 -&gt; v2 change)</text>
+  <text x="65" y="1010" class="label">v1 (superseded, see the "-v1-inprocess-superseded" SVG) had apexes-ui directly tokio::spawn the run_* task in its own</text>
+  <text x="65" y="1024" class="label">process, and every apexes-ui/apexes-paper/apexes-live-trading instance independently connected to Binance. v2 replaces</text>
+  <text x="65" y="1038" class="label">both: sessions are separate OS processes (crash/scheduling isolation, CPU affinity), and a shared gateway process removes</text>
+  <text x="65" y="1052" class="label">the redundant per-process upstream connections -- see design spec section 1.3 for the full crash/scheduling-isolation rationale.</text>
+
+  <!-- ============= Legend ============= -->
+  <rect x="50" y="1075" width="18" height="14" class="box-existing"/>
+  <text x="76" y="1087" class="legend-text">existing (13a)</text>
+  <rect x="220" y="1075" width="18" height="14" class="box-new"/>
+  <text x="246" y="1087" class="legend-text">new (13c)</text>
+  <rect x="380" y="1075" width="18" height="14" class="box-gateway"/>
+  <text x="406" y="1087" class="legend-text">new gateway (row 8.3 min-viable)</text>
+  <path d="M 640 1082 L 690 1082" class="edge-new" marker-end="url(#arrowRed)"/>
+  <text x="698" y="1087" class="legend-text">new data flow</text>
+  <path d="M 900 1082 L 950 1082" class="edge-gateway" marker-end="url(#arrowGreen)"/>
+  <text x="958" y="1087" class="legend-text">market-data flow</text>
+</svg>
