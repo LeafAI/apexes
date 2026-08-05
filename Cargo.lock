@@ -517,6 +517,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-market-data-gateway"
+version = "0.1.0"
+dependencies = [
+ "apexes-core",
+ "apexes-message-bus",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "apexes-market-data-hshare"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,247 @@
+//! [`Gateway`]: holds ONE real upstream `MarketDataProvider` connection
+//! and broadcasts every event to N connected WebSocket clients over
+//! `/market`. Deliberately NOT built on `apexes_message_bus::MarketEventBus`
+//! (an in-process-only broadcast wrapper) -- see this crate's own
+//! `lib.rs` docs and the design spec for the full rationale.
+
+use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent};
+use futures::StreamExt;
+use tokio::sync::{Mutex, broadcast};
+
+/// Default `tokio::sync::broadcast` channel capacity used by
+/// `Gateway::new` when a caller doesn't have a specific capacity in
+/// mind -- matches `apexes_message_bus::MarketEventBus`'s own default
+/// for consistency across this project's broadcast-based components.
+const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Whether `connect` has been called yet on this `Gateway` -- guards
+/// the "exactly once, at process startup" constraint documented on
+/// `connect` itself.
+enum ConnectState {
+    NotConnected,
+    Connected,
+}
+
+/// Holds one real upstream `MarketDataProvider` connection and
+/// broadcasts every event it produces to N subscribers via a
+/// `tokio::sync::broadcast::Sender`. A later task's `axum` `/market`
+/// WS handler calls `subscribe()` per incoming client connection and
+/// forwards each received event as a WS frame (see `protocol::Frame`).
+pub struct Gateway {
+    provider: Box<dyn MarketDataProvider>,
+    sender: broadcast::Sender<MarketEvent>,
+    state: Mutex<ConnectState>,
+}
+
+impl Gateway {
+    /// Constructs a `Gateway` wrapping `provider`, with a
+    /// `DEFAULT_BROADCAST_CAPACITY`-sized broadcast channel.
+    pub fn new(provider: Box<dyn MarketDataProvider>, capacity: usize) -> Self {
+        let capacity = if capacity == 0 {
+            DEFAULT_BROADCAST_CAPACITY
+        } else {
+            capacity
+        };
+        let (sender, _receiver) = broadcast::channel(capacity);
+        Self {
+            provider,
+            sender,
+            state: Mutex::new(ConnectState::NotConnected),
+        }
+    }
+
+    /// Subscribes to `instruments` from the real upstream provider ONCE
+    /// (called exactly once, at process startup by `main.rs`, a later
+    /// task) -- this crate does not support subscribing to a second,
+    /// different instrument set later in the same process lifetime
+    /// (matching `MarketEventBus`'s own fixed-instrument-set-per-
+    /// connection constraint, for the same underlying reason: one
+    /// upstream connection, one fixed subscription).
+    ///
+    /// Calling `connect` a second time (on an already-connected
+    /// `Gateway`, regardless of whether `instruments` matches the
+    /// first call) returns `Err(ApexesError::SubscriptionFailed { .. })`
+    /// rather than silently reusing or replacing the existing upstream
+    /// connection -- unlike `MarketEventBus::subscribe`, which lazily
+    /// connects on first call and transparently reuses the connection
+    /// for a matching instrument set on every later call, `connect`
+    /// here is an explicit, one-shot startup action with no lazy path,
+    /// so any second call is treated as caller error.
+    ///
+    /// The forwarding loop below (upstream provider stream ->
+    /// `self.sender.send(event)`) is structurally a *sender*-side
+    /// operation on the broadcast channel and therefore can never
+    /// observe `broadcast::error::RecvError::Lagged` -- that error is
+    /// only produced on the *receiver* side, when a slow consumer
+    /// falls behind and the ring buffer wraps underneath it. That
+    /// receiver-side handling is the responsibility of whatever holds
+    /// a `broadcast::Receiver` returned by `subscribe()` below (a
+    /// later task's per-client `/market` WS forwarding loop) -- not
+    /// this method. A `send` error here means every receiver has been
+    /// dropped (no clients currently connected); that is not a failure
+    /// worth logging, matching `MarketEventBus::subscribe`'s own
+    /// established convention for the identical situation.
+    pub async fn connect(&self, instruments: &[Instrument]) -> Result<(), ApexesError> {
+        let mut state = self.state.lock().await;
+        if matches!(*state, ConnectState::Connected) {
+            return Err(ApexesError::SubscriptionFailed {
+                symbol: instruments
+                    .first()
+                    .map(|i| i.symbol.clone())
+                    .unwrap_or_else(|| "*".to_string()),
+                venue: instruments
+                    .first()
+                    .map(|i| i.venue)
+                    .unwrap_or(apexes_core::Venue::Binance),
+                reason: "Gateway::connect was already called once on this Gateway -- a single \
+                         Gateway instance supports exactly one upstream connection for the \
+                         duration of the process, established exactly once at startup"
+                    .to_string(),
+                source_detail: None,
+            });
+        }
+
+        let mut stream = self.provider.subscribe(instruments).await?;
+        let forward_sender = self.sender.clone();
+        tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                // A `send` error here means every receiver has been
+                // dropped -- nothing left to forward to, not a
+                // failure worth logging.
+                let _ = forward_sender.send(event);
+            }
+            tracing::info!("Gateway: upstream provider stream ended, forwarding task exiting");
+        });
+        *state = ConnectState::Connected;
+        Ok(())
+    }
+
+    /// Returns a fresh `broadcast::Receiver` for a newly-connecting WS
+    /// client (a later task's `axum` handler calls this per
+    /// connection). Can be called before `connect` -- the returned
+    /// receiver simply sees no events until `connect` starts
+    /// forwarding.
+    pub fn subscribe(&self) -> broadcast::Receiver<MarketEvent> {
+        self.sender.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexes_core::{AssetClass, Instrument, MarketType, Venue};
+    use apexes_message_bus::test_support::MockMarketDataProvider;
+    use rust_decimal_macros::dec;
+
+    /// Yields repeatedly to let the spawned forwarding task (mock's
+    /// internal channel -> `connect`'s task -> broadcast) fully drain
+    /// before a test asserts on what subscribers received. Mirrors
+    /// `apexes_message_bus::bus`'s own test helper of the same shape
+    /// and for the same reason (a single `yield_now` only guarantees
+    /// one hop's worth of scheduling progress).
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn sample_instrument() -> Instrument {
+        Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("BTC".to_string()),
+            Some("USDT".to_string()),
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap()
+    }
+
+    fn sample_tick_event() -> MarketEvent {
+        MarketEvent::Tick(apexes_core::Tick {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            bid_price: dec!(64999.5),
+            bid_size: dec!(0.8),
+            ask_price: dec!(65000.5),
+            ask_size: dec!(1.2),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_a_receiver_that_sees_broadcast_events() {
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let gateway = Gateway::new(Box::new(mock), 16);
+
+        let mut receiver = gateway.subscribe();
+
+        gateway.connect(&[sample_instrument()]).await.unwrap();
+        settle().await;
+
+        let event = sample_tick_event();
+        handle.push_event(event.clone());
+        settle().await;
+
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received, event);
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_all_see_the_same_events() {
+        // Proves the core "one upstream connection, many downstream
+        // consumers" property this crate exists to provide: a single
+        // `push_event` on the mock's ONE upstream stream must be
+        // observed, in full and identically, by every independent
+        // subscriber -- not just that `subscribe()` hands back
+        // distinct receiver handles.
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let gateway = Gateway::new(Box::new(mock), 16);
+
+        let mut subscriber_a = gateway.subscribe();
+        let mut subscriber_b = gateway.subscribe();
+        let mut subscriber_c = gateway.subscribe();
+
+        gateway.connect(&[sample_instrument()]).await.unwrap();
+        settle().await;
+
+        assert_eq!(handle.subscribe_call_count(), 1);
+
+        let event = sample_tick_event();
+        handle.push_event(event.clone());
+        settle().await;
+
+        for receiver in [&mut subscriber_a, &mut subscriber_b, &mut subscriber_c] {
+            let received = receiver.recv().await.unwrap();
+            assert_eq!(received, event);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_can_only_be_called_once_per_instrument_set() {
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let gateway = Gateway::new(Box::new(mock), 16);
+
+        gateway.connect(&[sample_instrument()]).await.unwrap();
+        settle().await;
+        assert_eq!(handle.subscribe_call_count(), 1);
+
+        // A second `connect` call, even with the identical instrument
+        // set, is rejected -- `Gateway::connect` is a one-shot startup
+        // action with no lazy-reconnect/reuse path (unlike
+        // `MarketEventBus::subscribe`).
+        let second_call = gateway.connect(&[sample_instrument()]).await;
+        assert!(second_call.is_err());
+        assert_eq!(
+            handle.subscribe_call_count(),
+            1,
+            "a rejected second connect() must not touch the upstream provider again"
+        );
+    }
+}

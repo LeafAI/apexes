@@ -1,0 +1,25 @@
+[package]
+name = "apexes-market-data-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "apexes_market_data_gateway"
+path = "src/lib.rs"
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+apexes-message-bus = { path = "../apexes-message-bus" }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
+rust_decimal = { workspace = true }
+rust_decimal_macros = "1.40"
+chrono = { workspace = true }
