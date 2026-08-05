@@ -1,7 +1,7 @@
 //! Regression guard for the final-review fix: `BacktestConfig` must
 //! expose `margin_tiers` and `run_backtest` must thread it into the
 //! shared event loop, so a leveraged position opened through the REAL
-//! public entry point (not `run_event_loop` directly, which the
+//! public entry point (not `run_unified_event_loop` directly, which the
 //! event-loop unit tests already cover) is auto-liquidated when the
 //! mark price breaches the maintenance-margin ratio.
 

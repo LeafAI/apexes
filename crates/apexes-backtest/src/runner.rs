@@ -1,17 +1,22 @@
 use crate::clock::{BacktestClock, ReplaySpeed};
 use crate::cost_model::CostModel;
-use crate::event_loop::{EventLoopConfig, run_event_loop};
 use crate::market_data_source::HistoricalMarketDataSource;
+use crate::matching_engine::MatchingEngine;
+use crate::order_executor_adapter::{
+    BacktestLiquidationPolicy, MatchingEngineOrderExecutor, NeverFillSupplementalFillSource,
+};
 use crate::report::BacktestReport;
+use crate::unified_loop::{UnifiedLoopConfig, run_unified_event_loop};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
+use apexes_ems::Ems;
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{MarginTierTable, Strategy, VenueScorer};
+use apexes_strategy::{MarginTierTable, OrderExecutor, Strategy, VenueScorer};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Configuration for a single backtest run (design spec §8).
 pub struct BacktestConfig {
@@ -40,8 +45,8 @@ pub struct BacktestConfig {
     /// liquidation.
     pub margin_tiers: HashMap<String, MarginTierTable>,
     /// Extreme-market circuit breaker configuration. `None` (default)
-    /// disables it entirely -- see `EventLoopConfig.market_condition_config`'s
-    /// doc comment.
+    /// disables it entirely -- see
+    /// `UnifiedLoopConfig.market_condition_config`'s doc comment.
     pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
 }
 
@@ -50,11 +55,16 @@ pub struct BacktestConfig {
 /// portfolio state via a `PortfolioLedger`, and producing a
 /// `BacktestReport` with overall + per-symbol + per-venue performance
 /// summaries (design spec §8). Internally delegates to the shared
-/// `crate::event_loop::run_event_loop` core (see that module's docs) --
-/// this function's only job is to adapt `HistoricalMarketDataSource`'s
-/// pre-loaded `Vec<MarketEvent>` into the `Stream` the shared core
-/// expects, and to pass `stop_signal: None`/`latency_model: None` since
-/// neither concept applies to historical replay.
+/// `crate::unified_loop::run_unified_event_loop` core (see that module's
+/// docs) -- this function's job is to adapt
+/// `HistoricalMarketDataSource`'s pre-loaded `Vec<MarketEvent>` into the
+/// `Stream` the shared core expects, to build the backtest-flavored
+/// execution backend (a `MatchingEngine` wrapped as an `OrderExecutor`,
+/// an always-auto-execute `LiquidationPolicy`, and a never-yielding
+/// `SupplementalFillSource`, since historical replay has no fill source
+/// independent of the event stream), and to pass
+/// `stop_signal: None`/`latency_model: None` since neither concept
+/// applies to historical replay.
 /// `registry` (sub-project #9's registry retrofit) is used to resolve
 /// an optional `CompositeRiskChecker` via
 /// `registry.try_one::<Arc<CompositeRiskChecker>>()` -- absent means no
@@ -87,23 +97,55 @@ pub async fn run_backtest(
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
 
-    let event_loop_config = EventLoopConfig {
+    // `funding_rate_bps` is read off the `CostModel` BEFORE it is moved
+    // into the `MatchingEngine`: the unified loop needs the rate for its
+    // own funding-settlement pass (see `UnifiedLoopConfig::funding_rate_bps`),
+    // while the full `CostModel` -- fee schedule included -- belongs to
+    // the matching engine that computes per-fill fees.
+    let funding_rate_bps = config.cost_model.funding_rate_bps;
+    // `std::sync::Mutex` (not `tokio::sync::Mutex`) because both
+    // `MatchingEngineOrderExecutor` and `MatchingEngineChildOrderSink`
+    // take that exact type, and every access is a short synchronous
+    // critical section that never holds the guard across an `.await`.
+    // ONE shared engine instance backs both the executor (direct
+    // strategy orders) and the EMS child-order sink (algo orders), so
+    // both interact through a single order book rather than two
+    // independent simulations.
+    let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(
+        config.cost_model,
+        config.queue_position_factor,
+    )));
+    let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
+        &matching_engine,
+    )));
+    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
+        crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+    );
+    let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+        child_order_sink,
+        venue_scorer,
+        HashMap::new(),
+        volume_curve_provider,
+    ));
+
+    let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
         initial_balances: config.initial_balances,
-        cost_model: config.cost_model,
-        queue_position_factor: config.queue_position_factor,
+        funding_rate_bps,
         risk_free_return: config.risk_free_return,
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
     };
 
-    run_event_loop(
-        event_loop_config,
+    run_unified_event_loop(
+        unified_loop_config,
         event_stream,
         clock,
-        venue_scorer,
-        volume_curve_provider,
+        executor,
+        Arc::new(BacktestLiquidationPolicy),
+        NeverFillSupplementalFillSource,
+        ems,
         strategy,
         None,
         None,

@@ -1,0 +1,1352 @@
+//! The single unified event-loop core (`run_unified_event_loop`) driving
+//! `run_backtest` (historical replay, `Vec<MarketEvent>` wrapped as a
+//! `Stream`), `apexes-paper`'s `run_paper_trading` (live
+//! `MarketDataProvider::subscribe()` stream), and -- once a later plan
+//! task re-points it -- `apexes-live-trading`'s `run_live_trading`.
+//!
+//! This module replaces the former `crate::event_loop::run_event_loop`
+//! (same file, renamed: see design spec
+//! `2026-08-06-apexes-trading-loop-unification-design.md`). The logic is
+//! unchanged; only the MECHANISM by which orders reach an execution
+//! backend changed, from direct `MatchingEngine` method calls to the
+//! three `apexes_strategy` traits:
+//!
+//! - [`OrderExecutor`] -- submits intents, reacts to market events with
+//!   its own resting-order book (if it has one), and owns the
+//!   `OrderId -> Order` bookkeeping this loop used to keep itself.
+//! - [`LiquidationPolicy`] -- decides whether a computed liquidation /
+//!   de-risking order is actually submitted or merely logged.
+//! - [`SupplementalFillSource`] -- an asynchronous fill source
+//!   independent of the primary market-event stream (live trading's
+//!   exchange push updates + `reconcile()` poll); backtest/paper pass a
+//!   never-yielding implementation.
+//!
+//! This module is `pub` (cross-crate visible so `apexes-paper` and
+//! `apexes-live-trading` can call it) but deliberately NOT re-exported
+//! from `apexes-backtest`'s top-level `lib.rs` -- callers use the full
+//! path `apexes_backtest::unified_loop::run_unified_event_loop`.
+//! `run_backtest` remains `apexes-backtest`'s primary public entry
+//! point.
+
+use crate::clock::BacktestClock;
+use crate::cost_model::{CostModel, FlatFeeSchedule};
+use crate::latency::LatencyModel;
+use crate::ledger::PortfolioLedger;
+use crate::performance::PerformanceTracker;
+use crate::report::BacktestReport;
+use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, OrderType};
+use apexes_ems::Ems;
+use apexes_risk::{CompositeRiskChecker, MarketConditionEventMonitor, PreTradeCheck};
+use apexes_strategy::{
+    LiquidationPolicy, LiquidationReason, OrderExecutor, ParentOrderId, ParentOrderStatus,
+    Strategy, StrategyContext, SupplementalFillSource,
+};
+use futures::{Stream, StreamExt};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Configuration shared by every caller of [`run_unified_event_loop`]:
+/// `run_backtest` (whose public config type is `BacktestConfig`),
+/// `run_paper_trading` (`PaperTradingConfig`), and -- from a later plan
+/// task -- `run_live_trading` (`LiveTradingConfig`). Each caller
+/// constructs this shared internal struct before calling the loop.
+///
+/// `risk_checker` is `Option<Arc<CompositeRiskChecker>>` (not an owned
+/// `CompositeRiskChecker`) because every caller resolves it via
+/// `registry.try_one::<Arc<CompositeRiskChecker>>()` (sub-project #9's
+/// registry retrofit) before constructing this struct --
+/// `run_unified_event_loop` itself stays `Registry`-agnostic.
+///
+/// Deliberately ABSENT: `cost_model`/`queue_position_factor` (the
+/// backtest/paper matching-simulation parameters). Those stay on the
+/// caller's own public config type and are baked into the
+/// `MatchingEngine` the caller constructs before building its
+/// `Arc<dyn OrderExecutor>` -- live trading has no equivalent concept
+/// (real fills have no "queue position model"). See
+/// [`UnifiedLoopConfig::funding_rate_bps`] for the one funding-related
+/// exception.
+pub struct UnifiedLoopConfig {
+    pub instruments: Vec<Instrument>,
+    pub initial_balances: HashMap<String, Decimal>,
+    /// Funding rate (in basis points) for open leveraged positions;
+    /// `None` disables funding settlement entirely.
+    ///
+    /// This is the ONE piece of `CostModel` the unified loop itself
+    /// needs, and it is genuinely shared by all three callers (today's
+    /// `run_live_trading` performs the same funding settlement against
+    /// its own `LiveTradingConfig::cost_model`). The loop's periodic
+    /// `PortfolioLedger::apply_funding_payments` pass requires a
+    /// `&CostModel`, but the full `CostModel` (which also carries the
+    /// fee schedule) belongs to the caller's `MatchingEngine`, now
+    /// hidden behind `Arc<dyn OrderExecutor>` and unreachable from
+    /// here. Passing just the rate is provably equivalent:
+    /// `apply_funding_payments` consults ONLY
+    /// `CostModel::funding_payment`, which reads `funding_rate_bps` and
+    /// never touches `fee_schedule`, so the loop reconstructs a minimal
+    /// zero-fee `CostModel` carrying this rate purely for that call.
+    /// Callers must pass the same rate their own `CostModel` uses.
+    pub funding_rate_bps: Option<Decimal>,
+    pub risk_free_return: Decimal,
+    pub risk_checker: Option<Arc<CompositeRiskChecker>>,
+    /// Tiered maintenance-margin tables, keyed by symbol. Empty
+    /// `HashMap` disables all margin/liquidation monitoring (every
+    /// leveraged position's `margin_status` lookup simply finds no
+    /// table and produces no margin_ratio -- an intentional silent
+    /// no-op for callers that never use `OrderIntent.leverage`).
+    pub margin_tiers: HashMap<String, apexes_strategy::MarginTierTable>,
+    /// Extreme-market circuit breaker configuration (design spec
+    /// `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`).
+    /// `None` (the default for every pre-existing caller) is a silent
+    /// no-op: no volatility/jump detection, no de-risking.
+    pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
+}
+
+/// Runs the unified event loop: consumes `market_events` in order
+/// through `strategy`, executing orders through `executor`, applying
+/// `apexes-risk` checks if configured, tracking portfolio state via a
+/// `PortfolioLedger`, and producing a `BacktestReport`.
+///
+/// `clock` paces dispatch (an already-configured `BacktestClock` --
+/// historical-replay callers pass one built from their `ReplaySpeed`;
+/// live/paper callers pass `BacktestClock::new(ReplaySpeed::AsFastAsPossible)`
+/// since live events already arrive at real-time pace and need no
+/// additional artificial pacing).
+///
+/// `ems` is supplied by the caller rather than constructed here,
+/// because the `ChildOrderSink` an `Ems` submits through is
+/// backend-specific (backtest/paper wrap the very same
+/// `Arc<Mutex<MatchingEngine>>` they built `executor` from, so EMS
+/// child-order fills and direct-strategy fills interact through one
+/// single shared order book; live trading wraps its `OrderManager` and
+/// uses `PostgresEms` for crash-recoverable algo state).
+///
+/// `stop_signal`, if `Some`, causes the loop to exit early (returning
+/// whatever `BacktestReport` has accumulated so far, not an error) once
+/// it fires or its sender is dropped. `run_backtest` always passes
+/// `None` (historical replay runs to completion by construction, since
+/// `market_events` is a finite pre-loaded stream).
+///
+/// `latency_model`, if `Some`, is applied (via `LatencyModel::apply`,
+/// a real `tokio::time::sleep`) after a submitted `OrderIntent` passes
+/// its `PreTradeCheck` and before it reaches `executor`. `run_backtest`
+/// always passes `None` (historical replay has no "order submission
+/// delay" concept -- recorded timestamps are already fixed).
+// The parameter count is inherent to this being the one shared core
+// every caller drives; the design spec specifies this shape explicitly
+// (minus `venue_scorer`/`volume_curve_provider`, which moved into the
+// caller-constructed `ems` -- see that parameter's docs).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_unified_event_loop(
+    config: UnifiedLoopConfig,
+    mut market_events: impl Stream<Item = MarketEvent> + Unpin,
+    mut clock: BacktestClock,
+    executor: Arc<dyn OrderExecutor>,
+    liquidation_policy: Arc<dyn LiquidationPolicy>,
+    mut supplemental_fills: impl SupplementalFillSource,
+    ems: Arc<dyn Ems>,
+    mut strategy: impl Strategy,
+    mut stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
+    latency_model: Option<LatencyModel>,
+) -> Result<BacktestReport, ApexesError> {
+    let instruments_by_symbol: HashMap<String, Instrument> = config
+        .instruments
+        .iter()
+        .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
+        .collect();
+
+    let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances);
+    // A minimal, zero-fee `CostModel` existing solely to carry
+    // `funding_rate_bps` into `PortfolioLedger::apply_funding_payments`
+    // -- see `UnifiedLoopConfig::funding_rate_bps` for why the real
+    // `CostModel` (owned by the caller's `MatchingEngine`, behind
+    // `executor`) cannot be reached from here, and why this is
+    // equivalent.
+    let funding_cost_model = CostModel {
+        fee_schedule: Box::new(FlatFeeSchedule {
+            maker_bps: Decimal::ZERO,
+            taker_bps: Decimal::ZERO,
+        }),
+        funding_rate_bps: config.funding_rate_bps,
+    };
+    let mut open_parent_orders: HashMap<ParentOrderId, ParentOrderStatus> = HashMap::new();
+    let mut overall_tracker = PerformanceTracker::new(config.risk_free_return);
+    let mut per_symbol_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
+    let mut per_venue_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
+    let mut last_prices: HashMap<String, Decimal> = HashMap::new();
+    let mut mark_prices: HashMap<String, Decimal> = HashMap::new();
+    let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut all_fills: Vec<Fill> = Vec::new();
+    let mut recorded_initial_equity = false;
+    let mut risk_checker = config.risk_checker;
+
+    // Extreme-market circuit breaker (design spec
+    // `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`):
+    // this loop constructs its OWN local `MarketConditionMonitor` from
+    // `config.market_condition_config` and splits it locally --
+    // deliberately NOT routed through the caller's
+    // `CompositeRiskChecker` registration lists, because this loop also
+    // needs the `MarketConditionReadHandle` (for
+    // `on_equity_update`/`reduce_fractions`), which is not one of
+    // `CompositeRiskChecker`'s registered trait objects, and the
+    // checker arrives as an already-constructed `Arc` whose `with_*`
+    // builders consume `self` by value (not something this loop can
+    // extend at runtime). `include_spot` is captured BEFORE the config
+    // is moved out into `MarketConditionMonitor::new` (a partial move
+    // would otherwise make `config.market_condition_config` unusable
+    // for the `as_ref()` read at capture time).
+    let market_condition_include_spot = config
+        .market_condition_config
+        .as_ref()
+        .map(|c| c.include_spot)
+        .unwrap_or(false);
+    let mut market_condition_monitor = config
+        .market_condition_config
+        .map(apexes_risk::MarketConditionMonitor::new)
+        .map(apexes_risk::MarketConditionMonitor::split);
+
+    // Constructed ONCE, outside the loop: an implementation may hold
+    // internal state across yields (live trading's merges an exchange
+    // push stream with a `reconcile()` interval timer), which
+    // re-creating the stream every iteration would disturb.
+    let mut supplemental_fill_stream = supplemental_fills.stream();
+
+    loop {
+        // Polled at the top of each iteration, exactly as the former
+        // `run_event_loop` did -- NOT as a `tokio::select!` arm.
+        // `run_paper_trading` depends on this precise shape: it gates
+        // its own event stream with `take_until(stop_signal)` because
+        // this loop only observes the signal here, and moving the check
+        // into the `select!` below would change that documented
+        // interaction.
+        if let Some(signal) = stop_signal.as_mut() {
+            match signal.try_recv() {
+                Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        tokio::select! {
+            event = market_events.next() => {
+                let Some(event) = event else { break };
+
+                if !recorded_initial_equity {
+                    let initial_equity = ledger.equity(&last_prices)?;
+                    overall_tracker.record_equity_point(event_timestamp(&event), initial_equity);
+                    recorded_initial_equity = true;
+                }
+
+                let timestamp = event_timestamp(&event);
+                clock.wait_for_next_event(timestamp).await;
+
+                // Feed every event to the local `MarketConditionMonitor` (a
+                // no-op for events that don't match its configured
+                // `PriceSource`) so its per-symbol volatility/jump state -- and
+                // hence its de-risking fractions -- stay current. This must run
+                // BEFORE the de-risking block later in the same tick reads
+                // `reduce_fractions`.
+                if let Some((_, event_monitor, _)) = &mut market_condition_monitor
+                    && let Err(violations) = event_monitor.on_market_event(&event)
+                {
+                    tracing::warn!(?violations, "market condition monitor flagged a violation");
+                }
+
+                let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
+                    ApexesError::InvalidBacktestConfig {
+                        reason: format!("ems.on_market_event failed: {error}"),
+                    }
+                })?;
+                if !ems_fills.is_empty() {
+                    apply_fills(
+                        &mut ledger,
+                        &mut overall_tracker,
+                        &mut per_symbol_trackers,
+                        &mut per_venue_trackers,
+                        &mut all_fills,
+                        &ems_fills,
+                        config.risk_free_return,
+                    )?;
+                    if let Some(checker) = &mut risk_checker {
+                        for fill in &ems_fills {
+                            if let Err(violations) =
+                                checker.on_fill(fill, ledger.positions(), ledger.balances())
+                            {
+                                tracing::warn!(
+                                    ?violations,
+                                    symbol = %fill.symbol,
+                                    "in-trade risk monitor flagged a violation"
+                                );
+                            }
+                        }
+                    }
+                }
+                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+
+                // Price-map maintenance, split by event type exactly as
+                // before: `last_prices` (used to value non-quote-currency
+                // balances) is keyed by BASE ASSET (e.g. "BTC") from Trade
+                // prints; `mark_prices` (used by every `PortfolioLedger`
+                // margin method) is keyed the same way from MarkPrice
+                // updates. Tick/Bar events only advance the clock/context.
+                // This runs BEFORE `executor.on_market_event` below,
+                // preserving the former per-arm ordering (`last_prices`
+                // was inserted before `MatchingEngine::on_trade_event`).
+                match &event {
+                    MarketEvent::Trade(trade) => {
+                        if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
+                            && let Some(base) = &instrument.base_currency
+                        {
+                            last_prices.insert(base.clone(), trade.price);
+                        }
+                    }
+                    MarketEvent::MarkPrice(update) => {
+                        if let Some(instrument) = instruments_by_symbol.get(&update.symbol)
+                            && let Some(base) = &instrument.base_currency
+                        {
+                            mark_prices.insert(base.clone(), update.mark_price);
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Let the execution backend's own resting-order book react
+                // to this event (backtest/paper: the `MatchingEngine`'s
+                // depth-snapshot ingestion and resting-order matching; live
+                // trading: nothing, it holds no local simulation). The
+                // executor also owns the `OrderId -> Order`
+                // filled_quantity/status bookkeeping this loop used to do
+                // inline here.
+                for (_order_id, fills) in executor.on_market_event(&event) {
+                    apply_fills(
+                        &mut ledger,
+                        &mut overall_tracker,
+                        &mut per_symbol_trackers,
+                        &mut per_venue_trackers,
+                        &mut all_fills,
+                        &fills,
+                        config.risk_free_return,
+                    )?;
+                    if let Some(checker) = &mut risk_checker {
+                        for fill in &fills {
+                            if let Err(violations) =
+                                checker.on_fill(fill, ledger.positions(), ledger.balances())
+                            {
+                                tracing::warn!(
+                                    ?violations,
+                                    symbol = %fill.symbol,
+                                    "in-trade risk monitor flagged a violation"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Funding settlement: once per crossed Binance-aligned 8-hour
+                // UTC boundary (00:00/08:00/16:00) -- not per-boundary-precise
+                // if several boundaries fall within one tick's gap; a single
+                // settlement pass is applied per tick that crosses at least
+                // one new boundary.
+                let current_funding_boundary = last_funding_boundary(timestamp);
+                if last_funding_settlement != Some(current_funding_boundary) {
+                    ledger.apply_funding_payments(&mark_prices, &funding_cost_model)?;
+                    last_funding_settlement = Some(current_funding_boundary);
+                }
+
+                let margin_status = ledger.margin_status(&mark_prices, &config.margin_tiers);
+                if let Some(checker) = &risk_checker
+                    && let Err(violations) = checker.on_tick(&margin_status)
+                {
+                    tracing::warn!(?violations, "position monitor flagged a margin violation");
+                }
+
+                // Auto-liquidation: every position whose margin ratio has
+                // breached 1.0 is force-closed with a market order through
+                // `executor` -- but ONLY if `liquidation_policy` allows it.
+                // Backtest/paper always do (`BacktestLiquidationPolicy`);
+                // live trading never does for this reason, logging loudly
+                // instead, since real liquidation is the exchange's own
+                // responsibility.
+                let symbols_to_liquidate = ledger.check_liquidations(&mark_prices, &config.margin_tiers);
+                for symbol in symbols_to_liquidate {
+                    let Some(position) = ledger.positions().get(&symbol).cloned() else {
+                        continue;
+                    };
+                    if !liquidation_policy.should_auto_execute(LiquidationReason::MarginBreach) {
+                        tracing::error!(
+                            symbol = %symbol,
+                            "position margin ratio has breached the liquidation threshold -- \
+                             the configured LiquidationPolicy forbids auto-liquidation, so no \
+                             order was submitted; new orders for this symbol are blocked via \
+                             MarginMonitor."
+                        );
+                        continue;
+                    }
+                    let liquidation_intent = apexes_strategy::OrderIntent {
+                        symbol: symbol.clone(),
+                        venue: instruments_by_symbol
+                            .get(&symbol)
+                            .map(|i| i.venue)
+                            .unwrap_or(apexes_core::Venue::Binance),
+                        asset_class: instruments_by_symbol
+                            .get(&symbol)
+                            .map(|i| i.asset_class)
+                            .unwrap_or(apexes_core::AssetClass::Perpetual),
+                        side: if position.quantity.is_sign_positive() {
+                            apexes_core::Side::Sell
+                        } else {
+                            apexes_core::Side::Buy
+                        },
+                        order_type: OrderType::Market,
+                        quantity: position.quantity.abs(),
+                        price: None,
+                        stop_price: None,
+                        execution_algo: None,
+                        routing: apexes_strategy::OrderRouting::Fixed,
+                        // The closing fill must carry the position's OWN
+                        // leverage/margin_mode: `PortfolioLedger::apply_fill`
+                        // dispatches on `fill.leverage.is_some()`, so a
+                        // `leverage: None` close would take the SPOT path and
+                        // fail with `InsufficientBalance` (a leveraged perpetual
+                        // account holds no base-asset balance to debit) instead
+                        // of closing the position via `close_leveraged`.
+                        leverage: position.leverage,
+                        margin_mode: position.margin_mode,
+                    };
+                    match executor
+                        .submit(&liquidation_intent, ledger.positions(), ledger.balances(), timestamp)
+                        .await
+                    {
+                        Ok((_order, fills)) => {
+                            tracing::error!(symbol = %symbol, "position force-liquidated (margin ratio breached)");
+                            apply_fills(
+                                &mut ledger,
+                                &mut overall_tracker,
+                                &mut per_symbol_trackers,
+                                &mut per_venue_trackers,
+                                &mut all_fills,
+                                &fills,
+                                config.risk_free_return,
+                            )?;
+                        }
+                        Err(error) => {
+                            tracing::error!(?error, symbol = %symbol, "liquidation order submission failed");
+                        }
+                    }
+                }
+
+                // Extreme-market de-risking: every symbol
+                // `MarketConditionMonitor` has flagged gets a partial close
+                // proportional to its computed `reduce_fraction`, submitted
+                // as a market order through `executor` -- again only if
+                // `liquidation_policy` allows it for this reason (live
+                // trading defaults to monitor-only, gated on its own
+                // `auto_derisk_live` flag).
+                if let Some((_, _, read_handle)) = &market_condition_monitor {
+                    let equity_for_volatility = ledger.equity(&mark_prices).unwrap_or(Decimal::ZERO);
+                    if let Err(violations) = read_handle.on_equity_update(equity_for_volatility) {
+                        tracing::warn!(?violations, "account-wide market condition violation");
+                    }
+
+                    let open_symbols: Vec<String> = ledger.positions().keys().cloned().collect();
+                    let reduce_fractions = read_handle.reduce_fractions(&open_symbols);
+                    let de_risking_orders =
+                        ledger.check_de_risking(&reduce_fractions, market_condition_include_spot);
+
+                    for (symbol, side, quantity) in de_risking_orders {
+                        let Some(position) = ledger.positions().get(&symbol).cloned() else {
+                            continue;
+                        };
+                        if !liquidation_policy
+                            .should_auto_execute(LiquidationReason::ExtremeMarketCondition)
+                        {
+                            tracing::error!(
+                                symbol = %symbol,
+                                %quantity,
+                                "extreme market conditions detected -- the configured \
+                                 LiquidationPolicy forbids automatic de-risking, so no order \
+                                 was submitted; new orders for this symbol are blocked via \
+                                 MarketConditionMonitor."
+                            );
+                            continue;
+                        }
+                        let de_risk_intent = apexes_strategy::OrderIntent {
+                            symbol: symbol.clone(),
+                            venue: instruments_by_symbol
+                                .get(&symbol)
+                                .map(|i| i.venue)
+                                .unwrap_or(apexes_core::Venue::Binance),
+                            asset_class: instruments_by_symbol
+                                .get(&symbol)
+                                .map(|i| i.asset_class)
+                                .unwrap_or(apexes_core::AssetClass::Perpetual),
+                            side,
+                            order_type: OrderType::Market,
+                            quantity,
+                            price: None,
+                            stop_price: None,
+                            execution_algo: None,
+                            routing: apexes_strategy::OrderRouting::Fixed,
+                            // The closing fill must carry the position's OWN
+                            // leverage/margin_mode (same convention as the
+                            // auto-liquidation block above): `apply_fill`
+                            // dispatches on `fill.leverage.is_some()`, so a
+                            // spot position closes via the spot path and a
+                            // leveraged one via `close_leveraged`.
+                            leverage: position.leverage,
+                            margin_mode: position.margin_mode,
+                        };
+                        match executor
+                            .submit(&de_risk_intent, ledger.positions(), ledger.balances(), timestamp)
+                            .await
+                        {
+                            Ok((_order, fills)) => {
+                                tracing::warn!(symbol = %symbol, %quantity, "position partially closed (extreme market conditions)");
+                                apply_fills(
+                                    &mut ledger,
+                                    &mut overall_tracker,
+                                    &mut per_symbol_trackers,
+                                    &mut per_venue_trackers,
+                                    &mut all_fills,
+                                    &fills,
+                                    config.risk_free_return,
+                                )?;
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, symbol = %symbol, "de-risking order submission failed");
+                            }
+                        }
+                    }
+                }
+
+                // `open_orders` comes from the executor, fetched fresh --
+                // this loop no longer keeps its own map.
+                let open_orders = executor.open_orders().await;
+                let ctx = StrategyContext {
+                    positions: ledger.positions(),
+                    balances: ledger.balances(),
+                    open_orders: &open_orders,
+                    open_parent_orders: &open_parent_orders,
+                    margin_status: &margin_status,
+                    now: timestamp,
+                };
+                let intents = strategy.on_market_event(&event, &ctx);
+
+                for intent in intents {
+                    // Re-fetched per intent (not reusing `open_orders`
+                    // above): the former loop's own map was updated as
+                    // each intent was submitted, so a later intent's risk
+                    // check saw earlier submissions from the SAME tick.
+                    // Querying the executor per intent reproduces that
+                    // exactly.
+                    let open_orders_for_check = executor.open_orders().await;
+                    if let Some(checker) = &risk_checker
+                        && let Err(violations) = checker.check(
+                            &intent,
+                            ledger.positions(),
+                            ledger.balances(),
+                            &open_orders_for_check,
+                            timestamp,
+                        )
+                    {
+                        tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+                        continue;
+                    }
+                    if let Some((pre_trade, _, _)) = &market_condition_monitor
+                        && let Err(violations) = pre_trade.check(
+                            &intent,
+                            ledger.positions(),
+                            ledger.balances(),
+                            &open_orders_for_check,
+                            timestamp,
+                        )
+                    {
+                        tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
+                        continue;
+                    }
+
+                    if let Some(latency_model) = &latency_model {
+                        latency_model.apply().await;
+                    }
+
+                    if let Some(execution_algo) = intent.execution_algo {
+                        let request = apexes_ems::AlgoOrderRequest {
+                            symbol: intent.symbol.clone(),
+                            venue: intent.venue,
+                            side: intent.side,
+                            quantity: intent.quantity,
+                            execution_algo,
+                            routing: intent.routing,
+                            leverage: intent.leverage,
+                            margin_mode: intent.margin_mode,
+                        };
+                        match ems.submit_algo_order(request).await {
+                            Ok(parent_id) => {
+                                open_parent_orders
+                                    .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
+                            }
+                            Err(error) => {
+                                tracing::warn!(?error, symbol = %intent.symbol, "algo order submission failed");
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Order-type dispatch (Market vs. Limit vs.
+                    // Stop/StopLimit) now lives inside the executor,
+                    // which also decides whether any fills happened
+                    // immediately -- an empty fill vec is normal (a
+                    // resting limit order in backtest; every live
+                    // submission).
+                    match executor
+                        .submit(&intent, ledger.positions(), ledger.balances(), timestamp)
+                        .await
+                    {
+                        Ok((_order, fills)) => {
+                            if !fills.is_empty() {
+                                apply_fills(
+                                    &mut ledger,
+                                    &mut overall_tracker,
+                                    &mut per_symbol_trackers,
+                                    &mut per_venue_trackers,
+                                    &mut all_fills,
+                                    &fills,
+                                    config.risk_free_return,
+                                )?;
+                                if let Some(checker) = &mut risk_checker {
+                                    for fill in &fills {
+                                        if let Err(violations) =
+                                            checker.on_fill(fill, ledger.positions(), ledger.balances())
+                                        {
+                                            tracing::warn!(
+                                                ?violations,
+                                                symbol = %fill.symbol,
+                                                "in-trade risk monitor flagged a violation"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, symbol = %intent.symbol, "order submission rejected");
+                        }
+                    }
+                }
+
+                let equity = ledger.equity(&last_prices)?;
+                overall_tracker.record_equity_point(timestamp, equity);
+            }
+
+            Some(fills) = supplemental_fill_stream.next() => {
+                // Fills from a source independent of the primary market-event
+                // stream (live trading's exchange push updates and
+                // `reconcile()` poll). Backtest/paper's
+                // `NeverFillSupplementalFillSource` never yields, so this arm
+                // is unreachable for them.
+                apply_supplemental_fills(
+                    &mut ledger,
+                    &mut overall_tracker,
+                    &mut per_symbol_trackers,
+                    &mut per_venue_trackers,
+                    &mut risk_checker,
+                    &mut all_fills,
+                    fills,
+                    config.risk_free_return,
+                );
+                let equity = ledger.equity(&last_prices)?;
+                overall_tracker.record_equity_point(chrono::Utc::now(), equity);
+            }
+        }
+    }
+
+    Ok(BacktestReport {
+        overall: overall_tracker.summary().into(),
+        per_symbol: per_symbol_trackers
+            .into_iter()
+            .map(|(k, v)| (k, v.summary().into()))
+            .collect(),
+        per_venue: per_venue_trackers
+            .into_iter()
+            .map(|(k, v)| (k, v.summary().into()))
+            .collect(),
+        equity_curve: overall_tracker.equity_curve().to_vec(),
+        trades: all_fills,
+    })
+}
+
+/// Applies a batch of `Fill`s produced by the executor (or the EMS):
+/// updates the ledger, records each fill into the
+/// overall/per-symbol/per-venue `PerformanceTracker`s, and accumulates
+/// every fill into `all_fills` (the `BacktestReport.trades` source) in
+/// occurrence order.
+fn apply_fills(
+    ledger: &mut PortfolioLedger,
+    overall_tracker: &mut PerformanceTracker,
+    per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
+    per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
+    all_fills: &mut Vec<Fill>,
+    fills: &[Fill],
+    risk_free_return: Decimal,
+) -> Result<(), ApexesError> {
+    for fill in fills {
+        ledger.apply_fill(fill)?;
+        overall_tracker.record_fill(fill);
+        record_fill_in_split_trackers(
+            per_symbol_trackers,
+            per_venue_trackers,
+            fill,
+            risk_free_return,
+        );
+    }
+    all_fills.extend_from_slice(fills);
+    Ok(())
+}
+
+/// Applies a batch of `Fill`s that arrived from a
+/// [`SupplementalFillSource`] -- ported from `run_live_trading`'s
+/// `apply_new_fills`, whose error handling deliberately differs from
+/// [`apply_fills`]: a fill that the ledger rejects is LOGGED AND
+/// SKIPPED, never propagated as an error. These fills describe trades
+/// that already happened on a real exchange; failing the whole trading
+/// session because our local mirror of the books disagreed would be
+/// strictly worse than continuing with a logged discrepancy. A
+/// violation from `on_fill` is likewise logged, not propagated -- an
+/// in-trade monitor observes fills that have already happened; it
+/// cannot undo them, only flag them.
+#[allow(clippy::too_many_arguments)]
+fn apply_supplemental_fills(
+    ledger: &mut PortfolioLedger,
+    overall_tracker: &mut PerformanceTracker,
+    per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
+    per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
+    risk_checker: &mut Option<Arc<CompositeRiskChecker>>,
+    all_fills: &mut Vec<Fill>,
+    new_fills: Vec<Fill>,
+    risk_free_return: Decimal,
+) {
+    for fill in &new_fills {
+        if let Err(error) = ledger.apply_fill(fill) {
+            tracing::warn!(?error, order_id = ?fill.order_id, "failed to apply fill to ledger");
+            continue;
+        }
+        overall_tracker.record_fill(fill);
+        record_fill_in_split_trackers(
+            per_symbol_trackers,
+            per_venue_trackers,
+            fill,
+            risk_free_return,
+        );
+        if let Some(checker) = risk_checker
+            && let Err(violations) = checker.on_fill(fill, ledger.positions(), ledger.balances())
+        {
+            tracing::warn!(?violations, symbol = %fill.symbol, "in-trade risk monitor flagged a violation");
+        }
+    }
+    all_fills.extend(new_fills);
+}
+
+/// Records `fill` into its per-symbol and per-venue `PerformanceTracker`,
+/// creating either on first use. Shared by [`apply_fills`] and
+/// [`apply_supplemental_fills`] so the two paths cannot drift.
+fn record_fill_in_split_trackers(
+    per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
+    per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
+    fill: &Fill,
+    risk_free_return: Decimal,
+) {
+    per_symbol_trackers
+        .entry(fill.symbol.clone())
+        .or_insert_with(|| PerformanceTracker::new(risk_free_return))
+        .record_fill(fill);
+    per_venue_trackers
+        .entry(format!("{:?}", fill.venue))
+        .or_insert_with(|| PerformanceTracker::new(risk_free_return))
+        .record_fill(fill);
+}
+
+/// Returns the most recent Binance-aligned 8-hour UTC boundary
+/// (00:00/08:00/16:00) at or before `timestamp`.
+fn last_funding_boundary(
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    let hour_bucket = (timestamp.hour() / 8) * 8;
+    match timestamp.date_naive().and_hms_opt(hour_bucket, 0, 0) {
+        Some(boundary) => boundary.and_utc(),
+        // Unreachable for hour_bucket in {0, 8, 16}; fall back to the
+        // timestamp itself (still monotone) rather than panic.
+        None => timestamp,
+    }
+}
+
+fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
+    match event {
+        MarketEvent::Tick(tick) => tick.timestamp,
+        MarketEvent::Depth(depth) => depth.timestamp,
+        MarketEvent::Bar(bar) => bar.open_time,
+        MarketEvent::Trade(trade) => trade.timestamp,
+        MarketEvent::MarkPrice(mark_price) => mark_price.timestamp,
+    }
+}
+
+/// Refreshes `open_parent_orders` by querying `ems.parent_order_status`
+/// for every `ParentOrderId` already tracked. `Ems` has no "list all
+/// parent order IDs" method (deliberately out of scope, per the design
+/// spec) -- new parent orders are added to the map at the point
+/// `submit_algo_order` succeeds (see the call site above), not
+/// discovered here.
+async fn refresh_open_parent_orders(
+    ems: &dyn Ems,
+    open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+) {
+    let ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
+    for id in ids {
+        match ems.parent_order_status(id).await {
+            Ok(Some(status)) => {
+                open_parent_orders.insert(id, status);
+            }
+            Ok(None) => {
+                open_parent_orders.remove(&id);
+            }
+            Err(error) => {
+                tracing::warn!(?error, parent_id = ?id, "failed to refresh parent order status");
+            }
+        }
+    }
+}
+
+/// Type alias kept for readability at call sites that think of this
+/// loop's output as "the unified loop's report" (the design spec's
+/// `UnifiedLoopReport`). It IS `BacktestReport` -- the report shape both
+/// re-pointed callers already returned, unchanged by this refactor.
+pub type UnifiedLoopReport = BacktestReport;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ReplaySpeed;
+    use crate::cost_model::FlatFeeSchedule;
+    use crate::matching_engine::MatchingEngine;
+    use crate::order_executor_adapter::{
+        BacktestLiquidationPolicy, MatchingEngineOrderExecutor, NeverFillSupplementalFillSource,
+    };
+    use apexes_core::{
+        AssetClass, DepthUpdate, MarginMode, MarketType, PriceLevel, Side, TradeEvent,
+    };
+    use apexes_strategy::{MarginTier, MarginTierTable, OrderIntent, OrderRouting};
+    use chrono::{Duration, TimeZone, Utc};
+    use rust_decimal_macros::dec;
+    use std::sync::Mutex;
+
+    fn btcusdt_perpetual_instrument() -> Instrument {
+        Instrument {
+            symbol: "BTCUSDT".to_string(),
+            market_type: MarketType::Crypto,
+            venue: apexes_core::Venue::Binance,
+            asset_class: AssetClass::Perpetual,
+            base_currency: Some("BTC".to_string()),
+            quote_currency: Some("USDT".to_string()),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.001),
+            multiplier: dec!(1),
+        }
+    }
+
+    fn zero_cost_model(funding_rate_bps: Option<Decimal>) -> CostModel {
+        CostModel {
+            fee_schedule: Box::new(FlatFeeSchedule {
+                maker_bps: Decimal::ZERO,
+                taker_bps: Decimal::ZERO,
+            }),
+            funding_rate_bps,
+        }
+    }
+
+    fn depth_snapshot(timestamp: chrono::DateTime<Utc>) -> MarketEvent {
+        MarketEvent::Depth(DepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: apexes_core::Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(10),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(100),
+                quantity: dec!(10),
+            }],
+            sequence: None,
+            is_snapshot: true,
+            timestamp,
+        })
+    }
+
+    fn trade_event(price: Decimal, timestamp: chrono::DateTime<Utc>) -> MarketEvent {
+        MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: apexes_core::Venue::Binance,
+            price,
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp,
+        })
+    }
+
+    fn mark_price_event(price: Decimal, timestamp: chrono::DateTime<Utc>) -> MarketEvent {
+        MarketEvent::MarkPrice(apexes_core::MarkPriceUpdate {
+            symbol: "BTCUSDT".to_string(),
+            venue: apexes_core::Venue::Binance,
+            mark_price: price,
+            timestamp,
+        })
+    }
+
+    fn single_tier_table() -> MarginTierTable {
+        MarginTierTable {
+            tiers: vec![MarginTier {
+                notional_floor: dec!(0),
+                max_leverage: dec!(20),
+                maintenance_margin_rate: dec!(0.005),
+                maintenance_amount: dec!(0),
+            }],
+        }
+    }
+
+    /// Opens a 10x leveraged long on the first Trade event it sees, then
+    /// goes quiet. Records the margin-status entry it observes for
+    /// BTCUSDT on every subsequent tick (to verify `StrategyContext.
+    /// margin_status` is really wired).
+    struct LeveragedBuyOnce {
+        bought: bool,
+        observed_ratios: Arc<Mutex<Vec<Option<Decimal>>>>,
+    }
+
+    impl LeveragedBuyOnce {
+        fn new(observed_ratios: Arc<Mutex<Vec<Option<Decimal>>>>) -> Self {
+            Self {
+                bought: false,
+                observed_ratios,
+            }
+        }
+    }
+
+    impl Strategy for LeveragedBuyOnce {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if self.bought {
+                self.observed_ratios
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(
+                        ctx.margin_status
+                            .get("BTCUSDT")
+                            .and_then(|status| status.margin_ratio),
+                    );
+                return Vec::new();
+            }
+            if matches!(event, MarketEvent::Trade(_)) {
+                self.bought = true;
+                return vec![OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Perpetual,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: Some(dec!(10)),
+                    margin_mode: Some(MarginMode::Isolated),
+                }];
+            }
+            Vec::new()
+        }
+    }
+
+    /// Opens a 1-BTC spot long on the first Trade event it sees, then
+    /// goes quiet -- the minimal strategy the market-condition wiring
+    /// tests drive (its position is what the monitor de-risks).
+    struct BuyOnceStrategy {
+        bought: bool,
+    }
+
+    impl Strategy for BuyOnceStrategy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if !self.bought && matches!(event, MarketEvent::Trade(_)) {
+                self.bought = true;
+                return vec![OrderIntent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Perpetual,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
+                }];
+            }
+            Vec::new()
+        }
+    }
+
+    fn unified_loop_config(
+        initial_usdt: Decimal,
+        funding_rate_bps: Option<Decimal>,
+        margin_tiers: HashMap<String, MarginTierTable>,
+    ) -> UnifiedLoopConfig {
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), initial_usdt);
+        UnifiedLoopConfig {
+            instruments: vec![btcusdt_perpetual_instrument()],
+            initial_balances,
+            funding_rate_bps,
+            risk_free_return: Decimal::ZERO,
+            risk_checker: None,
+            margin_tiers,
+            market_condition_config: None,
+        }
+    }
+
+    /// Builds the backtest-flavored executor/policy/EMS trio around one
+    /// shared `MatchingEngine` and runs the unified loop -- the same
+    /// wiring `run_backtest` performs, in miniature. `cost_model` must
+    /// carry the same `funding_rate_bps` as `config`, exactly as
+    /// `run_backtest` guarantees for its own callers.
+    async fn run(
+        config: UnifiedLoopConfig,
+        cost_model: CostModel,
+        events: Vec<MarketEvent>,
+        strategy: impl Strategy,
+    ) -> BacktestReport {
+        let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(cost_model, dec!(0.5))));
+        let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(
+            Arc::clone(&matching_engine),
+        ));
+        let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
+            crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+        );
+        let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+            child_order_sink,
+            Arc::new(apexes_strategy::PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        ));
+
+        run_unified_event_loop(
+            config,
+            futures::stream::iter(events),
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+            executor,
+            Arc::new(BacktestLiquidationPolicy),
+            NeverFillSupplementalFillSource,
+            ems,
+            strategy,
+            None,
+            None,
+        )
+        .await
+        .expect("event loop must not error")
+    }
+
+    /// End-to-end auto-liquidation: a 10x long opened at 100 collapses
+    /// to a mark price of 89, breaching the maintenance-margin ratio --
+    /// the event loop must force-close the position through the
+    /// `MatchingEngine` (selling into the resting 99 bid) without any
+    /// strategy action.
+    #[tokio::test]
+    async fn breached_margin_ratio_force_liquidates_position_through_matching_engine() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            mark_price_event(dec!(100), t0 + Duration::seconds(2)),
+            mark_price_event(dec!(89), t0 + Duration::seconds(3)),
+            // One more event so the loop processes a tick AFTER the
+            // liquidation (the position must stay closed -- no second
+            // liquidation order).
+            mark_price_event(dec!(88), t0 + Duration::seconds(4)),
+        ];
+
+        let mut margin_tiers = HashMap::new();
+        margin_tiers.insert("BTCUSDT".to_string(), single_tier_table());
+
+        let report = run(
+            unified_loop_config(dec!(1000), None, margin_tiers),
+            zero_cost_model(None),
+            events,
+            LeveragedBuyOnce::new(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await;
+
+        // Exactly two fills: the strategy's leveraged buy at 100 (walked
+        // the 100 ask), then the liquidation sell at 99 (walked the 99
+        // bid) -- a `leverage: Some` closing fill, or it would never
+        // have closed the leveraged position.
+        assert_eq!(report.trades.len(), 2, "expected open + liquidation fills");
+        let open_fill = &report.trades[0];
+        assert_eq!(open_fill.side, Side::Buy);
+        assert_eq!(open_fill.price, dec!(100));
+        assert_eq!(open_fill.leverage, Some(dec!(10)));
+        let liquidation_fill = &report.trades[1];
+        assert_eq!(liquidation_fill.side, Side::Sell);
+        assert_eq!(liquidation_fill.price, dec!(99));
+        assert_eq!(liquidation_fill.quantity, dec!(1));
+        assert_eq!(
+            liquidation_fill.leverage,
+            Some(dec!(10)),
+            "liquidation fill must carry the position's leverage to take the close_leveraged path"
+        );
+        assert_eq!(liquidation_fill.margin_mode, Some(MarginMode::Isolated));
+
+        // Accounting: 1000 USDT - 10 reserved margin - 1 realized loss
+        // + 10 released margin = 999 USDT, no residual BTC balance.
+        let final_equity = report
+            .equity_curve
+            .last()
+            .map(|(_, equity)| *equity)
+            .expect("equity curve must be non-empty");
+        assert_eq!(final_equity, dec!(999));
+    }
+
+    /// The margin state computed by the ledger must be visible to the
+    /// strategy through `StrategyContext.margin_status` -- and must
+    /// disappear once the position has been liquidated.
+    #[tokio::test]
+    async fn strategy_context_exposes_live_margin_status() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            mark_price_event(dec!(100), t0 + Duration::seconds(2)),
+            mark_price_event(dec!(100), t0 + Duration::seconds(3)),
+        ];
+
+        let mut margin_tiers = HashMap::new();
+        margin_tiers.insert("BTCUSDT".to_string(), single_tier_table());
+
+        let observed_ratios = Arc::new(Mutex::new(Vec::new()));
+        let report = run(
+            unified_loop_config(dec!(1000), None, margin_tiers),
+            zero_cost_model(None),
+            events,
+            LeveragedBuyOnce::new(Arc::clone(&observed_ratios)),
+        )
+        .await;
+
+        assert_eq!(
+            report.trades.len(),
+            1,
+            "no liquidation at an unchanged mark"
+        );
+        // Observed on the two post-open ticks: mark 100, entry 100,
+        // allocated margin 10 -> effective margin 10, maintenance
+        // 100 * 0.005 = 0.5 -> ratio 20.
+        let observed = observed_ratios.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(observed.len(), 2, "two ticks after the opening trade");
+        assert_eq!(observed[0], Some(dec!(20)));
+        assert_eq!(observed[1], Some(dec!(20)));
+    }
+
+    /// Funding settles exactly once per crossed 8-hour UTC boundary:
+    /// events at 07:59 and 08:01 cross the 08:00 boundary (one
+    /// settlement of notional * 10bps = 0.1 USDT); a further event at
+    /// 08:02 must NOT settle again.
+    #[tokio::test]
+    async fn funding_settles_once_per_crossed_eight_hour_boundary() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 7, 59, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(30)),
+            // Mark price known before the boundary so notional is
+            // computed against it (100 either way).
+            mark_price_event(dec!(100), t0 + Duration::seconds(40)),
+            // 08:01 -- first tick past the 08:00 boundary: settle.
+            mark_price_event(dec!(100), t0 + Duration::minutes(2)),
+            // 08:02 -- same 8-hour bucket: must NOT settle again.
+            mark_price_event(dec!(100), t0 + Duration::minutes(3)),
+        ];
+
+        let report = run(
+            unified_loop_config(dec!(1000), Some(dec!(10)), HashMap::new()),
+            zero_cost_model(Some(dec!(10))),
+            events,
+            LeveragedBuyOnce::new(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .await;
+
+        assert_eq!(report.trades.len(), 1, "no margin tiers -> no liquidation");
+        // 1000 - 10 margin reserved - 0.1 funding (notional 100 * 10bps)
+        // = 989.9 exactly. A second settlement would give 989.8.
+        let final_equity = report
+            .equity_curve
+            .last()
+            .map(|(_, equity)| *equity)
+            .expect("equity curve must be non-empty");
+        assert_eq!(final_equity, dec!(989.9));
+    }
+
+    /// A spot-only backtest with no margin tiers configured must behave
+    /// exactly as before this task: no liquidation, no funding, no
+    /// margin status -- the empty-`margin_tiers` default is a silent
+    /// no-op.
+    #[tokio::test]
+    async fn empty_margin_tiers_is_a_silent_noop_for_spot_backtests() {
+        struct BuySpotOnce {
+            bought: bool,
+        }
+        impl Strategy for BuySpotOnce {
+            fn on_market_event(
+                &mut self,
+                event: &MarketEvent,
+                _ctx: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                if !self.bought && matches!(event, MarketEvent::Trade(_)) {
+                    self.bought = true;
+                    return vec![OrderIntent {
+                        symbol: "BTCUSDT".to_string(),
+                        venue: apexes_core::Venue::Binance,
+                        asset_class: AssetClass::Perpetual,
+                        side: Side::Buy,
+                        order_type: OrderType::Market,
+                        quantity: dec!(1),
+                        price: None,
+                        stop_price: None,
+                        execution_algo: None,
+                        routing: OrderRouting::Fixed,
+                        leverage: None,
+                        margin_mode: None,
+                    }];
+                }
+                Vec::new()
+            }
+        }
+
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            mark_price_event(dec!(50), t0 + Duration::seconds(2)),
+        ];
+
+        let report = run(
+            unified_loop_config(dec!(1000), Some(dec!(10)), HashMap::new()),
+            zero_cost_model(Some(dec!(10))),
+            events,
+            BuySpotOnce { bought: false },
+        )
+        .await;
+
+        // Spot fill only; the mark-price collapse liquidates nothing.
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].side, Side::Buy);
+    }
+
+    /// Regression guard: `market_condition_config: None` must run
+    /// byte-for-byte identically to the pre-this-plan behavior. Runs a
+    /// simple buy-once scenario (the same shape this file's other
+    /// pre-existing tests use) with `market_condition_config`
+    /// explicitly set to `None`, and asserts exactly the same fill
+    /// count a pre-this-plan run would have produced -- if the unified
+    /// loop ever starts unconditionally touching ledger state when
+    /// `market_condition_monitor` is `None`, this test's exact-fill
+    /// assertion will catch it.
+    #[tokio::test]
+    async fn market_condition_config_none_does_not_change_existing_behavior() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(130), t0 + Duration::seconds(2)),
+        ];
+
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+
+        let config = UnifiedLoopConfig {
+            instruments: vec![btcusdt_perpetual_instrument()],
+            initial_balances,
+            funding_rate_bps: None,
+            risk_free_return: Decimal::ZERO,
+            risk_checker: None,
+            margin_tiers: HashMap::new(),
+            market_condition_config: None,
+        };
+
+        let report = run(
+            config,
+            zero_cost_model(None),
+            events,
+            BuyOnceStrategy { bought: false },
+        )
+        .await;
+
+        // Exactly one fill (the strategy's opening buy) -- no
+        // de-risking activity, since market_condition_config is None
+        // (the 30% jump would trip the monitor if it were wired).
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].side, Side::Buy);
+    }
+
+    /// With `market_condition_config: Some(...)`, a price jump past
+    /// `jump_threshold_pct` must drive an automatic partial-close
+    /// market order through the `MatchingEngine` -- the strategy's
+    /// opening buy, then a de-risking sell on the jumped tick.
+    #[tokio::test]
+    async fn extreme_price_jump_triggers_a_partial_close_through_the_matching_engine() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            // A 30% jump -- well past the 10% threshold.
+            trade_event(dec!(130), t0 + Duration::seconds(2)),
+        ];
+
+        let mut initial_balances = HashMap::new();
+        initial_balances.insert("USDT".to_string(), dec!(10000));
+
+        let config = UnifiedLoopConfig {
+            instruments: vec![btcusdt_perpetual_instrument()],
+            initial_balances,
+            funding_rate_bps: None,
+            risk_free_return: Decimal::ZERO,
+            risk_checker: None,
+            margin_tiers: HashMap::new(),
+            market_condition_config: Some(apexes_risk::MarketConditionConfig {
+                volatility_threshold: dec!(1000000), // effectively disabled, isolate the jump signal
+                jump_threshold_pct: dec!(0.10),
+                sensitivity: dec!(1),
+                volatility_window: 20,
+                price_source: apexes_risk::PriceSource::Trade,
+                account_equity_volatility_threshold: None,
+                include_spot: true, // this test uses a SPOT buy-once strategy
+            }),
+        };
+
+        let report = run(
+            config,
+            zero_cost_model(None),
+            events,
+            BuyOnceStrategy { bought: false },
+        )
+        .await;
+
+        // Expect 2 fills: the strategy's opening buy, then a de-risking
+        // sell triggered by the 30% jump (fraction 1.0, full close).
+        assert_eq!(report.trades.len(), 2);
+        assert_eq!(report.trades[0].side, Side::Buy);
+        assert_eq!(report.trades[1].side, Side::Sell);
+    }
+}

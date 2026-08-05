@@ -1,20 +1,25 @@
 //! [`run_paper_trading`]: the `apexes-paper` counterpart to
 //! `apexes_backtest::run_backtest` -- drives the same shared event-loop
-//! core (`apexes_backtest::event_loop::run_event_loop`) against a live
-//! `MarketDataProvider::subscribe()` stream instead of pre-loaded
-//! historical data.
+//! core (`apexes_backtest::unified_loop::run_unified_event_loop`)
+//! against a live `MarketDataProvider::subscribe()` stream instead of
+//! pre-loaded historical data.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use apexes_backtest::clock::BacktestClock;
-use apexes_backtest::event_loop::{EventLoopConfig, run_event_loop};
-use apexes_backtest::{BacktestReport, CostModel, LatencyModel, ReplaySpeed};
+use apexes_backtest::ems_adapter::MatchingEngineChildOrderSink;
+use apexes_backtest::order_executor_adapter::{
+    BacktestLiquidationPolicy, MatchingEngineOrderExecutor, NeverFillSupplementalFillSource,
+};
+use apexes_backtest::unified_loop::{UnifiedLoopConfig, run_unified_event_loop};
+use apexes_backtest::{BacktestReport, CostModel, LatencyModel, MatchingEngine, ReplaySpeed};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
+use apexes_ems::Ems;
 use apexes_message_bus::{MarketEventBus, receiver_into_stream};
 use apexes_risk::CompositeRiskChecker;
-use apexes_strategy::{MarginTierTable, Strategy, VenueScorer};
+use apexes_strategy::{MarginTierTable, OrderExecutor, Strategy, VenueScorer};
 use futures::StreamExt;
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
@@ -82,14 +87,15 @@ pub async fn run_paper_trading(
             reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
         })?;
 
-    // `run_event_loop` polls its own stop signal only at the top of each
-    // iteration, so a signal arriving while the loop is blocked on the
-    // never-ending bus stream would never be observed (the loop would hang
-    // after the mock provider's finite events are drained). Gating the
+    // `run_unified_event_loop` polls its own stop signal only at the top
+    // of each iteration, so a signal arriving while the loop is blocked on
+    // the never-ending bus stream would never be observed (the loop would
+    // hang after the mock provider's finite events are drained). Gating the
     // stream with `take_until` instead makes the stop signal end the stream
     // -- the loop's own exit path -- preserving the same "fires or its
-    // sender is dropped" semantics `run_event_loop` documents for its own
-    // `stop_signal` parameter (a dropped oneshot sender resolves the await).
+    // sender is dropped" semantics `run_unified_event_loop` documents for
+    // its own `stop_signal` parameter (a dropped oneshot sender resolves
+    // the await).
     let event_stream = receiver_into_stream(bus.subscribe(&config.instruments).await?).take_until(
         Box::pin(async move {
             let _ = stop_signal.await;
@@ -97,23 +103,52 @@ pub async fn run_paper_trading(
     );
     let clock = BacktestClock::new(ReplaySpeed::AsFastAsPossible);
 
-    let event_loop_config = EventLoopConfig {
+    // `funding_rate_bps` is read off the `CostModel` BEFORE it is moved
+    // into the `MatchingEngine`: the unified loop needs the rate for its
+    // own funding-settlement pass (see
+    // `UnifiedLoopConfig::funding_rate_bps`), while the full `CostModel`
+    // -- fee schedule included -- belongs to the matching engine that
+    // computes per-fill fees.
+    let funding_rate_bps = config.cost_model.funding_rate_bps;
+    // ONE shared `MatchingEngine` instance backs both the executor
+    // (direct strategy orders) and the EMS child-order sink (algo
+    // orders), so both interact through a single simulated order book --
+    // the same wiring `run_backtest` performs.
+    let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(
+        config.cost_model,
+        config.queue_position_factor,
+    )));
+    let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
+        &matching_engine,
+    )));
+    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
+        MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+    );
+    let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+        child_order_sink,
+        venue_scorer,
+        HashMap::new(),
+        volume_curve_provider,
+    ));
+
+    let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
         initial_balances: config.initial_balances,
-        cost_model: config.cost_model,
-        queue_position_factor: config.queue_position_factor,
+        funding_rate_bps,
         risk_free_return: config.risk_free_return,
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
     };
 
-    run_event_loop(
-        event_loop_config,
+    run_unified_event_loop(
+        unified_loop_config,
         event_stream,
         clock,
-        venue_scorer,
-        volume_curve_provider,
+        executor,
+        Arc::new(BacktestLiquidationPolicy),
+        NeverFillSupplementalFillSource,
+        ems,
         strategy,
         None,
         Some(config.latency_model),

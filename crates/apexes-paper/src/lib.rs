@@ -1,5 +1,5 @@
 //! Apexes paper trading: drives `apexes-backtest`'s shared event-loop
-//! core (`apexes_backtest::event_loop::run_event_loop`) against a live
+//! core (`apexes_backtest::unified_loop::run_unified_event_loop`) against a live
 //! `apexes_core::MarketDataProvider` feed instead of pre-loaded
 //! historical data, applying simulated order-submission latency
 //! (`apexes_backtest::LatencyModel`) and accepting an explicit stop

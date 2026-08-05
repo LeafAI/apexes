@@ -4,7 +4,7 @@
 //! `apexes-ems` itself depending on `apexes-backtest` (see
 //! `apexes_ems`'s crate-level docs for why that dependency direction is
 //! forbidden). Wraps the SAME `Arc<Mutex<MatchingEngine>>` the owning
-//! `run_event_loop` call also drives directly for strategy-submitted
+//! `run_unified_event_loop` call also drives directly for strategy-submitted
 //! (non-algo) orders, so EMS child-order fills and direct-strategy
 //! fills interact through one single shared order book, not two
 //! independent simulations.

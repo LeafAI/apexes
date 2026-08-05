@@ -2,14 +2,14 @@
 //! [`NeverFillSupplementalFillSource`]: adapt `crate::matching_engine::MatchingEngine`
 //! and today's backtest/paper auto-liquidation behavior to the three
 //! `apexes_strategy` traits (`OrderExecutor`/`LiquidationPolicy`/
-//! `SupplementalFillSource`) a future unified event-loop core drives,
-//! abstracting over backtest/paper (this module) vs. live trading
-//! (a sibling adapter in `apexes-live-trading`, not part of this task).
+//! `SupplementalFillSource`) that `crate::unified_loop::run_unified_event_loop`
+//! drives, abstracting over backtest/paper (this module) vs. live
+//! trading (a sibling adapter in `apexes-live-trading`).
 //!
-//! NOT wired into `run_event_loop`/`run_backtest`/`run_paper_trading`
-//! yet -- a later plan task builds the unified loop and switches those
-//! callers over to it. This module has zero behavioral impact on any
-//! existing code path today.
+//! Both `run_backtest` and `apexes-paper`'s `run_paper_trading`
+//! construct this module's three types and pass them into the unified
+//! loop -- this is the execution backend for every simulated
+//! (backtest/paper) run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,19 +29,19 @@ use crate::matching_engine::MatchingEngine;
 /// Adapts `MatchingEngine` (backtest/paper's synchronous simulated
 /// matching kernel) to `OrderExecutor`. Wraps the SAME
 /// `Arc<Mutex<MatchingEngine>>` a unified loop shares with
-/// `crate::ems_adapter::MatchingEngineChildOrderSink` -- exactly as
-/// today's `run_event_loop` shares one engine instance between its own
-/// direct dispatch and the EMS child-order sink, so EMS fills and
-/// direct-strategy fills interact through one single order book, not
-/// two independent simulations.
+/// `crate::ems_adapter::MatchingEngineChildOrderSink` -- `run_backtest`
+/// and `run_paper_trading` each construct ONE engine instance and give
+/// it to both this executor (direct strategy dispatch) and the EMS
+/// child-order sink, so EMS fills and direct-strategy fills interact
+/// through one single order book, not two independent simulations.
 pub struct MatchingEngineOrderExecutor {
     engine: Arc<Mutex<MatchingEngine>>,
     /// Every order this executor has ever submitted, keyed by
     /// `OrderId`. `MatchingEngine` itself keeps no such lookup table
     /// (see `ems_adapter`'s `submitted` field for the same precedent),
-    /// so this adapter keeps its own -- mirroring today's
-    /// `run_event_loop`'s local `open_orders: HashMap<OrderId, Order>`,
-    /// including that it is NEVER pruned on terminal status (preserving
+    /// so this adapter keeps its own -- taking over the role the
+    /// former `run_event_loop`'s local `open_orders: HashMap<OrderId, Order>`
+    /// played, including that it is NEVER pruned on terminal status (preserving
     /// that exact, however unbounded, existing behavior is required by
     /// this plan's behavior-preservation constraint, not a defect this
     /// task is meant to fix).

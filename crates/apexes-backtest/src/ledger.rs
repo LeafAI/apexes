@@ -149,7 +149,7 @@ impl PortfolioLedger {
     /// `None` is also a safe no-op (via `funding_payment`'s existing
     /// `None`-propagating behavior).
     ///
-    /// Callers (`run_event_loop`) are responsible for deciding WHEN to
+    /// Callers (`run_unified_event_loop`) are responsible for deciding WHEN to
     /// call this -- this method itself performs exactly one settlement
     /// pass over all open leveraged positions each time it's called; it
     /// does not track time or funding-interval scheduling itself.
@@ -665,7 +665,7 @@ impl PortfolioLedger {
     /// Returns every symbol whose current `margin_status` has
     /// `margin_ratio <= 1.0` (maintenance margin requirement can no
     /// longer be met by the allocated/pooled margin) -- these positions
-    /// must be force-closed. Callers (`run_event_loop`, backtest/paper
+    /// must be force-closed. Callers (`run_unified_event_loop`, backtest/paper
     /// only -- `run_live_trading` calls this too but never force-closes,
     /// see Task 7) submit one market order per returned symbol.
     pub fn check_liquidations(

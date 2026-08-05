@@ -1,7 +1,7 @@
 //! [`LatencyModel`]: simulates network round-trip latency between a
 //! strategy deciding to submit an order and the (simulated) exchange
 //! receiving it. Defined in `apexes-backtest` (not `apexes-paper`) to
-//! avoid a circular crate dependency, since `run_event_loop` (this
+//! avoid a circular crate dependency, since `run_unified_event_loop` (this
 //! crate) needs to accept an `Option<LatencyModel>` parameter and
 //! `apexes-paper` depends on `apexes-backtest`, not the reverse.
 //! `apexes-paper` re-exports this type via `pub use
@@ -10,7 +10,7 @@
 //!
 //! Historical replay (`run_backtest`) has no use for this -- recorded
 //! event timestamps are already fixed, so `run_backtest` always passes
-//! `None` to `run_event_loop`'s `latency_model` parameter.
+//! `None` to `run_unified_event_loop`'s `latency_model` parameter.
 
 use rand::RngExt;
 use std::time::Duration;

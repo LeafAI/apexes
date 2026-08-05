@@ -157,7 +157,7 @@ impl MatchingEngine {
     }
 
     /// Read-only access to the engine's `CostModel` -- used by
-    /// `run_event_loop`'s periodic funding-settlement pass, which needs
+    /// `run_unified_event_loop`'s periodic funding-settlement pass, which needs
     /// the same `funding_rate_bps` configuration the engine was built
     /// with (`CostModel` is not `Clone`, and the engine owns the only
     /// instance).

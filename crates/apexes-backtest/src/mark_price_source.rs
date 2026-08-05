@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 pub struct StorageReaderMarkPriceProvider {
     reader: StorageReader,
-    /// Updated by the caller (`run_event_loop`) as it advances through
+    /// Updated by the caller (`run_unified_event_loop`) as it advances through
     /// replay -- "current" mark price means "as of this timestamp".
     current_timestamp: Mutex<DateTime<Utc>>,
 }

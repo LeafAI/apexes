@@ -7,10 +7,11 @@
 //! crypto gateway) will implement against unchanged, per the project's
 //! non-negotiable backtest/live logic-parity requirement.
 //!
-//! [`event_loop`] holds the shared core `run_backtest` and
-//! `apexes-paper`'s `run_paper_trading` both drive -- it is `pub` (so
-//! `apexes-paper` can reach it) but deliberately not re-exported here;
-//! `run_backtest` remains this crate's primary public entry point.
+//! [`unified_loop`] holds the single shared core `run_backtest`,
+//! `apexes-paper`'s `run_paper_trading` and `apexes-live-trading`'s
+//! `run_live_trading` all drive -- it is `pub` (so those crates can
+//! reach it) but deliberately not re-exported here; `run_backtest`
+//! remains this crate's primary public entry point.
 
 pub mod error;
 
@@ -27,7 +28,6 @@ pub mod order_book;
 // Populated in Task 5.
 pub mod cost_model;
 
-pub mod event_loop;
 pub mod latency;
 pub mod mark_price_source;
 
@@ -46,6 +46,8 @@ pub mod performance;
 // Populated in Task 14.
 pub mod report;
 pub mod runner;
+
+pub mod unified_loop;
 
 pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
