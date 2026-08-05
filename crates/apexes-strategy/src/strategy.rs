@@ -2,6 +2,7 @@ use crate::margin_tier::PositionMarginStatus;
 use apexes_core::{AssetClass, MarginMode, Order, OrderId, OrderType, Side, Venue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
@@ -223,7 +224,12 @@ pub struct OrderIntent {
 }
 
 /// A net position in a single symbol.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Derives `Serialize`/`Deserialize` (added by `apexes-engine`'s Task
+/// 8, design spec §6.2) so this type can be embedded in
+/// `apexes_backtest::SessionSnapshot` and sent over `/session/ws` --
+/// no existing behavior changes, this is purely additive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: String,
     /// Signed: positive = long, negative = short.

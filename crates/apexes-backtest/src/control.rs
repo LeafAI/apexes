@@ -11,12 +11,19 @@ use std::time::{Duration, Instant};
 use apexes_strategy::{Position, PositionMarginStatus};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
 /// A command sent by a caller holding the other half of a
 /// [`ControlHandle`] (e.g. `apexes-engine`'s WS handler) to steer a
 /// running session.
-#[derive(Debug, Clone)]
+///
+/// Derives `Serialize`/`Deserialize` (added by `apexes-engine`'s Task
+/// 8, design spec §6.2) so this type can be embedded directly in
+/// `apexes_engine::protocol::SessionMessage::Command` and sent over
+/// `/session/ws` -- Task 2 (this crate) had no serialization consumer
+/// of its own, so these derives were not required until now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionCommand {
     /// Hot-updates one tunable strategy parameter. Applied via
     /// `Strategy::set_param`; an unknown parameter name logs a warning
@@ -36,7 +43,10 @@ pub enum SessionCommand {
 /// A point-in-time view of a running session's state, pushed by the
 /// unified loop via a `watch` channel (throttled to `min_interval`) for
 /// monitoring/UI display.
-#[derive(Debug, Clone)]
+///
+/// Derives `Serialize`/`Deserialize` for the same reason
+/// [`SessionCommand`] does -- see that type's doc comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub positions: HashMap<String, Position>,
     pub balances: HashMap<String, Decimal>,

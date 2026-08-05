@@ -57,7 +57,11 @@ impl MarginTierTable {
 /// with the actual ledger data) but defined here so both
 /// `apexes-risk::MarginMonitor` and `apexes-strategy::StrategyContext`
 /// (neither of which depends on `apexes-backtest`) can reference it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Derives `Serialize`/`Deserialize` (added by `apexes-engine`'s Task
+/// 8, design spec §6.2) so this type can be embedded in
+/// `apexes_backtest::SessionSnapshot` and sent over `/session/ws` --
+/// purely additive, no existing behavior changes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PositionMarginStatus {
     /// `None`: spot position, margin doesn't apply. `Some(ratio)`:
     /// current margin / maintenance margin requirement -- `<= 1.0`

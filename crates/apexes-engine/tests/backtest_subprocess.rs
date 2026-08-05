@@ -66,7 +66,9 @@ async fn apexes_engine_binary_runs_a_backtest_session_to_completion() {
     let strategy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../apexes-strategy-loader/tests/fixtures/always_buy.drift");
 
+    let session_id = format!("engine-subprocess-test-{}", uuid::Uuid::new_v4());
     let config = LaunchConfig {
+        session_id: session_id.clone(),
         mode: SessionMode::Backtest {
             date_range: date..(date.succ_opt().unwrap()),
             clickhouse_url: CLICKHOUSE_URL.to_string(),
@@ -100,6 +102,13 @@ async fn apexes_engine_binary_runs_a_backtest_session_to_completion() {
         .expect("failed to spawn apexes-engine binary");
 
     let _ = std::fs::remove_dir_all(&dir);
+    if let Some(home) = std::env::var_os("HOME") {
+        let pid_file = std::path::PathBuf::from(home)
+            .join(".apexes")
+            .join("sessions")
+            .join(format!("{session_id}.pid"));
+        let _ = std::fs::remove_file(pid_file);
+    }
 
     assert!(
         output.status.success(),

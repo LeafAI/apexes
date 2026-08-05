@@ -114,6 +114,23 @@ pub enum SessionMode {
 /// `BacktestConfig`/`PaperTradingConfig`/`LiveTradingConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchConfig {
+    /// A caller-generated (by `apexes-ui`, BEFORE spawning this
+    /// process) unique identifier for this session, used ONLY to name
+    /// this engine process's PID file: `~/.apexes/sessions/<session_id>.pid`
+    /// (Task 8, design spec §6.2/§4). Added by Task 8 -- deliberately
+    /// NOT engine-generated (e.g. a UUID minted at startup, or derived
+    /// from the ephemeral port `/session/ws` happens to bind): the
+    /// whole point of a predictable PID-file path is that
+    /// `apexes-ui`'s future supervisor (Task 9) needs to know it
+    /// BEFORE spawning the process, so it can poll for the file's
+    /// existence/read it back without any out-of-band communication
+    /// (stdout scraping, a second file, etc.) from the child. Since
+    /// `apexes-ui` already constructs the whole `LaunchConfig` before
+    /// spawning, having it mint this identifier (e.g.
+    /// `uuid::Uuid::new_v4().to_string()`) and pass it through here is
+    /// the simplest mechanism that is genuinely predictable by the
+    /// caller.
+    pub session_id: String,
     pub mode: SessionMode,
     pub strategy_ref: StrategyRef,
     pub instruments: Vec<Instrument>,
@@ -185,6 +202,7 @@ mod tests {
 
     fn sample_backtest_config() -> LaunchConfig {
         LaunchConfig {
+            session_id: "test-session-backtest".to_string(),
             mode: SessionMode::Backtest {
                 date_range: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
                     ..NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
@@ -206,6 +224,7 @@ mod tests {
 
     fn sample_live_config() -> LaunchConfig {
         LaunchConfig {
+            session_id: "test-session-live".to_string(),
             mode: SessionMode::Live {
                 credentials_ref: "binance-main".to_string(),
                 auto_derisk_live: false,

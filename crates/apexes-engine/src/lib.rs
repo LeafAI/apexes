@@ -11,8 +11,12 @@
 pub mod credentials;
 pub mod gateway_client;
 pub mod launch_config;
+pub mod protocol;
+pub mod server;
 
 pub use apexes_strategy_loader::StrategyRef;
 pub use credentials::{CredentialsError, resolve_binance_credentials};
 pub use gateway_client::GatewayMarketDataProvider;
 pub use launch_config::{LaunchConfig, SessionMode};
+pub use protocol::SessionMessage;
+pub use server::build_app;

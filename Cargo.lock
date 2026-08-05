@@ -385,6 +385,7 @@ dependencies = [
  "apexes-strategy",
  "apexes-strategy-loader",
  "async-trait",
+ "axum",
  "chrono",
  "clap",
  "core_affinity",

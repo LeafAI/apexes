@@ -41,7 +41,7 @@ use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
 use apexes_engine::launch_config::{LaunchConfig, SessionMode};
-use apexes_engine::{credentials, resolve_binance_credentials};
+use apexes_engine::{build_app, credentials, resolve_binance_credentials};
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExecutionGateway, OrderManager, OrderStore};
@@ -49,6 +49,7 @@ use apexes_paper::{LatencyModel, PaperTradingConfig, run_paper_trading};
 use apexes_storage::StorageReader;
 use apexes_strategy::Strategy;
 use clap::Parser;
+use tokio::net::TcpListener;
 
 mod combined_market_data;
 
@@ -88,6 +89,8 @@ enum EngineError {
     OrderStore(#[from] apexes_oms::OmsError),
     #[error("failed to start Binance User Data Stream: {reason}")]
     UserDataStream { reason: String },
+    #[error("failed to bind /session/ws listener on 127.0.0.1:0: {0}")]
+    BindSessionWs(std::io::Error),
     #[error("run_backtest/run_paper_trading/run_live_trading failed: {0}")]
     Run(#[from] ApexesError),
 }
@@ -115,6 +118,69 @@ fn build_control_handle(
         timestamp: chrono::Utc::now(),
     };
     apexes_backtest::ControlHandle::new(snapshot_min_interval, initial_snapshot)
+}
+
+/// Writes this engine process's PID file at
+/// `~/.apexes/sessions/<session_id>.pid` (creating
+/// `~/.apexes/sessions/` first if it doesn't exist), so `apexes-ui`'s
+/// future supervisor (Task 9, not yet built) can predict the path
+/// BEFORE spawning this process (it already generates `session_id`
+/// and writes it into the `LaunchConfig` it hands to this binary --
+/// see `LaunchConfig::session_id`'s own doc comment for the full
+/// rationale for why the identifier is caller-generated rather than
+/// engine-generated).
+///
+/// # PID file format (AUTHORITATIVE -- mirrors
+/// `apexes-market-data-gateway`'s own PID file format exactly, see
+/// that crate's `main.rs` doc comment): the file's entire content is
+/// exactly two lines, `\n`-terminated, in this fixed order, with no
+/// other content:
+///
+/// ```text
+/// <pid>
+/// <port>
+/// ```
+///
+/// - Line 1: this process's OS PID (`std::process::id()`).
+/// - Line 2: the TCP port `/session/ws` actually bound (this engine
+///   always binds an ephemeral `127.0.0.1:0` port -- there is no
+///   `--port` CLI flag, since each session gets its own process and
+///   `apexes-ui` needs to read the ACTUALLY assigned port back from
+///   this file regardless).
+///
+/// A failure here (e.g. unwritable home directory) is logged via
+/// `tracing::error!` and does NOT abort startup -- matching
+/// `apexes-market-data-gateway`'s identical "auto-discovery degrades,
+/// the session itself is unaffected" convention. This process does
+/// NOT delete the PID file on graceful shutdown -- liveness is
+/// determined by the consumer checking whether the recorded PID is
+/// still alive, not by file presence/absence.
+fn write_pid_file(session_id: &str, port: u16) {
+    let Some(home) = std::env::var_os("HOME") else {
+        tracing::error!("apexes-engine: HOME environment variable not set, skipping PID file");
+        return;
+    };
+    let dir: PathBuf = PathBuf::from(home).join(".apexes").join("sessions");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::error!(
+            ?error,
+            path = ?dir,
+            "apexes-engine: failed to create PID file directory, skipping PID file"
+        );
+        return;
+    }
+    let path = dir.join(format!("{session_id}.pid"));
+    let contents = format!("{}\n{}\n", std::process::id(), port);
+    if let Err(error) = std::fs::write(&path, contents) {
+        tracing::error!(?error, path = ?path, "apexes-engine: failed to write PID file");
+    } else {
+        tracing::info!(
+            path = ?path,
+            pid = std::process::id(),
+            port,
+            "apexes-engine: wrote PID file"
+        );
+    }
 }
 
 /// A zero-fee `CostModel` used by `Backtest`/`Paper` mode's internal
@@ -287,13 +353,67 @@ async fn run(launch_config: LaunchConfig, strategy: Box<dyn Strategy>) -> i32 {
     }
 }
 
+/// Owns constructing the ONE shared `oneshot::channel()` used for
+/// graceful `Stop` requests (see `SessionCommand::Stop`'s own doc
+/// comment): NOT constructed per-mode-function (each mode function
+/// building its own throwaway `oneshot::channel()` and discarding the
+/// sender half, as an earlier draft of this file did, means a
+/// `Stop` command sent over `/session/ws` would have nowhere real to
+/// go). Also binds the `/session/ws` listener, spawns the `axum`
+/// server as its own concurrently-running task (NOT blocking the mode
+/// dispatch below), and writes this engine's PID file -- all BEFORE
+/// dispatching to the selected mode, so a client connecting
+/// immediately after this process starts never races against the
+/// listener not existing yet (a `watch` channel's "late subscriber
+/// gets the current value" semantics also mean starting the trading
+/// loop before the server binds is not itself a correctness concern,
+/// but binding first is simplest to reason about and costs nothing).
 async fn run_inner(
     launch_config: LaunchConfig,
     strategy: Box<dyn Strategy>,
 ) -> Result<(), EngineError> {
     let registry = Registry::new();
-    let (control_handle, _command_tx, _snapshot_rx) =
+    let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(EngineError::BindSessionWs)?;
+    let bound_port = listener
+        .local_addr()
+        .map_err(EngineError::BindSessionWs)?
+        .port();
+    write_pid_file(&launch_config.session_id, bound_port);
+
+    let app = build_app(command_tx, snapshot_rx);
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(
+                ?error,
+                "apexes-engine: /session/ws axum::serve exited with an error"
+            );
+        }
+    });
+    tracing::info!(
+        port = bound_port,
+        session_id = %launch_config.session_id,
+        "apexes-engine: listening on /session/ws"
+    );
+
+    // The one shared stop channel: `stop_rx` is handed to the mode
+    // dispatch below only for `Paper`/`Live` (`Backtest`'s historical
+    // replay has no live-stop concept -- see `run_backtest_mode`'s own
+    // doc comment). `_stop_tx` is deliberately kept alive for the
+    // ENTIRE duration of the `match` below (bound in this function's
+    // own scope, not dropped early) -- dropping it before the mode
+    // dispatch finishes would make `stop_rx` resolve immediately (a
+    // spurious stop). Nothing currently sends on it directly from
+    // `run_inner`: the `/session/ws` server's `Stop`-command path is
+    // wired through `ControlHandle`/`drain_commands` inside the
+    // unified loop itself (design spec §5.1/§5.2), NOT through this
+    // oneshot -- a future revision may additionally wire an
+    // OS-signal-triggered graceful shutdown through it.
+    let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
     match launch_config.mode.clone() {
         SessionMode::Backtest {
@@ -311,7 +431,7 @@ async fn run_inner(
             .await
         }
         SessionMode::Paper => {
-            run_paper_mode(&launch_config, &registry, strategy, control_handle).await
+            run_paper_mode(&launch_config, &registry, strategy, control_handle, stop_rx).await
         }
         SessionMode::Live {
             credentials_ref,
@@ -331,6 +451,7 @@ async fn run_inner(
                 strategy,
                 control_handle,
                 live_params,
+                stop_rx,
             )
             .await
         }
@@ -394,11 +515,19 @@ async fn run_backtest_mode(
 /// `SessionMode::Paper`: `run_paper_trading` takes `&MarketEventBus` --
 /// connects to `gateway_url` via `GatewayMarketDataProvider`, wraps it
 /// in a real `MarketEventBus`, and passes `&bus` directly.
+///
+/// `stop_signal`'s sender half is owned by `run_inner` (the shared
+/// stop channel, see that function's own doc comment) -- NOT
+/// constructed here anymore, since a per-mode-function throwaway
+/// `oneshot::channel()` whose sender is immediately discarded makes
+/// graceful `Stop` unreachable from outside the process (the bug
+/// Task 8 fixes).
 async fn run_paper_mode(
     launch_config: &LaunchConfig,
     registry: &Registry,
     strategy: Box<dyn Strategy>,
     control_handle: apexes_backtest::ControlHandle,
+    stop_signal: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), EngineError> {
     let provider = GatewayMarketDataProvider::new(launch_config.gateway_url.clone());
     let bus = MarketEventBus::new(Box::new(provider));
@@ -415,16 +544,7 @@ async fn run_paper_mode(
         control: Some(control_handle),
     };
 
-    // No external stop signal is wired up yet for Task 7 -- Task 8's
-    // `axum` `/session/ws` server (not built by this task) is expected
-    // to own the sender half of a fresh `oneshot` channel and trigger
-    // graceful shutdown on a client `Stop` request; until then, this
-    // session runs until the gateway connection ends the stream on its
-    // own (which, per `MarketEventBus`'s own docs, it never does for a
-    // live connection) or the process is killed externally.
-    let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-
-    run_paper_trading(config, registry, &bus, strategy, stop_rx)
+    run_paper_trading(config, registry, &bus, strategy, stop_signal)
         .await
         .map_err(EngineError::Run)?;
     Ok(())
@@ -449,12 +569,16 @@ struct LiveModeParams {
 /// it under every distinct venue in `launch_config.instruments` --
 /// see `register_gateway_bus_for_all_venues`'s own doc comment for why
 /// this is the correct shape.
+///
+/// `stop_signal`'s sender half is owned by `run_inner` (the shared
+/// stop channel) -- see `run_paper_mode`'s identical doc note.
 async fn run_live_mode(
     launch_config: &LaunchConfig,
     registry: &Registry,
     strategy: Box<dyn Strategy>,
     control_handle: apexes_backtest::ControlHandle,
     live_params: LiveModeParams,
+    stop_signal: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), EngineError> {
     let LiveModeParams {
         credentials_ref,
@@ -509,17 +633,13 @@ async fn run_live_mode(
         control: Some(control_handle),
     };
 
-    // Same "no external stop signal wired up yet" note as `run_paper_mode`
-    // -- Task 8 owns triggering graceful shutdown.
-    let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-
     run_live_trading(
         config,
         registry,
         strategy,
         order_manager,
         exchange_updates,
-        stop_rx,
+        stop_signal,
     )
     .await
     .map_err(EngineError::Run)?;
@@ -594,6 +714,7 @@ mod tests {
 
     fn sample_launch_config(mode: SessionMode) -> LaunchConfig {
         LaunchConfig {
+            session_id: format!("test-session-{}", uuid::Uuid::new_v4()),
             mode,
             strategy_ref: apexes_engine::StrategyRef::RustNative {
                 name: "does-not-matter-for-this-test".to_string(),
