@@ -15,12 +15,20 @@
 //! subscribe-once/broadcast/log-and-continue-on-lag conventions) without
 //! depending on or wrapping that crate directly.
 //!
-//! This module (part 1 of 3 for the gateway crate) provides only the
-//! subscriber-broadcast core: `Gateway::new`/`connect`/`subscribe`.
-//! Persistence/replay (reusing `apexes-storage`) and the `main.rs`/CLI/
-//! `axum` wiring that turns this into a runnable process are later tasks.
+//! Part 1 of 3 for the gateway crate provided the subscriber-broadcast
+//! core: `Gateway::new`/`connect`/`subscribe`. Part 2 (this addition)
+//! adds `replay.rs` (historical replay via `apexes_storage::StorageReader`)
+//! and `persistence.rs` (async, non-blocking persistence via
+//! `apexes_storage::StorageWriter`), wired into `Gateway` via
+//! `attach_persistence`/`flush_persistence_aged` and into `connect`'s
+//! forwarding loop. The `main.rs`/CLI/`axum` wiring that turns this into
+//! a runnable process is part 3, a later task.
 
 pub mod gateway;
+pub mod persistence;
 pub mod protocol;
+pub mod replay;
 
 pub use gateway::Gateway;
+pub use persistence::PersistenceBuffer;
+pub use replay::replay_since;

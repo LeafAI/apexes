@@ -522,6 +522,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-core",
  "apexes-message-bus",
+ "apexes-storage",
  "async-trait",
  "chrono",
  "futures",

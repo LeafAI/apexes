@@ -4,8 +4,10 @@
 //! (an in-process-only broadcast wrapper) -- see this crate's own
 //! `lib.rs` docs and the design spec for the full rationale.
 
+use crate::persistence::PersistenceBuffer;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent};
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
 
 /// Default `tokio::sync::broadcast` channel capacity used by
@@ -31,11 +33,21 @@ pub struct Gateway {
     provider: Box<dyn MarketDataProvider>,
     sender: broadcast::Sender<MarketEvent>,
     state: Mutex<ConnectState>,
+    /// `None` until/unless `attach_persistence` is called. Shared via
+    /// `Arc` (not just `Mutex`) because `connect`'s forwarding loop
+    /// runs in its own spawned task that outlives the `&self` borrow
+    /// of this method, so it needs an owned, independently-lockable
+    /// handle onto this same state -- and `Arc<Mutex<..>>` also lets a
+    /// separate periodic task (`main.rs`, Task 5) call
+    /// `flush_persistence_aged` concurrently with the forwarding
+    /// loop's per-event `record` calls without racing.
+    persistence: Arc<Mutex<Option<PersistenceBuffer>>>,
 }
 
 impl Gateway {
     /// Constructs a `Gateway` wrapping `provider`, with a
-    /// `DEFAULT_BROADCAST_CAPACITY`-sized broadcast channel.
+    /// `DEFAULT_BROADCAST_CAPACITY`-sized broadcast channel and no
+    /// persistence attached (see `attach_persistence`).
     pub fn new(provider: Box<dyn MarketDataProvider>, capacity: usize) -> Self {
         let capacity = if capacity == 0 {
             DEFAULT_BROADCAST_CAPACITY
@@ -47,6 +59,32 @@ impl Gateway {
             provider,
             sender,
             state: Mutex::new(ConnectState::NotConnected),
+            persistence: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Attaches `buffer` as this `Gateway`'s persistence sink. Can be
+    /// called before or after `connect` -- the forwarding loop reads
+    /// this shared, lockable slot fresh on every event rather than
+    /// snapshotting it once at `connect` time, so persistence starts
+    /// applying to subsequent events as soon as this call completes,
+    /// regardless of ordering relative to `connect`. Calling this a
+    /// second time replaces the previous buffer (its own unflushed
+    /// contents are dropped, matching this crate's established
+    /// "monitoring availability over historical completeness"
+    /// convention -- see `persistence.rs`'s docs).
+    pub async fn attach_persistence(&self, buffer: PersistenceBuffer) {
+        *self.persistence.lock().await = Some(buffer);
+    }
+
+    /// Runs the age-based flush pass (see
+    /// `PersistenceBuffer::flush_aged`) on the currently attached
+    /// persistence buffer, if any. A no-op if `attach_persistence` was
+    /// never called. Intended to be called periodically (e.g. from a
+    /// `tokio::time::interval` loop in `main.rs`, Task 5).
+    pub async fn flush_persistence_aged(&self) {
+        if let Some(buffer) = self.persistence.lock().await.as_mut() {
+            buffer.flush_aged().await;
         }
     }
 
@@ -103,8 +141,17 @@ impl Gateway {
 
         let mut stream = self.provider.subscribe(instruments).await?;
         let forward_sender = self.sender.clone();
+        let persistence = Arc::clone(&self.persistence);
         tokio::spawn(async move {
             while let Some(event) = stream.next().await {
+                // Buffering into `persistence` only appends to an
+                // in-memory `Vec` and, at most, `tokio::spawn`s a
+                // flush task -- it never itself awaits a ClickHouse
+                // network round-trip, so this never slows down the
+                // broadcast send below.
+                if let Some(buffer) = persistence.lock().await.as_mut() {
+                    buffer.record(&event).await;
+                }
                 // A `send` error here means every receiver has been
                 // dropped -- nothing left to forward to, not a
                 // failure worth logging.

@@ -10,7 +10,9 @@ path = "src/lib.rs"
 
 [dependencies]
 apexes-core = { path = "../apexes-core" }
+apexes-storage = { path = "../apexes-storage" }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,4 +24,3 @@ apexes-message-bus = { path = "../apexes-message-bus" }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 rust_decimal = { workspace = true }
 rust_decimal_macros = "1.40"
-chrono = { workspace = true }
