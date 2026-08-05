@@ -48,6 +48,14 @@ pub struct BacktestConfig {
     /// disables it entirely -- see
     /// `UnifiedLoopConfig.market_condition_config`'s doc comment.
     pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
+    /// Live-tuning/monitoring control channel (design spec
+    /// `2026-08-05-apexes-13c-strategy-monitoring-tuning-design.md`
+    /// §5), threaded straight through to
+    /// `UnifiedLoopConfig.control`. `None` (the default for every
+    /// pre-existing caller) is a silent no-op: no command draining, no
+    /// pause gating, no snapshot pushes -- identical to this crate's
+    /// behavior before this field existed.
+    pub control: Option<crate::control::ControlHandle>,
 }
 
 /// Runs a full backtest: replays `market_data` in chronological order
@@ -136,7 +144,7 @@ pub async fn run_backtest(
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
-        control: None,
+        control: config.control,
     };
 
     run_unified_event_loop(
@@ -282,6 +290,7 @@ mod tests {
             risk_free_return: Decimal::ZERO,
             margin_tiers: HashMap::new(),
             market_condition_config: None,
+            control: None,
         };
 
         let registry = Registry::new();

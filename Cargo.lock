@@ -373,18 +373,32 @@ dependencies = [
 name = "apexes-engine"
 version = "0.1.0"
 dependencies = [
+ "apexes-backtest",
  "apexes-core",
+ "apexes-gateway-binance",
+ "apexes-live-trading",
+ "apexes-message-bus",
+ "apexes-oms",
+ "apexes-paper",
  "apexes-risk",
+ "apexes-storage",
  "apexes-strategy",
  "apexes-strategy-loader",
+ "async-trait",
  "chrono",
+ "clap",
+ "core_affinity",
+ "futures",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

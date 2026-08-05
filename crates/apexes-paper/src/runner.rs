@@ -38,6 +38,11 @@ pub struct PaperTradingConfig {
     /// Extreme-market circuit breaker configuration. `None` (default)
     /// disables it entirely.
     pub market_condition_config: Option<apexes_risk::MarketConditionConfig>,
+    /// Live-tuning/monitoring control channel, threaded straight
+    /// through to `UnifiedLoopConfig.control`. `None` (the default for
+    /// every pre-existing caller) is a silent no-op -- identical to
+    /// this crate's behavior before this field existed.
+    pub control: Option<apexes_backtest::ControlHandle>,
 }
 
 /// Runs paper trading: subscribes to `bus` for `config.instruments`,
@@ -139,7 +144,7 @@ pub async fn run_paper_trading(
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
-        control: None,
+        control: config.control,
     };
 
     run_unified_event_loop(
@@ -283,6 +288,7 @@ mod tests {
             latency_model: LatencyModel::None,
             margin_tiers: HashMap::new(),
             market_condition_config: None,
+            control: None,
         }
     }
 

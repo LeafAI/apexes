@@ -17,6 +17,16 @@
 //! - `SessionMode::Backtest.date_range`: `BacktestConfig.date_range`'s
 //!   real type is `std::ops::Range<NaiveDate>` (NOT a `(NaiveDate,
 //!   NaiveDate)` tuple) -- matched exactly here.
+//! - `SessionMode::Backtest.clickhouse_url`: new, added by Task 7 --
+//!   `run_backtest` takes `impl HistoricalMarketDataSource`, not a
+//!   live stream, so backtest mode never connects to `gateway_url`;
+//!   `main.rs` instead constructs one
+//!   `apexes_backtest::StorageMarketDataSource` per instrument
+//!   directly from `apexes-storage`, which needs its own ClickHouse
+//!   URL. This is a real, additive gap fix to Task 6's original shape
+//!   (no ClickHouse URL field existed anywhere on `LaunchConfig`
+//!   before this task) -- not a breaking change, since no real caller
+//!   ever constructed a `SessionMode::Backtest` value before Task 7.
 //! - `SessionMode::Live.credentials_ref`/`auto_derisk_live`/
 //!   `reconcile_interval`/`ems_postgres_url`: all four map directly to
 //!   `LiveTradingConfig` fields of the same name/purpose (the first
@@ -62,6 +72,21 @@ pub enum SessionMode {
         /// Matches `BacktestConfig.date_range`'s real type exactly
         /// (`std::ops::Range<NaiveDate>`, not a tuple).
         date_range: Range<NaiveDate>,
+        /// ClickHouse URL (e.g. `http://localhost:8123`) `main.rs`
+        /// connects `apexes_storage::StorageReader` to, to construct
+        /// one `apexes_backtest::StorageMarketDataSource` per
+        /// instrument in `LaunchConfig.instruments` (design spec §4.2
+        /// re-verification against `run_backtest`'s real signature:
+        /// `run_backtest` takes `impl HistoricalMarketDataSource`, NOT
+        /// a live stream -- backtest mode reads history directly from
+        /// `apexes-storage`, bypassing `LaunchConfig.gateway_url`'s
+        /// live gateway entirely). Added by Task 7 -- this field was
+        /// genuinely missing from Task 6's original `LaunchConfig`
+        /// shape (no ClickHouse URL existed anywhere on this struct),
+        /// a real gap rather than an intentional omission, since
+        /// nothing before this task exercised `SessionMode::Backtest`
+        /// against a real caller.
+        clickhouse_url: String,
     },
     /// Drives `apexes_paper::run_paper_trading`.
     Paper,
@@ -163,6 +188,7 @@ mod tests {
             mode: SessionMode::Backtest {
                 date_range: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
                     ..NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+                clickhouse_url: "http://localhost:8123".to_string(),
             },
             strategy_ref: StrategyRef::DriftScript {
                 path: PathBuf::from("strategies/example.drift"),
@@ -207,8 +233,12 @@ mod tests {
         let deserialized: LaunchConfig = serde_json::from_str(&json).unwrap();
 
         match deserialized.mode {
-            SessionMode::Backtest { date_range } => {
+            SessionMode::Backtest {
+                date_range,
+                clickhouse_url,
+            } => {
                 assert_eq!(date_range, config_date_range(&config));
+                assert_eq!(clickhouse_url, "http://localhost:8123");
             }
             _ => panic!("expected SessionMode::Backtest"),
         }
@@ -243,7 +273,7 @@ mod tests {
 
     fn config_date_range(config: &LaunchConfig) -> Range<NaiveDate> {
         match &config.mode {
-            SessionMode::Backtest { date_range } => date_range.clone(),
+            SessionMode::Backtest { date_range, .. } => date_range.clone(),
             _ => panic!("expected SessionMode::Backtest"),
         }
     }

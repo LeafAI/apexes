@@ -43,6 +43,35 @@ pub trait Strategy: Send {
     }
 }
 
+/// Every `run_backtest`/`run_paper_trading`/`run_live_trading` call
+/// site takes `strategy: impl Strategy` BY VALUE (not `&mut dyn
+/// Strategy`), but `apexes_strategy_loader::load_strategy` -- the only
+/// way to select a strategy at runtime by name/path rather than at
+/// compile time -- necessarily returns a type-erased `Box<dyn
+/// Strategy>` (Rust has no runtime reflection to pick a concrete type
+/// otherwise). Without this blanket impl, nothing in the workspace
+/// could ever pass a `load_strategy`-produced strategy into any of the
+/// three runners -- a real, previously-undiscovered gap (no caller
+/// exercised this combination before `apexes-engine`'s `main.rs`
+/// needed to). Delegates every method to the boxed inner value.
+impl Strategy for Box<dyn Strategy> {
+    fn on_market_event(
+        &mut self,
+        event: &apexes_core::MarketEvent,
+        ctx: &StrategyContext,
+    ) -> Vec<OrderIntent> {
+        (**self).on_market_event(event, ctx)
+    }
+
+    fn current_params(&self) -> HashMap<String, Decimal> {
+        (**self).current_params()
+    }
+
+    fn set_param(&mut self, name: &str, value: Decimal) -> Result<(), crate::error::StrategyError> {
+        (**self).set_param(name, value)
+    }
+}
+
 /// Read-only view of current backtest/live state, passed to
 /// `Strategy::on_market_event` so it can make informed order decisions.
 pub struct StrategyContext<'a> {

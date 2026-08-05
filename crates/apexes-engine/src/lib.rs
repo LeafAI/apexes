@@ -8,7 +8,11 @@
 //! to whichever of `run_backtest`/`run_paper_trading`/
 //! `run_live_trading` the selected `SessionMode` needs.
 
+pub mod credentials;
+pub mod gateway_client;
 pub mod launch_config;
 
 pub use apexes_strategy_loader::StrategyRef;
+pub use credentials::{CredentialsError, resolve_binance_credentials};
+pub use gateway_client::GatewayMarketDataProvider;
 pub use launch_config::{LaunchConfig, SessionMode};

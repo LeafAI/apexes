@@ -75,6 +75,7 @@ fn base_config(events_range_end_day: chrono::NaiveDate) -> BacktestConfig {
         risk_free_return: dec!(0),
         margin_tiers: HashMap::new(),
         market_condition_config: None,
+        control: None,
     }
 }
 

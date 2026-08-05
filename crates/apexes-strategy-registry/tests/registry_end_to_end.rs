@@ -174,6 +174,7 @@ impl Evaluator for SourceBackedEvaluator {
             risk_free_return: dec!(0),
             margin_tiers: HashMap::new(),
             market_condition_config: None,
+            control: None,
         };
         let market_data_events = market_data.events().await.map_err(|e| e.to_string())?;
 

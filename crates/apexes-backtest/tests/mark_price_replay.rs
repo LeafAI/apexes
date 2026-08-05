@@ -73,6 +73,7 @@ async fn backtest_replays_a_mark_price_event_without_error() {
         risk_free_return: dec!(0),
         margin_tiers: HashMap::new(),
         market_condition_config: None,
+        control: None,
     };
 
     let registry = apexes_core::registry::Registry::new();

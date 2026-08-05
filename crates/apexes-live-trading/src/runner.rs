@@ -79,6 +79,11 @@ pub struct LiveTradingConfig {
     /// since `run_live_trading` only receives an already-constructed
     /// `OrderManager`, not a reusable connection pool.
     pub ems_postgres_url: String,
+    /// Live-tuning/monitoring control channel, threaded straight
+    /// through to `UnifiedLoopConfig.control`. `None` (the default for
+    /// every pre-existing caller) is a silent no-op -- identical to
+    /// this crate's behavior before this field existed.
+    pub control: Option<apexes_backtest::ControlHandle>,
 }
 
 pub struct LiveTradingReport {
@@ -238,7 +243,7 @@ pub async fn run_live_trading(
         risk_checker,
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
-        control: None,
+        control: config.control,
     };
 
     let report = run_unified_event_loop(

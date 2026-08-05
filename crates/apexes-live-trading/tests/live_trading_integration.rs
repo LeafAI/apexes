@@ -201,6 +201,7 @@ fn base_config() -> LiveTradingConfig {
         risk_free_return: dec!(0),
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),
+        control: None,
     }
 }
 
