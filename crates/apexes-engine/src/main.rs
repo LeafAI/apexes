@@ -385,7 +385,20 @@ async fn run_inner(
         .port();
     write_pid_file(&launch_config.session_id, bound_port);
 
-    let app = build_app(command_tx, snapshot_rx);
+    // The one shared stop channel: `stop_rx` is handed to the mode
+    // dispatch below only for `Paper`/`Live` (`Backtest`'s historical
+    // replay has no live-stop concept -- see `run_backtest_mode`'s own
+    // doc comment). `stop_tx` is handed into `build_app` -- the
+    // `/session/ws` command-reader task fires it when it receives a
+    // `SessionCommand::Stop`, in ADDITION to forwarding that command
+    // into `command_tx` as before, so a `Stop` unblocks a stalled
+    // `market_events` stream immediately rather than waiting for
+    // `ControlHandle::drain_commands` to next be polled (see
+    // `server.rs`'s own top-level doc comment for the full
+    // rationale).
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+    let app = build_app(command_tx, snapshot_rx, stop_tx);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::error!(
@@ -399,21 +412,6 @@ async fn run_inner(
         session_id = %launch_config.session_id,
         "apexes-engine: listening on /session/ws"
     );
-
-    // The one shared stop channel: `stop_rx` is handed to the mode
-    // dispatch below only for `Paper`/`Live` (`Backtest`'s historical
-    // replay has no live-stop concept -- see `run_backtest_mode`'s own
-    // doc comment). `_stop_tx` is deliberately kept alive for the
-    // ENTIRE duration of the `match` below (bound in this function's
-    // own scope, not dropped early) -- dropping it before the mode
-    // dispatch finishes would make `stop_rx` resolve immediately (a
-    // spurious stop). Nothing currently sends on it directly from
-    // `run_inner`: the `/session/ws` server's `Stop`-command path is
-    // wired through `ControlHandle`/`drain_commands` inside the
-    // unified loop itself (design spec §5.1/§5.2), NOT through this
-    // oneshot -- a future revision may additionally wire an
-    // OS-signal-triggered graceful shutdown through it.
-    let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
     match launch_config.mode.clone() {
         SessionMode::Backtest {

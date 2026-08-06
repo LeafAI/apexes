@@ -56,8 +56,9 @@ fn empty_snapshot() -> SessionSnapshot {
 async fn session_ws_forwards_snapshots_out_and_commands_in() {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel::<SessionCommand>();
     let (snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
 
-    let app = apexes_engine::build_app(command_tx, snapshot_rx);
+    let app = apexes_engine::build_app(command_tx, snapshot_rx, stop_tx);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind ephemeral port");
@@ -116,5 +117,108 @@ async fn session_ws_forwards_snapshots_out_and_commands_in() {
             assert_eq!(value, dec!(42));
         }
         other => panic!("expected SetParam, got {other:?}"),
+    }
+}
+
+/// Task 8b: a `SessionCommand::Stop` frame must ALSO fire the stop
+/// `oneshot` handed into `build_app` -- not just land on `command_tx`
+/// -- so `take_until(stop_signal)` in `run_paper_trading`/
+/// `run_live_trading` unblocks a STALLED market-event stream
+/// immediately, rather than waiting for `ControlHandle::
+/// drain_commands` to next be polled (which only happens when a new
+/// tick arrives). This test asserts the real `oneshot::Receiver` side
+/// resolves shortly after a real client sends `Stop` over a real WS
+/// connection -- proving the wiring described in `server.rs`'s
+/// top-level doc comment actually works end-to-end.
+#[tokio::test]
+async fn session_ws_stop_command_also_fires_the_stop_oneshot() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+    let app = apexes_engine::build_app(command_tx, snapshot_rx, stop_tx);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut ws_stream, _response) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session/ws"))
+            .await
+            .expect("client failed to connect to /session/ws");
+
+    let stop_message = SessionMessage::Command(SessionCommand::Stop);
+    let json = serde_json::to_string(&stop_message).unwrap();
+    ws_stream
+        .send(Message::Text(json.into()))
+        .await
+        .expect("failed to send Stop Command frame");
+
+    // The stop oneshot must resolve promptly -- this is the whole
+    // point of the fix: it must NOT require any further market event
+    // or channel activity to unblock.
+    tokio::time::timeout(Duration::from_secs(5), stop_rx)
+        .await
+        .expect("timed out waiting for the stop oneshot to resolve after sending Stop")
+        .expect("stop oneshot sender was dropped without sending");
+
+    // Stop must ALSO still land on command_tx as before (so
+    // ControlHandle::drain_commands still sees it, e.g. if the loop
+    // wasn't actually stalled).
+    let received_command = tokio::time::timeout(Duration::from_secs(5), command_rx.recv())
+        .await
+        .expect("timed out waiting for forwarded Stop SessionCommand")
+        .expect("command_rx closed unexpectedly");
+    assert!(matches!(received_command, SessionCommand::Stop));
+}
+
+/// A second `Stop` (from the same client re-sending, simulating what
+/// two connected clients both sending `Stop` would also produce on
+/// the shared sender) must not panic or hang the connection -- the
+/// oneshot sender is already consumed after the first `Stop`, and the
+/// second send must be a harmless no-op.
+#[tokio::test]
+async fn session_ws_duplicate_stop_commands_do_not_panic() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+    let app = apexes_engine::build_app(command_tx, snapshot_rx, stop_tx);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut ws_stream, _response) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session/ws"))
+            .await
+            .expect("client failed to connect to /session/ws");
+
+    let stop_message = SessionMessage::Command(SessionCommand::Stop);
+    let json = serde_json::to_string(&stop_message).unwrap();
+    for _ in 0..2 {
+        ws_stream
+            .send(Message::Text(json.clone().into()))
+            .await
+            .expect("failed to send Stop Command frame");
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), stop_rx)
+        .await
+        .expect("timed out waiting for the stop oneshot to resolve")
+        .expect("stop oneshot sender was dropped without sending");
+
+    for _ in 0..2 {
+        let received_command = tokio::time::timeout(Duration::from_secs(5), command_rx.recv())
+            .await
+            .expect("timed out waiting for forwarded Stop SessionCommand")
+            .expect("command_rx closed unexpectedly");
+        assert!(matches!(received_command, SessionCommand::Stop));
     }
 }
