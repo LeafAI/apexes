@@ -87,16 +87,18 @@ pub fn build_app_secured(
         storage_reader,
         instruments: Arc::new(instruments),
     };
-    let router = Router::new()
+    let market = Router::new()
         .route("/market", get(market_handler))
         .with_state(state);
-    match token {
-        Some(token) => router.route_layer(axum::middleware::from_fn_with_state(
+    let market = match token {
+        Some(token) => market.route_layer(axum::middleware::from_fn_with_state(
             token,
             apexes_security::require_bearer,
         )),
-        None => router,
-    }
+        None => market,
+    };
+    // Unauthenticated liveness probe for supervisors (carries no data).
+    market.route("/healthz", get(|| async { "ok\n" }))
 }
 
 async fn market_handler(
@@ -260,5 +262,34 @@ mod tests {
         good.headers_mut()
             .insert("Authorization", "Bearer gw-secret".parse().unwrap());
         assert!(tokio_tungstenite::connect_async(good).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn healthz_is_open_even_when_market_requires_a_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let gateway = Arc::new(Gateway::new(Box::new(MockMarketDataProvider::new()), 16));
+        let token = Arc::new(apexes_security::BearerToken::new("gw-secret"));
+        let app = build_app_secured(gateway, None, vec![btc_usdt()], Some(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.0\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        assert!(
+            raw.starts_with("HTTP/1.0 200") || raw.starts_with("HTTP/1.1 200"),
+            "{raw}"
+        );
+        assert!(raw.contains("ok"));
     }
 }

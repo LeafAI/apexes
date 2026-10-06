@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
+    /// Address to bind on. Defaults to loopback; containers pass
+    /// `--host 0.0.0.0` (set `APEXES_GATEWAY_TOKEN` when doing so).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
     /// Comma-separated CPU core IDs to pin this process's main thread
     /// to (e.g. `--cpu-cores 2,3`). Omit to leave OS scheduling at its
     /// default (fully backward-compatible: this is a performance
@@ -373,10 +378,13 @@ async fn run(cli: Cli, port: u16) {
         token,
     );
 
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match TcpListener::bind((cli.host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("apexes-market-data-gateway: failed to bind 127.0.0.1:{port}: {error}");
+            eprintln!(
+                "apexes-market-data-gateway: failed to bind {}:{port}: {error}",
+                cli.host
+            );
             std::process::exit(1);
         }
     };

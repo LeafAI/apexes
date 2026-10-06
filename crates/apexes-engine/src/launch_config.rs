@@ -250,6 +250,24 @@ mod tests {
         }
     }
 
+    /// `deploy/launch-config.example.json` is what the container
+    /// deployment mounts; keep it parseable as the types evolve.
+    #[test]
+    fn deploy_example_launch_config_parses_as_a_live_session() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/launch-config.example.json"
+        );
+        let json = std::fs::read_to_string(path).unwrap();
+        let config: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(config.mode, SessionMode::Live { .. }));
+        assert!(matches!(
+            config.strategy_ref,
+            StrategyRef::DriftScript { .. }
+        ));
+        assert!(!config.instruments.is_empty());
+    }
+
     #[test]
     fn backtest_launch_config_round_trips_through_json() {
         let config = sample_backtest_config();

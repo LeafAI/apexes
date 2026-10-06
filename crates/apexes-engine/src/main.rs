@@ -89,12 +89,12 @@ enum EngineError {
     OrderStore(#[from] apexes_oms::OmsError),
     #[error("failed to start Binance User Data Stream: {reason}")]
     UserDataStream { reason: String },
-    #[error("failed to bind /session/ws listener on 127.0.0.1:0: {0}")]
+    #[error("failed to bind /session/ws listener (APEXES_ENGINE_BIND or 127.0.0.1:0): {0}")]
     BindSessionWs(std::io::Error),
     #[error("live startup recovery failed: {0}")]
     Recovery(#[from] apexes_live_trading::RecoveryError),
     #[error(
-        "live sessions require a control token: set APEXES_CONTROL_TOKEN (and, optionally, APEXES_AUDIT_LOG)"
+        "live sessions require a control token and an audit log: set APEXES_CONTROL_TOKEN (and APEXES_AUDIT_LOG, or provide a writable $HOME)"
     )]
     MissingControlToken,
     #[error("failed to open audit log {path:?}: {source}")]
@@ -391,7 +391,15 @@ async fn run_inner(
     // authentication and an audit trail on its control endpoint.
     let security = build_server_security(&launch_config)?;
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    // Loopback + ephemeral port by default (UI-spawned sessions find the
+    // port via the PID file). Containers/supervised deployments set
+    // `APEXES_ENGINE_BIND` (e.g. `0.0.0.0:9100`) for a fixed, reachable
+    // port; a live session is then protected by its mandatory token.
+    let bind_addr = std::env::var("APEXES_ENGINE_BIND")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+    let listener = TcpListener::bind(&bind_addr)
         .await
         .map_err(EngineError::BindSessionWs)?;
     let bound_port = listener

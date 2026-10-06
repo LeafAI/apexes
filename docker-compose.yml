@@ -29,6 +29,56 @@ services:
     volumes:
       - apexes-postgres-data:/var/lib/postgresql/data
 
+  # --- application services -------------------------------------------
+  # `docker compose up -d` starts the databases and the market-data
+  # gateway. The live engine is opt-in: `docker compose --profile live up -d`
+  # (see docs/RUNBOOK.md for the required environment and mounts).
+
+  market-data-gateway:
+    build:
+      context: .
+      target: gateway
+    command: ["--host", "0.0.0.0", "--port", "9001", "--instruments", "BTCUSDT"]
+    environment:
+      # Optional bearer token for /market; the engine sends the same one.
+      APEXES_GATEWAY_TOKEN: ${APEXES_GATEWAY_TOKEN:-}
+    ports:
+      - "127.0.0.1:9001:9001"
+    restart: unless-stopped
+
+  engine:
+    profiles: ["live"]
+    build:
+      context: .
+      target: engine
+    depends_on:
+      postgres:
+        condition: service_started
+      market-data-gateway:
+        condition: service_healthy
+    environment:
+      # Both REQUIRED for a live session (the engine refuses to start
+      # without them): `?` makes compose fail loudly when unset.
+      APEXES_CONTROL_TOKEN: ${APEXES_CONTROL_TOKEN:?set APEXES_CONTROL_TOKEN}
+      APEXES_AUDIT_LOG: /var/lib/apexes/audit.jsonl
+      APEXES_GATEWAY_TOKEN: ${APEXES_GATEWAY_TOKEN:-}
+      # Credentials for credentials_ref "binance-main" in the launch config.
+      APEXES_CRED_BINANCE_MAIN_API_KEY: ${APEXES_CRED_BINANCE_MAIN_API_KEY:?set APEXES_CRED_BINANCE_MAIN_API_KEY}
+      APEXES_CRED_BINANCE_MAIN_API_SECRET: ${APEXES_CRED_BINANCE_MAIN_API_SECRET:?set APEXES_CRED_BINANCE_MAIN_API_SECRET}
+    volumes:
+      - ./deploy/launch-config.json:/etc/apexes/launch-config.json:ro
+      - ./deploy/strategy.drift:/etc/apexes/strategy.drift:ro
+      - apexes-engine-data:/var/lib/apexes
+    ports:
+      - "127.0.0.1:9100:9100"
+    # Restarts resume safely: startup recovery re-reads exchange state and
+    # REFUSES to start (non-zero exit) if it cannot reconcile. Docker backs
+    # off between attempts, so a refusal retries slowly rather than hammering
+    # the exchange -- watch for the restart loop (RUNBOOK.md).
+    restart: unless-stopped
+    stop_grace_period: 30s
+
 volumes:
+  apexes-engine-data:
   apexes-clickhouse-data:
   apexes-postgres-data:

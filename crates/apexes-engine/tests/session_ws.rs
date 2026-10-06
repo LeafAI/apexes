@@ -424,3 +424,21 @@ async fn secured_endpoint_rejects_unauthenticated_clients_and_audits_commands() 
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The exact frames documented in docs/RUNBOOK.md.
+#[test]
+fn runbook_halt_and_resume_frames_parse() {
+    let halt: SessionMessage =
+        serde_json::from_str(r#"{"type":"Command","Halt":{"reason":"operator: investigating"}}"#)
+            .unwrap();
+    assert!(matches!(
+        halt,
+        SessionMessage::Command(SessionCommand::Halt { ref reason }) if reason.starts_with("operator")
+    ));
+    let resume: SessionMessage =
+        serde_json::from_str(r#"{"type":"Command","ResumeTrading":null}"#).unwrap();
+    assert!(matches!(
+        resume,
+        SessionMessage::Command(SessionCommand::ResumeTrading)
+    ));
+}
