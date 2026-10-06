@@ -12,29 +12,38 @@ use apexes_oms::ExchangeUpdate;
 use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::rest::{ApiFamily, BinanceRestClient};
 
-/// Keeps the listenKey renewal and WebSocket-reading background tasks
-/// alive for both the Spot and Futures streams. Dropping this aborts
-/// all four tasks immediately -- callers must keep this alive for as
-/// long as they want the User Data Stream to keep running.
+/// Keeps the per-family stream tasks alive (each owns its own listenKey
+/// lifecycle: obtain, renew, re-obtain on every reconnect). Dropping this
+/// aborts both tasks immediately -- callers must keep it alive for as long
+/// as they want the User Data Stream to keep running.
 pub struct UserDataStreamHandle {
-    _spot_socket: tokio::task::JoinHandle<()>,
-    _spot_renewal: tokio::task::JoinHandle<()>,
-    _futures_socket: tokio::task::JoinHandle<()>,
-    _futures_renewal: tokio::task::JoinHandle<()>,
+    _spot: tokio::task::JoinHandle<()>,
+    _futures: tokio::task::JoinHandle<()>,
+    resync: Arc<Notify>,
+}
+
+impl UserDataStreamHandle {
+    /// Notified after every (re)connection of either stream. A websocket
+    /// gap means pushed updates may have been missed, so consumers should
+    /// run a full `OrderManager::reconcile()` on each notification rather
+    /// than wait for the next poll. Uses `notify_one` semantics: a
+    /// connection that happened before anyone waits is not lost.
+    pub fn resync_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.resync)
+    }
 }
 
 impl Drop for UserDataStreamHandle {
     fn drop(&mut self) {
-        self._spot_socket.abort();
-        self._spot_renewal.abort();
-        self._futures_socket.abort();
-        self._futures_renewal.abort();
+        self._spot.abort();
+        self._futures.abort();
     }
 }
 
@@ -48,7 +57,10 @@ async fn obtain_listen_key(rest: &BinanceRestClient, family: ApiFamily) -> Resul
     // signs, which Binance tolerates (extra params are ignored) per
     // community-verified behavior, so reusing signed_request here is
     // safe and avoids a second request-building code path.
-    let (status, body) = rest.signed_request("POST", family, path, "").await?;
+    // Safe to retry: while a key is active Binance returns the same key.
+    let (status, body) = rest
+        .signed_request_idempotent("POST", family, path, "")
+        .await?;
     if !status.is_success() {
         return Err(format!("failed to obtain listenKey: HTTP {status}: {body}"));
     }
@@ -145,31 +157,71 @@ fn parse_binance_status(status: &str) -> Option<OrderStatus> {
     }
 }
 
-/// Starts both the Spot and Futures User Data Streams, spawning a
-/// renewal background task for each (every 30 minutes -- well within
-/// Binance's 60-minute expiry window), and returns a merged stream of
-/// `ExchangeUpdate`s from both plus a handle that keeps renewal alive.
+/// Timing knobs for one stream task; injectable so tests run in
+/// milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct StreamTimings {
+    /// listenKey keep-alive period (Binance expires keys after 60 min).
+    renew_every: Duration,
+    /// Reconnect if no frame (data OR ping) arrives for this long.
+    idle_timeout: Duration,
+    reconnect_base: Duration,
+    reconnect_max: Duration,
+}
+
+impl Default for StreamTimings {
+    fn default() -> Self {
+        Self {
+            renew_every: Duration::from_secs(30 * 60),
+            // Spot pings every 20s and Futures every 3 min; any frame counts.
+            idle_timeout: Duration::from_secs(10 * 60),
+            reconnect_base: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Starts both the Spot and Futures User Data Streams and returns a
+/// merged stream of `ExchangeUpdate`s plus a handle that keeps the tasks
+/// alive and exposes [`UserDataStreamHandle::resync_notifier`].
+///
+/// The initial listenKeys are obtained eagerly so bad credentials fail
+/// startup; afterwards each stream task recovers on its own.
 pub async fn start_user_data_stream(
     rest: BinanceRestClient,
 ) -> Result<(UserDataStreamHandle, impl Stream<Item = ExchangeUpdate>), String> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let resync = Arc::new(Notify::new());
 
-    let spot_listen_key = obtain_listen_key(&rest, ApiFamily::Spot).await?;
-    let futures_listen_key = obtain_listen_key(&rest, ApiFamily::Futures).await?;
+    // Fail fast on bad credentials / connectivity before spawning anything.
+    obtain_listen_key(&rest, ApiFamily::Spot).await?;
+    obtain_listen_key(&rest, ApiFamily::Futures).await?;
 
-    let (spot_socket, spot_renewal) =
-        spawn_stream_tasks(rest.clone(), ApiFamily::Spot, spot_listen_key, tx.clone());
-    let (futures_socket, futures_renewal) =
-        spawn_stream_tasks(rest.clone(), ApiFamily::Futures, futures_listen_key, tx);
+    let spot = tokio::spawn(run_stream_task(
+        rest.clone(),
+        ApiFamily::Spot,
+        websocket_host(ApiFamily::Spot).to_string(),
+        tx.clone(),
+        Arc::clone(&resync),
+        StreamTimings::default(),
+    ));
+    let futures = tokio::spawn(run_stream_task(
+        rest,
+        ApiFamily::Futures,
+        websocket_host(ApiFamily::Futures).to_string(),
+        tx,
+        Arc::clone(&resync),
+        StreamTimings::default(),
+    ));
 
-    let handle = UserDataStreamHandle {
-        _spot_socket: spot_socket,
-        _spot_renewal: spot_renewal,
-        _futures_socket: futures_socket,
-        _futures_renewal: futures_renewal,
-    };
-
-    Ok((handle, tokio_stream_from_receiver(rx)))
+    Ok((
+        UserDataStreamHandle {
+            _spot: spot,
+            _futures: futures,
+            resync,
+        },
+        tokio_stream_from_receiver(rx),
+    ))
 }
 
 fn tokio_stream_from_receiver(
@@ -180,69 +232,102 @@ fn tokio_stream_from_receiver(
     })
 }
 
-/// Spawns two independently-tracked background tasks for `family`: one
-/// that connects the WebSocket using `listen_key` and forwards parsed
-/// `ExchangeUpdate`s to `tx`, and one that renews `listen_key` every 30
-/// minutes for as long as it runs. Both `JoinHandle`s are returned so
-/// `UserDataStreamHandle`'s `Drop` impl can abort both -- a listenKey
-/// renewal task spawned *inside* (nested under) the socket task, with
-/// its `JoinHandle` discarded, would keep running forever after the
-/// outer task is aborted, since aborting a task does not recursively
-/// abort tasks it spawned.
-fn spawn_stream_tasks(
+fn backoff_delay(timings: &StreamTimings, failures: u32) -> Duration {
+    timings
+        .reconnect_base
+        .saturating_mul(1u32 << failures.min(16))
+        .min(timings.reconnect_max)
+}
+
+/// One family's whole lifecycle, forever (until the receiver is dropped):
+/// obtain a listenKey -> connect -> notify resync -> read frames while
+/// renewing the key -> on ANY failure (socket error/close, idle timeout,
+/// failed renewal) start over with a freshly obtained key. Re-obtaining
+/// on every reconnect is what recovers from an expired/revoked key:
+/// Binance returns the existing key while it is still valid and issues a
+/// new one otherwise.
+async fn run_stream_task(
     rest: BinanceRestClient,
     family: ApiFamily,
-    listen_key: String,
+    ws_base: String,
     tx: mpsc::UnboundedSender<ExchangeUpdate>,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let renewal_rest = rest.clone();
-    let renewal_key = listen_key.clone();
-    let renewal_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
-        loop {
-            interval.tick().await;
-            if let Err(reason) = renew_listen_key(&renewal_rest, family, &renewal_key).await {
-                tracing::warn!(reason, ?family, "failed to renew Binance listenKey");
+    resync: Arc<Notify>,
+    timings: StreamTimings,
+) {
+    let mut failures = 0u32;
+    loop {
+        let listen_key = match obtain_listen_key(&rest, family).await {
+            Ok(key) => key,
+            Err(reason) => {
+                tracing::warn!(reason, ?family, "failed to obtain listenKey; will retry");
+                tokio::time::sleep(backoff_delay(&timings, failures)).await;
+                failures = failures.saturating_add(1);
+                continue;
             }
-        }
-    });
+        };
+        let url = format!("{ws_base}/{listen_key}");
+        let (ws_stream, _) = match tokio_tungstenite::connect_async(&url).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    ?family,
+                    "failed to connect User Data Stream WebSocket"
+                );
+                tokio::time::sleep(backoff_delay(&timings, failures)).await;
+                failures = failures.saturating_add(1);
+                continue;
+            }
+        };
+        failures = 0;
+        tracing::info!(?family, "User Data Stream connected");
+        // Updates pushed while we were disconnected are gone: have the
+        // consumer reconcile immediately.
+        resync.notify_one();
 
-    let socket_task = tokio::spawn(async move {
-        let url = format!("{}/{listen_key}", websocket_host(family));
+        let (_, mut read) = ws_stream.split();
+        let mut renew = tokio::time::interval_at(
+            tokio::time::Instant::now() + timings.renew_every,
+            timings.renew_every,
+        );
         loop {
-            match tokio_tungstenite::connect_async(&url).await {
-                Ok((ws_stream, _)) => {
-                    let (_, mut read) = ws_stream.split();
-                    while let Some(message) = read.next().await {
-                        match message {
-                            Ok(Message::Text(text)) => {
-                                if let Some(update) = parse_event(&text)
-                                    && tx.send(update).is_err()
-                                {
-                                    return; // receiver dropped, stop this task
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(?error, ?family, "User Data Stream WebSocket error");
-                                break;
-                            }
+            tokio::select! {
+                frame = tokio::time::timeout(timings.idle_timeout, read.next()) => match frame {
+                    Err(_) => {
+                        tracing::warn!(?family, "User Data Stream idle timeout; reconnecting");
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!(?family, "User Data Stream closed; reconnecting");
+                        break;
+                    }
+                    Ok(Some(Err(error))) => {
+                        tracing::warn!(?error, ?family, "User Data Stream WebSocket error; reconnecting");
+                        break;
+                    }
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        if let Some(update) = parse_event(&text)
+                            && tx.send(update).is_err()
+                        {
+                            return; // receiver dropped, stop this task
                         }
                     }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        ?family,
-                        "failed to connect User Data Stream WebSocket"
-                    );
+                    Ok(Some(Ok(Message::Close(_)))) => {
+                        tracing::warn!(?family, "User Data Stream received Close; reconnecting");
+                        break;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                },
+                _ = renew.tick() => {
+                    if let Err(reason) = renew_listen_key(&rest, family, &listen_key).await {
+                        tracing::warn!(reason, ?family, "failed to renew listenKey; re-establishing stream");
+                        break;
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-    });
-
-    (socket_task, renewal_task)
+        tokio::time::sleep(backoff_delay(&timings, 0)).await;
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +517,194 @@ mod tests {
     #[test]
     fn ignores_unparseable_json() {
         assert!(parse_event("not json").is_none());
+    }
+
+    // ---- reconnect / listenKey-recovery behaviour -------------------
+
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    fn fast_timings() -> StreamTimings {
+        StreamTimings {
+            renew_every: Duration::from_secs(3600),
+            idle_timeout: Duration::from_secs(3600),
+            reconnect_base: Duration::from_millis(10),
+            reconnect_max: Duration::from_millis(50),
+        }
+    }
+
+    fn exec_report(order_id: i64) -> String {
+        serde_json::json!({
+            "e": "executionReport",
+            "c": uuid::Uuid::new_v4().to_string(),
+            "i": order_id,
+            "X": "NEW",
+        })
+        .to_string()
+    }
+
+    /// Fake Binance WS: connection N (1-based) sends `scripts[N-1]`
+    /// frames; with `close_after == true` it then closes, else it holds
+    /// the connection open. Returns (port, connection counter).
+    async fn fake_ws_server(
+        scripts: Vec<(Vec<String>, bool)>,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use futures::SinkExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (frames, close_after) = scripts
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_else(|| (Vec::new(), false));
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    for frame in frames {
+                        ws.send(Message::Text(frame.into())).await.unwrap();
+                    }
+                    if close_after {
+                        let _ = ws.close(None).await;
+                    } else {
+                        futures::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        (port, count)
+    }
+
+    async fn listen_key_mock(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/v3/userDataStream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "listenKey": "key"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn recv(rx: &mut UnboundedReceiver<ExchangeUpdate>) -> ExchangeUpdate {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for update")
+            .expect("channel closed")
+    }
+
+    #[tokio::test]
+    async fn reconnects_with_a_fresh_listen_key_and_signals_resync_each_time() {
+        let server = MockServer::start().await;
+        listen_key_mock(&server).await;
+        let (port, connections) = fake_ws_server(vec![
+            (vec![exec_report(1)], true), // sends one update then drops
+            (vec![exec_report(2)], false),
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let resync = Arc::new(Notify::new());
+        let task = tokio::spawn(run_stream_task(
+            rest_against(&server),
+            ApiFamily::Spot,
+            format!("ws://127.0.0.1:{port}/ws"),
+            tx,
+            Arc::clone(&resync),
+            fast_timings(),
+        ));
+
+        // First connection: resync + update 1.
+        tokio::time::timeout(Duration::from_secs(5), resync.notified())
+            .await
+            .expect("no resync after first connect");
+        assert_eq!(recv(&mut rx).await.exchange_order_id.as_deref(), Some("1"));
+        // Server dropped us: reconnect -> another resync + update 2.
+        tokio::time::timeout(Duration::from_secs(5), resync.notified())
+            .await
+            .expect("no resync after reconnect");
+        assert_eq!(recv(&mut rx).await.exchange_order_id.as_deref(), Some("2"));
+
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let key_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        assert_eq!(
+            key_requests, 2,
+            "a listenKey must be (re)obtained per connect"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_keepalive_forces_a_reconnect_with_a_new_key() {
+        let server = MockServer::start().await;
+        listen_key_mock(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v3/userDataStream"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -1125, "msg": "This listenKey does not exist."
+            })))
+            .mount(&server)
+            .await;
+        let (port, connections) = fake_ws_server(vec![]).await; // holds every connection open
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let timings = StreamTimings {
+            renew_every: Duration::from_millis(50),
+            ..fast_timings()
+        };
+        let task = tokio::spawn(run_stream_task(
+            rest_against(&server),
+            ApiFamily::Spot,
+            format!("ws://127.0.0.1:{port}/ws"),
+            tx,
+            Arc::new(Notify::new()),
+            timings,
+        ));
+
+        for _ in 0..100 {
+            if connections.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                task.abort();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("stream never reconnected after the keep-alive failed");
+    }
+
+    #[tokio::test]
+    async fn idle_socket_is_dropped_and_reconnected() {
+        let server = MockServer::start().await;
+        listen_key_mock(&server).await;
+        let (port, connections) = fake_ws_server(vec![]).await; // silent connections
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let timings = StreamTimings {
+            idle_timeout: Duration::from_millis(100),
+            ..fast_timings()
+        };
+        let task = tokio::spawn(run_stream_task(
+            rest_against(&server),
+            ApiFamily::Spot,
+            format!("ws://127.0.0.1:{port}/ws"),
+            tx,
+            Arc::new(Notify::new()),
+            timings,
+        ));
+        for _ in 0..100 {
+            if connections.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                task.abort();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("silent socket was never recycled");
     }
 }

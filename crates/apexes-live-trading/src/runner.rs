@@ -95,6 +95,9 @@ pub struct LiveTradingConfig {
     /// Engage `kill_switch` automatically if no market event arrives
     /// for this long. Requires `kill_switch`; `None` disables.
     pub stale_data_timeout: Option<Duration>,
+    /// Notified when the exchange push stream (re)connects; triggers an
+    /// immediate `reconcile()`. `None` relies on `reconcile_interval` only.
+    pub resync: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub struct LiveTradingReport {
@@ -254,11 +257,14 @@ pub async fn run_live_trading(
     let executor: Arc<dyn OrderExecutor> =
         Arc::new(OrderManagerExecutor::new(Arc::clone(&order_manager)));
     let liquidation_policy = Arc::new(LiveLiquidationPolicy::new(config.auto_derisk_live));
-    let supplemental_fills = LiveSupplementalFillSource::new(
+    let mut supplemental_fills = LiveSupplementalFillSource::new(
         Arc::clone(&order_manager),
         exchange_updates,
         config.reconcile_interval,
     );
+    if let Some(resync) = config.resync.clone() {
+        supplemental_fills = supplemental_fills.with_resync(resync);
+    }
 
     // `funding_rate_bps` is read off the `CostModel` BEFORE the config
     // struct is otherwise consumed: the unified loop needs the rate for

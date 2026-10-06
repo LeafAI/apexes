@@ -673,6 +673,7 @@ async fn run_live_mode(
         control: Some(control_handle),
         kill_switch: Some(kill_switch),
         stale_data_timeout,
+        resync: Some(_user_data_stream_handle.resync_notifier()),
     };
 
     run_live_trading(
