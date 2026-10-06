@@ -327,3 +327,100 @@ async fn metrics_health_and_readiness_endpoints_reflect_kill_switch_state() {
     assert!(body.contains("\"status\":\"halted\"") && body.contains("maintenance"));
     assert_eq!(http_get(port, "/readyz").await.0, 503);
 }
+
+async fn spawn_secured_app(
+    security: apexes_engine::ServerSecurity,
+) -> (
+    u16,
+    std::sync::Arc<apexes_oms::KillSwitch>,
+    impl Sized, // keeps the loop-side channel halves alive
+) {
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let kill_switch = std::sync::Arc::new(apexes_oms::KillSwitch::new());
+    let app = apexes_engine::build_app_secured(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(std::sync::Arc::clone(&kill_switch)),
+        security,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (port, kill_switch, (command_rx, snapshot_tx, stop_rx))
+}
+
+#[tokio::test]
+async fn secured_endpoint_rejects_unauthenticated_clients_and_audits_commands() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let dir = std::env::temp_dir().join(format!("apexes-engine-audit-{}", std::process::id()));
+    let audit_path = dir.join("audit.jsonl");
+    let security = apexes_engine::ServerSecurity {
+        token: Some(std::sync::Arc::new(apexes_security::BearerToken::new(
+            "ctl",
+        ))),
+        audit: Some(std::sync::Arc::new(
+            apexes_security::AuditLog::open(&audit_path).unwrap(),
+        )),
+    };
+    let (port, kill_switch, _keepalive) = spawn_secured_app(security).await;
+    let url = format!("ws://127.0.0.1:{port}/session/ws");
+
+    // No token / wrong token: handshake refused with 401.
+    let err = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+    assert!(
+        matches!(&err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401),
+        "{err:?}"
+    );
+    let mut wrong = url.as_str().into_client_request().unwrap();
+    wrong
+        .headers_mut()
+        .insert("Authorization", "Bearer nope".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(wrong).await.is_err());
+
+    // /metrics is protected; /healthz is not.
+    assert_eq!(http_get(port, "/metrics").await.0, 401);
+    assert_eq!(http_get(port, "/healthz").await.0, 200);
+
+    // Correct token: connects, and a Halt both takes effect and is audited.
+    let mut good = url.as_str().into_client_request().unwrap();
+    good.headers_mut()
+        .insert("Authorization", "Bearer ctl".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(good).await.unwrap();
+    let halt = SessionMessage::Command(SessionCommand::Halt {
+        reason: "audit-me".to_string(),
+    });
+    ws.send(Message::Text(serde_json::to_string(&halt).unwrap().into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), kill_switch.wait_engaged())
+        .await
+        .expect("halt not applied");
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let actions: Vec<&str> = records
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"unauthorized_request"), "{actions:?}");
+    assert!(actions.contains(&"ws_connect"), "{actions:?}");
+    let command = records.iter().find(|r| r["action"] == "command").unwrap();
+    assert!(command["actor"].as_str().unwrap().starts_with("token:"));
+    assert!(command.to_string().contains("audit-me"));
+    // The secret itself is never written.
+    assert!(
+        !std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .contains("ctl\"")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

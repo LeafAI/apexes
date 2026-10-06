@@ -360,8 +360,18 @@ async fn run(cli: Cli, port: u16) {
 
     write_pid_file(port);
 
-    let app =
-        apexes_market_data_gateway::build_app(Arc::clone(&gateway), storage_reader, instruments);
+    let token = apexes_security::BearerToken::from_env("APEXES_GATEWAY_TOKEN").map(Arc::new);
+    if token.is_none() {
+        tracing::warn!(
+            "apexes-market-data-gateway: APEXES_GATEWAY_TOKEN not set; /market is UNAUTHENTICATED"
+        );
+    }
+    let app = apexes_market_data_gateway::build_app_secured(
+        Arc::clone(&gateway),
+        storage_reader,
+        instruments,
+        token,
+    );
 
     let listener = match TcpListener::bind(("127.0.0.1", port)).await {
         Ok(listener) => listener,

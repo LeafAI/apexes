@@ -71,14 +71,32 @@ pub fn build_app(
     storage_reader: Option<Arc<StorageReader>>,
     instruments: Vec<Instrument>,
 ) -> Router {
+    build_app_secured(gateway, storage_reader, instruments, None)
+}
+
+/// Like [`build_app`], but when `token` is `Some`, `/market` requires
+/// `Authorization: Bearer <token>`.
+pub fn build_app_secured(
+    gateway: Arc<Gateway>,
+    storage_reader: Option<Arc<StorageReader>>,
+    instruments: Vec<Instrument>,
+    token: Option<Arc<apexes_security::BearerToken>>,
+) -> Router {
     let state = AppState {
         gateway,
         storage_reader,
         instruments: Arc::new(instruments),
     };
-    Router::new()
+    let router = Router::new()
         .route("/market", get(market_handler))
-        .with_state(state)
+        .with_state(state);
+    match token {
+        Some(token) => router.route_layer(axum::middleware::from_fn_with_state(
+            token,
+            apexes_security::require_bearer,
+        )),
+        None => router,
+    }
 }
 
 async fn market_handler(
@@ -208,5 +226,39 @@ mod tests {
         let mock = MockMarketDataProvider::new();
         let gateway = Arc::new(Gateway::new(Box::new(mock), 16));
         let _router = build_app(gateway, None, vec![btc_usdt()]);
+    }
+
+    #[tokio::test]
+    async fn market_endpoint_requires_the_bearer_token_when_configured() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let gateway = Arc::new(Gateway::new(Box::new(MockMarketDataProvider::new()), 16));
+        let token = Arc::new(apexes_security::BearerToken::new("gw-secret"));
+        let app = build_app_secured(gateway, None, vec![btc_usdt()], Some(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("ws://127.0.0.1:{port}/market");
+
+        // No token: handshake refused (HTTP 401).
+        let err = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+        assert!(
+            matches!(&err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401),
+            "{err:?}"
+        );
+
+        // Wrong token: refused.
+        let mut bad = url.as_str().into_client_request().unwrap();
+        bad.headers_mut()
+            .insert("Authorization", "Bearer wrong".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(bad).await.is_err());
+
+        // Right token: connects.
+        let mut good = url.as_str().into_client_request().unwrap();
+        good.headers_mut()
+            .insert("Authorization", "Bearer gw-secret".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(good).await.is_ok());
     }
 }

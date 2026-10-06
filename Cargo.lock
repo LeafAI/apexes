@@ -381,6 +381,7 @@ dependencies = [
  "apexes-oms",
  "apexes-paper",
  "apexes-risk",
+ "apexes-security",
  "apexes-storage",
  "apexes-strategy",
  "apexes-strategy-loader",
@@ -560,6 +561,7 @@ dependencies = [
  "apexes-core",
  "apexes-market-data",
  "apexes-message-bus",
+ "apexes-security",
  "apexes-storage",
  "apexes-telemetry",
  "async-trait",
@@ -689,6 +691,20 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "uuid",
+]
+
+[[package]]
+name = "apexes-security"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

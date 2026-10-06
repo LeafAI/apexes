@@ -41,7 +41,7 @@ use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
 use apexes_engine::launch_config::{LaunchConfig, SessionMode};
-use apexes_engine::{build_app_with_kill_switch, credentials, resolve_binance_credentials};
+use apexes_engine::{ServerSecurity, build_app_secured, credentials, resolve_binance_credentials};
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExecutionGateway, OrderManager, OrderStore};
@@ -93,6 +93,15 @@ enum EngineError {
     BindSessionWs(std::io::Error),
     #[error("live startup recovery failed: {0}")]
     Recovery(#[from] apexes_live_trading::RecoveryError),
+    #[error(
+        "live sessions require a control token: set APEXES_CONTROL_TOKEN (and, optionally, APEXES_AUDIT_LOG)"
+    )]
+    MissingControlToken,
+    #[error("failed to open audit log {path:?}: {source}")]
+    AuditLog {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("run_backtest/run_paper_trading/run_live_trading failed: {0}")]
     Run(#[from] ApexesError),
 }
@@ -378,6 +387,10 @@ async fn run_inner(
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
 
+    // Before binding anything: a live session must not start without
+    // authentication and an audit trail on its control endpoint.
+    let security = build_server_security(&launch_config)?;
+
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(EngineError::BindSessionWs)?;
@@ -402,11 +415,12 @@ async fn run_inner(
 
     let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
     spawn_snapshot_gauges(snapshot_rx.clone());
-    let app = build_app_with_kill_switch(
+    let app = build_app_secured(
         command_tx,
         snapshot_rx,
         stop_tx,
         Some(Arc::clone(&kill_switch)),
+        security,
     );
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
@@ -466,6 +480,58 @@ async fn run_inner(
             .await
         }
     }
+}
+
+/// Control-endpoint authentication/audit from the environment:
+/// `APEXES_CONTROL_TOKEN` (bearer token) and `APEXES_AUDIT_LOG` (path;
+/// default `$HOME/.apexes/audit-<session_id>.jsonl`).
+fn build_server_security(launch_config: &LaunchConfig) -> Result<ServerSecurity, EngineError> {
+    let default_path = std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".apexes")
+            .join(format!("audit-{}.jsonl", launch_config.session_id))
+    });
+    let audit_path = std::env::var_os("APEXES_AUDIT_LOG")
+        .map(PathBuf::from)
+        .or(default_path);
+    security_from_parts(
+        matches!(launch_config.mode, SessionMode::Live { .. }),
+        apexes_security::BearerToken::from_env("APEXES_CONTROL_TOKEN"),
+        audit_path,
+    )
+}
+
+/// Policy: live sessions REQUIRE a token and a working audit log;
+/// backtest/paper sessions degrade to a loud warning.
+fn security_from_parts(
+    is_live: bool,
+    token: Option<apexes_security::BearerToken>,
+    audit_path: Option<PathBuf>,
+) -> Result<ServerSecurity, EngineError> {
+    if token.is_none() {
+        if is_live {
+            return Err(EngineError::MissingControlToken);
+        }
+        tracing::warn!(
+            "apexes-engine: APEXES_CONTROL_TOKEN not set; /session/ws and /metrics are UNAUTHENTICATED"
+        );
+    }
+    let audit = match audit_path {
+        Some(path) => match apexes_security::AuditLog::open(&path) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(source) if is_live => return Err(EngineError::AuditLog { path, source }),
+            Err(error) => {
+                tracing::warn!(?error, ?path, "apexes-engine: audit log unavailable");
+                None
+            }
+        },
+        None if is_live => return Err(EngineError::MissingControlToken),
+        None => None,
+    };
+    Ok(ServerSecurity {
+        token: token.map(Arc::new),
+        audit,
+    })
 }
 
 /// Mirrors each pushed `SessionSnapshot` into the Prometheus gauges
@@ -567,7 +633,8 @@ async fn run_paper_mode(
     control_handle: apexes_backtest::ControlHandle,
     stop_signal: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), EngineError> {
-    let provider = GatewayMarketDataProvider::new(launch_config.gateway_url.clone());
+    let provider = GatewayMarketDataProvider::new(launch_config.gateway_url.clone())
+        .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
     let bus = MarketEventBus::new(Box::new(provider));
 
     let config = PaperTradingConfig {
@@ -749,7 +816,8 @@ fn register_gateway_bus_for_all_venues(
     gateway_url: &str,
     instruments: &[Instrument],
 ) -> Result<(), EngineError> {
-    let provider = GatewayMarketDataProvider::new(gateway_url.to_string());
+    let provider = GatewayMarketDataProvider::new(gateway_url.to_string())
+        .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
     let bus = Arc::new(MarketEventBus::new(Box::new(provider)));
 
     let mut venues: Vec<Venue> = instruments.iter().map(|i| i.venue).collect();
@@ -768,6 +836,39 @@ mod tests {
     use apexes_core::{AssetClass, MarketType};
     use rust_decimal_macros::dec;
     use std::ops::Range;
+
+    #[test]
+    fn live_sessions_require_a_token_and_a_usable_audit_log() {
+        let dir = std::env::temp_dir().join(format!("apexes-engine-policy-{}", std::process::id()));
+        let good_path = dir.join("a.jsonl");
+        let token = || Some(apexes_security::BearerToken::new("t"));
+
+        // Live without token: refused.
+        assert!(matches!(
+            security_from_parts(true, None, Some(good_path.clone())),
+            Err(EngineError::MissingControlToken)
+        ));
+        // Live without audit path: refused.
+        assert!(matches!(
+            security_from_parts(true, token(), None),
+            Err(EngineError::MissingControlToken)
+        ));
+        // Live with an unopenable audit path (parent is a file): refused.
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(matches!(
+            security_from_parts(true, token(), Some(blocker.join("audit.jsonl"))),
+            Err(EngineError::AuditLog { .. })
+        ));
+        // Live with both: ok.
+        let ok = security_from_parts(true, token(), Some(good_path)).unwrap();
+        assert!(ok.token.is_some() && ok.audit.is_some());
+        // Paper/backtest degrade to warnings.
+        let open = security_from_parts(false, None, None).unwrap();
+        assert!(open.token.is_none() && open.audit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sample_instrument(symbol: &str, venue: Venue) -> Instrument {
         Instrument::new(

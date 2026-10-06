@@ -38,11 +38,14 @@
 use crate::protocol::SessionMessage;
 use apexes_backtest::{SessionCommand, SessionSnapshot};
 use apexes_oms::KillSwitch;
+use apexes_security::{AuditLog, BearerToken};
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -63,6 +66,51 @@ struct AppState {
     snapshot_rx: watch::Receiver<SessionSnapshot>,
     stop_tx: SharedStopSender,
     kill_switch: Option<Arc<KillSwitch>>,
+    security: ServerSecurity,
+}
+
+/// Authentication and audit configuration for the HTTP/WS surface.
+/// `Default` is open and unaudited (tests, backtest/paper on loopback).
+#[derive(Clone, Default)]
+pub struct ServerSecurity {
+    /// When set, `/session/ws` and `/metrics` require
+    /// `Authorization: Bearer <token>`. `/healthz` and `/readyz` stay open
+    /// for supervisors and carry no sensitive data.
+    pub token: Option<Arc<BearerToken>>,
+    /// When set, every connection, rejected request and control command is
+    /// appended to it.
+    pub audit: Option<Arc<AuditLog>>,
+}
+
+impl ServerSecurity {
+    fn actor(&self) -> String {
+        match &self.token {
+            Some(token) => format!("token:{}", token.fingerprint()),
+            None => "unauthenticated".to_string(),
+        }
+    }
+
+    fn audit(&self, actor: &str, action: &str, detail: serde_json::Value) {
+        if let Some(audit) = &self.audit {
+            audit.record(actor, action, detail);
+        }
+    }
+}
+
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let Some(token) = &state.security.token else {
+        return next.run(request).await;
+    };
+    if token.check_headers(request.headers()) {
+        next.run(request).await
+    } else {
+        state.security.audit(
+            "anonymous",
+            "unauthorized_request",
+            serde_json::json!({ "path": request.uri().path() }),
+        );
+        apexes_security::unauthorized()
+    }
 }
 
 /// Builds the `axum::Router` `apexes-engine`'s `main.rs` serves.
@@ -94,18 +142,42 @@ pub fn build_app_with_kill_switch(
     stop_tx: oneshot::Sender<()>,
     kill_switch: Option<Arc<KillSwitch>>,
 ) -> Router {
+    build_app_secured(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        kill_switch,
+        ServerSecurity::default(),
+    )
+}
+
+/// Full constructor: like [`build_app_with_kill_switch`] plus
+/// authentication and audit logging per [`ServerSecurity`].
+pub fn build_app_secured(
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    snapshot_rx: watch::Receiver<SessionSnapshot>,
+    stop_tx: oneshot::Sender<()>,
+    kill_switch: Option<Arc<KillSwitch>>,
+    security: ServerSecurity,
+) -> Router {
     let state = AppState {
         command_tx,
         snapshot_rx,
         stop_tx: Arc::new(Mutex::new(Some(stop_tx))),
         kill_switch,
+        security,
     };
-    Router::new()
+    let protected = Router::new()
         .route("/session/ws", get(session_ws_handler))
         .route("/metrics", get(metrics_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
+    let open = Router::new()
         .route("/healthz", get(healthz_handler))
-        .route("/readyz", get(readyz_handler))
-        .with_state(state)
+        .route("/readyz", get(readyz_handler));
+    protected.merge(open).with_state(state)
 }
 
 /// Prometheus scrape endpoint.
@@ -167,6 +239,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let command_tx = state.command_tx;
     let stop_tx = state.stop_tx;
     let kill_switch = state.kill_switch;
+    let security = state.security;
+    let actor = security.actor();
+    security.audit(&actor, "ws_connect", serde_json::json!({}));
 
     loop {
         tokio::select! {
@@ -186,7 +261,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !forward_command(&text, &command_tx, &stop_tx, kill_switch.as_deref()).await {
+                        if !forward_command(&text, &command_tx, &stop_tx, kill_switch.as_deref(), &security, &actor).await {
                             // Not a fatal error for this connection --
                             // an unparseable frame is logged and
                             // skipped, matching
@@ -259,6 +334,8 @@ async fn forward_command(
     command_tx: &mpsc::UnboundedSender<SessionCommand>,
     stop_tx: &SharedStopSender,
     kill_switch: Option<&KillSwitch>,
+    security: &ServerSecurity,
+    actor: &str,
 ) -> bool {
     let message: SessionMessage = match serde_json::from_str(text) {
         Ok(message) => message,
@@ -274,6 +351,13 @@ async fn forward_command(
     match message {
         SessionMessage::Command(command) => {
             let is_stop = matches!(command, SessionCommand::Stop);
+            // Audited BEFORE it takes effect, so the record exists even if
+            // acting on it crashes the process.
+            security.audit(
+                actor,
+                "command",
+                serde_json::to_value(&command).unwrap_or(serde_json::Value::Null),
+            );
             // Engage/release BEFORE forwarding: the halt must take effect
             // even if the trading loop is stalled or already gone.
             match (&command, kill_switch) {

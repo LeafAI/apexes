@@ -72,13 +72,22 @@ impl BackoffState {
 /// only ever read by that one caller anyway.
 pub struct GatewayMarketDataProvider {
     gateway_url: String,
+    token: Option<String>,
 }
 
 impl GatewayMarketDataProvider {
     pub fn new(gateway_url: impl Into<String>) -> Self {
         Self {
             gateway_url: gateway_url.into(),
+            token: None,
         }
+    }
+
+    /// Sends `Authorization: Bearer <token>` when connecting (for
+    /// gateways started with `APEXES_GATEWAY_TOKEN`). `None`/empty: no header.
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token.filter(|t| !t.trim().is_empty());
+        self
     }
 }
 
@@ -89,7 +98,11 @@ impl MarketDataProvider for GatewayMarketDataProvider {
         _instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_connection_loop(self.gateway_url.clone(), tx));
+        tokio::spawn(run_connection_loop(
+            self.gateway_url.clone(),
+            self.token.clone(),
+            tx,
+        ));
 
         // Adapts the `mpsc::UnboundedReceiver` into a `Stream` via
         // `futures::stream::unfold` rather than pulling in
@@ -102,14 +115,48 @@ impl MarketDataProvider for GatewayMarketDataProvider {
     }
 }
 
+/// Connects, attaching the bearer token header when configured.
+async fn connect(
+    url: &str,
+    token: Option<&str>,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url.into_client_request()?;
+    if let Some(token) = token {
+        request.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(token)
+                .parse()
+                .map_err(|_| {
+                    tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(
+                        "invalid characters in gateway token",
+                    ))
+                })?,
+        );
+    }
+    tokio_tungstenite::connect_async(request).await
+}
+
 /// Runs forever: connects to `url`, forwards parsed `MarketEvent`s
 /// into `tx`, and reconnects with backoff on any error or unexpected
 /// close. Returns only if `tx` is closed (every receiver -- ultimately
 /// `MarketEventBus`'s own internal forwarding task -- was dropped).
-async fn run_connection_loop(url: String, tx: mpsc::UnboundedSender<MarketEvent>) {
+async fn run_connection_loop(
+    url: String,
+    token: Option<String>,
+    tx: mpsc::UnboundedSender<MarketEvent>,
+) {
     let mut backoff = BackoffState::new();
     loop {
-        match tokio_tungstenite::connect_async(&url).await {
+        match connect(&url, token.as_deref()).await {
             Ok((socket, _response)) => {
                 tracing::info!(%url, "apexes-engine gateway_client: connected");
                 backoff.reset();
