@@ -91,6 +91,8 @@ enum EngineError {
     UserDataStream { reason: String },
     #[error("failed to bind /session/ws listener on 127.0.0.1:0: {0}")]
     BindSessionWs(std::io::Error),
+    #[error("live startup recovery failed: {0}")]
+    Recovery(#[from] apexes_live_trading::RecoveryError),
     #[error("run_backtest/run_paper_trading/run_live_trading failed: {0}")]
     Run(#[from] ApexesError),
 }
@@ -604,7 +606,8 @@ async fn run_live_mode(
         .map_err(|reason| EngineError::UserDataStream { reason })?;
     let exchange_updates = Box::pin(exchange_updates);
 
-    let gateway: Arc<dyn ExecutionGateway> = Arc::new(binance_gateway);
+    let binance_gateway = Arc::new(binance_gateway);
+    let gateway: Arc<dyn ExecutionGateway> = binance_gateway.clone();
     registry.register::<Arc<dyn ExecutionGateway>, ()>((), gateway)?;
 
     register_gateway_bus_for_all_venues(
@@ -614,13 +617,38 @@ async fn run_live_mode(
     )?;
 
     let order_store = OrderStore::new(&ems_postgres_url).await?;
-    let order_manager = OrderManager::new(order_store, registry)
+    let mut order_manager = OrderManager::new(order_store, registry)
         .await
         .map_err(EngineError::from)?;
 
+    // Seed the ledger from the exchange's real account state (not the
+    // operator-supplied `initial_balances`), and refuse to start if
+    // local/exchange order state cannot be brought into agreement.
+    if !launch_config.initial_balances.is_empty() {
+        tracing::warn!(
+            "apexes-engine: ignoring launch_config.initial_balances in live mode; \
+             balances are recovered from the exchange"
+        );
+    }
+    let recovered = apexes_live_trading::recover_live_state(
+        &mut order_manager,
+        &[
+            apexes_core::AssetClass::Spot,
+            apexes_core::AssetClass::Perpetual,
+        ],
+        async {
+            Ok(apexes_live_trading::ExchangeSnapshot {
+                balances: binance_gateway.account_balances().await?,
+                positions: binance_gateway.account_positions().await?,
+            })
+        },
+    )
+    .await?;
+
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
-        initial_balances: launch_config.initial_balances.clone(),
+        initial_balances: recovered.snapshot.balances,
+        initial_positions: recovered.snapshot.positions,
         cost_model: default_cost_model(),
         margin_tiers: launch_config.margin_tiers.clone(),
         market_condition_config: launch_config.market_condition_config.clone(),

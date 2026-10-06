@@ -139,6 +139,7 @@ pub async fn run_backtest(
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
         initial_balances: config.initial_balances,
+        initial_positions: HashMap::new(),
         funding_rate_bps,
         risk_free_return: config.risk_free_return,
         risk_checker,

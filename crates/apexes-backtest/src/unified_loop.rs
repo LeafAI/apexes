@@ -42,7 +42,7 @@ use apexes_ems::Ems;
 use apexes_risk::{CompositeRiskChecker, MarketConditionEventMonitor, PreTradeCheck};
 use apexes_strategy::{
     LiquidationPolicy, LiquidationReason, OrderExecutor, ParentOrderId, ParentOrderStatus,
-    Strategy, StrategyContext, SupplementalFillSource,
+    Position, Strategy, StrategyContext, SupplementalFillSource,
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
@@ -72,6 +72,9 @@ use std::sync::Arc;
 pub struct UnifiedLoopConfig {
     pub instruments: Vec<Instrument>,
     pub initial_balances: HashMap<String, Decimal>,
+    /// Pre-existing positions to seed the ledger with (live startup
+    /// recovery from the exchange). Empty for backtest/paper.
+    pub initial_positions: HashMap<String, Position>,
     /// Funding rate (in basis points) for open leveraged positions;
     /// `None` disables funding settlement entirely.
     ///
@@ -164,7 +167,8 @@ pub async fn run_unified_event_loop(
         .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
         .collect();
 
-    let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances);
+    let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances)
+        .with_positions(config.initial_positions);
     // A minimal, zero-fee `CostModel` existing solely to carry
     // `funding_rate_bps` into `PortfolioLedger::apply_funding_payments`
     // -- see `UnifiedLoopConfig::funding_rate_bps` for why the real
@@ -1078,6 +1082,7 @@ mod tests {
         UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
@@ -1345,6 +1350,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps: None,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
@@ -1388,6 +1394,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps: None,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,

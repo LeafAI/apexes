@@ -483,6 +483,33 @@ impl OrderManager {
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {
         &self.open_orders
     }
+
+    /// Queries the exchange's open orders for each of `asset_classes`
+    /// and returns the client order IDs we have NO local record of
+    /// (orphans: e.g. placed manually or by another process).
+    /// `reconcile()` only logs these and only looks at asset classes
+    /// with local open orders, so startup recovery calls this
+    /// explicitly to refuse to start on an account it cannot account for.
+    pub async fn unknown_exchange_orders(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<Vec<OrderId>, OmsError> {
+        let mut unknown = Vec::new();
+        for asset_class in asset_classes {
+            let exchange_orders = self
+                .gateway
+                .query_all_open_orders(*asset_class)
+                .await
+                .map_err(|reason| OmsError::QueryFailed { reason })?;
+            unknown.extend(
+                exchange_orders
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .filter(|id| !self.open_orders.contains_key(id)),
+            );
+        }
+        Ok(unknown)
+    }
 }
 
 #[cfg(test)]

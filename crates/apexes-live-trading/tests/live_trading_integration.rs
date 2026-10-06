@@ -186,6 +186,7 @@ fn base_config() -> LiveTradingConfig {
     LiveTradingConfig {
         instruments: vec![btc_usdt_instrument()],
         initial_balances,
+        initial_positions: HashMap::new(),
         // Live trading never simulates fees itself; `cost_model` exists
         // only for `funding_rate_bps` (disabled here).
         cost_model: CostModel {

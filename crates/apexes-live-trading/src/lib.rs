@@ -15,8 +15,12 @@
 
 pub mod order_executor_adapter;
 pub mod runner;
+pub mod startup_recovery;
 
 pub use order_executor_adapter::{
     LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
 };
 pub use runner::{LiveTradingConfig, LiveTradingReport, run_live_trading};
+pub use startup_recovery::{
+    ExchangeSnapshot, RecoveredState, RecoveryError, RecoveryOrders, recover_live_state,
+};

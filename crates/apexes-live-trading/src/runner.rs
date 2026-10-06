@@ -39,6 +39,9 @@ use crate::order_executor_adapter::{
 pub struct LiveTradingConfig {
     pub instruments: Vec<Instrument>,
     pub initial_balances: HashMap<String, Decimal>,
+    /// Pre-existing exchange positions recovered at startup (see
+    /// `crate::startup_recovery`). Empty if the account is flat.
+    pub initial_positions: HashMap<String, apexes_strategy::Position>,
     /// Live trading does not simulate fills/fees itself (real fills
     /// arrive via the exchange push/reconcile paths); this field exists
     /// purely for its `funding_rate_bps`, which the local ledger's
@@ -238,6 +241,7 @@ pub async fn run_live_trading(
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
         initial_balances: config.initial_balances,
+        initial_positions: config.initial_positions,
         funding_rate_bps,
         risk_free_return: config.risk_free_return,
         risk_checker,
