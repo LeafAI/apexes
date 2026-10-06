@@ -281,6 +281,19 @@ async fn run_stream_task(
         };
         failures = 0;
         tracing::info!(?family, "User Data Stream connected");
+        let family_label = match family {
+            ApiFamily::Spot => "spot",
+            ApiFamily::Futures => "futures",
+        };
+        let telemetry = apexes_telemetry::metrics();
+        telemetry
+            .stream_connected
+            .with_label_values(&[family_label])
+            .set(1.0);
+        telemetry
+            .stream_reconnects
+            .with_label_values(&[family_label])
+            .inc();
         // Updates pushed while we were disconnected are gone: have the
         // consumer reconcile immediately.
         resync.notify_one();
@@ -326,6 +339,10 @@ async fn run_stream_task(
                 }
             }
         }
+        telemetry
+            .stream_connected
+            .with_label_values(&[family_label])
+            .set(0.0);
         tokio::time::sleep(backoff_delay(&timings, 0)).await;
     }
 }

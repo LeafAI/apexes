@@ -41,6 +41,7 @@ use apexes_oms::KillSwitch;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
@@ -101,7 +102,56 @@ pub fn build_app_with_kill_switch(
     };
     Router::new()
         .route("/session/ws", get(session_ws_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
         .with_state(state)
+}
+
+/// Prometheus scrape endpoint.
+async fn metrics_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        apexes_telemetry::render(),
+    )
+}
+
+fn health_body(state: &AppState) -> (bool, serde_json::Value) {
+    let halt_reason = state
+        .kill_switch
+        .as_ref()
+        .filter(|ks| ks.is_engaged())
+        .map(|ks| ks.reason().unwrap_or_default());
+    let halted = halt_reason.is_some();
+    (
+        halted,
+        serde_json::json!({
+            "status": if halted { "halted" } else { "ok" },
+            "halt_reason": halt_reason,
+        }),
+    )
+}
+
+/// Liveness: 200 whenever the process is serving, with halt state in the
+/// body (a halted engine is alive and must not be restarted by a
+/// supervisor, which would only lose the halt).
+async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let (_, body) = health_body(&state);
+    (StatusCode::OK, axum::Json(body))
+}
+
+/// Readiness: 503 while the kill switch is engaged.
+async fn readyz_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let (halted, body) = health_body(&state);
+    let code = if halted {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, axum::Json(body))
 }
 
 async fn session_ws_handler(

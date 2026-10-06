@@ -8,6 +8,7 @@ license.workspace = true
 apexes-core = { path = "../apexes-core" }
 apexes-risk = { path = "../apexes-risk" }
 apexes-strategy = { path = "../apexes-strategy" }
+apexes-telemetry = { path = "../apexes-telemetry" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

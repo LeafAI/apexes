@@ -276,3 +276,54 @@ async fn halt_and_resume_commands_engage_and_release_the_kill_switch_without_a_l
     }
     panic!("kill switch was not released by ResumeTrading");
 }
+
+/// Minimal HTTP/1.0 GET over a raw socket (no HTTP client dev-dependency).
+async fn http_get(port: u16, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    let status = raw.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
+#[tokio::test]
+async fn metrics_health_and_readiness_endpoints_reflect_kill_switch_state() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+    let kill_switch = std::sync::Arc::new(apexes_oms::KillSwitch::new());
+    let app = apexes_engine::build_app_with_kill_switch(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(std::sync::Arc::clone(&kill_switch)),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (status, body) = http_get(port, "/healthz").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    assert_eq!(http_get(port, "/readyz").await.0, 200);
+
+    let (status, body) = http_get(port, "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("apexes_kill_switch_engaged"), "{body}");
+
+    kill_switch.engage("maintenance");
+    let (status, body) = http_get(port, "/healthz").await;
+    assert_eq!(status, 200, "liveness stays 200 while halted");
+    assert!(body.contains("\"status\":\"halted\"") && body.contains("maintenance"));
+    assert_eq!(http_get(port, "/readyz").await.0, 503);
+}

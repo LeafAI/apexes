@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+apexes-telemetry = { path = "../apexes-telemetry" }
 apexes-core = { path = "../apexes-core" }
 apexes-oms = { path = "../apexes-oms" }
 apexes-strategy = { path = "../apexes-strategy" }

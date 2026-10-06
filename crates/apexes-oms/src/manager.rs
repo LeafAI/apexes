@@ -120,6 +120,10 @@ impl OrderManager {
         if let Some(kill_switch) = &self.kill_switch
             && kill_switch.is_engaged()
         {
+            apexes_telemetry::metrics()
+                .orders_submitted
+                .with_label_values(&[apexes_telemetry::order_result::HALTED])
+                .inc();
             return Err(OmsError::TradingHalted {
                 reason: kill_switch.reason().unwrap_or_default(),
             });
@@ -129,6 +133,10 @@ impl OrderManager {
             if let Err(violations) =
                 checker.check(&intent, positions, balances, &empty_open_orders, Utc::now())
             {
+                apexes_telemetry::metrics()
+                    .orders_submitted
+                    .with_label_values(&[apexes_telemetry::order_result::RISK_REJECTED])
+                    .inc();
                 return Err(OmsError::RiskCheckFailed { violations });
             }
         }
@@ -154,7 +162,19 @@ impl OrderManager {
         };
         self.store.upsert_order(&order).await?;
 
-        match self.gateway.submit_order(&order).await {
+        let submit_started = std::time::Instant::now();
+        let outcome = self.gateway.submit_order(&order).await;
+        let telemetry = apexes_telemetry::metrics();
+        telemetry.observe_submit_latency(submit_started.elapsed());
+        telemetry
+            .orders_submitted
+            .with_label_values(&[match &outcome {
+                GatewayOutcome::Accepted { .. } => apexes_telemetry::order_result::ACCEPTED,
+                GatewayOutcome::Rejected { .. } => apexes_telemetry::order_result::REJECTED,
+                GatewayOutcome::Uncertain { .. } => apexes_telemetry::order_result::UNCERTAIN,
+            }])
+            .inc();
+        let result = match outcome {
             GatewayOutcome::Accepted { exchange_order_id } => {
                 order.exchange_order_id = Some(exchange_order_id);
                 order.updated_at = Utc::now();
@@ -179,7 +199,9 @@ impl OrderManager {
                 self.open_orders.insert(order_id, order);
                 Ok(order_id)
             }
-        }
+        };
+        telemetry.open_orders.set(self.open_orders.len() as i64);
+        result
     }
 
     /// Cancels an existing order:
@@ -380,6 +402,9 @@ impl OrderManager {
             self.open_orders.remove(&client_order_id);
         }
 
+        let telemetry = apexes_telemetry::metrics();
+        telemetry.fills.inc_by(new_fills.len() as u64);
+        telemetry.open_orders.set(self.open_orders.len() as i64);
         Ok(new_fills)
     }
 
@@ -413,6 +438,20 @@ impl OrderManager {
     /// what changed and apply any new `Fill`s to its own portfolio
     /// tracking.
     pub async fn reconcile(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
+        let telemetry = apexes_telemetry::metrics();
+        let result = self.reconcile_inner().await;
+        match &result {
+            Ok(changes) => {
+                telemetry.reconcile_runs.with_label_values(&["ok"]).inc();
+                telemetry.reconcile_changes.inc_by(changes.len() as u64);
+            }
+            Err(_) => telemetry.reconcile_runs.with_label_values(&["error"]).inc(),
+        }
+        telemetry.open_orders.set(self.open_orders.len() as i64);
+        result
+    }
+
+    async fn reconcile_inner(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
         let asset_classes: HashSet<AssetClass> = self
             .open_orders
             .values()
@@ -686,6 +725,10 @@ mod tests {
             .await
             .with_kill_switch(Arc::clone(&kill_switch));
 
+        let halted_before = apexes_telemetry::metrics()
+            .orders_submitted
+            .with_label_values(&[apexes_telemetry::order_result::HALTED])
+            .get();
         kill_switch.engage("test halt");
         let err = manager
             .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
@@ -693,6 +736,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, OmsError::TradingHalted { ref reason } if reason == "test halt"));
         assert!(manager.open_orders().is_empty());
+        assert!(
+            apexes_telemetry::metrics()
+                .orders_submitted
+                .with_label_values(&[apexes_telemetry::order_result::HALTED])
+                .get()
+                > halted_before
+        );
 
         kill_switch.release();
         manager

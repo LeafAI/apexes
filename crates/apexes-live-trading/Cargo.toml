@@ -12,6 +12,7 @@ apexes-oms = { path = "../apexes-oms" }
 apexes-backtest = { path = "../apexes-backtest" }
 apexes-strategy = { path = "../apexes-strategy" }
 apexes-risk = { path = "../apexes-risk" }
+apexes-telemetry = { path = "../apexes-telemetry" }
 tokio = { workspace = true, features = ["time", "sync"] }
 futures = { workspace = true }
 chrono = { workspace = true }

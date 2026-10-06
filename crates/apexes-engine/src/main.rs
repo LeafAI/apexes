@@ -271,7 +271,7 @@ fn pin_current_thread_round_robin(
 /// comment (Task 5) for the full rationale against "simplifying" this
 /// back to `#[tokio::main]` + a single call.
 fn main() {
-    tracing_subscriber::fmt::init();
+    apexes_telemetry::init_tracing();
 
     let cli = Cli::parse();
 
@@ -401,6 +401,7 @@ async fn run_inner(
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
     let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
+    spawn_snapshot_gauges(snapshot_rx.clone());
     let app = build_app_with_kill_switch(
         command_tx,
         snapshot_rx,
@@ -465,6 +466,34 @@ async fn run_inner(
             .await
         }
     }
+}
+
+/// Mirrors each pushed `SessionSnapshot` into the Prometheus gauges
+/// (equity, realized PnL, open positions). Ends when the loop drops the
+/// snapshot sender.
+fn spawn_snapshot_gauges(
+    mut snapshot_rx: tokio::sync::watch::Receiver<apexes_backtest::SessionSnapshot>,
+) {
+    use rust_decimal::prelude::ToPrimitive;
+    tokio::spawn(async move {
+        let telemetry = apexes_telemetry::metrics();
+        while snapshot_rx.changed().await.is_ok() {
+            let snapshot = snapshot_rx.borrow_and_update().clone();
+            telemetry
+                .equity
+                .set(snapshot.equity.to_f64().unwrap_or(f64::NAN));
+            telemetry.realized_pnl.set(
+                snapshot
+                    .realized_pnl
+                    .values()
+                    .map(|v| v.to_f64().unwrap_or(0.0))
+                    .sum(),
+            );
+            telemetry
+                .open_positions
+                .set(snapshot.positions.len() as i64);
+        }
+    });
 }
 
 /// `SessionMode::Backtest`: `run_backtest` takes `impl

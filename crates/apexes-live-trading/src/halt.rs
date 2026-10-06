@@ -98,6 +98,9 @@ pub fn spawn_staleness_watchdog(
                 continue;
             }
             let idle = clock.idle();
+            apexes_telemetry::metrics()
+                .market_data_idle_seconds
+                .set(idle.as_secs_f64());
             if idle >= stale_after {
                 kill_switch.engage(format!(
                     "market data stale: no events for {:.1}s (limit {:.1}s)",

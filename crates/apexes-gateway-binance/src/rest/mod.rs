@@ -291,6 +291,7 @@ impl BinanceRestClient {
             .await
             .map_err(|error| format!("request failed: {error}"))?;
         let status = response.status();
+        apexes_telemetry::metrics().count_rest_status(status.as_u16());
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)

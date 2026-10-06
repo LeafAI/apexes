@@ -296,7 +296,7 @@ async fn build_persistence(
 /// call without re-reading this comment; that regression has already
 /// been caught and fixed once.
 fn main() {
-    tracing_subscriber::fmt::init();
+    apexes_telemetry::init_tracing();
 
     let cli = Cli::parse();
     let port = resolve_port(&cli);

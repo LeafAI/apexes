@@ -27,6 +27,7 @@ impl KillSwitch {
         if !self.engaged.swap(true, Ordering::SeqCst) {
             tracing::error!(%reason, "KILL SWITCH ENGAGED: new orders blocked");
             *self.reason.lock().unwrap() = Some(reason);
+            apexes_telemetry::metrics().kill_switch_engaged.set(1);
         }
         self.notify.notify_waiters();
     }
@@ -36,6 +37,7 @@ impl KillSwitch {
         if self.engaged.swap(false, Ordering::SeqCst) {
             tracing::warn!("kill switch released: new orders allowed again");
             *self.reason.lock().unwrap() = None;
+            apexes_telemetry::metrics().kill_switch_engaged.set(0);
         }
     }
 

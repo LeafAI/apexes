@@ -384,6 +384,7 @@ dependencies = [
  "apexes-storage",
  "apexes-strategy",
  "apexes-strategy-loader",
+ "apexes-telemetry",
  "async-trait",
  "axum",
  "chrono",
@@ -409,6 +410,7 @@ dependencies = [
  "apexes-core",
  "apexes-oms",
  "apexes-strategy",
+ "apexes-telemetry",
  "async-trait",
  "chrono",
  "futures",
@@ -479,6 +481,7 @@ dependencies = [
  "apexes-oms",
  "apexes-risk",
  "apexes-strategy",
+ "apexes-telemetry",
  "async-trait",
  "chrono",
  "futures",
@@ -558,6 +561,7 @@ dependencies = [
  "apexes-market-data",
  "apexes-message-bus",
  "apexes-storage",
+ "apexes-telemetry",
  "async-trait",
  "axum",
  "chrono",
@@ -620,6 +624,7 @@ dependencies = [
  "apexes-core",
  "apexes-risk",
  "apexes-strategy",
+ "apexes-telemetry",
  "async-trait",
  "chrono",
  "rust_decimal",
@@ -757,6 +762,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "apexes-telemetry"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4615,6 +4629,20 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "thiserror 2.0.19",
+]
 
 [[package]]
 name = "prost"
