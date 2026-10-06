@@ -4,7 +4,9 @@
 #   docker build --target engine  -t apexes-engine .
 #   docker build --target gateway -t apexes-market-data-gateway .
 
-FROM rust:1 AS builder
+# Pinned to match CI (.github/workflows/ci.yml); bump both together.
+ARG RUST_VERSION=1.97
+FROM rust:${RUST_VERSION} AS builder
 WORKDIR /src
 COPY . .
 # Release binaries only; cache mounts keep rebuilds incremental.

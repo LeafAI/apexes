@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+# The Rust toolchain is pinned (see the dtolnay/rust-toolchain refs below and
+# the Dockerfile's RUST_VERSION): a floating `stable` turns every new clippy
+# lint into a red build under -D warnings. Bump deliberately, with the fixes.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -15,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -40,7 +43,7 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       # Postgres-backed packages share ONE database that their tests
       # TRUNCATE, so they run serially, OMS first (it creates the tables the
