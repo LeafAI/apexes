@@ -41,7 +41,7 @@ use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
 use apexes_engine::launch_config::{LaunchConfig, SessionMode};
-use apexes_engine::{build_app, credentials, resolve_binance_credentials};
+use apexes_engine::{build_app_with_kill_switch, credentials, resolve_binance_credentials};
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExecutionGateway, OrderManager, OrderStore};
@@ -400,7 +400,13 @@ async fn run_inner(
     // rationale).
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
-    let app = build_app(command_tx, snapshot_rx, stop_tx);
+    let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
+    let app = build_app_with_kill_switch(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(Arc::clone(&kill_switch)),
+    );
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::error!(
@@ -438,12 +444,15 @@ async fn run_inner(
             auto_derisk_live,
             reconcile_interval,
             ems_postgres_url,
+            stale_data_timeout_secs,
         } => {
             let live_params = LiveModeParams {
                 credentials_ref,
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
+                kill_switch,
+                stale_data_timeout: stale_data_timeout_secs.map(std::time::Duration::from_secs),
             };
             run_live_mode(
                 &launch_config,
@@ -559,6 +568,8 @@ struct LiveModeParams {
     auto_derisk_live: bool,
     reconcile_interval: std::time::Duration,
     ems_postgres_url: String,
+    kill_switch: Arc<apexes_oms::KillSwitch>,
+    stale_data_timeout: Option<std::time::Duration>,
 }
 
 /// `SessionMode::Live`: `run_live_trading` takes no direct market-data
@@ -585,6 +596,8 @@ async fn run_live_mode(
         auto_derisk_live,
         reconcile_interval,
         ems_postgres_url,
+        kill_switch,
+        stale_data_timeout,
     } = live_params;
 
     let gateway_config = resolve_binance_credentials(&credentials_ref, |name| std::env::var(name))?;
@@ -619,7 +632,8 @@ async fn run_live_mode(
     let order_store = OrderStore::new(&ems_postgres_url).await?;
     let mut order_manager = OrderManager::new(order_store, registry)
         .await
-        .map_err(EngineError::from)?;
+        .map_err(EngineError::from)?
+        .with_kill_switch(Arc::clone(&kill_switch));
 
     // Seed the ledger from the exchange's real account state (not the
     // operator-supplied `initial_balances`), and refuse to start if
@@ -657,6 +671,8 @@ async fn run_live_mode(
         reconcile_interval,
         ems_postgres_url,
         control: Some(control_handle),
+        kill_switch: Some(kill_switch),
+        stale_data_timeout,
     };
 
     run_live_trading(

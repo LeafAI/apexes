@@ -87,6 +87,14 @@ pub struct LiveTradingConfig {
     /// every pre-existing caller) is a silent no-op -- identical to
     /// this crate's behavior before this field existed.
     pub control: Option<apexes_backtest::ControlHandle>,
+    /// Kill switch shared with the engine's control endpoint. When
+    /// engaged it blocks new orders (attach the SAME `Arc` to the
+    /// `OrderManager` via `with_kill_switch`) and this runner cancels
+    /// every open order. `None` disables the halt machinery.
+    pub kill_switch: Option<Arc<apexes_oms::KillSwitch>>,
+    /// Engage `kill_switch` automatically if no market event arrives
+    /// for this long. Requires `kill_switch`; `None` disables.
+    pub stale_data_timeout: Option<Duration>,
 }
 
 pub struct LiveTradingReport {
@@ -200,8 +208,32 @@ pub async fn run_live_trading(
     // arm most likely to be the one actually driving forward progress)
     // is gated with `take_until(stop_signal)`, and `None` is passed as
     // `run_unified_event_loop`'s own `stop_signal` parameter.
+    let activity_clock = Arc::new(crate::halt::ActivityClock::new());
+    let mut halt_tasks = Vec::new();
+    if let Some(kill_switch) = &config.kill_switch {
+        halt_tasks.push(crate::halt::spawn_cancel_all_task(
+            Arc::clone(kill_switch),
+            Arc::clone(&order_manager),
+        ));
+        if let Some(stale_after) = config.stale_data_timeout {
+            halt_tasks.push(crate::halt::spawn_staleness_watchdog(
+                Arc::clone(kill_switch),
+                Arc::clone(&activity_clock),
+                stale_after,
+            ));
+        }
+    } else if config.stale_data_timeout.is_some() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "stale_data_timeout requires a kill_switch".to_string(),
+        });
+    }
+
     let market_events = subscribe_all_venues(registry, &config.instruments)
         .await?
+        .inspect({
+            let activity_clock = Arc::clone(&activity_clock);
+            move |_| activity_clock.touch()
+        })
         .take_until(Box::pin(async move {
             let _ = stop_signal.await;
         }));

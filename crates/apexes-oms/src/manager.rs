@@ -19,13 +19,34 @@ use uuid::Uuid;
 
 use crate::error::OmsError;
 use crate::gateway::{ExecutionGateway, GatewayOutcome};
+use crate::kill_switch::KillSwitch;
 use crate::store::OrderStore;
+
+/// Outcome of [`OrderManager::cancel_all_open`].
+#[derive(Debug, Default)]
+pub struct CancelAllReport {
+    /// Orders whose cancellation the exchange accepted.
+    pub cancelled: Vec<OrderId>,
+    /// Orders whose cancellation failed (rejected / query error); still
+    /// believed open, worth retrying.
+    pub failed: Vec<(OrderId, String)>,
+    /// Orders with no known exchange id even after a reconcile attempt
+    /// (submission outcome still unknown); cannot be cancelled yet.
+    pub unresolved: Vec<OrderId>,
+}
+
+impl CancelAllReport {
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.unresolved.is_empty()
+    }
+}
 
 pub struct OrderManager {
     store: OrderStore,
     gateway: Arc<dyn ExecutionGateway>,
     risk_checker: Option<Arc<CompositeRiskChecker>>,
     open_orders: HashMap<OrderId, Order>,
+    kill_switch: Option<Arc<KillSwitch>>,
 }
 
 impl OrderManager {
@@ -55,7 +76,15 @@ impl OrderManager {
             gateway,
             risk_checker,
             open_orders,
+            kill_switch: None,
         })
+    }
+
+    /// Attaches a [`KillSwitch`]: while engaged, `submit_order` fails
+    /// with `OmsError::TradingHalted` (cancels remain allowed).
+    pub fn with_kill_switch(mut self, kill_switch: Arc<KillSwitch>) -> Self {
+        self.kill_switch = Some(kill_switch);
+        self
     }
 
     /// Submits a new order:
@@ -88,6 +117,13 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
+        if let Some(kill_switch) = &self.kill_switch
+            && kill_switch.is_engaged()
+        {
+            return Err(OmsError::TradingHalted {
+                reason: kill_switch.reason().unwrap_or_default(),
+            });
+        }
         if let Some(checker) = &self.risk_checker {
             let empty_open_orders = HashMap::new();
             if let Err(violations) =
@@ -480,6 +516,41 @@ impl OrderManager {
         Ok(results)
     }
 
+    /// Best-effort cancel of every open order. Runs `reconcile()` first
+    /// so orders whose submission outcome was `Uncertain` learn their
+    /// exchange id (and orders that already filled/cancelled drop out).
+    /// Never returns early on a per-order failure: every order is
+    /// attempted and the report says what is left, so the caller (the
+    /// kill-switch task) can retry until `is_complete()`.
+    pub async fn cancel_all_open(&mut self) -> CancelAllReport {
+        if let Err(error) = self.reconcile().await {
+            tracing::warn!(
+                ?error,
+                "cancel_all_open: pre-cancel reconcile failed; continuing"
+            );
+        }
+        let mut report = CancelAllReport::default();
+        let ids: Vec<OrderId> = self.open_orders.keys().copied().collect();
+        for id in ids {
+            match self.cancel_order(id).await {
+                Ok(()) => {
+                    // `Uncertain` cancels return Ok but leave the order open.
+                    if self.open_orders.contains_key(&id) {
+                        report
+                            .failed
+                            .push((id, "cancel outcome uncertain".to_string()));
+                    } else {
+                        report.cancelled.push(id);
+                    }
+                }
+                Err(OmsError::ExchangeOrderIdUnknown { .. }) => report.unresolved.push(id),
+                Err(OmsError::OrderNotCancellable { .. }) => {}
+                Err(error) => report.failed.push((id, error.to_string())),
+            }
+        }
+        report
+    }
+
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {
         &self.open_orders
     }
@@ -604,6 +675,49 @@ mod tests {
         clean_db(&store).await;
         let registry = registry_with_gateway(gateway);
         OrderManager::new(store, &registry).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn engaged_kill_switch_blocks_submit_but_not_after_release() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let kill_switch = Arc::new(KillSwitch::new());
+        let mut manager = fresh_manager(gateway)
+            .await
+            .with_kill_switch(Arc::clone(&kill_switch));
+
+        kill_switch.engage("test halt");
+        let err = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmsError::TradingHalted { ref reason } if reason == "test halt"));
+        assert!(manager.open_orders().is_empty());
+
+        kill_switch.release();
+        manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cancel_all_open_cancels_every_open_order() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+        for _ in 0..3 {
+            manager
+                .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(manager.open_orders().len(), 3);
+
+        let report = manager.cancel_all_open().await;
+        assert_eq!(report.cancelled.len(), 3);
+        assert!(report.is_complete());
+        assert!(manager.open_orders().is_empty());
     }
 
     #[tokio::test]

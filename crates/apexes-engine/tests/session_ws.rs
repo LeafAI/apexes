@@ -222,3 +222,57 @@ async fn session_ws_duplicate_stop_commands_do_not_panic() {
         assert!(matches!(received_command, SessionCommand::Stop));
     }
 }
+
+#[tokio::test]
+async fn halt_and_resume_commands_engage_and_release_the_kill_switch_without_a_loop() {
+    // Nothing consumes `command_rx` (the receiver is held but never
+    // drained), modelling a trading loop stalled on a dead market feed:
+    // the kill switch must still engage.
+    let (command_tx, _command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+    let kill_switch = std::sync::Arc::new(apexes_oms::KillSwitch::new());
+
+    let app = apexes_engine::build_app_with_kill_switch(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(std::sync::Arc::clone(&kill_switch)),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (mut ws_stream, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session/ws"))
+            .await
+            .unwrap();
+
+    let send = |c: SessionCommand| serde_json::to_string(&SessionMessage::Command(c)).unwrap();
+    ws_stream
+        .send(Message::Text(
+            send(SessionCommand::Halt {
+                reason: "operator".to_string(),
+            })
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), kill_switch.wait_engaged())
+        .await
+        .expect("kill switch was not engaged by Halt");
+    assert_eq!(kill_switch.reason().as_deref(), Some("operator"));
+
+    ws_stream
+        .send(Message::Text(send(SessionCommand::ResumeTrading).into()))
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if !kill_switch.is_engaged() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("kill switch was not released by ResumeTrading");
+}

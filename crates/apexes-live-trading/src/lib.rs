@@ -13,6 +13,7 @@
 //! temporary position/balance tracking, pending sub-project #11
 //! (account & fund management), which will supersede it.
 
+pub mod halt;
 pub mod order_executor_adapter;
 pub mod runner;
 pub mod startup_recovery;

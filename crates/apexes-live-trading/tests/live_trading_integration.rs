@@ -203,6 +203,8 @@ fn base_config() -> LiveTradingConfig {
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),
         control: None,
+        kill_switch: None,
+        stale_data_timeout: None,
     }
 }
 

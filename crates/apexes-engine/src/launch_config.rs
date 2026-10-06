@@ -105,6 +105,10 @@ pub enum SessionMode {
         reconcile_interval: Duration,
         /// Maps directly to `LiveTradingConfig.ems_postgres_url`.
         ems_postgres_url: String,
+        /// Engage the kill switch automatically if no market event
+        /// arrives for this many seconds. `None` (default) disables.
+        #[serde(default)]
+        stale_data_timeout_secs: Option<u64>,
     },
 }
 
@@ -230,6 +234,7 @@ mod tests {
                 auto_derisk_live: false,
                 reconcile_interval: Duration::from_secs(30),
                 ems_postgres_url: "postgres://localhost/apexes_ems".to_string(),
+                stale_data_timeout_secs: Some(20),
             },
             strategy_ref: StrategyRef::RustNative {
                 name: "example".to_string(),
@@ -280,7 +285,9 @@ mod tests {
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
+                stale_data_timeout_secs,
             } => {
+                assert_eq!(stale_data_timeout_secs, Some(20));
                 assert_eq!(credentials_ref, "binance-main");
                 assert!(!auto_derisk_live);
                 assert_eq!(reconcile_interval, Duration::from_secs(30));

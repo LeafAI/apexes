@@ -38,6 +38,14 @@ pub enum SessionCommand {
     /// Requests the unified loop exit after this tick, equivalent to
     /// `stop_signal` firing.
     Stop,
+    /// Engages the live kill switch (blocks new orders, cancels all open
+    /// orders) and pauses strategy dispatch. The switch itself is engaged
+    /// by the engine's control endpoint directly -- this loop only drains
+    /// commands on market ticks, which is exactly when a halt cannot be
+    /// relied upon -- so the loop-side effect is just the pause.
+    Halt { reason: String },
+    /// Releases the kill switch and resumes strategy dispatch.
+    ResumeTrading,
 }
 
 /// A point-in-time view of a running session's state, pushed by the
@@ -130,6 +138,8 @@ impl ControlHandle {
                     SessionCommand::Pause => self.paused = true,
                     SessionCommand::Resume => self.paused = false,
                     SessionCommand::Stop => stop_requested = true,
+                    SessionCommand::Halt { .. } => self.paused = true,
+                    SessionCommand::ResumeTrading => self.paused = false,
                 },
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,

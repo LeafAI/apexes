@@ -20,6 +20,9 @@ pub enum OmsError {
         violations: Vec<apexes_risk::RiskViolation>,
     },
 
+    #[error("trading halted by kill switch: {reason}")]
+    TradingHalted { reason: String },
+
     #[error("order rejected by exchange: {reason}")]
     OrderRejected { reason: String },
 

@@ -19,4 +19,4 @@ pub use credentials::{CredentialsError, resolve_binance_credentials};
 pub use gateway_client::GatewayMarketDataProvider;
 pub use launch_config::{LaunchConfig, SessionMode};
 pub use protocol::SessionMessage;
-pub use server::build_app;
+pub use server::{build_app, build_app_with_kill_switch};

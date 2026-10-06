@@ -37,6 +37,7 @@
 
 use crate::protocol::SessionMessage;
 use apexes_backtest::{SessionCommand, SessionSnapshot};
+use apexes_oms::KillSwitch;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -60,6 +61,7 @@ struct AppState {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
     snapshot_rx: watch::Receiver<SessionSnapshot>,
     stop_tx: SharedStopSender,
+    kill_switch: Option<Arc<KillSwitch>>,
 }
 
 /// Builds the `axum::Router` `apexes-engine`'s `main.rs` serves.
@@ -78,10 +80,24 @@ pub fn build_app(
     snapshot_rx: watch::Receiver<SessionSnapshot>,
     stop_tx: oneshot::Sender<()>,
 ) -> Router {
+    build_app_with_kill_switch(command_tx, snapshot_rx, stop_tx, None)
+}
+
+/// Like [`build_app`], but `Halt`/`ResumeTrading` commands also
+/// engage/release `kill_switch` immediately, on the connection task
+/// itself -- not via the command channel, whose consumer (the trading
+/// loop) only drains it on market ticks.
+pub fn build_app_with_kill_switch(
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    snapshot_rx: watch::Receiver<SessionSnapshot>,
+    stop_tx: oneshot::Sender<()>,
+    kill_switch: Option<Arc<KillSwitch>>,
+) -> Router {
     let state = AppState {
         command_tx,
         snapshot_rx,
         stop_tx: Arc::new(Mutex::new(Some(stop_tx))),
+        kill_switch,
     };
     Router::new()
         .route("/session/ws", get(session_ws_handler))
@@ -100,6 +116,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut snapshot_rx = state.snapshot_rx;
     let command_tx = state.command_tx;
     let stop_tx = state.stop_tx;
+    let kill_switch = state.kill_switch;
 
     loop {
         tokio::select! {
@@ -119,7 +136,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !forward_command(&text, &command_tx, &stop_tx).await {
+                        if !forward_command(&text, &command_tx, &stop_tx, kill_switch.as_deref()).await {
                             // Not a fatal error for this connection --
                             // an unparseable frame is logged and
                             // skipped, matching
@@ -191,6 +208,7 @@ async fn forward_command(
     text: &str,
     command_tx: &mpsc::UnboundedSender<SessionCommand>,
     stop_tx: &SharedStopSender,
+    kill_switch: Option<&KillSwitch>,
 ) -> bool {
     let message: SessionMessage = match serde_json::from_str(text) {
         Ok(message) => message,
@@ -206,6 +224,18 @@ async fn forward_command(
     match message {
         SessionMessage::Command(command) => {
             let is_stop = matches!(command, SessionCommand::Stop);
+            // Engage/release BEFORE forwarding: the halt must take effect
+            // even if the trading loop is stalled or already gone.
+            match (&command, kill_switch) {
+                (SessionCommand::Halt { reason }, Some(ks)) => ks.engage(reason.clone()),
+                (SessionCommand::ResumeTrading, Some(ks)) => ks.release(),
+                (SessionCommand::Halt { .. } | SessionCommand::ResumeTrading, None) => {
+                    tracing::warn!(
+                        "apexes-engine server: halt/resume received but no kill switch is configured (non-live session)"
+                    );
+                }
+                _ => {}
+            }
             if command_tx.send(command).is_err() {
                 tracing::warn!(
                     "apexes-engine server: command_tx receiver dropped (trading loop ended), \
