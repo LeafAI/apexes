@@ -498,6 +498,12 @@ struct WithdrawHistoryEntry {
     apply_time: String,
 }
 
+/// Binance's definitive "no such order" answer (`-2013`), returned with
+/// HTTP 400.
+fn is_order_does_not_exist(body: &str) -> bool {
+    serde_json::from_str::<BinanceApiError>(body).is_ok_and(|e| e.code == -2013)
+}
+
 fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {
     match status {
         "NEW" => Ok(OrderStatus::New),
@@ -650,7 +656,7 @@ impl ExecutionGateway for BinanceExecutionGateway {
             .signed_request("GET", family, Self::order_path(family), &params)
             .await?;
 
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if status == reqwest::StatusCode::NOT_FOUND || is_order_does_not_exist(&body) {
             return Ok(None);
         }
         if !status.is_success() {
@@ -664,6 +670,40 @@ impl ExecutionGateway for BinanceExecutionGateway {
         let parsed: SingleOrderStatus = serde_json::from_str(&body)
             .map_err(|error| format!("parse error: {error}; body={body}"))?;
         Ok(Some(parse_binance_status(&parsed.status)?))
+    }
+
+    /// Looks the order up by `origClientOrderId` (our `Order.id`, which
+    /// `submit_order` sent as `newClientOrderId`). Binance answers
+    /// `-2013 Order does not exist` for an order it never received.
+    async fn query_order_by_client_id(
+        &self,
+        order: &Order,
+    ) -> Result<Option<(String, OrderStatus)>, String> {
+        let family = ApiFamily::from(order.asset_class);
+        let params = format!("symbol={}&origClientOrderId={}", order.symbol, order.id.0);
+        let (status, body) = self
+            .rest
+            .signed_request("GET", family, Self::order_path(family), &params)
+            .await?;
+        if is_order_does_not_exist(&body) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {body}"));
+        }
+
+        #[derive(Deserialize)]
+        struct OrderByClientId {
+            #[serde(rename = "orderId")]
+            order_id: i64,
+            status: String,
+        }
+        let parsed: OrderByClientId = serde_json::from_str(&body)
+            .map_err(|error| format!("parse error: {error}; body={body}"))?;
+        Ok(Some((
+            parsed.order_id.to_string(),
+            parse_binance_status(&parsed.status)?,
+        )))
     }
 
     async fn query_all_open_orders(

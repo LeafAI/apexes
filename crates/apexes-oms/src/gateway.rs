@@ -82,6 +82,22 @@ pub trait ExecutionGateway: Send + Sync {
     /// "query failed" -- that's `Err`).
     async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String>;
 
+    /// Looks an order up by OUR client order id (`order.id`) -- the only
+    /// handle available for an order whose submission outcome was
+    /// `Uncertain` or whose acknowledgement was lost in a crash, so its
+    /// exchange id was never recorded. Returns `(exchange_order_id,
+    /// status)` if the exchange knows the order, `Ok(None)` ONLY if the
+    /// exchange definitively has no such order, `Err` if that cannot be
+    /// determined. The default is `Err`: gateways that cannot do this
+    /// lookup must not let `OrderManager` conclude an order never
+    /// reached the exchange.
+    async fn query_order_by_client_id(
+        &self,
+        _order: &Order,
+    ) -> Result<Option<(String, OrderStatus)>, String> {
+        Err("query_order_by_client_id is not supported by this gateway".to_string())
+    }
+
     /// Queries the exchange for every currently open (not Filled/
     /// Cancelled/Rejected) order within ONE asset class -- used by
     /// `OrderManager::reconcile` after a reconnect. Callers needing

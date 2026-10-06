@@ -436,3 +436,67 @@ async fn submit_order_uses_futures_stop_limit_type_name_on_perpetual() {
 
     assert!(matches!(outcome, GatewayOutcome::Accepted { .. }));
 }
+
+#[tokio::test]
+async fn query_order_by_client_id_returns_exchange_id_and_status() {
+    let mock_server = MockServer::start().await;
+    let id = Uuid::new_v4();
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .and(query_param("origClientOrderId", id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId": 777, "status": "FILLED"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    let found = gateway
+        .query_order_by_client_id(&sample_order(id))
+        .await
+        .unwrap();
+    assert_eq!(found, Some(("777".to_string(), OrderStatus::Filled)));
+}
+
+#[tokio::test]
+async fn query_order_by_client_id_maps_binance_order_does_not_exist_to_none() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "code": -2013, "msg": "Order does not exist."
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    assert_eq!(
+        gateway
+            .query_order_by_client_id(&sample_order(Uuid::new_v4()))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn query_order_by_client_id_errors_on_other_failures_instead_of_claiming_unknown() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "code": -1021, "msg": "Timestamp outside of recvWindow"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    assert!(
+        gateway
+            .query_order_by_client_id(&sample_order(Uuid::new_v4()))
+            .await
+            .is_err(),
+        "an inconclusive lookup must never read as 'order never reached the exchange'"
+    );
+}
