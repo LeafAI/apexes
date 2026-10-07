@@ -361,7 +361,13 @@ async fn forward_command(
             // Engage/release BEFORE forwarding: the halt must take effect
             // even if the trading loop is stalled or already gone.
             match (&command, kill_switch) {
-                (SessionCommand::Halt { reason }, Some(ks)) => ks.engage(reason.clone()),
+                (SessionCommand::Halt { reason, flatten }, Some(ks)) => {
+                    // Request first: the runner reads it when `engage` wakes it.
+                    if *flatten {
+                        ks.request_flatten();
+                    }
+                    ks.engage(reason.clone());
+                }
                 (SessionCommand::ResumeTrading, Some(ks)) => ks.release(),
                 (SessionCommand::Halt { .. } | SessionCommand::ResumeTrading, None) => {
                     tracing::warn!(

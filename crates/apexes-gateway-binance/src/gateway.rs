@@ -162,6 +162,22 @@ impl BinanceExecutionGateway {
         }
     }
 
+    /// Raw open-order entries for `asset_class`'s API family.
+    async fn fetch_open_order_entries(
+        &self,
+        asset_class: AssetClass,
+    ) -> Result<Vec<OpenOrderEntry>, String> {
+        let family = ApiFamily::from(asset_class);
+        let (status, body) = self
+            .rest
+            .signed_request("GET", family, Self::open_orders_path(family), "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).map_err(|error| format!("parse error: {error}; body={body}"))
+    }
+
     /// Starts the Binance User Data Stream (both Spot and Futures),
     /// returning a handle that must be kept alive for as long as the
     /// stream should keep running, plus the merged update stream
@@ -710,16 +726,7 @@ impl ExecutionGateway for BinanceExecutionGateway {
         &self,
         asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
-        let family = ApiFamily::from(asset_class);
-        let (status, body) = self
-            .rest
-            .signed_request("GET", family, Self::open_orders_path(family), "")
-            .await?;
-        if !status.is_success() {
-            return Err(format!("HTTP {status}: {body}"));
-        }
-        let entries: Vec<OpenOrderEntry> = serde_json::from_str(&body)
-            .map_err(|error| format!("parse error: {error}; body={body}"))?;
+        let entries = self.fetch_open_order_entries(asset_class).await?;
 
         // A single entry this gateway can't parse (a non-UUID
         // clientOrderId from an order placed by something other than
@@ -748,6 +755,17 @@ impl ExecutionGateway for BinanceExecutionGateway {
                 }
             })
             .collect())
+    }
+
+    async fn count_foreign_open_orders(&self, asset_class: AssetClass) -> Result<usize, String> {
+        // "Foreign" = a clientOrderId that is not one of ours (a UUID). An
+        // entry with a UUID but an unmapped status is still our own order.
+        Ok(self
+            .fetch_open_order_entries(asset_class)
+            .await?
+            .iter()
+            .filter(|entry| entry.client_order_id.parse::<uuid::Uuid>().is_err())
+            .count())
     }
 
     async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {

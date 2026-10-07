@@ -43,7 +43,13 @@ pub enum SessionCommand {
     /// by the engine's control endpoint directly -- this loop only drains
     /// commands on market ticks, which is exactly when a halt cannot be
     /// relied upon -- so the loop-side effect is just the pause.
-    Halt { reason: String },
+    /// With `flatten`, the live runner also closes open positions after
+    /// cancelling orders. Absent on the wire = `false`.
+    Halt {
+        reason: String,
+        #[serde(default)]
+        flatten: bool,
+    },
     /// Releases the kill switch and resumes strategy dispatch.
     ResumeTrading,
 }

@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 #[derive(Debug, Default)]
 pub struct KillSwitch {
     engaged: AtomicBool,
+    flatten_requested: AtomicBool,
     reason: Mutex<Option<String>>,
     notify: Notify,
 }
@@ -32,8 +33,20 @@ impl KillSwitch {
         self.notify.notify_waiters();
     }
 
+    /// Asks the live runner to also close open positions once the
+    /// cancel-all sweep has finished. Call BEFORE [`Self::engage`] so the
+    /// runner sees the request when it wakes. Cleared on release.
+    pub fn request_flatten(&self) {
+        self.flatten_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn flatten_requested(&self) -> bool {
+        self.flatten_requested.load(Ordering::SeqCst)
+    }
+
     /// Releases the switch; trading may resume.
     pub fn release(&self) {
+        self.flatten_requested.store(false, Ordering::SeqCst);
         if self.engaged.swap(false, Ordering::SeqCst) {
             tracing::warn!("kill switch released: new orders allowed again");
             *self.reason.lock().unwrap() = None;
@@ -82,6 +95,17 @@ mod tests {
         ks.release();
         assert!(!ks.is_engaged());
         assert_eq!(ks.reason(), None);
+    }
+
+    #[test]
+    fn flatten_request_is_cleared_by_release() {
+        let ks = KillSwitch::new();
+        assert!(!ks.flatten_requested());
+        ks.request_flatten();
+        ks.engage("x");
+        assert!(ks.flatten_requested());
+        ks.release();
+        assert!(!ks.flatten_requested());
     }
 
     #[tokio::test]

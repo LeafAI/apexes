@@ -35,6 +35,10 @@ pub enum RecoveryError {
     Oms(#[from] OmsError),
     #[error("exchange has open orders with no local record: {0:?}")]
     OrphanOrders(Vec<OrderId>),
+    #[error(
+        "exchange has {0} open order(s) not placed through this system (e.g. entered manually); cancel them or place the account under this system's control before starting"
+    )]
+    ForeignOrders(usize),
     #[error("local orders cannot be resolved against the exchange (no exchange order id): {0:?}")]
     UnresolvableOrders(Vec<OrderId>),
     #[error("failed to read exchange account state: {0}")]
@@ -50,6 +54,10 @@ pub trait RecoveryOrders: Send {
         &self,
         asset_classes: &[AssetClass],
     ) -> Result<Vec<OrderId>, OmsError>;
+    async fn foreign_open_order_count(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<usize, OmsError>;
     fn unresolvable_orders(&self) -> Vec<OrderId>;
 }
 
@@ -64,6 +72,13 @@ impl RecoveryOrders for OrderManager {
         asset_classes: &[AssetClass],
     ) -> Result<Vec<OrderId>, OmsError> {
         OrderManager::unknown_exchange_orders(self, asset_classes).await
+    }
+
+    async fn foreign_open_order_count(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<usize, OmsError> {
+        OrderManager::foreign_open_order_count(self, asset_classes).await
     }
 
     fn unresolvable_orders(&self) -> Vec<OrderId> {
@@ -97,6 +112,10 @@ where
     if !orphans.is_empty() {
         return Err(RecoveryError::OrphanOrders(orphans));
     }
+    let foreign = orders.foreign_open_order_count(asset_classes).await?;
+    if foreign > 0 {
+        return Err(RecoveryError::ForeignOrders(foreign));
+    }
     let unresolvable = orders.unresolvable_orders();
     if !unresolvable.is_empty() {
         return Err(RecoveryError::UnresolvableOrders(unresolvable));
@@ -125,6 +144,7 @@ mod tests {
     struct FakeOrders {
         orphans: Vec<OrderId>,
         unresolvable: Vec<OrderId>,
+        foreign: usize,
         reconcile_fails: bool,
     }
 
@@ -143,6 +163,9 @@ mod tests {
             _: &[AssetClass],
         ) -> Result<Vec<OrderId>, OmsError> {
             Ok(self.orphans.clone())
+        }
+        async fn foreign_open_order_count(&self, _: &[AssetClass]) -> Result<usize, OmsError> {
+            Ok(self.foreign)
         }
         fn unresolvable_orders(&self) -> Vec<OrderId> {
             self.unresolvable.clone()
@@ -177,6 +200,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RecoveryError::OrphanOrders(v) if v == vec![id]));
+    }
+
+    #[tokio::test]
+    async fn manually_placed_exchange_orders_refuse_startup() {
+        let mut orders = FakeOrders {
+            foreign: 2,
+            ..Default::default()
+        };
+        let err = recover_live_state(&mut orders, &[AssetClass::Spot], async { Ok(snapshot()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RecoveryError::ForeignOrders(2)));
     }
 
     #[tokio::test]

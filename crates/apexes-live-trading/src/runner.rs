@@ -98,6 +98,9 @@ pub struct LiveTradingConfig {
     /// Notified when the exchange push stream (re)connects; triggers an
     /// immediate `reconcile()`. `None` relies on `reconcile_interval` only.
     pub resync: Option<Arc<tokio::sync::Notify>>,
+    /// Where open exchange positions are read from when a halt asks to
+    /// flatten. `None`: a flatten request is logged as unfulfillable.
+    pub position_source: Option<Arc<dyn crate::flatten::PositionSource>>,
 }
 
 pub struct LiveTradingReport {
@@ -214,9 +217,24 @@ pub async fn run_live_trading(
     let activity_clock = Arc::new(crate::halt::ActivityClock::new());
     let mut halt_tasks = Vec::new();
     if let Some(kill_switch) = &config.kill_switch {
+        let flatten = config
+            .position_source
+            .as_ref()
+            .map(|source| crate::flatten::FlattenSetup {
+                source: Arc::clone(source),
+                instruments: Arc::new(
+                    config
+                        .instruments
+                        .iter()
+                        .map(|i| (i.symbol.clone(), i.clone()))
+                        .collect(),
+                ),
+                config: crate::flatten::FlattenConfig::default(),
+            });
         halt_tasks.push(crate::halt::spawn_cancel_all_task(
             Arc::clone(kill_switch),
             Arc::clone(&order_manager),
+            flatten,
         ));
         if let Some(stale_after) = config.stale_data_timeout {
             halt_tasks.push(crate::halt::spawn_staleness_watchdog(

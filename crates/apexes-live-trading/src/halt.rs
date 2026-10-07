@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use apexes_oms::{KillSwitch, OrderManager};
+
+use crate::flatten::{FlattenSetup, flatten_positions};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -51,9 +53,14 @@ impl Default for ActivityClock {
     }
 }
 
+/// Once the switch engages: cancel every open order (retrying until none
+/// remain), then -- if the engagement asked for it and `flatten` is
+/// configured -- close open positions. One engagement = one sweep and at
+/// most one flatten; re-arms after release.
 pub fn spawn_cancel_all_task(
     kill_switch: Arc<KillSwitch>,
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
+    flatten: Option<FlattenSetup>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -71,8 +78,27 @@ pub fn spawn_cancel_all_task(
                 }
                 tokio::time::sleep(CANCEL_RETRY_INTERVAL).await;
             }
-            // Re-arm only after release so one engagement = one cancel sweep.
+            // Until release: honour a flatten request (it may arrive on a
+            // re-sent Halt after the sweep already finished), once.
+            let mut flattened = false;
             while kill_switch.is_engaged() {
+                if kill_switch.flatten_requested() && !flattened {
+                    flattened = true;
+                    match &flatten {
+                        Some(setup) => {
+                            let report = flatten_positions(setup, &order_manager).await;
+                            if !report.is_flat() {
+                                tracing::error!(
+                                    remaining = ?report.remaining,
+                                    "kill switch: flatten INCOMPLETE -- positions still open, close them manually"
+                                );
+                            }
+                        }
+                        None => tracing::error!(
+                            "kill switch: flatten requested but no position source is configured; positions stay open"
+                        ),
+                    }
+                }
                 tokio::time::sleep(RELEASE_POLL_INTERVAL).await;
             }
         }

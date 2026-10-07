@@ -118,6 +118,15 @@ pub trait ExecutionGateway: Send + Sync {
         asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String>;
 
+    /// Number of open orders in `asset_class` that were NOT placed through
+    /// this system (e.g. entered by hand in the exchange UI), which
+    /// `query_all_open_orders` cannot report because it has no `OrderId` for
+    /// them. Startup recovery refuses to run beside such orders. The default
+    /// `Ok(0)` is for gateways with no way to tell.
+    async fn count_foreign_open_orders(&self, _asset_class: AssetClass) -> Result<usize, String> {
+        Ok(0)
+    }
+
     /// Returns every trade execution the exchange has recorded for
     /// `order` (identified by `order.exchange_order_id`, which the
     /// caller guarantees is `Some`, and `order.asset_class`, used the

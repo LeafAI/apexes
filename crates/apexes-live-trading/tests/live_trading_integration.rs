@@ -206,6 +206,7 @@ fn base_config() -> LiveTradingConfig {
         kill_switch: None,
         stale_data_timeout: None,
         resync: None,
+        position_source: None,
     }
 }
 

@@ -542,6 +542,17 @@ fn security_from_parts(
     })
 }
 
+/// Exchange-truth futures positions for the kill switch's flatten step
+/// (spot holdings are deliberately not positions to unwind).
+struct BinancePositionSource(Arc<apexes_gateway_binance::BinanceExecutionGateway>);
+
+#[async_trait::async_trait]
+impl apexes_live_trading::PositionSource for BinancePositionSource {
+    async fn open_positions(&self) -> Result<Vec<apexes_strategy::Position>, String> {
+        Ok(self.0.account_positions().await?.into_values().collect())
+    }
+}
+
 /// Mirrors each pushed `SessionSnapshot` into the Prometheus gauges
 /// (equity, realized PnL, open positions). Ends when the loop drops the
 /// snapshot sender.
@@ -778,6 +789,9 @@ async fn run_live_mode(
         kill_switch: Some(kill_switch),
         stale_data_timeout,
         resync: Some(_user_data_stream_handle.resync_notifier()),
+        position_source: Some(Arc::new(BinancePositionSource(Arc::clone(
+            &binance_gateway,
+        )))),
     };
 
     run_live_trading(

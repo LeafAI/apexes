@@ -500,3 +500,30 @@ async fn query_order_by_client_id_errors_on_other_failures_instead_of_claiming_u
         "an inconclusive lookup must never read as 'order never reached the exchange'"
     );
 }
+
+#[tokio::test]
+async fn count_foreign_open_orders_counts_only_orders_not_placed_by_this_system() {
+    let mock_server = MockServer::start().await;
+    let ours = Uuid::new_v4().to_string();
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"orderId": 1, "clientOrderId": ours, "status": "NEW"},
+            // our own order in a status this gateway does not map: still ours
+            {"orderId": 2, "clientOrderId": Uuid::new_v4().to_string(), "status": "PENDING_CANCEL"},
+            // entered by hand in the exchange UI
+            {"orderId": 3, "clientOrderId": "web_8f3a2c", "status": "NEW"},
+            {"orderId": 4, "clientOrderId": "ios_91bb", "status": "PARTIALLY_FILLED"}
+        ])))
+        .mount(&mock_server)
+        .await;
+
+    let gateway = gateway_against(&mock_server).await;
+    assert_eq!(
+        gateway
+            .count_foreign_open_orders(AssetClass::Spot)
+            .await
+            .unwrap(),
+        2
+    );
+}

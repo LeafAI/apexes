@@ -254,6 +254,7 @@ async fn halt_and_resume_commands_engage_and_release_the_kill_switch_without_a_l
         .send(Message::Text(
             send(SessionCommand::Halt {
                 reason: "operator".to_string(),
+                flatten: true,
             })
             .into(),
         ))
@@ -263,6 +264,10 @@ async fn halt_and_resume_commands_engage_and_release_the_kill_switch_without_a_l
         .await
         .expect("kill switch was not engaged by Halt");
     assert_eq!(kill_switch.reason().as_deref(), Some("operator"));
+    assert!(
+        kill_switch.flatten_requested(),
+        "a Halt with flatten set must request a flatten"
+    );
 
     ws_stream
         .send(Message::Text(send(SessionCommand::ResumeTrading).into()))
@@ -394,6 +399,7 @@ async fn secured_endpoint_rejects_unauthenticated_clients_and_audits_commands() 
     let (mut ws, _) = tokio_tungstenite::connect_async(good).await.unwrap();
     let halt = SessionMessage::Command(SessionCommand::Halt {
         reason: "audit-me".to_string(),
+        flatten: false,
     });
     ws.send(Message::Text(serde_json::to_string(&halt).unwrap().into()))
         .await
@@ -433,7 +439,7 @@ fn runbook_halt_and_resume_frames_parse() {
             .unwrap();
     assert!(matches!(
         halt,
-        SessionMessage::Command(SessionCommand::Halt { ref reason }) if reason.starts_with("operator")
+        SessionMessage::Command(SessionCommand::Halt { ref reason, flatten: false }) if reason.starts_with("operator")
     ));
     let resume: SessionMessage =
         serde_json::from_str(r#"{"type":"Command","ResumeTrading":null}"#).unwrap();

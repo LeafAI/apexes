@@ -40,7 +40,9 @@ built in yet).
    never received are marked `Rejected` after 60 s; fills missed while down are
    recorded.
 3. The engine **refuses to start** (non-zero exit) if the exchange has open
-   orders it has no record of, or a local order cannot be resolved.
+   orders it has no record of, open orders that were **not placed through this
+   system** (e.g. entered by hand — cancel them first), or a local order that
+   cannot be resolved.
 4. Balances and positions are then read from the exchange and seed the ledger;
    `initial_balances` in the launch config is ignored in live mode.
 
@@ -62,21 +64,41 @@ it is not a fault); `/readyz` returns 503.
 ```
 # message frames are JSON; authenticate with the Authorization header
 {"type":"Command","Halt":{"reason":"operator: investigating"}}
+{"type":"Command","Halt":{"reason":"exchange incident","flatten":true}}
 {"type":"Command","ResumeTrading":null}
 ```
 
 Resuming never happens automatically: confirm the cause, then send
-`ResumeTrading`. Positions are *not* flattened by a halt (tracked in the
-roadmap); close them manually if required.
+`ResumeTrading`.
+
+### Flatten
+
+`"flatten":true` additionally **closes open futures positions** once the
+cancel-all sweep has finished: opposite-side market orders sized from the
+exchange's own position report (not the local ledger), re-polled every 2 s
+for up to 10 rounds, never re-ordering a symbol whose closing order is still
+working. These orders deliberately bypass the halt and the pre-trade risk
+checks — reducing exposure must not be blockable.
+
+- Spot balances are **not** sold: they are holdings, not exposure, and
+  liquidating them is a decision for you.
+- If it cannot finish (exchange errors, a position in a symbol missing from
+  the launch config, rounds exhausted) the engine logs
+  `flatten INCOMPLETE -- positions still open` and
+  `apexes_unflattened_positions` stays above zero: **close them manually**.
+- The automatic stale-data halt does not flatten (a dead feed is a poor moment
+  to fire market orders unattended); send a `Halt` with `flatten` if you want it.
 
 ## Monitoring
 
 Prometheus scrapes `http://<engine>:9100/metrics` (send
-`Authorization: Bearer $APEXES_CONTROL_TOKEN`). Suggested alerts:
+`Authorization: Bearer $APEXES_CONTROL_TOKEN`). Ready-to-load rules are in
+`deploy/prometheus/alerts.yml` (same thresholds as below):
 
 | Condition | Metric |
 |---|---|
 | Halted | `apexes_kill_switch_engaged == 1` |
+| Positions left open after a flatten | `apexes_unflattened_positions > 0` for > 1 min while halted |
 | Stream down | `apexes_stream_connected == 0` for > 1 min |
 | Reconnect storm | `rate(apexes_stream_reconnects_total[10m]) > 3` |
 | Feed stale | `apexes_market_data_idle_seconds > 15` |
@@ -95,5 +117,5 @@ It lives on the `apexes-engine-data` volume; back it up.
 
 ## Not covered yet
 
-High availability / failover, TLS/mTLS, KMS-held keys, flatten-on-halt, and
+High availability / failover, TLS/mTLS, KMS-held keys, and
 post-trade compliance reporting are tracked in the production-readiness epic.

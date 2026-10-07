@@ -167,6 +167,22 @@ impl OrderManager {
             }
         }
 
+        self.place_order(intent).await
+    }
+
+    /// Submits a position-closing order for the kill switch's flatten
+    /// step. Deliberately bypasses the kill switch (it is engaged by
+    /// definition) AND the pre-trade risk checks (they exist to stop risk
+    /// being added; a closing order must not be blocked by, say, a position
+    /// limit). Callers must only pass orders that reduce exposure.
+    pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
+        tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
+        self.place_order(intent).await
+    }
+
+    /// Persists, then sends, one order. Shared tail of `submit_order` and
+    /// `submit_flatten_order`; applies no gating of its own.
+    async fn place_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         let now = Utc::now();
         let mut order = Order {
             id: OrderId(Uuid::new_v4()),
@@ -629,6 +645,24 @@ impl OrderManager {
         }
 
         Ok(results)
+    }
+
+    /// Open orders on the exchange (across `asset_classes`) that this system
+    /// did not place and therefore cannot track. See
+    /// `ExecutionGateway::count_foreign_open_orders`.
+    pub async fn foreign_open_order_count(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<usize, OmsError> {
+        let mut total = 0;
+        for asset_class in asset_classes {
+            total += self
+                .gateway
+                .count_foreign_open_orders(*asset_class)
+                .await
+                .map_err(|reason| OmsError::QueryFailed { reason })?;
+        }
+        Ok(total)
     }
 
     /// Best-effort cancel of every open order. Runs `reconcile()` first

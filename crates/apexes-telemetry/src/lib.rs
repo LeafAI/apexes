@@ -37,6 +37,8 @@ pub struct Metrics {
     pub stream_reconnects: IntCounterVec,
     pub market_data_idle_seconds: Gauge,
     pub kill_switch_engaged: IntGauge,
+    pub flatten_orders: IntCounter,
+    pub unflattened_positions: IntGauge,
     pub rest_requests: IntCounterVec,
     pub rest_rate_limited: IntCounter,
     pub equity: Gauge,
@@ -119,6 +121,20 @@ impl Metrics {
             ),
             kill_switch_engaged: reg!(
                 IntGauge::new("kill_switch_engaged", "1 while the kill switch is engaged").unwrap()
+            ),
+            flatten_orders: reg!(
+                IntCounter::new(
+                    "flatten_orders_total",
+                    "Closing orders submitted by a kill-switch flatten"
+                )
+                .unwrap()
+            ),
+            unflattened_positions: reg!(
+                IntGauge::new(
+                    "unflattened_positions",
+                    "Open positions seen by the last flatten round"
+                )
+                .unwrap()
             ),
             rest_requests: reg!(
                 IntCounterVec::new(
