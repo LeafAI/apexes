@@ -93,6 +93,42 @@ checks — reducing exposure must not be blockable.
 - The automatic stale-data halt does not flatten (a dead feed is a poor moment
   to fire market orders unattended); send a `Halt` with `flatten` if you want it.
 
+## Operator console
+
+`apexes-operator` is a desktop console for a running engine: connection and
+halt state, equity/PnL, positions (with margin ratio), open orders, balances,
+editable strategy parameters, and the controls.
+
+```sh
+APEXES_CONTROL_TOKEN=<an operator or viewer token> \
+  apexes-operator --engine ws://127.0.0.1:9100/session/ws
+```
+
+(Use the environment variable, not a `--token` argument: command lines are
+visible to other users of the machine. The engine port is published on
+`127.0.0.1` only; reach a remote engine through an SSH tunnel or VPN.)
+
+What it does and does not let you do:
+
+- **HALT TRADING** is one click, always available to operators: stopping must
+  never be behind a dialog. **Resume trading**, **Halt + flatten** and **Stop
+  session** ask for a second, explicit confirmation, and say what they will do.
+- A **viewer** token sees everything but every control is disabled; the engine
+  enforces this too (a modified client is refused and the attempt audited).
+- Nothing is sent while disconnected, and anything clicked against a dead link
+  is discarded on reconnect, so an old click can never fire later.
+- A red **TRADING HALTED** banner shows the reason (and when a flatten is in
+  progress); an amber **NO CONNECTION** banner means everything below it may
+  be out of date; **snapshot Ns old** turns amber after 5 s. The engine only
+  pushes snapshots as market data arrives, so an old snapshot usually means a
+  stalled feed, which is exactly when the halt state above still updates.
+- A console that connects late shows the engine's last known state
+  immediately. "Waiting for the first snapshot" means the engine has not
+  pushed a real one yet (it never shows a fake all-zero account).
+
+Not in the console yet: placing or cancelling individual orders, editing risk
+limits, launching sessions, and watching several sessions at once.
+
 ## Monitoring
 
 Prometheus scrapes `http://<engine>:9100/metrics` (send

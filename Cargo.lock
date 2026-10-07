@@ -793,10 +793,16 @@ dependencies = [
 name = "apexes-ui"
 version = "0.1.0"
 dependencies = [
+ "apexes-backtest",
  "apexes-chart",
  "apexes-core",
+ "apexes-engine",
  "apexes-market-data",
  "apexes-message-bus",
+ "apexes-oms",
+ "apexes-security",
+ "apexes-strategy",
+ "apexes-telemetry",
  "axum",
  "chrono",
  "clap",

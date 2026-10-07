@@ -76,6 +76,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

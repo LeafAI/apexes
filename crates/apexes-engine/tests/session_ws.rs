@@ -48,6 +48,7 @@ fn empty_snapshot() -> SessionSnapshot {
         margin_status: HashMap::new(),
         params: HashMap::new(),
         paused: false,
+        open_orders: Vec::new(),
         timestamp: Utc::now(),
     }
 }
@@ -93,8 +94,12 @@ async fn session_ws_forwards_snapshots_out_and_commands_in() {
         let message: SessionMessage =
             serde_json::from_str(&text).expect("failed to parse SessionMessage JSON");
         match message {
-            SessionMessage::Snapshot(snapshot) => break snapshot,
-            SessionMessage::Status(_) => continue,
+            // The current (initial) snapshot is sent on connect; keep reading
+            // until the one we pushed arrives.
+            SessionMessage::Snapshot(snapshot) if snapshot.equity == dec!(1234.5) => {
+                break snapshot;
+            }
+            SessionMessage::Snapshot(_) | SessionMessage::Status(_) => continue,
             other => panic!("unexpected frame {other:?}"),
         }
     };
@@ -622,4 +627,38 @@ async fn viewers_can_scrape_metrics_and_unknown_tokens_are_rejected() {
     let (status, body) = http_get_with(port, "/metrics", Some(BOB)).await;
     assert_eq!(status, 200, "a viewer may scrape metrics");
     assert!(body.contains("apexes_kill_switch_engaged"));
+}
+
+#[tokio::test]
+async fn a_late_joining_client_gets_the_current_snapshot_immediately() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    // The snapshot is already in the watch channel BEFORE anyone connects and
+    // never changes again (a stalled engine): it must still be delivered.
+    let mut already_there = empty_snapshot();
+    already_there.equity = dec!(777);
+    let (_snapshot_tx, snapshot_rx) = watch::channel(already_there);
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+    let app = apexes_engine::build_app(command_tx, snapshot_rx, stop_tx);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session/ws"))
+        .await
+        .unwrap();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("a late joiner never received the current snapshot")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = frame
+            && let SessionMessage::Snapshot(snapshot) = serde_json::from_str(&text).unwrap()
+        {
+            assert_eq!(snapshot.equity, dec!(777));
+            return;
+        }
+    }
 }

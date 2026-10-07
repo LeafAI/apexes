@@ -268,6 +268,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, identity: Identity) {
         serde_json::json!({ "role": identity.role.as_str() }),
     );
 
+    // A client that connects LATE (typically during an incident, to an engine
+    // whose feed has stalled and so pushes no new snapshots) must still see
+    // the last known state straight away, not only after the next change.
+    // `borrow_and_update` also marks it seen so it is not sent twice.
+    let current = snapshot_rx.borrow_and_update().clone();
+    if !send_snapshot(&mut sender, &current).await {
+        return;
+    }
+
     let mut status_tick = tokio::time::interval(STATUS_POLL);
     let mut last_status: Option<EngineStatus> = None;
 
@@ -501,6 +510,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

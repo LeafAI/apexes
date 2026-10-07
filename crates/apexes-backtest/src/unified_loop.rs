@@ -671,6 +671,13 @@ pub async fn run_unified_event_loop(
                     // thrown away by `maybe_push_snapshot`'s own
                     // (redundant, but harmless) throttle check.
                     if handle.is_snapshot_due() {
+                        let mut open_orders: Vec<crate::control::OpenOrderView> = executor
+                            .open_orders()
+                            .await
+                            .values()
+                            .map(crate::control::OpenOrderView::from)
+                            .collect();
+                        open_orders.sort_by_key(|o| o.created_at);
                         let snapshot = SessionSnapshot {
                             positions: ledger.positions().clone(),
                             balances: ledger.balances().clone(),
@@ -679,6 +686,7 @@ pub async fn run_unified_event_loop(
                             margin_status: margin_status.clone(),
                             params: strategy.current_params(),
                             paused: handle.is_paused(),
+                            open_orders,
                             timestamp,
                         };
                         handle.maybe_push_snapshot(snapshot);
@@ -1463,6 +1471,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

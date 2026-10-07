@@ -53,7 +53,7 @@ pub mod unified_loop;
 
 pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
-pub use control::{ControlHandle, SessionCommand, SessionSnapshot};
+pub use control::{ControlHandle, OpenOrderView, SessionCommand, SessionSnapshot};
 pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
 };

@@ -128,7 +128,11 @@ fn build_control_handle(
         margin_status: HashMap::new(),
         params: HashMap::new(),
         paused: false,
-        timestamp: chrono::Utc::now(),
+        open_orders: Vec::new(),
+        // The UNIX epoch marks "no real snapshot pushed yet" (see
+        // `apexes_backtest::SessionSnapshot::is_placeholder`): clients must
+        // not present this all-zero state as real.
+        timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
     };
     apexes_backtest::ControlHandle::new(snapshot_min_interval, initial_snapshot)
 }

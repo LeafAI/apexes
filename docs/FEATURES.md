@@ -116,8 +116,8 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 |---|---|---|---|---|
 | 9.1 | Real-time market dashboard (Level-2 depth, tick-by-tick trade heatmap) | #13 | 🚧 In Progress | Sub-project #13a (UI foundation) delivers the first slice via the new apexes-ui crate: an axum WebSocket server wrapping a real MarketEventBus/BinanceMarketDataProvider, a tokio-tungstenite client with exponential-backoff reconnect, and an egui/eframe desktop table of bid/ask/last-trade price for three hardcoded Binance Spot instruments (BTCUSDT/ETHUSDT/BNBUSDT), with a real end-to-end server<->client roundtrip test and an egui_kittest headless render test. Level-2 depth visualization and tick-by-tick trade heatmap (both named in this row's own description) remain unimplemented -- explicitly deferred to a later UI sub-phase. |
 | 9.2 | High-performance K-line/tick chart engine (GPU rendering, wgpu) | #13 | ✅ Done | Sub-project #13b delivers this row's full scope via a new reusable `apexes-chart` crate: a genuinely hand-written `wgpu` rendering pipeline (real `wgpu::RenderPipeline`/WGSL vertex+fragment shaders/vertex buffers, embedded into `egui` via `egui_wgpu::CallbackTrait`, not `egui_plot`'s CPU tessellation) powering two chart widgets -- a K-line `CandlestickChart` (fed by real-time OHLCV aggregation of the `Trade` stream via `apexes_market_data::BarAggregator`, including a new `current_open_bar` accessor exposing the still-forming candle) and a `TickLineChart` (dual bid/ask lines, fed directly by the `Tick` stream, retained in a 1-hour time-windowed ring buffer evicted on every push). Both charts are interactive (scroll-to-zoom-toward-cursor, drag-to-pan) and share one `ViewState`, keeping their visible time range synchronized; a "follow live" default view auto-advances with new data until the user manually interacts, at which point switching the selected symbol is the documented (and, after a final-review fix, correctly implemented) way back to follow-live mode. No ClickHouse historical backfill -- both charts start empty at launch and fill in as real-time data arrives, an explicit design-spec Non-Goal, not a gap. Tested via pure-logic unit tests for the view/zoom/pan/Y-axis-auto-fit math and the bar/tick-to-vertex geometry conversion, plus two `egui_kittest` `wgpu`-feature headless render tests that genuinely exercise the real `CallbackTrait::prepare`/`paint` GPU code path (confirmed by the final reviewer via direct code tracing, not just a passing test). A genuine f32-precision-loss test-flakiness bug (an epoch-scale timestamp difference losing precision when routed through `f32`, in a test helper only, never production code) was found and fixed during review, confirmed flake-free across 15+ repeated test runs. The final whole-branch review also found and the controller fixed two Important issues before this row was marked Done: the documented symbol-switch-resets-follow-live recovery path was not actually wired up, and the closed-bar history accumulator had no bound (unlike the tick buffer, which already had one) -- both fixed with accompanying new tests. |
-| 9.3 | Strategy monitoring & live tuning panel | #13 | 🔲 Not Started | |
-| 9.4 | Order/position/risk management UI | #13 | 🔲 Not Started | |
+| 9.3 | Strategy monitoring & live tuning panel | #13 | 🚧 In Progress | MVP delivered by the new `apexes-operator` binary (in the `apexes-ui` crate): live equity/PnL/positions/balances/margin ratio, an editable strategy-parameter table (`SetParam`), pause/resume strategy, stop session. Deliberately a separate binary from the market dashboard so it keeps working when market-data connectivity is what is broken. Not yet done: the session launcher tab from the #13c design, and automatic engine respawn. |
+| 9.4 | Order/position/risk management UI | #13 | 🚧 In Progress | MVP in `apexes-operator`: open-orders and positions tables, halt-state banner, one-click HALT, confirmed halt+flatten / resume trading / stop, read-only mode for viewer tokens (per-user identity and roles via `APEXES_CONTROL_TOKENS`). Not yet done: order entry/cancel from the UI, per-order cancel, risk-limit editing, multi-session view. |
 | 9.5 | Interactive backtest report visualization | #13 | 🔲 Not Started | |
 | 9.6 | Multi-screen system monitoring wall (latency, throughput, error rate) | #13 | 🔲 Not Started | |
 
@@ -157,10 +157,10 @@ Sub-project numbers refer to the table in §3 of the vision/roadmap doc: `#0` Fo
 
 | Status | Count |
 |---|---|
-| 🔲 Not Started | 16 |
+| 🔲 Not Started | 14 |
 | 📝 Designing | 0 |
 | 📋 Planned | 0 |
-| 🚧 In Progress | 11 |
+| 🚧 In Progress | 13 |
 | ✅ Done | 42 |
 | ⏸️ Deferred | 1 |
 | **Total** | **70** |

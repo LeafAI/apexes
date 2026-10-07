@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 /// `apexes_engine::protocol::SessionMessage::Command` and sent over
 /// `/session/ws` -- Task 2 (this crate) had no serialization consumer
 /// of its own, so these derives were not required until now.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionCommand {
     /// Hot-updates one tunable strategy parameter. Applied via
     /// `Strategy::set_param`; an unknown parameter name logs a warning
@@ -60,6 +60,50 @@ pub enum SessionCommand {
 ///
 /// Derives `Serialize`/`Deserialize` for the same reason
 /// [`SessionCommand`] does -- see that type's doc comment.
+/// One open order as shown to an operator: plain strings/decimals so a UI
+/// needs no knowledge of the core order types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenOrderView {
+    pub id: String,
+    pub symbol: String,
+    /// `"Buy"` / `"Sell"`.
+    pub side: String,
+    /// `"Market"`, `"Limit"`, ...
+    pub order_type: String,
+    pub quantity: Decimal,
+    pub filled_quantity: Decimal,
+    pub price: Option<Decimal>,
+    /// `"New"` / `"PartiallyFilled"` / ...
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl SessionSnapshot {
+    /// True for the initial value a `ControlHandle` is created with (stamped
+    /// with the UNIX epoch) before the trading loop has pushed a real
+    /// snapshot. Consumers must treat it as "no data yet", not as a flat,
+    /// zero-equity account.
+    pub fn is_placeholder(&self) -> bool {
+        self.timestamp.timestamp() == 0
+    }
+}
+
+impl From<&apexes_core::Order> for OpenOrderView {
+    fn from(order: &apexes_core::Order) -> Self {
+        Self {
+            id: order.id.0.to_string(),
+            symbol: order.symbol.clone(),
+            side: format!("{:?}", order.side),
+            order_type: format!("{:?}", order.order_type),
+            quantity: order.quantity,
+            filled_quantity: order.filled_quantity,
+            price: order.price,
+            status: format!("{:?}", order.status),
+            created_at: order.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub positions: HashMap<String, Position>,
@@ -69,6 +113,10 @@ pub struct SessionSnapshot {
     pub margin_status: HashMap<String, PositionMarginStatus>,
     pub params: HashMap<String, Decimal>,
     pub paused: bool,
+    /// Orders currently working (live: the order manager's open orders;
+    /// backtest/paper: the simulated book's). Absent in older engines.
+    #[serde(default)]
+    pub open_orders: Vec<OpenOrderView>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -209,6 +257,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }
