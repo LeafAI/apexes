@@ -5,7 +5,7 @@
 #   docker build --target gateway -t apexes-market-data-gateway .
 
 # Pinned to match CI (.github/workflows/ci.yml); bump both together.
-ARG RUST_VERSION=1.97
+ARG RUST_VERSION=1.99
 FROM rust:${RUST_VERSION} AS builder
 WORKDIR /src
 COPY . .

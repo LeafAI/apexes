@@ -93,7 +93,9 @@ checks — reducing exposure must not be blockable.
 
 Prometheus scrapes `http://<engine>:9100/metrics` (send
 `Authorization: Bearer $APEXES_CONTROL_TOKEN`). Ready-to-load rules are in
-`deploy/prometheus/alerts.yml` (same thresholds as below):
+`deploy/prometheus/alerts.yml` (same thresholds as below). An importable Grafana dashboard is in
+`deploy/grafana/apexes-engine.json` (Dashboards → Import; pick your Prometheus
+data source).
 
 | Condition | Metric |
 |---|---|

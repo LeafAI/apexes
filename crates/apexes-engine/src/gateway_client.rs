@@ -115,34 +115,30 @@ impl MarketDataProvider for GatewayMarketDataProvider {
     }
 }
 
-/// Connects, attaching the bearer token header when configured.
+/// Connects, attaching the bearer token header when configured. The error is
+/// a plain string: callers only log it, and `tungstenite::Error` is large
+/// enough to trip `clippy::result_large_err`.
 async fn connect(
     url: &str,
     token: Option<&str>,
 ) -> Result<
-    (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    tokio_tungstenite::tungstenite::Error,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
 > {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = url.into_client_request()?;
+    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     if let Some(token) = token {
         request.headers_mut().insert(
             "Authorization",
             apexes_security::bearer_header_value(token)
                 .parse()
-                .map_err(|_| {
-                    tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(
-                        "invalid characters in gateway token",
-                    ))
-                })?,
+                .map_err(|_| "invalid characters in gateway token".to_string())?,
         );
     }
-    tokio_tungstenite::connect_async(request).await
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(socket, _response)| socket)
+        .map_err(|e| e.to_string())
 }
 
 /// Runs forever: connects to `url`, forwards parsed `MarketEvent`s
@@ -157,7 +153,7 @@ async fn run_connection_loop(
     let mut backoff = BackoffState::new();
     loop {
         match connect(&url, token.as_deref()).await {
-            Ok((socket, _response)) => {
+            Ok(socket) => {
                 tracing::info!(%url, "apexes-engine gateway_client: connected");
                 backoff.reset();
                 let (_write, mut read) = socket.split();

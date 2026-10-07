@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -44,9 +44,24 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Same image and settings as docker-compose.yml.
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.12
+        env:
+          CLICKHOUSE_DB: apexes
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ""
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -q --spider http://localhost:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       # Postgres-backed packages share ONE database that their tests
       # TRUNCATE, so they run serially, OMS first (it creates the tables the
@@ -56,6 +71,16 @@ jobs:
           cargo test -p apexes-oms --locked -- --include-ignored --test-threads=1
           cargo test -p apexes-ems --locked -- --include-ignored --test-threads=1
           cargo test -p apexes-live-trading --locked -- --include-ignored --test-threads=1
+      # ClickHouse-backed tests (also #[ignore]d by default). The Binance
+      # live-network tests (apexes-market-data live_ingestion, testnet) are
+      # deliberately not run: they need credentials/exchange reachability.
+      - name: ClickHouse-backed tests
+        run: |
+          cargo test -p apexes-storage --locked -- --ignored --test-threads=1
+          cargo test -p apexes-strategy-registry --locked -- --ignored --test-threads=1
+          cargo test -p apexes-backtest --locked --test live_storage_backtest -- --ignored --test-threads=1
+          cargo test -p apexes-market-data-gateway --locked --test live_clickhouse -- --ignored --test-threads=1
+          cargo test -p apexes-engine --locked --test backtest_subprocess -- --ignored --test-threads=1
       # Everything else: hermetic. apexes-chart's render tests need a GPU
       # adapter, which hosted runners lack.
       - name: Remaining workspace tests
