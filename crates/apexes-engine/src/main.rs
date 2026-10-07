@@ -94,9 +94,11 @@ enum EngineError {
     #[error("live startup recovery failed: {0}")]
     Recovery(#[from] apexes_live_trading::RecoveryError),
     #[error(
-        "live sessions require a control token and an audit log: set APEXES_CONTROL_TOKEN (and APEXES_AUDIT_LOG, or provide a writable $HOME)"
+        "live sessions require control tokens and an audit log: set APEXES_CONTROL_TOKEN and/or APEXES_CONTROL_TOKENS (and APEXES_AUDIT_LOG, or provide a writable $HOME)"
     )]
     MissingControlToken,
+    #[error("invalid control tokens: {0}")]
+    ControlTokens(String),
     #[error("failed to open audit log {path:?}: {source}")]
     AuditLog {
         path: PathBuf,
@@ -502,9 +504,12 @@ fn build_server_security(launch_config: &LaunchConfig) -> Result<ServerSecurity,
     let audit_path = std::env::var_os("APEXES_AUDIT_LOG")
         .map(PathBuf::from)
         .or(default_path);
+    let tokens =
+        apexes_security::TokenSet::from_env("APEXES_CONTROL_TOKEN", "APEXES_CONTROL_TOKENS")
+            .map_err(EngineError::ControlTokens)?;
     security_from_parts(
         matches!(launch_config.mode, SessionMode::Live { .. }),
-        apexes_security::BearerToken::from_env("APEXES_CONTROL_TOKEN"),
+        tokens,
         audit_path,
     )
 }
@@ -513,15 +518,15 @@ fn build_server_security(launch_config: &LaunchConfig) -> Result<ServerSecurity,
 /// backtest/paper sessions degrade to a loud warning.
 fn security_from_parts(
     is_live: bool,
-    token: Option<apexes_security::BearerToken>,
+    tokens: Option<apexes_security::TokenSet>,
     audit_path: Option<PathBuf>,
 ) -> Result<ServerSecurity, EngineError> {
-    if token.is_none() {
+    if tokens.is_none() {
         if is_live {
             return Err(EngineError::MissingControlToken);
         }
         tracing::warn!(
-            "apexes-engine: APEXES_CONTROL_TOKEN not set; /session/ws and /metrics are UNAUTHENTICATED"
+            "apexes-engine: no APEXES_CONTROL_TOKEN/APEXES_CONTROL_TOKENS set; /session/ws and /metrics are UNAUTHENTICATED"
         );
     }
     let audit = match audit_path {
@@ -537,7 +542,7 @@ fn security_from_parts(
         None => None,
     };
     Ok(ServerSecurity {
-        token: token.map(Arc::new),
+        tokens: tokens.map(Arc::new),
         audit,
     })
 }
@@ -863,7 +868,7 @@ mod tests {
     fn live_sessions_require_a_token_and_a_usable_audit_log() {
         let dir = std::env::temp_dir().join(format!("apexes-engine-policy-{}", std::process::id()));
         let good_path = dir.join("a.jsonl");
-        let token = || Some(apexes_security::BearerToken::new("t"));
+        let token = || Some(apexes_security::TokenSet::single("t"));
 
         // Live without token: refused.
         assert!(matches!(
@@ -885,10 +890,10 @@ mod tests {
         ));
         // Live with both: ok.
         let ok = security_from_parts(true, token(), Some(good_path)).unwrap();
-        assert!(ok.token.is_some() && ok.audit.is_some());
+        assert!(ok.tokens.is_some() && ok.audit.is_some());
         // Paper/backtest degrade to warnings.
         let open = security_from_parts(false, None, None).unwrap();
-        assert!(open.token.is_none() && open.audit.is_none());
+        assert!(open.tokens.is_none() && open.audit.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

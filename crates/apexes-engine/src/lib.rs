@@ -18,5 +18,5 @@ pub use apexes_strategy_loader::StrategyRef;
 pub use credentials::{CredentialsError, resolve_binance_credentials};
 pub use gateway_client::GatewayMarketDataProvider;
 pub use launch_config::{LaunchConfig, SessionMode};
-pub use protocol::SessionMessage;
+pub use protocol::{EngineStatus, SessionMessage};
 pub use server::{ServerSecurity, build_app, build_app_secured, build_app_with_kill_switch};

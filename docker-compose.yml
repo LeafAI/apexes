@@ -57,9 +57,11 @@ services:
       market-data-gateway:
         condition: service_healthy
     environment:
-      # Both REQUIRED for a live session (the engine refuses to start
-      # without them): `?` makes compose fail loudly when unset.
-      APEXES_CONTROL_TOKEN: ${APEXES_CONTROL_TOKEN:?set APEXES_CONTROL_TOKEN}
+      # A live session REQUIRES control tokens and an audit log: the engine
+      # refuses to start without them. Set APEXES_CONTROL_TOKENS
+      # ("name:role:token,...") and/or the legacy APEXES_CONTROL_TOKEN.
+      APEXES_CONTROL_TOKENS: ${APEXES_CONTROL_TOKENS:-}
+      APEXES_CONTROL_TOKEN: ${APEXES_CONTROL_TOKEN:-}
       APEXES_AUDIT_LOG: /var/lib/apexes/audit.jsonl
       APEXES_GATEWAY_TOKEN: ${APEXES_GATEWAY_TOKEN:-}
       # Credentials for credentials_ref "binance-main" in the launch config.

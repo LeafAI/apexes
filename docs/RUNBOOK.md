@@ -9,7 +9,10 @@ what the safety machinery does, and how to respond when it trips.
 cp deploy/launch-config.example.json deploy/launch-config.json   # edit instruments, mode params
 cp my-strategy.drift deploy/strategy.drift
 
-export APEXES_CONTROL_TOKEN=$(openssl rand -hex 32)               # required for live
+# Named, role-scoped control tokens (>= 16 chars each); at least one of these
+# two is REQUIRED for live. Operators may send commands; viewers are read-only.
+export APEXES_CONTROL_TOKENS="alice:operator:$(openssl rand -hex 24),bob:viewer:$(openssl rand -hex 24)"
+# export APEXES_CONTROL_TOKEN=$(openssl rand -hex 32)             # legacy single shared operator token
 export APEXES_GATEWAY_TOKEN=$(openssl rand -hex 32)               # recommended
 export APEXES_CRED_BINANCE_MAIN_API_KEY=...                       # credentials_ref "binance-main"
 export APEXES_CRED_BINANCE_MAIN_API_SECRET=...
@@ -26,7 +29,8 @@ built in yet).
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `APEXES_CONTROL_TOKEN` | engine | Bearer token for `/session/ws` and `/metrics`. **Live sessions refuse to start without it.** |
+| `APEXES_CONTROL_TOKENS` | engine | `name:role:token[,...]` bearer tokens for `/session/ws` and `/metrics`; `role` is `operator` (may send commands) or `viewer` (read-only). Tokens must be >= 16 characters; names are unique and appear in the audit log. |
+| `APEXES_CONTROL_TOKEN` | engine | Legacy single shared operator token (audited as `shared`). Combine with, or use instead of, the above. **Live sessions refuse to start with neither.** |
 | `APEXES_AUDIT_LOG` | engine | Append-only JSONL audit trail (default `~/.apexes/audit-<session>.jsonl`). **Live sessions refuse to start if it cannot be opened.** |
 | `APEXES_ENGINE_BIND` | engine | Listen address (default `127.0.0.1:0`; the image sets `0.0.0.0:9100`). |
 | `APEXES_GATEWAY_TOKEN` | gateway, engine | Bearer token for the gateway's `/market`; the engine sends it. |
@@ -35,7 +39,7 @@ built in yet).
 
 ## What happens at startup (live)
 
-1. Token and audit log are validated (refuse otherwise).
+1. Tokens and the audit log are validated (refuse otherwise).
 2. Local open orders are reconciled with the exchange. Orders the exchange
    never received are marked `Rejected` after 60 s; fills missed while down are
    recorded.
@@ -92,7 +96,7 @@ checks — reducing exposure must not be blockable.
 ## Monitoring
 
 Prometheus scrapes `http://<engine>:9100/metrics` (send
-`Authorization: Bearer $APEXES_CONTROL_TOKEN`). Ready-to-load rules are in
+`Authorization: Bearer <any valid token, viewer included>`). Ready-to-load rules are in
 `deploy/prometheus/alerts.yml` (same thresholds as below). An importable Grafana dashboard is in
 `deploy/grafana/apexes-engine.json` (Dashboards → Import; pick your Prometheus
 data source).
@@ -113,8 +117,10 @@ data source).
 ## Audit log
 
 `docker compose exec engine cat /var/lib/apexes/audit.jsonl` — one JSON object
-per line: `ts`, `actor` (`token:<fingerprint>`; `anonymous` for rejected
-requests), `action` (`ws_connect`, `command`, `unauthorized_request`), `detail`.
+per line: `ts`, `actor` (the token's name, e.g. `alice`; `shared` for the
+legacy token; `anonymous` for rejected requests), `action` (`ws_connect`,
+`command`, `command_denied` for a viewer's attempt, `unauthorized_request`),
+`detail`.
 It lives on the `apexes-engine-data` volume; back it up.
 
 ## Not covered yet

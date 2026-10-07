@@ -80,20 +80,25 @@ async fn session_ws_forwards_snapshots_out_and_commands_in() {
         .send(pushed_snapshot.clone())
         .expect("snapshot receiver should still be alive (server task holds it)");
 
-    let received = tokio::time::timeout(Duration::from_secs(5), ws_stream.next())
-        .await
-        .expect("timed out waiting for Snapshot frame")
-        .expect("stream ended unexpectedly")
-        .expect("received a WS error frame");
-    let Message::Text(text) = received else {
-        panic!("expected a Text frame, got {received:?}");
+    // The engine also sends a `Status` frame on connect; wait for the Snapshot.
+    let snapshot = loop {
+        let received = tokio::time::timeout(Duration::from_secs(5), ws_stream.next())
+            .await
+            .expect("timed out waiting for Snapshot frame")
+            .expect("stream ended unexpectedly")
+            .expect("received a WS error frame");
+        let Message::Text(text) = received else {
+            panic!("expected a Text frame, got {received:?}");
+        };
+        let message: SessionMessage =
+            serde_json::from_str(&text).expect("failed to parse SessionMessage JSON");
+        match message {
+            SessionMessage::Snapshot(snapshot) => break snapshot,
+            SessionMessage::Status(_) => continue,
+            other => panic!("unexpected frame {other:?}"),
+        }
     };
-    let message: SessionMessage =
-        serde_json::from_str(&text).expect("failed to parse SessionMessage JSON");
-    match message {
-        SessionMessage::Snapshot(snapshot) => assert_eq!(snapshot.equity, dec!(1234.5)),
-        SessionMessage::Command(_) => panic!("expected a Snapshot frame"),
-    }
+    assert_eq!(snapshot.equity, dec!(1234.5));
 
     // UI -> Engine: send a SetParam command and assert it lands on the
     // receiver side of the exact `command_tx` given to `build_app`.
@@ -284,12 +289,19 @@ async fn halt_and_resume_commands_engage_and_release_the_kill_switch_without_a_l
 
 /// Minimal HTTP/1.0 GET over a raw socket (no HTTP client dev-dependency).
 async fn http_get(port: u16, path: &str) -> (u16, String) {
+    http_get_with(port, path, None).await
+}
+
+async fn http_get_with(port: u16, path: &str, bearer: Option<&str>) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
     stream
-        .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+        .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n{auth}\r\n").as_bytes())
         .await
         .unwrap();
     let mut raw = String::new();
@@ -366,7 +378,7 @@ async fn secured_endpoint_rejects_unauthenticated_clients_and_audits_commands() 
     let dir = std::env::temp_dir().join(format!("apexes-engine-audit-{}", std::process::id()));
     let audit_path = dir.join("audit.jsonl");
     let security = apexes_engine::ServerSecurity {
-        token: Some(std::sync::Arc::new(apexes_security::BearerToken::new(
+        tokens: Some(std::sync::Arc::new(apexes_security::TokenSet::single(
             "ctl",
         ))),
         audit: Some(std::sync::Arc::new(
@@ -420,7 +432,7 @@ async fn secured_endpoint_rejects_unauthenticated_clients_and_audits_commands() 
     assert!(actions.contains(&"unauthorized_request"), "{actions:?}");
     assert!(actions.contains(&"ws_connect"), "{actions:?}");
     let command = records.iter().find(|r| r["action"] == "command").unwrap();
-    assert!(command["actor"].as_str().unwrap().starts_with("token:"));
+    assert_eq!(command["actor"], "shared");
     assert!(command.to_string().contains("audit-me"));
     // The secret itself is never written.
     assert!(
@@ -447,4 +459,167 @@ fn runbook_halt_and_resume_frames_parse() {
         resume,
         SessionMessage::Command(SessionCommand::ResumeTrading)
     ));
+}
+
+// ---- per-user identity and roles -------------------------------------
+
+async fn next_status(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> apexes_engine::EngineStatus {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a Status frame")
+            .expect("stream ended")
+            .expect("ws error");
+        if let Message::Text(text) = frame
+            && let SessionMessage::Status(status) = serde_json::from_str(&text).unwrap()
+        {
+            return status;
+        }
+    }
+}
+
+async fn connect_as(
+    port: u16,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = format!("ws://127.0.0.1:{port}/session/ws")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
+
+#[tokio::test]
+async fn viewers_can_watch_but_not_command_and_actions_are_attributed_to_people() {
+    const ALICE: &str = "alice-operator-token-0001";
+    const BOB: &str = "bob-viewer-token-000002";
+    let dir = std::env::temp_dir().join(format!("apexes-engine-roles-{}", std::process::id()));
+    let audit_path = dir.join("audit.jsonl");
+    let security = apexes_engine::ServerSecurity {
+        tokens: Some(std::sync::Arc::new(
+            apexes_security::TokenSet::from_spec(&format!(
+                "alice:operator:{ALICE},bob:viewer:{BOB}"
+            ))
+            .unwrap(),
+        )),
+        audit: Some(std::sync::Arc::new(
+            apexes_security::AuditLog::open(&audit_path).unwrap(),
+        )),
+    };
+    let (port, kill_switch, _keepalive) = spawn_secured_app(security).await;
+
+    // Each connection is told who it is and what it may do.
+    let mut bob = connect_as(port, BOB).await;
+    let status = next_status(&mut bob).await;
+    assert_eq!(
+        (status.actor.as_str(), status.role.as_str()),
+        ("bob", "viewer")
+    );
+    assert!(!status.halted);
+
+    // A viewer's Halt is refused: nothing happens, and the viewer is told.
+    let halt = SessionMessage::Command(SessionCommand::Halt {
+        reason: "viewer tries".to_string(),
+        flatten: false,
+    });
+    bob.send(Message::Text(serde_json::to_string(&halt).unwrap().into()))
+        .await
+        .unwrap();
+    let refusal = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), bob.next())
+            .await
+            .expect("no refusal received")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = frame
+            && let SessionMessage::Error { message } = serde_json::from_str(&text).unwrap()
+        {
+            break message;
+        }
+    };
+    assert!(
+        refusal.contains("bob") && refusal.contains("viewer"),
+        "{refusal}"
+    );
+    assert!(
+        !kill_switch.is_engaged(),
+        "a viewer must not be able to halt"
+    );
+
+    // The operator can; the status then reaches the viewer too.
+    let mut alice = connect_as(port, ALICE).await;
+    let status = next_status(&mut alice).await;
+    assert_eq!(
+        (status.actor.as_str(), status.role.as_str()),
+        ("alice", "operator")
+    );
+    let halt = SessionMessage::Command(SessionCommand::Halt {
+        reason: "alice halts".to_string(),
+        flatten: true,
+    });
+    alice
+        .send(Message::Text(serde_json::to_string(&halt).unwrap().into()))
+        .await
+        .unwrap();
+    let seen_by_bob = loop {
+        let s = next_status(&mut bob).await;
+        if s.halted {
+            break s;
+        }
+    };
+    assert_eq!(seen_by_bob.halt_reason.as_deref(), Some("alice halts"));
+    assert!(seen_by_bob.flatten_requested);
+
+    // The audit trail names people, and records the refused attempt.
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let find = |action: &str, actor: &str| {
+        records
+            .iter()
+            .any(|r| r["action"] == action && r["actor"] == actor)
+    };
+    assert!(find("ws_connect", "bob") && find("ws_connect", "alice"));
+    assert!(find("command_denied", "bob"));
+    assert!(find("command", "alice"));
+    assert!(!find("command", "bob"));
+    let text = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        !text.contains(ALICE) && !text.contains(BOB),
+        "secrets in audit log"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn viewers_can_scrape_metrics_and_unknown_tokens_are_rejected() {
+    const BOB: &str = "bob-viewer-token-000002";
+    let security = apexes_engine::ServerSecurity {
+        tokens: Some(std::sync::Arc::new(
+            apexes_security::TokenSet::from_spec(&format!("bob:viewer:{BOB}")).unwrap(),
+        )),
+        audit: None,
+    };
+    let (port, _ks, _keepalive) = spawn_secured_app(security).await;
+
+    assert_eq!(http_get(port, "/metrics").await.0, 401, "no token");
+    assert_eq!(
+        http_get_with(port, "/metrics", Some("wrong-token-wrong-token"))
+            .await
+            .0,
+        401,
+        "unknown token"
+    );
+    let (status, body) = http_get_with(port, "/metrics", Some(BOB)).await;
+    assert_eq!(status, 200, "a viewer may scrape metrics");
+    assert!(body.contains("apexes_kill_switch_engaged"));
 }
