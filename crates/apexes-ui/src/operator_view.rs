@@ -32,6 +32,14 @@ fn dash(value: Option<impl ToString>) -> String {
 pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand> {
     let mut out = Vec::new();
 
+    // The environment comes first and from the engine's own report: it is
+    // the last thing an operator checks before trusting what follows.
+    crate::evaluation_view::banner(
+        ui,
+        &crate::evaluation_view::environment_banner(
+            state.snapshot.as_ref().and_then(|s| s.identity.as_ref()),
+        ),
+    );
     header(ui, state);
     ui.separator();
     controls(ui, state, &mut out);
@@ -43,6 +51,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         summary(ui, state);
+        if let Some(snapshot) = &state.snapshot {
+            crate::evaluation_view::show_evaluation(ui, snapshot);
+            ui.separator();
+        }
         positions(ui, state);
         open_orders(ui, state);
         balances(ui, state);
@@ -359,8 +371,10 @@ impl OperatorApp {
     }
 }
 
-impl eframe::App for OperatorApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl OperatorApp {
+    /// Draws the console and forwards the operator's commands. Used by the
+    /// standalone binary (via `eframe::App`) and by the launcher shell.
+    pub fn render(&mut self, ui: &mut egui::Ui) {
         self.drain();
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         ui.horizontal(|ui| {
@@ -373,5 +387,11 @@ impl eframe::App for OperatorApp {
                 let _ = tx.send(command);
             }
         }
+    }
+}
+
+impl eframe::App for OperatorApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
     }
 }

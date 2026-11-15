@@ -810,6 +810,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "egui_plot",
  "futures",
  "rust_decimal",
  "rust_decimal_macros",
@@ -2279,6 +2280,17 @@ dependencies = [
  "serde",
  "toml",
  "wgpu",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302515219c63e7f380058ecc899c5a6b2c5fe9f140ef1d91c3b685c9f0355fa3"
+dependencies = [
+ "ahash 0.8.12",
+ "egui",
+ "emath",
 ]
 
 [[package]]

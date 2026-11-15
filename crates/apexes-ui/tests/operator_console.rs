@@ -232,3 +232,139 @@ fn editing_a_parameter_sends_set_param() {
         }]
     );
 }
+
+fn identity(mode: &str, network: Option<&str>) -> apexes_backtest::SessionIdentity {
+    apexes_backtest::SessionIdentity {
+        session_id: "s-42".to_string(),
+        network: network.map(str::to_string),
+        mode: mode.to_string(),
+        strategy: "demo.drift".to_string(),
+    }
+}
+
+fn evaluation() -> apexes_backtest::EvaluationSummary {
+    apexes_backtest::EvaluationSummary {
+        start_equity: dec!(10000),
+        total_pnl: dec!(500),
+        realized_pnl: dec!(120),
+        unrealized_pnl: dec!(380),
+        current_drawdown: dec!(0.02),
+        max_drawdown: dec!(0.05),
+        gross_exposure_fraction: dec!(0.3),
+        fees_paid: HashMap::from([("USDT".to_string(), dec!(1.25))]),
+        trade_count: 7,
+        turnover: dec!(4200),
+        time_in_market_fraction: dec!(0.6),
+        limit_usage: vec![apexes_backtest::LimitUsage {
+            name: "position per symbol".to_string(),
+            used: dec!(0.04),
+            limit: dec!(0.05),
+        }],
+    }
+}
+
+fn history() -> Vec<(chrono::DateTime<Utc>, rust_decimal::Decimal)> {
+    let now = Utc::now();
+    (0..30)
+        .map(|i| {
+            (
+                now + chrono::Duration::seconds(i),
+                dec!(10000) + rust_decimal::Decimal::from(i * 10),
+            )
+        })
+        .collect()
+}
+
+fn state_with(snapshot: SessionSnapshot) -> OperatorState {
+    let mut s = OperatorState::default();
+    s.set_connection(ConnectionStatus::Connected);
+    s.apply(SessionMessage::Status(status("operator", false)));
+    s.apply(SessionMessage::Snapshot(snapshot));
+    s
+}
+
+fn has_text(h: &Harness<'static, Fixture>, text: &str) -> bool {
+    h.query_all_by_label_contains(text).next().is_some()
+}
+
+#[test]
+fn a_testnet_session_is_labelled_testnet_with_virtual_funds() {
+    let mut snap = snapshot();
+    snap.identity = Some(identity("live", Some("testnet")));
+    let mut h = harness(state_with(snap));
+    h.run();
+    assert!(has_text(&h, "TESTNET"));
+    assert!(has_text(&h, "virtual funds"));
+    assert!(has_text(&h, "demo.drift"));
+    assert!(!has_text(&h, "REAL FUNDS"));
+}
+
+#[test]
+fn a_mainnet_session_is_labelled_real_funds() {
+    let mut snap = snapshot();
+    snap.identity = Some(identity("live", Some("mainnet")));
+    let mut h = harness(state_with(snap));
+    h.run();
+    assert!(has_text(&h, "MAINNET"));
+    assert!(has_text(&h, "REAL FUNDS"));
+}
+
+#[test]
+fn an_engine_that_reports_no_identity_is_flagged_not_assumed_safe() {
+    // `snapshot()` carries `identity: None`, like an older engine would.
+    let mut h = harness(state_with(snapshot()));
+    h.run();
+    assert!(has_text(&h, "ENVIRONMENT UNKNOWN"));
+    assert!(!has_text(&h, "TESTNET"));
+}
+
+#[test]
+fn the_evaluation_view_shows_metrics_limits_and_the_timeline() {
+    let mut snap = snapshot();
+    snap.identity = Some(identity("live", Some("testnet")));
+    snap.evaluation = Some(evaluation());
+    snap.equity_history = history();
+    let mut h = harness(state_with(snap));
+    h.run();
+    for text in [
+        "Evaluation",
+        "Total PnL",
+        "+500",
+        "Drawdown (max)",
+        "5%",
+        "Gross exposure",
+        "Fees paid",
+        "1.25 USDT",
+        "Risk limits",
+        "position per symbol",
+    ] {
+        assert!(
+            has_text(&h, text),
+            "missing {text:?} in the evaluation view"
+        );
+    }
+    assert!(!has_text(&h, "collecting equity history"));
+}
+
+#[test]
+fn a_session_with_no_history_yet_says_so_instead_of_drawing_nothing() {
+    let mut snap = snapshot();
+    snap.evaluation = Some(evaluation());
+    let mut h = harness(state_with(snap));
+    h.run();
+    assert!(has_text(&h, "collecting equity history"));
+    assert!(has_text(&h, "Total PnL"));
+}
+
+#[test]
+fn an_engine_without_evaluation_data_does_not_break_the_console() {
+    let mut snap = snapshot();
+    snap.equity_history = history();
+    let mut h = harness(state_with(snap));
+    h.run();
+    assert!(has_text(&h, "no evaluation data"));
+    assert!(
+        has_text(&h, "BTCUSDT"),
+        "the rest of the console still renders"
+    );
+}

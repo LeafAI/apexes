@@ -1,6 +1,7 @@
 pub mod app_state;
 pub mod chart_state;
 pub mod client;
+pub mod evaluation_view;
 pub mod operator;
 pub mod operator_client;
 pub mod operator_view;

@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_plot = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]

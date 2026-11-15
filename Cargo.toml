@@ -35,6 +35,8 @@ axum = "0.8"
 tracing-subscriber = "0.3"
 eframe = "0.35"
 egui = "0.35"
+# 0.36 is the release built against egui 0.35 (0.35 targets egui 0.34, 0.37 targets 0.36).
+egui_plot = "0.36"
 egui_kittest = { version = "0.35", features = ["eframe"] }
 egui-wgpu = "0.35"
 wgpu = "29.0"
