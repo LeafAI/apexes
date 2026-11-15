@@ -212,3 +212,48 @@ async fn multiple_ws_clients_all_receive_the_same_broadcast_event() {
         }
     }
 }
+
+/// The `/market` upgrade announces the gateway's Binance network in the
+/// `x-apexes-network` header (engines refuse a gateway on the other
+/// network), and announces nothing when no network was configured.
+#[tokio::test]
+async fn market_upgrade_announces_the_configured_network() {
+    async fn upgrade_headers(
+        network: Option<String>,
+    ) -> tokio_tungstenite::tungstenite::http::HeaderMap {
+        let mock = MockMarketDataProvider::new();
+        let gateway = Arc::new(Gateway::new(Box::new(mock), 16));
+        gateway.connect(&[btc_usdt()]).await.expect("connect");
+        let app = apexes_market_data_gateway::build_app_for_network(
+            Arc::clone(&gateway),
+            None,
+            vec![btc_usdt()],
+            None,
+            network,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let (_ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/market"))
+            .await
+            .expect("connect to /market");
+        response.headers().clone()
+    }
+
+    let headers = upgrade_headers(Some("testnet".to_string())).await;
+    assert_eq!(
+        headers
+            .get(apexes_market_data_gateway::NETWORK_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("testnet")
+    );
+
+    let headers = upgrade_headers(None).await;
+    assert!(
+        headers
+            .get(apexes_market_data_gateway::NETWORK_HEADER)
+            .is_none()
+    );
+}

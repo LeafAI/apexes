@@ -46,6 +46,7 @@ struct AppState {
     gateway: Arc<Gateway>,
     storage_reader: Option<Arc<StorageReader>>,
     instruments: Arc<Vec<Instrument>>,
+    network: Option<Arc<str>>,
 }
 
 /// Optional query parameters accepted by `GET /market`. `replay_from`
@@ -82,10 +83,28 @@ pub fn build_app_secured(
     instruments: Vec<Instrument>,
     token: Option<Arc<apexes_security::BearerToken>>,
 ) -> Router {
+    build_app_for_network(gateway, storage_reader, instruments, token, None)
+}
+
+/// Header carrying the Binance network a gateway serves (`mainnet` /
+/// `testnet`) on the `/market` upgrade response, so an engine can refuse a
+/// gateway running on a different network than its own.
+pub const NETWORK_HEADER: &str = "x-apexes-network";
+
+/// Like [`build_app_secured`], additionally announcing `network` in the
+/// [`NETWORK_HEADER`] response header of every `/market` upgrade.
+pub fn build_app_for_network(
+    gateway: Arc<Gateway>,
+    storage_reader: Option<Arc<StorageReader>>,
+    instruments: Vec<Instrument>,
+    token: Option<Arc<apexes_security::BearerToken>>,
+    network: Option<String>,
+) -> Router {
     let state = AppState {
         gateway,
         storage_reader,
         instruments: Arc::new(instruments),
+        network: network.map(Arc::from),
     };
     let market = Router::new()
         .route("/market", get(market_handler))
@@ -106,7 +125,12 @@ async fn market_handler(
     Query(query): Query<MarketQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, query, state))
+    let network = state.network.clone();
+    let mut response = ws.on_upgrade(move |socket| handle_socket(socket, query, state));
+    if let Some(value) = network.as_deref().and_then(|n| n.parse().ok()) {
+        response.headers_mut().insert(NETWORK_HEADER, value);
+    }
+    response
 }
 
 async fn handle_socket(socket: WebSocket, query: MarketQuery, state: AppState) {

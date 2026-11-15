@@ -1,5 +1,7 @@
 use crate::provider::BinanceExchangeKind;
 use crate::symbol::{split_symbol, symbol_of};
+use crate::testnet::BinanceSpotTestnet;
+use apexes_core::binance_network::BinanceNetwork;
 use apexes_core::{MarketEvent, Tick, Venue};
 use barter_data::{
     exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
@@ -18,35 +20,63 @@ use tokio::sync::mpsc::UnboundedSender;
 pub async fn run(
     symbols: Vec<String>,
     exchange: BinanceExchangeKind,
+    network: BinanceNetwork,
     tx: UnboundedSender<MarketEvent>,
 ) {
     let mut merged = match exchange {
         BinanceExchangeKind::Spot => {
-            let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
-                (
-                    BinanceSpot::default(),
-                    base,
-                    quote,
-                    MarketDataInstrumentKind::Spot,
-                    OrderBooksL1,
-                )
-            });
-            if subscriptions.is_empty() {
-                tracing::warn!(
-                    ?symbols,
-                    "ticker_task: no valid Binance spot subscriptions derived from symbols"
-                );
-                return;
-            }
-            match Streams::<OrderBooksL1>::builder()
-                .subscribe(subscriptions)
-                .init()
-                .await
-            {
+            let streams = match network {
+                BinanceNetwork::Mainnet => {
+                    let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                        (
+                            BinanceSpot::default(),
+                            base,
+                            quote,
+                            MarketDataInstrumentKind::Spot,
+                            OrderBooksL1,
+                        )
+                    });
+                    if subscriptions.is_empty() {
+                        tracing::warn!(
+                            ?symbols,
+                            "ticker_task: no valid Binance spot subscriptions derived from symbols"
+                        );
+                        return;
+                    }
+                    Streams::<OrderBooksL1>::builder()
+                        .subscribe(subscriptions)
+                        .init()
+                        .await
+                }
+                BinanceNetwork::Testnet => {
+                    let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                        (
+                            BinanceSpotTestnet::default(),
+                            base,
+                            quote,
+                            MarketDataInstrumentKind::Spot,
+                            OrderBooksL1,
+                        )
+                    });
+                    if subscriptions.is_empty() {
+                        tracing::warn!(
+                            ?symbols,
+                            "ticker_task: no valid Binance spot subscriptions derived from symbols"
+                        );
+                        return;
+                    }
+                    Streams::<OrderBooksL1>::builder()
+                        .subscribe(subscriptions)
+                        .init()
+                        .await
+                }
+            };
+            match streams {
                 Ok(streams) => streams.select_all(),
                 Err(error) => {
                     tracing::warn!(
                         ?error,
+                        %network,
                         "ticker_task: failed to initialize barter-data OrderBooksL1 stream (spot)"
                     );
                     return;

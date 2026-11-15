@@ -25,7 +25,7 @@ use crate::rest::{ApiFamily, BinanceRestClient};
 /// as they want the User Data Stream to keep running.
 pub struct UserDataStreamHandle {
     _spot: tokio::task::JoinHandle<()>,
-    _futures: tokio::task::JoinHandle<()>,
+    _futures: Option<tokio::task::JoinHandle<()>>,
     resync: Arc<Notify>,
 }
 
@@ -43,7 +43,9 @@ impl UserDataStreamHandle {
 impl Drop for UserDataStreamHandle {
     fn drop(&mut self) {
         self._spot.abort();
-        self._futures.abort();
+        if let Some(futures) = &self._futures {
+            futures.abort();
+        }
     }
 }
 
@@ -92,11 +94,8 @@ async fn renew_listen_key(
     Ok(())
 }
 
-fn websocket_host(family: ApiFamily) -> &'static str {
-    match family {
-        ApiFamily::Spot => "wss://stream.binance.com:9443/ws",
-        ApiFamily::Futures => "wss://fstream.binance.com/ws",
-    }
+fn futures_websocket_host() -> &'static str {
+    "wss://fstream.binance.com/ws"
 }
 
 /// Parses one raw WebSocket text message into an `ExchangeUpdate`, or
@@ -135,7 +134,7 @@ fn parse_event(raw: &str) -> Option<ExchangeUpdate> {
     }
 }
 
-fn parse_binance_status(status: &str) -> Option<OrderStatus> {
+pub(crate) fn parse_binance_status(status: &str) -> Option<OrderStatus> {
     match status {
         "NEW" => Some(OrderStatus::New),
         "PARTIALLY_FILLED" => Some(OrderStatus::PartiallyFilled),
@@ -160,13 +159,13 @@ fn parse_binance_status(status: &str) -> Option<OrderStatus> {
 /// Timing knobs for one stream task; injectable so tests run in
 /// milliseconds.
 #[derive(Debug, Clone, Copy)]
-struct StreamTimings {
+pub(crate) struct StreamTimings {
     /// listenKey keep-alive period (Binance expires keys after 60 min).
-    renew_every: Duration,
+    pub(crate) renew_every: Duration,
     /// Reconnect if no frame (data OR ping) arrives for this long.
-    idle_timeout: Duration,
-    reconnect_base: Duration,
-    reconnect_max: Duration,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) reconnect_base: Duration,
+    pub(crate) reconnect_max: Duration,
 }
 
 impl Default for StreamTimings {
@@ -181,42 +180,51 @@ impl Default for StreamTimings {
     }
 }
 
-/// Starts both the Spot and Futures User Data Streams and returns a
-/// merged stream of `ExchangeUpdate`s plus a handle that keeps the tasks
-/// alive and exposes [`UserDataStreamHandle::resync_notifier`].
+/// Starts the user-data streams and returns a merged stream of
+/// `ExchangeUpdate`s plus a handle that keeps the tasks alive and exposes
+/// [`UserDataStreamHandle::resync_notifier`].
 ///
-/// The initial listenKeys are obtained eagerly so bad credentials fail
-/// startup; afterwards each stream task recovers on its own.
+/// Spot uses the WebSocket-API subscription (`crate::ws_user_stream`):
+/// Binance removed the Spot listenKey stream. USDS-M Futures still uses its
+/// listenKey stream, and is only started when `with_futures` is set.
+///
+/// The Spot subscription is made eagerly, so bad credentials, a wrong
+/// network or a clock problem fail startup with the exchange's own message;
+/// afterwards the stream task recovers on its own.
 pub async fn start_user_data_stream(
     rest: BinanceRestClient,
+    spot: crate::ws_user_stream::SpotStreamConfig,
+    with_futures: bool,
 ) -> Result<(UserDataStreamHandle, impl Stream<Item = ExchangeUpdate>), String> {
     let (tx, rx) = mpsc::unbounded_channel();
     let resync = Arc::new(Notify::new());
 
-    // Fail fast on bad credentials / connectivity before spawning anything.
-    obtain_listen_key(&rest, ApiFamily::Spot).await?;
-    obtain_listen_key(&rest, ApiFamily::Futures).await?;
+    let first = crate::ws_user_stream::connect_and_subscribe(&spot).await?;
+    if with_futures {
+        obtain_listen_key(&rest, ApiFamily::Futures).await?;
+    }
 
-    let spot = tokio::spawn(run_stream_task(
-        rest.clone(),
-        ApiFamily::Spot,
-        websocket_host(ApiFamily::Spot).to_string(),
+    let spot_task = tokio::spawn(crate::ws_user_stream::run_ws_stream(
+        spot,
+        Some(first),
         tx.clone(),
         Arc::clone(&resync),
         StreamTimings::default(),
     ));
-    let futures = tokio::spawn(run_stream_task(
-        rest,
-        ApiFamily::Futures,
-        websocket_host(ApiFamily::Futures).to_string(),
-        tx,
-        Arc::clone(&resync),
-        StreamTimings::default(),
-    ));
+    let futures = with_futures.then(|| {
+        tokio::spawn(run_stream_task(
+            rest,
+            ApiFamily::Futures,
+            futures_websocket_host().to_string(),
+            tx,
+            Arc::clone(&resync),
+            StreamTimings::default(),
+        ))
+    });
 
     Ok((
         UserDataStreamHandle {
-            _spot: spot,
+            _spot: spot_task,
             _futures: futures,
             resync,
         },
@@ -232,7 +240,7 @@ fn tokio_stream_from_receiver(
     })
 }
 
-fn backoff_delay(timings: &StreamTimings, failures: u32) -> Duration {
+pub(crate) fn backoff_delay(timings: &StreamTimings, failures: u32) -> Duration {
     timings
         .reconnect_base
         .saturating_mul(1u32 << failures.min(16))

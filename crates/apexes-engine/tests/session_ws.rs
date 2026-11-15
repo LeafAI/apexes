@@ -41,6 +41,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 fn empty_snapshot() -> SessionSnapshot {
     SessionSnapshot {
+        identity: None,
+        evaluation: None,
+        equity_history: Vec::new(),
         positions: HashMap::new(),
         balances: HashMap::new(),
         equity: Decimal::ZERO,

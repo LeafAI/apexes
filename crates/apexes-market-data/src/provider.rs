@@ -1,3 +1,4 @@
+use apexes_core::binance_network::BinanceNetwork;
 use apexes_core::{ApexesError, AssetClass, Instrument, MarketDataProvider, MarketEvent, Venue};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -52,11 +53,28 @@ fn filter_binance_instruments(instruments: &[Instrument]) -> (Vec<&Instrument>, 
 /// public WebSocket feeds, via `barter-data` (plus a hand-rolled
 /// mark-price stream for Perpetual). Produces `Trade`, `Tick`, `Depth`,
 /// self-aggregated `Bar`, and (Perpetual only) `MarkPrice` events.
-pub struct BinanceMarketDataProvider;
+///
+/// [`Self::new`] targets mainnet. [`Self::for_network`] selects the Spot
+/// Test Network: Spot only (there is no Futures testnet here), trades,
+/// ticks and bars, and **no depth** -- `barter-data` implements L2 only for
+/// the mainnet type.
+pub struct BinanceMarketDataProvider {
+    network: BinanceNetwork,
+}
 
 impl BinanceMarketDataProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            network: BinanceNetwork::Mainnet,
+        }
+    }
+
+    pub fn for_network(network: BinanceNetwork) -> Self {
+        Self { network }
+    }
+
+    pub fn network(&self) -> BinanceNetwork {
+        self.network
     }
 }
 
@@ -72,7 +90,15 @@ impl MarketDataProvider for BinanceMarketDataProvider {
         &self,
         instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
-        let (spot, perpetual) = filter_binance_instruments(instruments);
+        let (spot, mut perpetual) = filter_binance_instruments(instruments);
+        if self.network == BinanceNetwork::Testnet && !perpetual.is_empty() {
+            tracing::warn!(
+                count = perpetual.len(),
+                "skipping Perpetual instruments: the Binance testnet is Spot only"
+            );
+            perpetual.clear();
+        }
+        let network = self.network;
 
         if spot.is_empty() && perpetual.is_empty() {
             return Err(ApexesError::SubscriptionFailed {
@@ -94,17 +120,21 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             spawn_task_thread("trade_task_spot", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, tx)
+                move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, network, tx)
             });
             spawn_task_thread("ticker_task_spot", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::ticker_task::run(symbols, BinanceExchangeKind::Spot, tx)
+                move || crate::ticker_task::run(symbols, BinanceExchangeKind::Spot, network, tx)
             });
-            spawn_task_thread("depth_task_spot", {
-                let tx = tx.clone();
-                move || crate::depth_task::run(symbols, BinanceExchangeKind::Spot, tx)
-            });
+            if network == BinanceNetwork::Mainnet {
+                spawn_task_thread("depth_task_spot", {
+                    let tx = tx.clone();
+                    move || crate::depth_task::run(symbols, BinanceExchangeKind::Spot, tx)
+                });
+            } else {
+                tracing::info!("order-book depth is not available on the Binance testnet");
+            }
         }
 
         if !perpetual.is_empty() {
@@ -112,12 +142,14 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             spawn_task_thread("trade_task_perpetual", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::trade_task::run(symbols, BinanceExchangeKind::Perpetual, tx)
+                move || crate::trade_task::run(symbols, BinanceExchangeKind::Perpetual, network, tx)
             });
             spawn_task_thread("ticker_task_perpetual", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::ticker_task::run(symbols, BinanceExchangeKind::Perpetual, tx)
+                move || {
+                    crate::ticker_task::run(symbols, BinanceExchangeKind::Perpetual, network, tx)
+                }
             });
             spawn_task_thread("depth_task_perpetual", {
                 let symbols = symbols.clone();

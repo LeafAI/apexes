@@ -21,7 +21,8 @@
 //! `/ws` protocol (bare `serde_json`-serialized `MarketEvent` frames,
 //! no envelope -- see `apexes-market-data-gateway`'s `protocol.rs`).
 
-use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent};
+use apexes_core::binance_network::BinanceNetwork;
+use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent, Venue};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -73,6 +74,55 @@ impl BackoffState {
 pub struct GatewayMarketDataProvider {
     gateway_url: String,
     token: Option<String>,
+    /// When set, the gateway must announce this network in its
+    /// `x-apexes-network` response header on every connect.
+    expected_network: Option<BinanceNetwork>,
+}
+
+/// Response header a gateway uses to announce its Binance network. Kept in
+/// step with `apexes_market_data_gateway::NETWORK_HEADER` (the engine does
+/// not depend on the gateway crate); a test pins the two together.
+pub const GATEWAY_NETWORK_HEADER: &str = "x-apexes-network";
+
+/// What a live session concludes from a gateway's announced network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkCheck {
+    Matches,
+    Mismatch {
+        expected: BinanceNetwork,
+        announced: String,
+    },
+    Unannounced {
+        expected: BinanceNetwork,
+    },
+}
+
+impl NetworkCheck {
+    pub fn evaluate(expected: BinanceNetwork, announced: Option<&str>) -> Self {
+        match announced {
+            Some(value) if value == expected.as_str() => Self::Matches,
+            Some(value) => Self::Mismatch {
+                expected,
+                announced: value.to_string(),
+            },
+            None => Self::Unannounced { expected },
+        }
+    }
+
+    pub fn describe(&self) -> Option<String> {
+        match self {
+            Self::Matches => None,
+            Self::Mismatch {
+                expected,
+                announced,
+            } => Some(format!(
+                "market-data gateway is on {announced} but this session is on {expected}; refusing to trade on the wrong network's prices"
+            )),
+            Self::Unannounced { expected } => Some(format!(
+                "market-data gateway did not announce its network (older build?) but this session requires {expected}"
+            )),
+        }
+    }
 }
 
 impl GatewayMarketDataProvider {
@@ -80,7 +130,16 @@ impl GatewayMarketDataProvider {
         Self {
             gateway_url: gateway_url.into(),
             token: None,
+            expected_network: None,
         }
+    }
+
+    /// Requires the gateway to be on `network`: `subscribe` fails on a
+    /// mismatch, and a gateway that later reconnects on another network ends
+    /// the stream instead of feeding it wrong prices.
+    pub fn with_expected_network(mut self, network: BinanceNetwork) -> Self {
+        self.expected_network = Some(network);
+        self
     }
 
     /// Sends `Authorization: Bearer <token>` when connecting (for
@@ -98,9 +157,26 @@ impl MarketDataProvider for GatewayMarketDataProvider {
         _instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
         let (tx, rx) = mpsc::unbounded_channel();
+        // With an expected network, connect once up front so a mismatch is
+        // a `subscribe` error rather than something found in a log later.
+        let first_socket = match self.expected_network {
+            Some(expected) => Some(
+                connect_checked(&self.gateway_url, self.token.as_deref(), expected)
+                    .await
+                    .map_err(|reason| ApexesError::SubscriptionFailed {
+                        symbol: String::new(),
+                        venue: Venue::Binance,
+                        reason,
+                        source_detail: None,
+                    })?,
+            ),
+            None => None,
+        };
         tokio::spawn(run_connection_loop(
             self.gateway_url.clone(),
             self.token.clone(),
+            self.expected_network,
+            first_socket,
             tx,
         ));
 
@@ -118,13 +194,33 @@ impl MarketDataProvider for GatewayMarketDataProvider {
 /// Connects, attaching the bearer token header when configured. The error is
 /// a plain string: callers only log it, and `tungstenite::Error` is large
 /// enough to trip `clippy::result_large_err`.
-async fn connect(
+type GatewaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connects, then (when `expected` is set) verifies the gateway's announced
+/// network, returning an error message that names both networks.
+async fn connect_checked(
     url: &str,
     token: Option<&str>,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
-> {
+    expected: BinanceNetwork,
+) -> Result<GatewaySocket, String> {
+    let (socket, announced) = connect_with_headers(url, token).await?;
+    match NetworkCheck::evaluate(expected, announced.as_deref()).describe() {
+        None => Ok(socket),
+        Some(reason) => Err(reason),
+    }
+}
+
+async fn connect(url: &str, token: Option<&str>) -> Result<GatewaySocket, String> {
+    connect_with_headers(url, token)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+async fn connect_with_headers(
+    url: &str,
+    token: Option<&str>,
+) -> Result<(GatewaySocket, Option<String>), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     if let Some(token) = token {
@@ -137,7 +233,14 @@ async fn connect(
     }
     tokio_tungstenite::connect_async(request)
         .await
-        .map(|(socket, _response)| socket)
+        .map(|(socket, response)| {
+            let announced = response
+                .headers()
+                .get(GATEWAY_NETWORK_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            (socket, announced)
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -148,11 +251,37 @@ async fn connect(
 async fn run_connection_loop(
     url: String,
     token: Option<String>,
+    expected_network: Option<BinanceNetwork>,
+    mut first_socket: Option<GatewaySocket>,
     tx: mpsc::UnboundedSender<MarketEvent>,
 ) {
     let mut backoff = BackoffState::new();
     loop {
-        match connect(&url, token.as_deref()).await {
+        let attempt = match first_socket.take() {
+            Some(socket) => Ok(socket),
+            None => match expected_network {
+                Some(expected) => {
+                    match connect_with_headers(&url, token.as_deref()).await {
+                        Ok((socket, announced)) => {
+                            match NetworkCheck::evaluate(expected, announced.as_deref()).describe()
+                            {
+                                None => Ok(socket),
+                                Some(reason) => {
+                                    // Wrong network after a reconnect is not
+                                    // retried: ending the stream stops the
+                                    // session rather than feeding it bad prices.
+                                    tracing::error!(%reason, "apexes-engine gateway_client: stopping");
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                None => connect(&url, token.as_deref()).await,
+            },
+        };
+        match attempt {
             Ok(socket) => {
                 tracing::info!(%url, "apexes-engine gateway_client: connected");
                 backoff.reset();
@@ -230,5 +359,36 @@ mod tests {
         let _ = backoff.next_delay();
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn matching_network_passes_the_check() {
+        let check = NetworkCheck::evaluate(BinanceNetwork::Testnet, Some("testnet"));
+        assert_eq!(check, NetworkCheck::Matches);
+        assert!(check.describe().is_none());
+    }
+
+    #[test]
+    fn a_different_network_is_refused_and_both_are_named() {
+        let reason = NetworkCheck::evaluate(BinanceNetwork::Testnet, Some("mainnet"))
+            .describe()
+            .unwrap();
+        assert!(
+            reason.contains("mainnet") && reason.contains("testnet"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_announces_nothing_is_refused() {
+        let reason = NetworkCheck::evaluate(BinanceNetwork::Mainnet, None)
+            .describe()
+            .unwrap();
+        assert!(reason.contains("did not announce"), "{reason}");
+    }
+
+    #[test]
+    fn the_header_name_matches_the_gateways() {
+        assert_eq!(GATEWAY_NETWORK_HEADER, "x-apexes-network");
     }
 }

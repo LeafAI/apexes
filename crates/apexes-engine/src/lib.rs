@@ -15,8 +15,10 @@ pub mod protocol;
 pub mod server;
 
 pub use apexes_strategy_loader::StrategyRef;
-pub use credentials::{CredentialsError, resolve_binance_credentials};
+pub mod risk_limits;
+pub use credentials::{CredentialsError, credential_var_names, resolve_binance_credentials};
 pub use gateway_client::GatewayMarketDataProvider;
 pub use launch_config::{LaunchConfig, SessionMode};
 pub use protocol::{EngineStatus, SessionMessage};
+pub use risk_limits::{LiveRiskLimits, RiskLimitsError};
 pub use server::{ServerSecurity, build_app, build_app_secured, build_app_with_kill_switch};

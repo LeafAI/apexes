@@ -2,6 +2,13 @@
   "session_id": "live-1",
   "mode": {
     "Live": {
+      "network": "testnet",
+      "risk_limits": {
+        "max_order_notional": "100",
+        "max_order_quantity": "0.01",
+        "max_position_per_symbol": "0.05",
+        "max_daily_trade_count": 50
+      },
       "credentials_ref": "binance-main",
       "auto_derisk_live": false,
       "reconcile_interval": 30000,

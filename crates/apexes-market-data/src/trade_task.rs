@@ -1,6 +1,8 @@
 use crate::bar_aggregator::BarAggregator;
 use crate::provider::BinanceExchangeKind;
 use crate::symbol::{split_symbol, symbol_of};
+use crate::testnet::BinanceSpotTestnet;
+use apexes_core::binance_network::BinanceNetwork;
 use apexes_core::{MarketEvent, Side as ApexesSide, TradeEvent, Venue};
 use barter_data::{
     exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
@@ -47,6 +49,7 @@ fn f64_to_decimal(value: f64, field_name: &str) -> Decimal {
 pub async fn run(
     symbols: Vec<String>,
     exchange: BinanceExchangeKind,
+    network: BinanceNetwork,
     tx: UnboundedSender<MarketEvent>,
 ) {
     let mut aggregators: HashMap<String, BarAggregator> = symbols
@@ -61,31 +64,58 @@ pub async fn run(
 
     let mut merged = match exchange {
         BinanceExchangeKind::Spot => {
-            let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
-                (
-                    BinanceSpot::default(),
-                    base,
-                    quote,
-                    MarketDataInstrumentKind::Spot,
-                    PublicTrades,
-                )
-            });
-            if subscriptions.is_empty() {
-                tracing::warn!(
-                    ?symbols,
-                    "trade_task: no valid Binance spot subscriptions derived from symbols"
-                );
-                return;
-            }
-            match Streams::<PublicTrades>::builder()
-                .subscribe(subscriptions)
-                .init()
-                .await
-            {
+            let streams = match network {
+                BinanceNetwork::Mainnet => {
+                    let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                        (
+                            BinanceSpot::default(),
+                            base,
+                            quote,
+                            MarketDataInstrumentKind::Spot,
+                            PublicTrades,
+                        )
+                    });
+                    if subscriptions.is_empty() {
+                        tracing::warn!(
+                            ?symbols,
+                            "trade_task: no valid Binance spot subscriptions derived from symbols"
+                        );
+                        return;
+                    }
+                    Streams::<PublicTrades>::builder()
+                        .subscribe(subscriptions)
+                        .init()
+                        .await
+                }
+                BinanceNetwork::Testnet => {
+                    let subscriptions: Vec<_> = build_subscriptions(&symbols, |base, quote| {
+                        (
+                            BinanceSpotTestnet::default(),
+                            base,
+                            quote,
+                            MarketDataInstrumentKind::Spot,
+                            PublicTrades,
+                        )
+                    });
+                    if subscriptions.is_empty() {
+                        tracing::warn!(
+                            ?symbols,
+                            "trade_task: no valid Binance spot subscriptions derived from symbols"
+                        );
+                        return;
+                    }
+                    Streams::<PublicTrades>::builder()
+                        .subscribe(subscriptions)
+                        .init()
+                        .await
+                }
+            };
+            match streams {
                 Ok(streams) => streams.select_all(),
                 Err(error) => {
                     tracing::warn!(
                         ?error,
+                        %network,
                         "trade_task: failed to initialize barter-data PublicTrades stream (spot)"
                     );
                     return;

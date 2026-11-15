@@ -55,13 +55,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
-use apexes_core::Instrument;
+use apexes_core::{AssetClass, Instrument, Venue};
+use apexes_gateway_binance::BinanceNetwork;
 use apexes_risk::MarketConditionConfig;
 use apexes_strategy::MarginTierTable;
 use apexes_strategy_loader::StrategyRef;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+use crate::risk_limits::{LiveRiskLimits, RiskLimitsError};
 
 /// Which of the three trading modes this session runs, plus the
 /// mode-specific parameters each one needs.
@@ -92,6 +95,14 @@ pub enum SessionMode {
     Paper,
     /// Drives `apexes_live_trading::run_live_trading`.
     Live {
+        /// Which Binance Spot system this session trades on. REQUIRED, no
+        /// default: a config that omits it fails to parse, so mainnet can
+        /// never be selected by omission. The market-data gateway must be
+        /// running on the same network (checked at connect time).
+        network: BinanceNetwork,
+        /// Pre-trade limits. REQUIRED: a live engine used to run with no
+        /// risk checker at all.
+        risk_limits: LiveRiskLimits,
         /// A reference (e.g. `"binance-main"`), NOT the credentials
         /// themselves -- credentials never cross a process boundary
         /// over the network. `apexes-engine`'s own `main.rs` resolves
@@ -156,7 +167,86 @@ pub struct LaunchConfig {
     pub gateway_url: String,
 }
 
+/// Why a [`LaunchConfig`] was refused before any process work started.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum LaunchConfigError {
+    #[error(transparent)]
+    RiskLimits(#[from] RiskLimitsError),
+    #[error("live sessions need at least one instrument")]
+    NoInstruments,
+    #[error(
+        "live sessions are Binance Spot only; instrument {symbol} is {venue:?}/{asset_class:?}"
+    )]
+    NotBinanceSpot {
+        symbol: String,
+        venue: Venue,
+        asset_class: AssetClass,
+    },
+}
+
 impl LaunchConfig {
+    /// Checks the parts of a config that serde cannot: live risk limits are
+    /// positive, and every live instrument is a Binance Spot instrument.
+    /// Backtest and paper configs are not constrained here.
+    pub fn validate(&self) -> Result<(), LaunchConfigError> {
+        let SessionMode::Live { risk_limits, .. } = &self.mode else {
+            return Ok(());
+        };
+        risk_limits.validate()?;
+        if self.instruments.is_empty() {
+            return Err(LaunchConfigError::NoInstruments);
+        }
+        for instrument in &self.instruments {
+            if instrument.venue != Venue::Binance || instrument.asset_class != AssetClass::Spot {
+                return Err(LaunchConfigError::NotBinanceSpot {
+                    symbol: instrument.symbol.clone(),
+                    venue: instrument.venue,
+                    asset_class: instrument.asset_class,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// What this session is, as shown in the operator console. Built from
+    /// the config the engine actually runs, so the banner cannot disagree
+    /// with the real network.
+    pub fn identity(&self) -> apexes_backtest::SessionIdentity {
+        let (mode, network) = match &self.mode {
+            SessionMode::Backtest { .. } => ("backtest", None),
+            SessionMode::Paper => ("paper", None),
+            SessionMode::Live { network, .. } => ("live", Some(network.to_string())),
+        };
+        let strategy = match &self.strategy_ref {
+            StrategyRef::DriftScript { path } => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            StrategyRef::RustNative { name } => name.clone(),
+        };
+        apexes_backtest::SessionIdentity {
+            session_id: self.session_id.clone(),
+            network,
+            mode: mode.to_string(),
+            strategy,
+        }
+    }
+
+    /// Limits the evaluation view reports utilisation against: only live
+    /// sessions carry them.
+    pub fn limit_spec(&self) -> apexes_backtest::LimitSpec {
+        match &self.mode {
+            SessionMode::Live { risk_limits, .. } => apexes_backtest::LimitSpec {
+                max_position_per_symbol: Some(risk_limits.max_position_per_symbol),
+                max_daily_fills: Some(risk_limits.max_daily_trade_count),
+            },
+            _ => apexes_backtest::LimitSpec {
+                max_position_per_symbol: None,
+                max_daily_fills: None,
+            },
+        }
+    }
+
     /// `snapshot_min_interval`'s default per design spec §4.2/§五.
     pub fn default_snapshot_min_interval() -> Duration {
         Duration::from_millis(500)
@@ -230,6 +320,15 @@ mod tests {
         LaunchConfig {
             session_id: "test-session-live".to_string(),
             mode: SessionMode::Live {
+                network: BinanceNetwork::Testnet,
+                risk_limits: crate::risk_limits::LiveRiskLimits {
+                    max_order_notional: dec!(100),
+                    max_order_quantity: dec!(0.01),
+                    max_position_per_symbol: dec!(0.05),
+                    max_daily_trade_count: 50,
+                    min_account_equity: None,
+                    max_daily_volume: None,
+                },
                 credentials_ref: "binance-main".to_string(),
                 auto_derisk_live: false,
                 reconcile_interval: Duration::from_secs(30),
@@ -260,7 +359,16 @@ mod tests {
         );
         let json = std::fs::read_to_string(path).unwrap();
         let config: LaunchConfig = serde_json::from_str(&json).unwrap();
-        assert!(matches!(config.mode, SessionMode::Live { .. }));
+        assert!(matches!(
+            config.mode,
+            SessionMode::Live {
+                network: BinanceNetwork::Testnet,
+                ..
+            }
+        ));
+        config
+            .validate()
+            .expect("the shipped example must validate");
         assert!(matches!(
             config.strategy_ref,
             StrategyRef::DriftScript { .. }
@@ -299,12 +407,16 @@ mod tests {
 
         match deserialized.mode {
             SessionMode::Live {
+                network,
+                risk_limits,
                 credentials_ref,
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
                 stale_data_timeout_secs,
             } => {
+                assert_eq!(network, BinanceNetwork::Testnet);
+                assert_eq!(risk_limits.max_daily_trade_count, 50);
                 assert_eq!(stale_data_timeout_secs, Some(20));
                 assert_eq!(credentials_ref, "binance-main");
                 assert!(!auto_derisk_live);
@@ -313,6 +425,108 @@ mod tests {
             }
             _ => panic!("expected SessionMode::Live"),
         }
+    }
+
+    fn live_json_without(field: &str) -> String {
+        let mut value = serde_json::to_value(sample_live_config()).unwrap();
+        let live = value["mode"]["Live"].as_object_mut().unwrap();
+        assert!(
+            live.remove(field).is_some(),
+            "{field} not present to remove"
+        );
+        value.to_string()
+    }
+
+    #[test]
+    fn a_live_config_without_network_does_not_parse() {
+        let error = serde_json::from_str::<LaunchConfig>(&live_json_without("network"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("network"), "{error}");
+    }
+
+    #[test]
+    fn a_live_config_without_risk_limits_does_not_parse() {
+        let error = serde_json::from_str::<LaunchConfig>(&live_json_without("risk_limits"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("risk_limits"), "{error}");
+    }
+
+    #[test]
+    fn a_valid_live_config_validates() {
+        assert!(sample_live_config().validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_zero_risk_limits() {
+        let mut config = sample_live_config();
+        if let SessionMode::Live { risk_limits, .. } = &mut config.mode {
+            risk_limits.max_order_notional = dec!(0);
+        }
+        assert!(matches!(
+            config.validate(),
+            Err(LaunchConfigError::RiskLimits(_))
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_non_spot_and_empty_instrument_lists() {
+        let mut config = sample_live_config();
+        config.instruments.clear();
+        assert_eq!(config.validate(), Err(LaunchConfigError::NoInstruments));
+
+        let mut config = sample_live_config();
+        config.instruments = vec![
+            Instrument::new(
+                "BTCUSDT",
+                MarketType::Crypto,
+                Venue::Binance,
+                AssetClass::Perpetual,
+                Some("BTC".to_string()),
+                Some("USDT".to_string()),
+                dec!(0.01),
+                dec!(0.0001),
+                dec!(1),
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            config.validate(),
+            Err(LaunchConfigError::NotBinanceSpot { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_reports_the_live_network_and_strategy_file_name() {
+        let mut config = sample_live_config();
+        config.strategy_ref = StrategyRef::DriftScript {
+            path: PathBuf::from("/etc/apexes/strategy.drift"),
+        };
+        let identity = config.identity();
+        assert_eq!(identity.network.as_deref(), Some("testnet"));
+        assert_eq!(identity.mode, "live");
+        assert_eq!(identity.strategy, "strategy.drift");
+        assert_eq!(identity.session_id, "test-session-live");
+    }
+
+    #[test]
+    fn identity_has_no_network_for_sessions_that_touch_no_exchange() {
+        assert_eq!(sample_backtest_config().identity().network, None);
+        assert_eq!(sample_backtest_config().identity().mode, "backtest");
+    }
+
+    #[test]
+    fn limit_spec_comes_from_live_risk_limits_only() {
+        let live = sample_live_config().limit_spec();
+        assert_eq!(live.max_position_per_symbol, Some(dec!(0.05)));
+        assert_eq!(live.max_daily_fills, Some(50));
+        assert_eq!(sample_backtest_config().limit_spec().max_daily_fills, None);
+    }
+
+    #[test]
+    fn backtest_configs_are_not_constrained_by_live_validation() {
+        assert!(sample_backtest_config().validate().is_ok());
     }
 
     fn config_date_range(config: &LaunchConfig) -> Range<NaiveDate> {

@@ -29,6 +29,9 @@ fn snapshot() -> SessionSnapshot {
         },
     );
     SessionSnapshot {
+        identity: None,
+        evaluation: None,
+        equity_history: Vec::new(),
         positions,
         balances: HashMap::from([("USDT".to_string(), dec!(1234.5))]),
         equity: dec!(10500),

@@ -117,7 +117,33 @@ pub struct SessionSnapshot {
     /// backtest/paper: the simulated book's). Absent in older engines.
     #[serde(default)]
     pub open_orders: Vec<OpenOrderView>,
+    /// Who this session is (network, id, strategy). Set once from the
+    /// session's launch config; `None` from older engines and for sessions
+    /// that were not given an identity.
+    #[serde(default)]
+    pub identity: Option<SessionIdentity>,
+    /// Running evaluation (PnL, drawdown, exposure, fees, limit usage).
+    /// `None` until the loop has computed one.
+    #[serde(default)]
+    pub evaluation: Option<crate::evaluation::EvaluationSummary>,
+    /// Thinned equity history ending at the latest point, for the console's
+    /// timeline. Bounded (see `evaluation::SNAPSHOT_HISTORY_POINTS`).
+    #[serde(default)]
+    pub equity_history: Vec<(DateTime<Utc>, Decimal)>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Identity of a running session, shown in the console so an operator can
+/// always see which network and strategy they are looking at. Describes
+/// what the *engine* is actually using, not what a launcher intended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub session_id: String,
+    /// `"mainnet"` / `"testnet"` for live sessions; `None` for paper and
+    /// backtest, which touch no exchange.
+    pub network: Option<String>,
+    pub mode: String,
+    pub strategy: String,
 }
 
 /// Constructed by the caller (`apexes-engine`, a later task) BEFORE
@@ -127,6 +153,8 @@ pub struct SessionSnapshot {
 /// into its own `axum` WS handler), passing this struct (which holds
 /// the OTHER halves) into `UnifiedLoopConfig.control`.
 pub struct ControlHandle {
+    identity: Option<SessionIdentity>,
+    limits: crate::evaluation::LimitSpec,
     snapshot_tx: watch::Sender<SessionSnapshot>,
     command_rx: mpsc::UnboundedReceiver<SessionCommand>,
     min_interval: Duration,
@@ -154,6 +182,11 @@ impl ControlHandle {
         let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let handle = Self {
+            identity: None,
+            limits: crate::evaluation::LimitSpec {
+                max_position_per_symbol: None,
+                max_daily_fills: None,
+            },
             snapshot_tx,
             command_rx,
             min_interval,
@@ -161,6 +194,26 @@ impl ControlHandle {
             paused: false,
         };
         (handle, command_tx, snapshot_rx)
+    }
+
+    /// Identity stamped onto every snapshot this handle pushes.
+    pub fn with_identity(mut self, identity: SessionIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Limits the evaluation view reports utilisation against.
+    pub fn with_limits(mut self, limits: crate::evaluation::LimitSpec) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub(crate) fn identity(&self) -> Option<SessionIdentity> {
+        self.identity.clone()
+    }
+
+    pub(crate) fn limit_spec(&self) -> crate::evaluation::LimitSpec {
+        self.limits.clone()
     }
 
     /// Called once per tick by the unified loop. Drains ALL pending
@@ -250,6 +303,9 @@ mod tests {
 
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
+            identity: None,
+            evaluation: None,
+            equity_history: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,

@@ -29,13 +29,23 @@ use rust_decimal::Decimal;
 /// workload that doesn't need reader/writer differentiation at this
 /// scale.
 pub struct ParamStore {
+    /// Values explicitly set (initial overrides and `set` calls). These
+    /// always win over a script's literal default.
     values: Mutex<HashMap<String, Decimal>>,
+    /// Parameters a script has declared by calling `param(name, default)`,
+    /// with the default it passed. Kept apart from `values` so declaring a
+    /// parameter never counts as setting it: a later `set` starts from a
+    /// clean slate. Exists so `snapshot` can list parameters the operator
+    /// has not touched yet -- without it a live-tuning console would show
+    /// an empty table until something had already been changed.
+    declared: Mutex<HashMap<String, Decimal>>,
 }
 
 impl ParamStore {
     pub fn new(initial_overrides: HashMap<String, Decimal>) -> Self {
         Self {
             values: Mutex::new(initial_overrides),
+            declared: Mutex::new(HashMap::new()),
         }
     }
 
@@ -44,6 +54,13 @@ impl ParamStore {
     /// subsequent `set` for `name` starts from a clean slate, not from
     /// whatever various call sites' literal defaults happened to be).
     pub fn get_or_default(&self, name: &str, default: Decimal) -> Decimal {
+        {
+            let mut declared = match self.declared.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            declared.entry(name.to_string()).or_insert(default);
+        }
         let values = match self.values.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -60,13 +77,20 @@ impl ParamStore {
         values.insert(name, value);
     }
 
-    /// A point-in-time copy of every currently-stored parameter value.
+    /// A point-in-time copy of every parameter's *effective* value: each
+    /// declared parameter at its default, overridden by any value set since.
+    /// Parameters set without ever being declared are included too.
     pub fn snapshot(&self) -> HashMap<String, Decimal> {
+        let mut effective = match self.declared.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         let values = match self.values.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        values.clone()
+        effective.extend(values.iter().map(|(k, v)| (k.clone(), *v)));
+        effective
     }
 }
 
@@ -239,5 +263,52 @@ mod tests {
 
         let value = interp.env().get("x").unwrap();
         assert!(matches!(value, DriftValue::Number(n) if n == 1.0));
+    }
+
+    #[test]
+    fn snapshot_lists_declared_params_at_their_defaults_before_any_set() {
+        let store = ParamStore::new(HashMap::new());
+        assert!(store.snapshot().is_empty(), "nothing declared yet");
+        store.get_or_default("quantity", rust_decimal_macros::dec!(0.001));
+        assert_eq!(
+            store.snapshot().get("quantity"),
+            Some(&rust_decimal_macros::dec!(0.001))
+        );
+    }
+
+    #[test]
+    fn a_set_value_overrides_the_declared_default_in_the_snapshot() {
+        let store = ParamStore::new(HashMap::new());
+        store.get_or_default("quantity", rust_decimal_macros::dec!(0.001));
+        store.set("quantity".to_string(), rust_decimal_macros::dec!(0.5));
+        assert_eq!(
+            store.snapshot().get("quantity"),
+            Some(&rust_decimal_macros::dec!(0.5))
+        );
+        // Re-declaring with the same default must not undo the set value.
+        let value = store.get_or_default("quantity", rust_decimal_macros::dec!(0.001));
+        assert_eq!(value, rust_decimal_macros::dec!(0.5));
+    }
+
+    #[test]
+    fn declaring_a_param_does_not_count_as_setting_it() {
+        let store = ParamStore::new(HashMap::new());
+        store.get_or_default("x", rust_decimal_macros::dec!(1));
+        // A different default at another call site still resolves to that
+        // call site's own default, because nothing was ever set.
+        assert_eq!(
+            store.get_or_default("x", rust_decimal_macros::dec!(2)),
+            rust_decimal_macros::dec!(2)
+        );
+    }
+
+    #[test]
+    fn params_set_but_never_declared_are_still_listed() {
+        let store = ParamStore::new(HashMap::new());
+        store.set("late".to_string(), rust_decimal_macros::dec!(7));
+        assert_eq!(
+            store.snapshot().get("late"),
+            Some(&rust_decimal_macros::dec!(7))
+        );
     }
 }

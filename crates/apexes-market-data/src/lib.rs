@@ -9,6 +9,7 @@ pub mod ingestion;
 pub mod mark_price_task;
 pub mod provider;
 pub mod symbol;
+pub mod testnet;
 pub mod ticker_task;
 pub mod trade_task;
 

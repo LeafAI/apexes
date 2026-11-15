@@ -1,0 +1,69 @@
+// DEMO ONLY. Not a trading recommendation, and not expected to make money.
+//
+// It exists to exercise the whole pipeline (market data -> strategy -> risk
+// limits -> orders -> fills -> console) and live parameter tuning, on the
+// Binance Spot TESTNET. A trend-following toy: hold `quantity` of the base
+// asset while the latest trade price is above its simple moving average,
+// and be flat otherwise.
+//
+// Tunable from the console while running. `param()` is read INSIDE
+// on_market_event on purpose: a top-level param() is read once at load and
+// would not change when you edit it.
+//
+//   quantity  base units to hold when "long" (keep it below the
+//             max_order_quantity / max_position_per_symbol in the launch
+//             config's risk_limits, or orders are rejected)
+//   enabled   1 = trade, 0 = stay flat (use this to stop trading without
+//             stopping the session)
+
+let sma = indicators.sma(20);
+
+function on_market_event(event, ctx) {
+  // Trades only; ticks/bars/depth are ignored.
+  if (event.type != "trade") {
+    return [];
+  }
+
+  let quantity = param("quantity", 0.001);
+  let enabled = param("enabled", 1);
+
+  let average = sma.update(event.price);
+  if (average == null) {
+    // Still warming up: not enough trades to form an average yet.
+    return [];
+  }
+
+  let position = ctx.get_position(event.symbol);
+  let held = position.quantity;
+
+  // One working order at a time: never stack orders on top of each other.
+  if (ctx.has_open_order(event.symbol)) {
+    return [];
+  }
+
+  let want_long = enabled > 0 && event.price > average;
+
+  if (want_long && held < quantity) {
+    return [{
+      symbol: event.symbol,
+      venue: event.venue,
+      asset_class: "spot",
+      side: "buy",
+      order_type: "market",
+      quantity: quantity - held,
+    }];
+  }
+
+  if (!want_long && held > 0) {
+    return [{
+      symbol: event.symbol,
+      venue: event.venue,
+      asset_class: "spot",
+      side: "sell",
+      order_type: "market",
+      quantity: held,
+    }];
+  }
+
+  return [];
+}

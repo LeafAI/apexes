@@ -11,8 +11,9 @@
 //!
 //! On successful startup (after binding the listener, before
 //! `axum::serve` starts accepting connections), this process writes a
-//! PID file at `~/.apexes/market-data-gateway.pid` (creating the
-//! `~/.apexes/` directory first if it doesn't exist). The file's
+//! PID file at `~/.apexes/market-data-gateway-<network>.pid` (`<network>` is
+//! `mainnet` or `testnet`, so a testnet and a mainnet gateway never overwrite
+//! each other's file; `~/.apexes/` is created first if it doesn't exist). The file's
 //! entire content is exactly two lines, `\n`-terminated, in this
 //! fixed order, with NO other content, comments, or blank lines:
 //!
@@ -104,6 +105,14 @@ struct Cli {
     /// `--instruments BTCUSDT,ETHUSDT`.
     #[arg(long, value_delimiter = ',')]
     instruments: Vec<String>,
+
+    /// Which Binance Spot system to stream from: `mainnet` or `testnet`.
+    /// REQUIRED -- there is deliberately no default, so mainnet is never
+    /// selected by omission. Announced to clients in the
+    /// `x-apexes-network` response header; an engine on the other network
+    /// refuses to use this gateway. Testnet has no order-book depth.
+    #[arg(long)]
+    network: apexes_core::binance_network::BinanceNetwork,
 }
 
 fn resolve_port(cli: &Cli) -> u16 {
@@ -222,7 +231,7 @@ fn pin_current_thread_round_robin(
 /// and does NOT abort startup -- the gateway is still fully functional
 /// for clients that already know its port; only auto-discovery by a
 /// future supervisor degrades.
-fn write_pid_file(port: u16) {
+fn write_pid_file(network: apexes_core::binance_network::BinanceNetwork, port: u16) {
     let Some(home) = std::env::var_os("HOME") else {
         tracing::error!(
             "apexes-market-data-gateway: HOME environment variable not set, skipping PID file"
@@ -234,7 +243,7 @@ fn write_pid_file(port: u16) {
         tracing::error!(?error, path = ?dir, "apexes-market-data-gateway: failed to create PID file directory, skipping PID file");
         return;
     }
-    let path = dir.join("market-data-gateway.pid");
+    let path = dir.join(format!("market-data-gateway-{network}.pid"));
     let contents = format!("{}\n{}\n", std::process::id(), port);
     if let Err(error) = std::fs::write(&path, contents) {
         tracing::error!(?error, path = ?path, "apexes-market-data-gateway: failed to write PID file");
@@ -329,7 +338,11 @@ fn main() {
 async fn run(cli: Cli, port: u16) {
     let instruments = instruments_from_symbols(&cli.instruments);
 
-    let gateway = Arc::new(Gateway::new(Box::new(BinanceMarketDataProvider::new()), 0));
+    tracing::info!(network = %cli.network, "apexes-market-data-gateway: upstream network");
+    let gateway = Arc::new(Gateway::new(
+        Box::new(BinanceMarketDataProvider::for_network(cli.network)),
+        0,
+    ));
 
     // Design spec §3.2: subscribe once at startup and hold the
     // connection for the process lifetime -- a subscribe failure exits
@@ -363,7 +376,7 @@ async fn run(cli: Cli, port: u16) {
         }
     });
 
-    write_pid_file(port);
+    write_pid_file(cli.network, port);
 
     let token = apexes_security::BearerToken::from_env("APEXES_GATEWAY_TOKEN").map(Arc::new);
     if token.is_none() {
@@ -371,11 +384,12 @@ async fn run(cli: Cli, port: u16) {
             "apexes-market-data-gateway: APEXES_GATEWAY_TOKEN not set; /market is UNAUTHENTICATED"
         );
     }
-    let app = apexes_market_data_gateway::build_app_secured(
+    let app = apexes_market_data_gateway::build_app_for_network(
         Arc::clone(&gateway),
         storage_reader,
         instruments,
         token,
+        Some(cli.network.to_string()),
     );
 
     let listener = match TcpListener::bind((cli.host.as_str(), port)).await {

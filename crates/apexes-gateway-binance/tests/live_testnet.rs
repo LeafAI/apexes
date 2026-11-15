@@ -168,23 +168,33 @@ async fn query_all_open_orders_returns_the_order_just_placed() {
     gateway.cancel_order(&order_with_id).await;
 }
 
+/// The Spot user-data stream over the WebSocket API, against the real
+/// testnet and through the real gateway: subscribing must succeed, and the
+/// updates for an order this test places and cancels must arrive keyed by
+/// OUR client order id (including the cancel, which Binance reports under a
+/// different `c` and puts our id in `C`).
 #[tokio::test]
 #[ignore]
-async fn user_data_stream_connects_and_receives_at_least_the_initial_handshake() {
-    let gateway = BinanceExecutionGateway::new(testnet_config());
-    let (_handle, stream) = gateway.start_user_data_stream().await.unwrap();
-    // The merged user-data stream is `!Unpin` (it contains
-    // `pin-project`-based websocket machinery internally), so pin it on
-    // the stack to make `StreamExt::next()` callable.
+async fn spot_user_data_stream_delivers_updates_for_our_order_through_the_gateway() {
+    use apexes_core::binance_network::BinanceNetwork;
+    use futures::StreamExt;
+
+    let gateway = BinanceExecutionGateway::for_network(
+        BinanceNetwork::Testnet,
+        std::env::var("APEXES_BINANCE_TESTNET_API_KEY")
+            .expect("set APEXES_BINANCE_TESTNET_API_KEY to run this ignored test"),
+        std::env::var("APEXES_BINANCE_TESTNET_API_SECRET")
+            .expect("set APEXES_BINANCE_TESTNET_API_SECRET to run this ignored test"),
+    );
+    let (_handle, stream) = gateway
+        .start_user_data_stream()
+        .await
+        .expect("the Spot user-data subscription must succeed on testnet");
     futures::pin_mut!(stream);
 
-    // Submit an order to generate a User Data Stream event, then wait
-    // briefly for it to arrive. This test only proves connectivity and
-    // basic event delivery -- it does not assert on specific field
-    // values (those are covered by user_data_stream.rs's unit tests
-    // against synthetic JSON).
     let quantity = dec!(0.001);
-    let price = safe_resting_limit_price("https://testnet.binance.vision", quantity).await;
+    let price =
+        safe_resting_limit_price(BinanceNetwork::Testnet.endpoints().spot_rest, quantity).await;
     let order = Order {
         id: OrderId(Uuid::new_v4()),
         exchange_order_id: None,
@@ -204,20 +214,38 @@ async fn user_data_stream_connects_and_receives_at_least_the_initial_handshake()
         updated_at: Utc::now(),
     };
     let outcome = gateway.submit_order(&order).await;
+    let GatewayOutcome::Accepted { exchange_order_id } = outcome else {
+        panic!("the resting order must be accepted, got {outcome:?}");
+    };
 
-    use futures::StreamExt;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
-
-    // Clean up: cancel the resting order so it doesn't linger on the
-    // testnet account across repeated runs of this test.
-    if let GatewayOutcome::Accepted { exchange_order_id } = outcome {
-        let mut order_with_id = order.clone();
-        order_with_id.exchange_order_id = Some(exchange_order_id);
-        gateway.cancel_order(&order_with_id).await;
-    }
-
-    assert!(
-        result.is_ok(),
-        "expected at least one ExchangeUpdate within 10 seconds of submitting an order"
+    let wait = std::time::Duration::from_secs(15);
+    let new_update = tokio::time::timeout(wait, async {
+        while let Some(update) = stream.next().await {
+            if update.client_order_id == order.id && update.status == OrderStatus::New {
+                return update;
+            }
+        }
+        panic!("stream ended");
+    })
+    .await
+    .expect("a NEW update for our order within 15s");
+    assert_eq!(
+        new_update.exchange_order_id.as_deref(),
+        Some(exchange_order_id.as_str())
     );
+
+    let mut with_id = order.clone();
+    with_id.exchange_order_id = Some(exchange_order_id);
+    gateway.cancel_order(&with_id).await;
+
+    tokio::time::timeout(wait, async {
+        while let Some(update) = stream.next().await {
+            if update.client_order_id == order.id && update.status == OrderStatus::Cancelled {
+                return;
+            }
+        }
+        panic!("stream ended");
+    })
+    .await
+    .expect("a CANCELED update keyed by OUR order id within 15s");
 }

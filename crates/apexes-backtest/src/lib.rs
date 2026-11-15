@@ -16,6 +16,7 @@
 pub mod error;
 
 pub mod control;
+pub mod evaluation;
 
 pub mod ems_adapter;
 
@@ -53,11 +54,12 @@ pub mod unified_loop;
 
 pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, StrategyContext};
 pub use clock::ReplaySpeed;
-pub use control::{ControlHandle, OpenOrderView, SessionCommand, SessionSnapshot};
+pub use control::{ControlHandle, OpenOrderView, SessionCommand, SessionIdentity, SessionSnapshot};
 pub use cost_model::{
     BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
 };
 pub use error::ApexesError;
+pub use evaluation::{EvaluationSummary, EvaluationTracker, LimitSpec, LimitUsage};
 pub use latency::LatencyModel;
 pub use ledger::PortfolioLedger;
 pub use mark_price_source::StorageReaderMarkPriceProvider;

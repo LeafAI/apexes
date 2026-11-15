@@ -16,9 +16,21 @@ use std::sync::Mutex;
 use crate::config::BinanceGatewayConfig;
 use crate::error::BinanceApiError;
 use crate::rest::{ApiFamily, BinanceRestClient};
+use apexes_core::binance_network::BinanceNetwork;
 
 pub struct BinanceExecutionGateway {
     rest: BinanceRestClient,
+    /// When set, no Futures endpoint is ever contacted: balances come
+    /// from Spot only, positions are empty, and the user-data stream
+    /// covers Spot only. Required for the Spot Test Network (which has
+    /// no Futures API) and sensible for any Spot-only session.
+    spot_only: bool,
+    /// WebSocket-API endpoint the Spot user-data stream subscribes on.
+    spot_ws_api: String,
+    /// Signs the stream's subscribe request. Built from the API key and
+    /// secret by default; replaceable (see [`Self::with_signer`]).
+    signer: std::sync::Arc<dyn crate::auth::ParamSigner>,
+    recv_window_ms: u64,
     /// Per-symbol leverage/margin-mode last successfully set on the
     /// exchange -- avoids redundant `POST /fapi/v1/leverage`/
     /// `marginType` calls when consecutive orders for the same symbol
@@ -29,10 +41,57 @@ pub struct BinanceExecutionGateway {
 
 impl BinanceExecutionGateway {
     pub fn new(config: BinanceGatewayConfig) -> Self {
+        let signer: std::sync::Arc<dyn crate::auth::ParamSigner> = std::sync::Arc::new(
+            crate::auth::HmacSigner::new(config.api_key.clone(), config.api_secret.clone()),
+        );
+        let recv_window_ms = config.recv_window_ms;
         Self {
             rest: BinanceRestClient::new(config),
+            spot_only: false,
+            spot_ws_api: BinanceNetwork::Mainnet.endpoints().spot_ws_api.to_string(),
+            signer,
+            recv_window_ms,
             leverage_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replaces how the user-data subscription is signed, for example with
+    /// an Ed25519 signer whose private key lives in an agent. REST requests
+    /// keep using the HMAC secret in the config.
+    pub fn with_signer(mut self, signer: std::sync::Arc<dyn crate::auth::ParamSigner>) -> Self {
+        self.signer = signer;
+        self
+    }
+
+    /// Points the user-data subscription at a specific WebSocket-API URL
+    /// (tests use a local server).
+    pub fn with_ws_api_url(mut self, url: impl Into<String>) -> Self {
+        self.spot_ws_api = url.into();
+        self
+    }
+
+    /// A Spot-only gateway for `network`: REST and user-data-stream
+    /// hosts both come from [`BinanceNetwork::endpoints`], and no
+    /// Futures endpoint is ever contacted (the Futures base URL is left
+    /// empty so an accidental Futures call fails loudly).
+    pub fn for_network(network: BinanceNetwork, api_key: String, api_secret: String) -> Self {
+        let endpoints = network.endpoints();
+        let mut gateway = Self::new(BinanceGatewayConfig {
+            api_key,
+            api_secret,
+            spot_base_url: endpoints.spot_rest.to_string(),
+            futures_base_url: String::new(),
+            recv_window_ms: 5000,
+        })
+        .spot_only();
+        gateway.spot_ws_api = endpoints.spot_ws_api.to_string();
+        gateway
+    }
+
+    /// Restricts this gateway to Spot. See the `spot_only` field.
+    pub fn spot_only(mut self) -> Self {
+        self.spot_only = true;
+        self
     }
 
     /// Ensures `symbol` is set to `leverage`/`margin_mode` on the
@@ -168,6 +227,12 @@ impl BinanceExecutionGateway {
         asset_class: AssetClass,
     ) -> Result<Vec<OpenOrderEntry>, String> {
         let family = ApiFamily::from(asset_class);
+        // A Spot-only gateway has no Futures endpoint, so it has no Futures
+        // orders to report: that is an honest "none", not an error. (Startup
+        // recovery asks about every asset class the engine supports.)
+        if self.spot_only && family == ApiFamily::Futures {
+            return Ok(Vec::new());
+        }
         let (status, body) = self
             .rest
             .signed_request("GET", family, Self::open_orders_path(family), "")
@@ -178,10 +243,11 @@ impl BinanceExecutionGateway {
         serde_json::from_str(&body).map_err(|error| format!("parse error: {error}; body={body}"))
     }
 
-    /// Starts the Binance User Data Stream (both Spot and Futures),
-    /// returning a handle that must be kept alive for as long as the
-    /// stream should keep running, plus the merged update stream
-    /// itself. See `crate::user_data_stream` for details.
+    /// Starts the Binance user-data stream: Spot over the WebSocket API,
+    /// plus Futures (listenKey) unless the gateway is Spot-only. Returns a
+    /// handle that must be kept alive for as long as the stream should keep
+    /// running, plus the merged update stream. See
+    /// `crate::ws_user_stream` and `crate::user_data_stream`.
     pub async fn start_user_data_stream(
         &self,
     ) -> Result<
@@ -191,7 +257,16 @@ impl BinanceExecutionGateway {
         ),
         String,
     > {
-        crate::user_data_stream::start_user_data_stream(self.rest.clone()).await
+        crate::user_data_stream::start_user_data_stream(
+            self.rest.clone(),
+            crate::ws_user_stream::SpotStreamConfig {
+                url: self.spot_ws_api.clone(),
+                signer: std::sync::Arc::clone(&self.signer),
+                recv_window_ms: self.recv_window_ms,
+            },
+            !self.spot_only,
+        )
+        .await
     }
 }
 
@@ -221,6 +296,10 @@ impl BinanceExecutionGateway {
             *totals.entry(entry.asset).or_insert(Decimal::ZERO) += entry.free + entry.locked;
         }
 
+        if self.spot_only {
+            return Ok(totals);
+        }
+
         let (status, body) = self
             .rest
             .signed_request("GET", ApiFamily::Futures, "/fapi/v2/balance", "")
@@ -245,6 +324,9 @@ impl BinanceExecutionGateway {
     /// entirely -- matching `PortfolioLedger::positions()`'s convention
     /// of only containing symbols with an actual net position.
     pub async fn account_positions(&self) -> Result<HashMap<String, Position>, String> {
+        if self.spot_only {
+            return Ok(HashMap::new());
+        }
         let (status, body) = self
             .rest
             .signed_request("GET", ApiFamily::Futures, "/fapi/v2/positionRisk", "")

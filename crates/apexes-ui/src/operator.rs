@@ -232,6 +232,9 @@ mod tests {
 
     fn snapshot(params: &[(&str, Decimal)], paused: bool) -> SessionSnapshot {
         SessionSnapshot {
+            identity: None,
+            evaluation: None,
+            equity_history: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: dec!(100),

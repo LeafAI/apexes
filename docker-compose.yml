@@ -38,7 +38,9 @@ services:
     build:
       context: .
       target: gateway
-    command: ["--host", "0.0.0.0", "--port", "9001", "--instruments", "BTCUSDT"]
+    # --network is REQUIRED (no default) and must match the engine's
+    # launch-config `network`; an engine refuses a gateway on the other one.
+    command: ["--host", "0.0.0.0", "--port", "9001", "--instruments", "BTCUSDT", "--network", "${APEXES_NETWORK:?set APEXES_NETWORK to testnet or mainnet}"]
     environment:
       # Optional bearer token for /market; the engine sends the same one.
       APEXES_GATEWAY_TOKEN: ${APEXES_GATEWAY_TOKEN:-}
@@ -64,9 +66,14 @@ services:
       APEXES_CONTROL_TOKEN: ${APEXES_CONTROL_TOKEN:-}
       APEXES_AUDIT_LOG: /var/lib/apexes/audit.jsonl
       APEXES_GATEWAY_TOKEN: ${APEXES_GATEWAY_TOKEN:-}
-      # Credentials for credentials_ref "binance-main" in the launch config.
-      APEXES_CRED_BINANCE_MAIN_API_KEY: ${APEXES_CRED_BINANCE_MAIN_API_KEY:?set APEXES_CRED_BINANCE_MAIN_API_KEY}
-      APEXES_CRED_BINANCE_MAIN_API_SECRET: ${APEXES_CRED_BINANCE_MAIN_API_SECRET:?set APEXES_CRED_BINANCE_MAIN_API_SECRET}
+      # Credentials for credentials_ref "binance-main" on the launch
+      # config's network. The network is part of the variable name, so
+      # testnet keys and mainnet keys can never be mixed up. Set the pair
+      # that matches APEXES_NETWORK (the other pair may stay unset).
+      APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY: ${APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY:-}
+      APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET: ${APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET:-}
+      APEXES_CRED_BINANCE_MAIN_MAINNET_API_KEY: ${APEXES_CRED_BINANCE_MAIN_MAINNET_API_KEY:-}
+      APEXES_CRED_BINANCE_MAIN_MAINNET_API_SECRET: ${APEXES_CRED_BINANCE_MAIN_MAINNET_API_SECRET:-}
     volumes:
       - ./deploy/launch-config.json:/etc/apexes/launch-config.json:ro
       - ./deploy/strategy.drift:/etc/apexes/strategy.drift:ro

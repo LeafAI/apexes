@@ -6,6 +6,7 @@
 //! `OrderStatus` state machine.
 
 pub mod account;
+pub mod binance_network;
 pub mod chain_data;
 pub mod error;
 pub mod fill;

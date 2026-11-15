@@ -193,6 +193,11 @@ pub async fn run_unified_event_loop(
     let mut recorded_initial_equity = false;
     let mut risk_checker = config.risk_checker;
     let mut control = config.control;
+    // Only built for sessions with a control handle: `control: None` stays
+    // a true no-op (no extra state, no extra work per tick).
+    let mut evaluation = control
+        .as_ref()
+        .map(|handle| crate::evaluation::EvaluationTracker::new(handle.limit_spec()));
 
     // Extreme-market circuit breaker (design spec
     // `2026-08-04-apexes-extreme-market-circuit-breaker-design.md`):
@@ -658,6 +663,15 @@ pub async fn run_unified_event_loop(
 
                 let equity = ledger.equity(&last_prices)?;
                 overall_tracker.record_equity_point(timestamp, equity);
+                if let Some(tracker) = &mut evaluation {
+                    tracker.observe_fills(&all_fills);
+                    tracker.record_equity(
+                        timestamp,
+                        equity,
+                        ledger.positions().values().any(|p| !p.quantity.is_zero()),
+                        holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                    );
+                }
 
                 if let Some(handle) = &mut control {
                     let drain_result = handle.drain_commands(&mut strategy);
@@ -678,7 +692,30 @@ pub async fn run_unified_event_loop(
                             .map(crate::control::OpenOrderView::from)
                             .collect();
                         open_orders.sort_by_key(|o| o.created_at);
+                        let (evaluation_summary, equity_history) = match &evaluation {
+                            Some(tracker) => {
+                                let (gross_exposure, max_abs_position) = exposure_inputs(
+                                    ledger.positions(),
+                                    &last_prices,
+                                    &instruments_by_symbol,
+                                );
+                                let realized: Decimal = ledger.realized_pnl().values().copied().sum();
+                                (
+                                    Some(tracker.summary(
+                                        equity,
+                                        realized,
+                                        gross_exposure,
+                                        max_abs_position,
+                                    )),
+                                    tracker.equity_history(),
+                                )
+                            }
+                            None => (None, Vec::new()),
+                        };
                         let snapshot = SessionSnapshot {
+                            identity: handle.identity(),
+                            evaluation: evaluation_summary,
+                            equity_history,
                             positions: ledger.positions().clone(),
                             balances: ledger.balances().clone(),
                             equity,
@@ -730,7 +767,17 @@ pub async fn run_unified_event_loop(
                     config.risk_free_return,
                 );
                 let equity = ledger.equity(&last_prices)?;
-                overall_tracker.record_equity_point(chrono::Utc::now(), equity);
+                let now = chrono::Utc::now();
+                overall_tracker.record_equity_point(now, equity);
+                if let Some(tracker) = &mut evaluation {
+                    tracker.observe_fills(&all_fills);
+                    tracker.record_equity(
+                        now,
+                        equity,
+                        ledger.positions().values().any(|p| !p.quantity.is_zero()),
+                        holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                    );
+                }
             }
         }
     }
@@ -748,6 +795,52 @@ pub async fn run_unified_event_loop(
         equity_curve: overall_tracker.equity_curve().to_vec(),
         trades: all_fills,
     })
+}
+
+/// True when every non-zero balance is either a quote currency of a traded
+/// instrument or has a last trade price. The ledger values an asset with no
+/// price at 1.0, so until this holds `ledger.equity` is not a real number.
+fn holdings_priced(
+    balances: &HashMap<String, Decimal>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> bool {
+    balances.iter().all(|(asset, balance)| {
+        balance.is_zero()
+            || last_prices.contains_key(asset)
+            || instruments_by_symbol
+                .values()
+                .any(|i| i.quote_currency.as_deref() == Some(asset.as_str()))
+    })
+}
+
+/// Gross exposure (sum of |position value| in quote currency) and the
+/// largest |net position| in base units, for the evaluation view. Prices
+/// use the same base-asset-keyed `last_prices` map equity uses, falling
+/// back to a position's entry price before the first trade print.
+fn exposure_inputs(
+    positions: &HashMap<String, Position>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> (Decimal, Decimal) {
+    let mut gross = Decimal::ZERO;
+    let mut largest = Decimal::ZERO;
+    for position in positions.values() {
+        let quantity = position.quantity.abs();
+        if quantity.is_zero() {
+            continue;
+        }
+        let price = instruments_by_symbol
+            .get(&position.symbol)
+            .and_then(|instrument| instrument.base_currency.as_ref())
+            .and_then(|base| last_prices.get(base).copied())
+            .unwrap_or(position.average_entry_price);
+        gross += quantity * price;
+        if quantity > largest {
+            largest = quantity;
+        }
+    }
+    (gross, largest)
 }
 
 /// Applies a batch of `Fill`s produced by the executor (or the EMS):
@@ -1434,6 +1527,19 @@ mod tests {
         assert_eq!(report.trades[1].side, Side::Sell);
     }
 
+    /// Never trades.
+    struct NoopStrategy;
+
+    impl Strategy for NoopStrategy {
+        fn on_market_event(
+            &mut self,
+            _event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            Vec::new()
+        }
+    }
+
     /// Buys 1 BTC spot on EVERY market event (not just once) -- used to
     /// distinguish "strategy dispatch happened" from "strategy dispatch
     /// was skipped because the session was paused".
@@ -1464,6 +1570,9 @@ mod tests {
 
     fn empty_session_snapshot() -> crate::control::SessionSnapshot {
         crate::control::SessionSnapshot {
+            identity: None,
+            evaluation: None,
+            equity_history: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,
@@ -1521,6 +1630,131 @@ mod tests {
         // point -- proving equity kept recording every tick, paused or
         // not.
         assert_eq!(report.equity_curve.len(), num_events + 1);
+    }
+
+    /// With a control handle, pushed snapshots carry the session identity,
+    /// a running evaluation (equity history, PnL, fills, limit usage), and
+    /// the data the console's timeline and banner need.
+    #[tokio::test]
+    async fn snapshots_carry_identity_evaluation_and_equity_history() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(110), t0 + Duration::seconds(2)),
+            trade_event(dec!(120), t0 + Duration::seconds(3)),
+        ];
+
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let control_handle = control_handle
+            .with_identity(crate::control::SessionIdentity {
+                session_id: "s-1".to_string(),
+                network: Some("testnet".to_string()),
+                mode: "live".to_string(),
+                strategy: "demo.drift".to_string(),
+            })
+            .with_limits(crate::evaluation::LimitSpec {
+                max_position_per_symbol: Some(dec!(1)),
+                max_daily_fills: Some(10),
+            });
+
+        let config = unified_loop_config(dec!(10000), None, HashMap::new());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            ..config
+        };
+        let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
+        assert!(!report.trades.is_empty(), "the strategy must have traded");
+
+        let snapshot = snapshot_rx.borrow().clone();
+        let identity = snapshot
+            .identity
+            .expect("identity stamped on every snapshot");
+        assert_eq!(identity.network.as_deref(), Some("testnet"));
+        assert_eq!(identity.strategy, "demo.drift");
+
+        let evaluation = snapshot.evaluation.expect("evaluation present");
+        assert!(evaluation.trade_count >= 1);
+        assert!(evaluation.turnover > Decimal::ZERO);
+        let names: Vec<_> = evaluation
+            .limit_usage
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect();
+        assert_eq!(names, ["position per symbol", "fills today"]);
+
+        assert!(
+            snapshot.equity_history.len() >= 2,
+            "a timeline needs points"
+        );
+        assert!(
+            snapshot.equity_history.windows(2).all(|w| w[0].0 <= w[1].0),
+            "history is chronological"
+        );
+    }
+
+    /// A live account already holds the base asset (here 1 BTC) before the
+    /// first price arrives. The ledger values unpriced BTC at 1.0, so equity
+    /// starts at ~10001 and would jump to ~110k on the first trade. The
+    /// evaluation must not treat that as a 100k gain: it starts only once
+    /// the holding is priced.
+    #[tokio::test]
+    async fn a_pre_existing_holding_does_not_create_phantom_pnl_in_the_evaluation() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(101), t0 + Duration::seconds(2)),
+            trade_event(dec!(102), t0 + Duration::seconds(3)),
+        ];
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+
+        let mut balances = HashMap::new();
+        balances.insert("USDT".to_string(), dec!(10000));
+        balances.insert("BTC".to_string(), dec!(1));
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            ..unified_loop_config(dec!(10000), None, HashMap::new())
+        };
+        let config = UnifiedLoopConfig {
+            initial_balances: balances,
+            ..config
+        };
+        run(config, zero_cost_model(None), events, NoopStrategy).await;
+
+        let snapshot = snapshot_rx.borrow().clone();
+        let evaluation = snapshot.evaluation.expect("evaluation present");
+        // 10 000 USDT + 1 BTC at the first printed price (100). Valued at the
+        // ledger's 1.0 placeholder it would have been 10 001.
+        assert_eq!(
+            evaluation.start_equity,
+            dec!(10100),
+            "start equity must use BTC's real price, not the 1.0 placeholder"
+        );
+        assert!(
+            evaluation.total_pnl.abs() < dec!(10),
+            "PnL over 100 -> 102 on 1 BTC is about 2, not tens of thousands: {}",
+            evaluation.total_pnl
+        );
+        assert_eq!(evaluation.max_drawdown, dec!(0));
+    }
+
+    /// `control: None` must stay free of evaluation work: no handle, no
+    /// tracker, and the report is unchanged (the existing guard
+    /// `control_none_is_a_true_no_op` covers the config; this covers the
+    /// loop's behaviour).
+    #[tokio::test]
+    async fn without_a_control_handle_the_loop_still_reports_normally() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+        ];
+        let config = unified_loop_config(dec!(10000), None, HashMap::new());
+        let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
+        assert!(!report.equity_curve.is_empty());
     }
 
     /// A strategy that reads a hot-updatable `threshold` param (shared

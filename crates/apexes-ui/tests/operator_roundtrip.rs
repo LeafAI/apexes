@@ -24,6 +24,9 @@ const BOB: &str = "bob-viewer-token-000002";
 
 fn snapshot() -> SessionSnapshot {
     SessionSnapshot {
+        identity: None,
+        evaluation: None,
+        equity_history: Vec::new(),
         positions: HashMap::new(),
         balances: HashMap::from([("USDT".to_string(), dec!(500))]),
         equity: dec!(500),

@@ -81,6 +81,8 @@ enum EngineError {
     ParseLaunchConfig(#[from] serde_json::Error),
     #[error("failed to load strategy: {0}")]
     StrategyLoad(#[from] apexes_strategy_loader::StrategyLoadError),
+    #[error("invalid launch config: {0}")]
+    InvalidLaunchConfig(#[from] apexes_engine::launch_config::LaunchConfigError),
     #[error("failed to resolve live-trading credentials: {0}")]
     Credentials(#[from] credentials::CredentialsError),
     #[error("registry registration failed: {0}")]
@@ -121,6 +123,9 @@ fn build_control_handle(
     tokio::sync::watch::Receiver<apexes_backtest::SessionSnapshot>,
 ) {
     let initial_snapshot = apexes_backtest::SessionSnapshot {
+        identity: None,
+        evaluation: None,
+        equity_history: Vec::new(),
         positions: HashMap::new(),
         balances: HashMap::new(),
         equity: rust_decimal::Decimal::ZERO,
@@ -172,6 +177,58 @@ fn build_control_handle(
 /// NOT delete the PID file on graceful shutdown -- liveness is
 /// determined by the consumer checking whether the recorded PID is
 /// still alive, not by file presence/absence.
+/// Keeps only the balances of assets this session can price and trade: the
+/// base and quote currency of each instrument. Returns them and how many
+/// other assets were dropped.
+///
+/// An account can hold many other assets (a real one, or a testnet account
+/// pre-filled with hundreds). The ledger values an asset it has no price for
+/// at 1.0, so every such balance would be added to equity as if it were one
+/// unit of quote currency, and the session's PnL and drawdown would be
+/// meaningless. Order placement, reconciliation and risk checks are not
+/// affected: they do not read the ledger's view of unrelated assets.
+fn session_balances(
+    balances: HashMap<String, rust_decimal::Decimal>,
+    instruments: &[Instrument],
+) -> (HashMap<String, rust_decimal::Decimal>, usize) {
+    let relevant: std::collections::HashSet<&str> = instruments
+        .iter()
+        .flat_map(|i| [i.base_currency.as_deref(), i.quote_currency.as_deref()])
+        .flatten()
+        .collect();
+    let total = balances.len();
+    let kept: HashMap<_, _> = balances
+        .into_iter()
+        .filter(|(asset, _)| relevant.contains(asset.as_str()))
+        .collect();
+    let ignored = total - kept.len();
+    (kept, ignored)
+}
+
+/// Writes this session's PID file exactly once, when the session is ready.
+#[derive(Clone)]
+struct ReadyMarker {
+    session_id: String,
+    port: u16,
+    written: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReadyMarker {
+    fn new(session_id: &str, port: u16) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            port,
+            written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_ready(&self) {
+        if !self.written.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            write_pid_file(&self.session_id, self.port);
+        }
+    }
+}
+
 fn write_pid_file(session_id: &str, port: u16) {
     let Some(home) = std::env::var_os("HOME") else {
         tracing::error!("apexes-engine: HOME environment variable not set, skipping PID file");
@@ -357,6 +414,7 @@ fn load_launch_config(path: &PathBuf) -> Result<LaunchConfig, EngineError> {
             source,
         })?;
     let launch_config: LaunchConfig = serde_json::from_str(&contents)?;
+    launch_config.validate()?;
     Ok(launch_config)
 }
 
@@ -392,6 +450,9 @@ async fn run_inner(
     let registry = Registry::new();
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
+    let control_handle = control_handle
+        .with_identity(launch_config.identity())
+        .with_limits(launch_config.limit_spec());
 
     // Before binding anything: a live session must not start without
     // authentication and an audit trail on its control endpoint.
@@ -412,7 +473,17 @@ async fn run_inner(
         .local_addr()
         .map_err(EngineError::BindSessionWs)?
         .port();
-    write_pid_file(&launch_config.session_id, bound_port);
+    // The PID file is how a supervisor learns this session is up. Paper and
+    // backtest sessions are up as soon as they listen. A LIVE session is not
+    // up until startup recovery has succeeded: the control port is open
+    // earlier (an operator must always be able to connect and Halt), but the
+    // PID file is only written by `ReadyMarker::mark_ready`, called from
+    // `run_live_mode` once recovery is done. A session that refuses to start
+    // therefore never looks started.
+    let ready = ReadyMarker::new(&launch_config.session_id, bound_port);
+    if !matches!(launch_config.mode, SessionMode::Live { .. }) {
+        ready.mark_ready();
+    }
 
     // The one shared stop channel: `stop_rx` is handed to the mode
     // dispatch below only for `Paper`/`Live` (`Backtest`'s historical
@@ -469,19 +540,25 @@ async fn run_inner(
             run_paper_mode(&launch_config, &registry, strategy, control_handle, stop_rx).await
         }
         SessionMode::Live {
+            network,
+            risk_limits,
             credentials_ref,
             auto_derisk_live,
             reconcile_interval,
             ems_postgres_url,
             stale_data_timeout_secs,
         } => {
+            tracing::info!(%network, "apexes-engine: LIVE session network");
             let live_params = LiveModeParams {
+                network,
+                risk_limits,
                 credentials_ref,
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
                 kill_switch,
                 stale_data_timeout: stale_data_timeout_secs.map(std::time::Duration::from_secs),
+                ready,
             };
             run_live_mode(
                 &launch_config,
@@ -688,6 +765,9 @@ async fn run_paper_mode(
 /// `run_live_mode`'s parameter count under clippy's
 /// `too_many_arguments` threshold -- no behavior beyond that.
 struct LiveModeParams {
+    ready: ReadyMarker,
+    network: apexes_core::binance_network::BinanceNetwork,
+    risk_limits: apexes_engine::LiveRiskLimits,
     credentials_ref: String,
     auto_derisk_live: bool,
     reconcile_interval: std::time::Duration,
@@ -716,6 +796,9 @@ async fn run_live_mode(
     stop_signal: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), EngineError> {
     let LiveModeParams {
+        ready,
+        network,
+        risk_limits,
         credentials_ref,
         auto_derisk_live,
         reconcile_interval,
@@ -724,8 +807,15 @@ async fn run_live_mode(
         stale_data_timeout,
     } = live_params;
 
-    let gateway_config = resolve_binance_credentials(&credentials_ref, |name| std::env::var(name))?;
-    let binance_gateway = apexes_gateway_binance::BinanceExecutionGateway::new(gateway_config);
+    let binance_gateway =
+        resolve_binance_credentials(&credentials_ref, network, |name| std::env::var(name))?;
+
+    // Pre-trade limits are mandatory in live: without a registered checker
+    // the runner would apply no risk checking at all.
+    registry.register::<Arc<apexes_risk::CompositeRiskChecker>, ()>(
+        (),
+        Arc::new(risk_limits.build_checker()),
+    )?;
 
     // `start_user_data_stream` is a method on the CONCRETE
     // `BinanceExecutionGateway` type, not part of the `ExecutionGateway`
@@ -751,6 +841,7 @@ async fn run_live_mode(
         registry,
         &launch_config.gateway_url,
         &launch_config.instruments,
+        Some(network),
     )?;
 
     let order_store = OrderStore::new(&ems_postgres_url).await?;
@@ -783,9 +874,24 @@ async fn run_live_mode(
     )
     .await?;
 
+    // Recovery succeeded: local and exchange state agree and the ledger is
+    // seeded. Only now does this session count as started.
+    ready.mark_ready();
+
+    let (session_balances, ignored_assets) =
+        session_balances(recovered.snapshot.balances, &launch_config.instruments);
+    if ignored_assets > 0 {
+        tracing::info!(
+            ignored_assets,
+            kept = session_balances.len(),
+            "apexes-engine: ledger seeded with the assets this session trades; other account \
+             assets are ignored (they cannot be priced and would distort equity)"
+        );
+    }
+
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
-        initial_balances: recovered.snapshot.balances,
+        initial_balances: session_balances,
         initial_positions: recovered.snapshot.positions,
         cost_model: default_cost_model(),
         margin_tiers: launch_config.margin_tiers.clone(),
@@ -846,9 +952,13 @@ fn register_gateway_bus_for_all_venues(
     registry: &Registry,
     gateway_url: &str,
     instruments: &[Instrument],
+    expected_network: Option<apexes_core::binance_network::BinanceNetwork>,
 ) -> Result<(), EngineError> {
-    let provider = GatewayMarketDataProvider::new(gateway_url.to_string())
+    let mut provider = GatewayMarketDataProvider::new(gateway_url.to_string())
         .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
+    if let Some(network) = expected_network {
+        provider = provider.with_expected_network(network);
+    }
     let bus = Arc::new(MarketEventBus::new(Box::new(provider)));
 
     let mut venues: Vec<Venue> = instruments.iter().map(|i| i.venue).collect();
@@ -962,8 +1072,13 @@ mod tests {
             sample_instrument("ETHUSDT", Venue::Binance),
         ];
 
-        register_gateway_bus_for_all_venues(&registry, "ws://localhost:9001/market", &instruments)
-            .unwrap();
+        register_gateway_bus_for_all_venues(
+            &registry,
+            "ws://localhost:9001/market",
+            &instruments,
+            None,
+        )
+        .unwrap();
 
         let buses = registry.get::<Arc<MarketEventBus>, Venue>();
         assert_eq!(buses.len(), 1);
@@ -1000,5 +1115,41 @@ mod tests {
         ));
         let error = load_launch_config(&missing).unwrap_err();
         assert!(matches!(error, EngineError::ReadLaunchConfig { .. }));
+    }
+
+    #[test]
+    fn only_the_assets_a_session_trades_seed_the_ledger() {
+        let btcusdt = Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("BTC".to_string()),
+            Some("USDT".to_string()),
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap();
+        let balances = HashMap::from([
+            ("USDT".to_string(), dec!(10000)),
+            ("BTC".to_string(), dec!(1)),
+            ("ETH".to_string(), dec!(1)),
+            ("BNB".to_string(), dec!(1)),
+            ("这是测试币".to_string(), dec!(10000)),
+            ("456".to_string(), dec!(10000)),
+        ]);
+        let (kept, ignored) = session_balances(balances, &[btcusdt]);
+        assert_eq!(ignored, 4);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept["USDT"], dec!(10000));
+        assert_eq!(kept["BTC"], dec!(1));
+    }
+
+    #[test]
+    fn a_session_with_no_instruments_keeps_nothing_and_never_panics() {
+        let (kept, ignored) = session_balances(HashMap::from([("USDT".to_string(), dec!(1))]), &[]);
+        assert!(kept.is_empty());
+        assert_eq!(ignored, 1);
     }
 }

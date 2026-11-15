@@ -70,6 +70,31 @@ const DEFAULT_BAN: Duration = Duration::from_secs(60);
 /// Used when a 429 carries no `Retry-After`.
 const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
 
+/// A hostname can resolve to several addresses of which one is dead (the
+/// Binance testnet does this: one of four addresses black-holes connections
+/// and a default client then waits ~30s). The connect timeout is divided
+/// across a host's addresses, so a dead one fails fast and the next is tried.
+/// Requests are signed with a timestamp taken *before* connecting and valid
+/// for `recvWindow` (5s), so waiting out a dead address would also turn into
+/// a `-1021` rejection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Upper bound for a whole request, so a stalled server cannot hang a caller.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                ?error,
+                "could not build the tuned HTTP client; using defaults"
+            );
+            reqwest::Client::new()
+        })
+}
+
 /// Thin wrapper around a `reqwest::Client` plus the config needed to
 /// build and sign Binance requests. `BinanceExecutionGateway` (Task 16)
 /// holds one of these. Besides "build the URL, sign the query string,
@@ -91,7 +116,7 @@ pub struct BinanceRestClient {
 impl BinanceRestClient {
     pub fn new(config: BinanceGatewayConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             config,
             retry: RetryConfig::default(),
             blocked_until: Arc::new(Mutex::new(None)),

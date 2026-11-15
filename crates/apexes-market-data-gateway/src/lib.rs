@@ -36,4 +36,4 @@ pub mod server;
 pub use gateway::Gateway;
 pub use persistence::PersistenceBuffer;
 pub use replay::replay_since;
-pub use server::{build_app, build_app_secured};
+pub use server::{NETWORK_HEADER, build_app, build_app_for_network, build_app_secured};
