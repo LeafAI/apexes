@@ -3,6 +3,55 @@
 Covers running the live engine and market-data gateway under Docker Compose,
 what the safety machinery does, and how to respond when it trips.
 
+## Quick start: a Binance Spot **testnet** session from the GUI
+
+The Spot Test Network is a separate system from your Binance account: its own
+keys, virtual funds, periodic resets. Use it first.
+
+1. **Keys.** Log in at <https://testnet.binance.vision/> with GitHub and
+   generate an HMAC key. Put it where the app can read it as environment
+   variables, never in the launcher or a config file:
+   `APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY` and
+   `APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET` (`binance-main` is the
+   default credentials name; the network is part of the variable name, so
+   testnet and mainnet keys can never be confused).
+2. **Postgres** (order store): `docker compose up -d postgres`.
+3. **Build:** `cargo build --release -p apexes-engine -p apexes-market-data-gateway -p apexes-ui`.
+4. **Run:** `target/release/apexes-operator`. The launcher defaults to Testnet and
+   conservative limits. Pick the symbols and strategy (`deploy/strategy.example.drift`
+   is a trivial demo, not a recommendation), press **Launch on TESTNET**, then
+   **Open console**.
+
+The launcher starts a market-data gateway and an engine as **detached
+processes**: closing the window never stops a session, and reopening the app
+finds running sessions again. A launch only counts as started once the engine
+has passed startup recovery; if it refuses, the launcher shows its log.
+Everything the app starts is logged under `~/.apexes/` (`*.log`, mode 0600),
+alongside a per-session control token it generates itself.
+
+**Mainnet** is the same flow with the Network switched and the word `MAINNET`
+typed to confirm. It trades real funds; do not use it until a testnet run has
+behaved the way you expect.
+
+### Binance changed its user-data API (2026-02-20)
+
+The old listenKey user-data stream is gone (`POST /api/v3/userDataStream`
+answers **HTTP 410**). Spot order updates now come from the WebSocket API's
+`userDataStream.subscribe.signature`, which this system uses (HMAC keys work;
+no Ed25519 is needed). If a session dies at startup with
+`user-data subscription rejected`, the message carries Binance's own error
+code (`-2015`: key, IP restriction or permissions; `-1021`: your clock is off).
+
+### Network gotcha: a dead address in the testnet's DNS
+
+`testnet.binance.vision` resolves to several addresses, and at the time of
+writing one of them accepts no connections. A client that waits for it stalls
+about 30 s per request, which turns signed requests into `-1021` (outside
+`recvWindow`) rejections. The Binance client here connects with a 4 s
+timeout per address so it moves on to a working one. If testnet requests are
+slow or failing with `-1021`, test `curl -w '%{time_connect}' https://testnet.binance.vision/api/v3/ping`
+a few times first.
+
 ## Deploy
 
 ```sh
@@ -14,8 +63,9 @@ cp my-strategy.drift deploy/strategy.drift
 export APEXES_CONTROL_TOKENS="alice:operator:$(openssl rand -hex 24),bob:viewer:$(openssl rand -hex 24)"
 # export APEXES_CONTROL_TOKEN=$(openssl rand -hex 32)             # legacy single shared operator token
 export APEXES_GATEWAY_TOKEN=$(openssl rand -hex 32)               # recommended
-export APEXES_CRED_BINANCE_MAIN_API_KEY=...                       # credentials_ref "binance-main"
-export APEXES_CRED_BINANCE_MAIN_API_SECRET=...
+export APEXES_NETWORK=testnet                                     # testnet | mainnet; gateway AND engine must agree
+export APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY=...               # credentials_ref "binance-main", per network
+export APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET=...
 
 docker compose up -d                       # postgres, clickhouse, market-data-gateway
 docker compose --profile live up -d engine # the live engine
@@ -34,7 +84,8 @@ built in yet).
 | `APEXES_AUDIT_LOG` | engine | Append-only JSONL audit trail (default `~/.apexes/audit-<session>.jsonl`). **Live sessions refuse to start if it cannot be opened.** |
 | `APEXES_ENGINE_BIND` | engine | Listen address (default `127.0.0.1:0`; the image sets `0.0.0.0:9100`). |
 | `APEXES_GATEWAY_TOKEN` | gateway, engine | Bearer token for the gateway's `/market`; the engine sends it. |
-| `APEXES_CRED_<REF>_API_KEY/_SECRET` | engine | Exchange credentials for `credentials_ref`. |
+| `APEXES_NETWORK` | compose | `testnet` or `mainnet`: passed to the gateway as `--network`. Must equal the launch config's `network`. Required (no default). |
+| `APEXES_CRED_<REF>_<NETWORK>_API_KEY/_SECRET` | engine | Exchange credentials for `credentials_ref` on that network, e.g. `APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY`. The network is part of the name; the old un-suffixed names are no longer read. Testnet keys come from `https://testnet.binance.vision/` (GitHub login), not from your Binance account. |
 | `RUST_LOG`, `APEXES_LOG_FORMAT=json` | all | Log filter / JSON lines. |
 
 ## What happens at startup (live)
@@ -126,8 +177,22 @@ What it does and does not let you do:
   immediately. "Waiting for the first snapshot" means the engine has not
   pushed a real one yet (it never shows a fake all-zero account).
 
+The window has a **Launcher** tab (start, find, stop sessions) and a **Console**
+tab (this section). The console always opens with a banner from the *engine's
+own* report: `TESTNET (virtual funds)`, `MAINNET - REAL FUNDS`, or
+`ENVIRONMENT UNKNOWN` if the engine says nothing (never assume testnet). Below
+the controls is an **Evaluation** view: an equity timeline with its running
+peak, PnL, drawdown, exposure, fees, trades, time in market, and how close each
+risk limit is to being hit (amber from 70 %, red from 90 %). Live sessions
+carry pre-trade risk limits (order size/notional, position size, trades per
+day) that are required in the launch config; an engine will not start without
+them.
+
+`apexes-operator --engine ws://...` still opens just the console, for an engine
+started elsewhere.
+
 Not in the console yet: placing or cancelling individual orders, editing risk
-limits, launching sessions, and watching several sessions at once.
+limits, and watching several sessions at once.
 
 ## Monitoring
 

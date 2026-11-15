@@ -53,7 +53,7 @@ Apexes is a Cargo workspace. At runtime it is a small set of cooperating OS proc
               when market-data connectivity is what is broken.
 ```
 
-> **Target vs. today:** the design has `apexes-ui` spawn and supervise the gateway and engines (session launcher, automatic respawn). That supervisor is **not built yet** (see [`docs/PLAN.md`](docs/PLAN.md)). Today the gateway and engines are started by hand or by Docker Compose.
+> **Launching:** `apexes-operator` starts the gateway and an engine itself (as detached processes, so closing the window never stops a session) and finds running sessions again on the next start. Automatic respawn after repeated failure is deliberately not built: a dead live engine needs a human to look at why. Docker Compose is the alternative for a server deployment.
 
 - **`apexes-market-data-gateway`** holds the single real exchange connection, fans events out to subscribers, persists them via `apexes-storage`, and can replay history.
 - **`apexes-engine`** runs one trading session. It reads its own credentials, can pin its threads to CPU cores, and exposes a `/session/ws` endpoint streaming throttled state snapshots and accepting control commands.
@@ -83,7 +83,7 @@ Strategies are written either as Rust types implementing the `Strategy` trait or
 
 ## Status
 
-[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (70 rows; currently 42 done, 13 in progress, 14 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
+[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (70 rows; currently 42 done, 16 in progress, 11 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
 
 **Implemented**
 - Binance Spot market data, ClickHouse historical storage, tick-level backtesting with matching simulation and cost models.
@@ -94,7 +94,7 @@ Strategies are written either as Rust types implementing the `Strategy` trait or
 - Live-trading safety and operations groundwork: a kill switch with cancel-all and flatten, a stale-market-data watchdog, startup recovery from exchange state, crash-safe order persistence, authenticated and audited control endpoints, Prometheus metrics with alert rules and a Grafana dashboard, container images, CI, and an operations runbook ([`docs/RUNBOOK.md`](docs/RUNBOOK.md)). Several of these map to `FEATURES.md` rows 10.x and 11.x that are still marked Not Started, so the table lags the code here.
 
 **In progress**
-- Strategy monitoring, live tuning and risk controls (rows 9.3 and 9.4): the `apexes-operator` console MVP exists. The session launcher and the process supervisor from the #13c design do not (see `PLAN.md`).
+- Binance Spot **testnet** trading from the GUI (rows 9.3, 9.4): built, and verified end to end against the real Spot Test Network (launch, authenticated console, halt, stop), but not yet exercised by a human clicking through the window, with a real strategy-driven trade, or through a testnet reset. See [`docs/PLAN.md`](docs/PLAN.md) for exactly what is and is not verified. **Mainnet has never been run.**
 - A-share, H-share, US-equity and DEX market data and gateways — scaffolded, with explicit scope limits recorded in `FEATURES.md`.
 
 **Not started**
@@ -123,15 +123,19 @@ cargo test --workspace
 
 Tests that need external services are marked `#[ignore]`. Most need the databases from `docker-compose.yml`; the Binance gateway's live tests also need exchange testnet access. Run them explicitly with `cargo test -p <crate> -- --ignored`.
 
-`apexes-engine`, `apexes-market-data-gateway`, `apexes-ui` and `apexes-operator` are separate binaries (`cargo run -p <crate>`). There is no supervisor yet, so start them yourself or use Docker Compose:
+**Run a testnet session** (shortest path: `scripts/run-testnet.sh`, see [`USAGE.md`](USAGE.md)) (the Spot Test Network has virtual funds and its own keys from <https://testnet.binance.vision/>; full steps in [`docs/RUNBOOK.md`](docs/RUNBOOK.md)):
 
 ```sh
-docker compose up -d                        # postgres, clickhouse, market-data-gateway
-docker compose --profile live up -d engine  # live engine (needs credentials and control tokens)
-APEXES_CONTROL_TOKEN=<token> cargo run -p apexes-ui --bin apexes-operator -- --engine ws://127.0.0.1:9100/session/ws
+docker compose up -d postgres
+export APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY=...      # never typed into the app
+export APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET=...
+cargo build --release -p apexes-engine -p apexes-market-data-gateway -p apexes-ui
+target/release/apexes-operator                           # launcher + console
 ```
 
-An engine takes `--launch-config <path>` (see [`deploy/launch-config.example.json`](deploy/launch-config.example.json)). Live trading reads exchange credentials from `APEXES_CRED_<REF>_API_KEY` and `APEXES_CRED_<REF>_API_SECRET`, and requires control tokens (`APEXES_CONTROL_TOKENS` or `APEXES_CONTROL_TOKEN`). Deployment, the kill switch, monitoring and the audit log are covered in [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Never commit credentials.
+`apexes-operator --engine ws://host:port/session/ws` opens just the console for an engine started elsewhere. For a server deployment use Docker Compose (`APEXES_NETWORK=testnet docker compose --profile live up -d`) with an engine launch config such as [`deploy/launch-config.example.json`](deploy/launch-config.example.json).
+
+Live sessions **require** a `network` (`testnet`/`mainnet`, no default) and pre-trade `risk_limits` in the launch config, read credentials from `APEXES_CRED_<REF>_<NETWORK>_API_KEY` / `_API_SECRET`, and require control tokens (`APEXES_CONTROL_TOKENS` or `APEXES_CONTROL_TOKEN`; the launcher generates its own). Never commit credentials. Binance retired its old listenKey user-data stream in February 2026; this system uses the WebSocket-API subscription, which works with HMAC keys.
 
 ---
 

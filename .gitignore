@@ -13,3 +13,7 @@
 
 # Local deployment config (copied from deploy/*.example.json)
 /deploy/launch-config.json
+
+# Python bytecode
+__pycache__/
+*.pyc
