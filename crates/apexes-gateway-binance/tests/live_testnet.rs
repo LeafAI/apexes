@@ -115,10 +115,24 @@ async fn submit_and_cancel_a_limit_order_far_from_market_price_on_spot_testnet()
     let mut order_with_id = order.clone();
     order_with_id.exchange_order_id = Some(exchange_order_id.clone());
 
-    let status = gateway.query_order_status(&order_with_id).await.unwrap();
-    assert_eq!(status, Some(OrderStatus::New));
-
+    // The testnet's order lookup can lag a moment behind placement (it
+    // sometimes answers "Order does not exist" for an order it just
+    // accepted), so poll briefly. Production reconcile treats that answer as
+    // "log and retry", never as an order that is gone.
+    let mut status = Ok(None);
+    for _ in 0..10 {
+        status = gateway.query_order_status(&order_with_id).await;
+        if matches!(status, Ok(Some(_))) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Cancel on every path, including a failed assertion below: a resting
+    // order left on the shared testnet account makes the next live engine
+    // refuse to start ("exchange has open orders with no local record").
     let cancel_outcome = gateway.cancel_order(&order_with_id).await;
+    println!("exchange_order_id={exchange_order_id} status={status:?} cancel={cancel_outcome:?}");
+    assert_eq!(status.unwrap(), Some(OrderStatus::New));
     assert!(matches!(cancel_outcome, GatewayOutcome::Accepted { .. }));
 }
 

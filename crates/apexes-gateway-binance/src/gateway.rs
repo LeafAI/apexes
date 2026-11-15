@@ -598,6 +598,27 @@ struct WithdrawHistoryEntry {
 
 /// Binance's definitive "no such order" answer (`-2013`), returned with
 /// HTTP 400.
+/// Most decimal places Binance accepts in a quantity or price field.
+const MAX_WIRE_DECIMALS: u32 = 8;
+
+/// `value` as Binance wants it on the wire: plain decimal notation, no
+/// exponent, trailing zeros trimmed, at most [`MAX_WIRE_DECIMALS`] places.
+///
+/// Rounds to that precision, and refuses a value that is zero (or negative)
+/// once rounded, because an order for "nothing" is a strategy bug the
+/// exchange would reject anyway, with a worse message. The exchange's own
+/// LOT_SIZE and PRICE_FILTER still decide whether the rounded value is valid
+/// for the symbol.
+fn wire_decimal(value: Decimal) -> Result<String, String> {
+    let rounded = value.round_dp(MAX_WIRE_DECIMALS).normalize();
+    if rounded <= Decimal::ZERO {
+        return Err(format!(
+            "rounds to {rounded} at {MAX_WIRE_DECIMALS} decimal places; the order is too small to send"
+        ));
+    }
+    Ok(rounded.to_string())
+}
+
 fn is_order_does_not_exist(body: &str) -> bool {
     serde_json::from_str::<BinanceApiError>(body).is_ok_and(|e| e.code == -2013)
 }
@@ -682,11 +703,31 @@ impl ExecutionGateway for BinanceExecutionGateway {
             (ApiFamily::Futures, apexes_core::OrderType::StopLimit) => "STOP",
         };
 
+        // Binance accepts at most 20 decimal places and refuses anything else
+        // with a -1100 "Illegal characters" error. A quantity or price that
+        // went through floating point can carry dozens of digits of residue,
+        // so send them as plain, bounded decimals.
+        let quantity = match wire_decimal(order.quantity) {
+            Ok(quantity) => quantity,
+            Err(reason) => {
+                return GatewayOutcome::Rejected {
+                    reason: format!("invalid order quantity {}: {reason}", order.quantity),
+                };
+            }
+        };
         let mut params = format!(
-            "symbol={}&side={side}&type={order_type}&quantity={}&newClientOrderId={}",
-            order.symbol, order.quantity, order.id.0
+            "symbol={}&side={side}&type={order_type}&quantity={quantity}&newClientOrderId={}",
+            order.symbol, order.id.0
         );
         if let Some(price) = order.price {
+            let price = match wire_decimal(price) {
+                Ok(price) => price,
+                Err(reason) => {
+                    return GatewayOutcome::Rejected {
+                        reason: format!("invalid order price {price}: {reason}"),
+                    };
+                }
+            };
             params.push_str(&format!("&price={price}"));
             let needs_time_in_force = matches!(
                 (family, order.order_type),
@@ -879,5 +920,32 @@ impl ExecutionGateway for BinanceExecutionGateway {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod wire_decimal_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn wire_decimals_are_short_plain_and_never_zero() {
+        assert_eq!(wire_decimal(dec!(0.0066)).unwrap(), "0.0066");
+        assert_eq!(wire_decimal(dec!(1.50000)).unwrap(), "1.5");
+        assert_eq!(wire_decimal(dec!(65447.01)).unwrap(), "65447.01");
+        assert_eq!(wire_decimal(dec!(100)).unwrap(), "100");
+        // The exact residue that the real testnet rejected with -1100.
+        let residue: Decimal = "0.000000000000000001734723476".parse().unwrap();
+        assert!(
+            wire_decimal(residue).is_err(),
+            "rounds to nothing: refuse, do not send"
+        );
+        // Long fractions are cut to what the exchange takes, in plain notation.
+        let long: Decimal = "0.0109000000000000000000000001".parse().unwrap();
+        let text = wire_decimal(long).unwrap();
+        assert_eq!(text, "0.0109");
+        assert!(!text.contains('e') && !text.contains('E'));
+        assert!(wire_decimal(dec!(0)).is_err());
+        assert!(wire_decimal(dec!(-1)).is_err());
     }
 }

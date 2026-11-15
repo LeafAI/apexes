@@ -10,11 +10,20 @@
 // on_market_event on purpose: a top-level param() is read once at load and
 // would not change when you edit it.
 //
-//   quantity  base units to hold when "long" (keep it below the
-//             max_order_quantity / max_position_per_symbol in the launch
-//             config's risk_limits, or orders are rejected)
+//   notional  value to hold when "long", in the quote currency (USDT). The
+//             base quantity is derived from the latest price, so the same
+//             strategy works for BTC and ETH. Keep it above the exchange's
+//             minimum order value (5 USDT on the Binance Spot testnet) or
+//             every order is rejected with a NOTIONAL filter failure.
+//   step      the smallest quantity increment the exchange accepts, in base
+//             units. 0.0001 is valid for both BTCUSDT and ETHUSDT. Quantities
+//             that are not a multiple of it fail the exchange's LOT_SIZE
+//             filter.
 //   enabled   1 = trade, 0 = stay flat (use this to stop trading without
 //             stopping the session)
+//
+// The launch config's risk limits are in BASE units of each symbol, so they
+// must be at least notional / price (see USAGE.md).
 
 let sma = indicators.sma(20);
 
@@ -24,12 +33,19 @@ function on_market_event(event, ctx) {
     return [];
   }
 
-  let quantity = param("quantity", 0.001);
+  let notional = param("notional", 20);
+  let step = param("step", 0.0001);
   let enabled = param("enabled", 1);
 
   let average = sma.update(event.price);
   if (average == null) {
     // Still warming up: not enough trades to form an average yet.
+    return [];
+  }
+
+  // Whole multiples of `step`, rounded down, so the order is always valid.
+  let target = math.floor(notional / event.price / step) * step;
+  if (target <= 0) {
     return [];
   }
 
@@ -43,25 +59,28 @@ function on_market_event(event, ctx) {
 
   let want_long = enabled > 0 && event.price > average;
 
-  if (want_long && held < quantity) {
+  // Work in whole `step`s so floating-point residue (target - held can leave
+  // something like 1e-18 when they are equal) is never sent as an order.
+  let missing = math.floor((target - held) / step + 0.5) * step;
+  if (want_long && missing >= step) {
     return [{
       symbol: event.symbol,
       venue: event.venue,
       asset_class: "spot",
       side: "buy",
       order_type: "market",
-      quantity: quantity - held,
+      quantity: missing,
     }];
   }
 
-  if (!want_long && held > 0) {
+  if (!want_long && held >= step) {
     return [{
       symbol: event.symbol,
       venue: event.venue,
       asset_class: "spot",
       side: "sell",
       order_type: "market",
-      quantity: held,
+      quantity: math.floor(held / step + 0.5) * step,
     }];
   }
 
