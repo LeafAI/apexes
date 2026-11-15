@@ -24,7 +24,7 @@ scripts/run-testnet.sh           # starts Postgres if needed, builds if needed, 
 
 The app has two tabs. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first). When the status turns green, press **Open console**.
 
-You should see a blue banner `TESTNET (virtual funds)`, equity around 75 000 (10 000 USDT + 1 BTC at testnet prices), and the strategy's two parameters `quantity` and `enabled`.
+You should see a blue banner `TESTNET (virtual funds)`, equity of roughly 10 000 USDT plus the value of the base asset you trade (about 12 000 for ETHUSDT, about 75 000 for BTCUSDT), and the strategy's three parameters `notional`, `step` and `enabled`.
 
 ## 3. What to test
 
@@ -32,17 +32,17 @@ You should see a blue banner `TESTNET (virtual funds)`, equity around 75 000 (10
 |---|---|---|
 | Banner | Look at the top of the console | Blue `TESTNET (virtual funds)`, never red or `UNKNOWN` |
 | Evaluation | Wait a minute | Equity line draws; PnL near 0; fees `-` until a trade |
-| Strategy trades | Wait ~2 min (it needs 20 trades to warm up) | A BUY of 0.001 BTC appears under positions / open orders, then fills (testnet is liquid) |
-| Live tuning | Change `quantity` to `0.002`, press **Set** | The table shows the new value; the next order uses it |
+| Strategy trades | Wait 1-3 min (it needs 20 trades to warm up) | A BUY worth about 20 USDT (for example 0.011 ETH) appears and fills; `Trades` and `Turnover` in the evaluation move |
+| Live tuning | Change `notional` to `40`, press **Set** | The table shows the new value; the position grows to about 40 USDT |
 | Switch off | Set `enabled` to `0` | It sells down what it holds and stops buying |
 | Pause / Resume | Use the buttons | Banner says `STRATEGY PAUSED`; equity keeps updating |
 | Halt | **HALT TRADING** (one click) | Red `TRADING HALTED` banner; open orders cancelled; no new orders |
 | Resume | **Resume trading** | Needs a second confirming click |
 | Survives the window | Close the app, run the script again | The session is still in the Launcher list as `running`; **Open console** reconnects |
 | Stop | **Stop** then **Yes, stop** | Session goes `stopped`; **Remove files** cleans it up |
-| Risk limits | In the launcher set `Max order quantity` below `quantity`, relaunch | Orders are rejected (look for `order rejected by risk checker` in the log) |
+| Risk limits | In the launcher set `Max position per symbol` to a very small value (for example `0.001`), relaunch | Orders are blocked (look for `order rejected by risk checker` in the log) |
 
-The risk limits default to small values (order ≤ 300 USDT / 0.002 BTC, position ≤ 0.005 BTC, 50 trades a day). The demo strategy buys 0.001 BTC.
+The risk limits default to: order value ≤ 100 USDT, order and position size ≤ 1 base unit, 50 orders a day. The demo strategy holds about 20 USDT worth of the symbol (sized by value, so one setting works for BTC and ETH; Binance refuses orders worth less than 5 USDT). Only orders the exchange accepts count against the daily cap.
 
 ## 4. Where things are
 
@@ -52,7 +52,7 @@ The risk limits default to small values (order ≤ 300 USDT / 0.002 BTC, positio
 | Gateway log | `~/.apexes/market-data-gateway-testnet.log` |
 | Audit log (commands, logins) | `~/.apexes/sessions/<id>.audit.jsonl` |
 | Per-session control token | `~/.apexes/sessions/<id>.token` (mode 600; generated for you) |
-| Orders in Postgres | `docker exec apexes-postgres psql -U apexes -d apexes -c "select id,symbol,status from orders order by created_at desc limit 10;"` |
+| Orders in Postgres | `docker exec apexes-postgres psql -U apexes -d apexes_live -c "select id,symbol,status from orders order by created_at desc limit 10;"` (live sessions use `apexes_live`; the test suites use and wipe `apexes`) |
 
 Metrics and health are on the engine's port (shown in the launcher): `/healthz`, `/readyz`, `/metrics` (the latter needs the token).
 
@@ -70,7 +70,8 @@ Metrics and health are on the engine's port (shown in the launcher): `/healthz`,
 | `user-data subscription rejected ... -2015` | Wrong/expired testnet key, or a key from your real Binance account |
 | `... -1021` / requests very slow | Clock off by more than ~5 s, or the testnet's dead DNS address (see `docs/RUNBOOK.md`); the script prints your offset |
 | Launch fails with `live startup recovery failed` | Open orders on the account that this system didn't place (cancel them), or Postgres down |
-| Reconcile warnings `-1100` in the log | A stale order row in your local Postgres from an earlier test: harmless noise |
+| Reconcile warnings `-1100` in the log | An order row in the database with a non-Binance id. Live sessions use their own database (`apexes_live`) so test runs cannot cause this; if you see it, remove the row |
+| `market data stale ... halted` | No market data for 90 s on testnet (30 s on mainnet). Check the gateway log; resume with **Resume trading** once data flows |
 | Everything vanished | The testnet resets periodically: balances and orders are wiped; relaunch |
 
 ## 7. What has and has not been verified

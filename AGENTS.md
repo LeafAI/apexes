@@ -62,6 +62,11 @@ These are load-bearing. A change that violates one needs a design discussion fir
 14. **A live session is started only after startup recovery.** The engine writes its PID file (the supervisor's "started" signal) after recovery succeeds; its control port opens earlier so an operator can always Halt. Do not move the PID file earlier.
 15. **Test against the real service before trusting mocks.** Binance's listenKey stream was removed (HTTP 410) and every mock-based test still passed; only running the real engine against the testnet showed it. Mocks pin behaviour you already know; for an exchange integration, also run the `#[ignore]`d live tests (testnet keys in `~/.apexes/binance.yaml` or the `APEXES_*` variables) and `scripts/smoke_binance_testnet_*.py` after any change to that code.
 
+16. **Risk checks are questions, not events.** `PreTradeCheck::check` must not change state (the loop and `OrderManager` both ask about the same order); stateful limits advance only in `on_order_accepted`, called once by the unified loop after an order is accepted. Counting inside `check` made each order count twice and let rejected orders exhaust the daily cap.
+17. **Never hold the `OrderManager` lock across a network call in a future that is only polled on the trading loop's turn.** It deadlocked the live engine (no events processed, false stale-data halt). Run such work as its own task (`run_detached`), and keep `open_orders()` non-blocking. `a_slow_exchange_query_must_not_stall_market_events...` guards it.
+18. **Test suites and live sessions use different databases.** Tests TRUNCATE `apexes`; the launcher uses `apexes_live`. Live tests must cancel what they place on the shared testnet account (a stray resting order makes the next engine refuse to start).
+19. **Quantities and prices go to Binance through `wire_decimal`** (plain, at most 8 places, never zero). A float-derived value can carry 20+ digits and is refused with `-1100`.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.
