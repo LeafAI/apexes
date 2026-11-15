@@ -1,0 +1,10 @@
+[package]
+name = "apexes-telemetry"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+prometheus = { version = "0.14", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

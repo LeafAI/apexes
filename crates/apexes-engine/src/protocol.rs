@@ -35,6 +35,28 @@ use serde::{Deserialize, Serialize};
 pub enum SessionMessage {
     Snapshot(SessionSnapshot),
     Command(SessionCommand),
+    /// Engine -> client: who you are, what you may do, and the engine's
+    /// halt state. Sent on connect and whenever it changes.
+    Status(EngineStatus),
+    /// Engine -> client: a command was refused (e.g. a viewer sent one).
+    Error {
+        message: String,
+    },
+}
+
+/// Connection-level state the trading loop's `SessionSnapshot` does not
+/// carry (the kill switch lives outside the event loop on purpose).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct EngineStatus {
+    /// Authenticated name of THIS connection (`unauthenticated` when the
+    /// engine runs without tokens).
+    pub actor: String,
+    /// `"operator"` may send commands; `"viewer"` is read-only.
+    pub role: String,
+    pub halted: bool,
+    pub halt_reason: Option<String>,
+    /// A halt asked for positions to be closed.
+    pub flatten_requested: bool,
 }
 
 #[cfg(test)]
@@ -54,6 +76,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }
@@ -67,7 +90,7 @@ mod tests {
         let deserialized: SessionMessage = serde_json::from_str(&json).unwrap();
         match deserialized {
             SessionMessage::Snapshot(snapshot) => assert_eq!(snapshot.equity, Decimal::ZERO),
-            SessionMessage::Command(_) => panic!("expected Snapshot"),
+            other => panic!("expected Snapshot, got {other:?}"),
         }
     }
 
@@ -88,5 +111,29 @@ mod tests {
             }
             _ => panic!("expected Command(SetParam)"),
         }
+    }
+
+    #[test]
+    fn status_and_error_frames_have_stable_wire_shapes() {
+        let status = SessionMessage::Status(EngineStatus {
+            actor: "alice".to_string(),
+            role: "operator".to_string(),
+            halted: true,
+            halt_reason: Some("why".to_string()),
+            flatten_requested: false,
+        });
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"type\":\"Status\""), "{json}");
+        assert!(json.contains("\"actor\":\"alice\"") && json.contains("\"halted\":true"));
+        let back: SessionMessage = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, SessionMessage::Status(s) if s.halt_reason.as_deref() == Some("why"))
+        );
+
+        let error = r#"{"type":"Error","message":"nope"}"#;
+        assert!(matches!(
+            serde_json::from_str::<SessionMessage>(error).unwrap(),
+            SessionMessage::Error { message } if message == "nope"
+        ));
     }
 }

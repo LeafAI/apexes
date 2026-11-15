@@ -42,7 +42,7 @@ use apexes_ems::Ems;
 use apexes_risk::{CompositeRiskChecker, MarketConditionEventMonitor, PreTradeCheck};
 use apexes_strategy::{
     LiquidationPolicy, LiquidationReason, OrderExecutor, ParentOrderId, ParentOrderStatus,
-    Strategy, StrategyContext, SupplementalFillSource,
+    Position, Strategy, StrategyContext, SupplementalFillSource,
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
@@ -72,6 +72,9 @@ use std::sync::Arc;
 pub struct UnifiedLoopConfig {
     pub instruments: Vec<Instrument>,
     pub initial_balances: HashMap<String, Decimal>,
+    /// Pre-existing positions to seed the ledger with (live startup
+    /// recovery from the exchange). Empty for backtest/paper.
+    pub initial_positions: HashMap<String, Position>,
     /// Funding rate (in basis points) for open leveraged positions;
     /// `None` disables funding settlement entirely.
     ///
@@ -164,7 +167,8 @@ pub async fn run_unified_event_loop(
         .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
         .collect();
 
-    let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances);
+    let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances)
+        .with_positions(config.initial_positions);
     // A minimal, zero-fee `CostModel` existing solely to carry
     // `funding_rate_bps` into `PortfolioLedger::apply_funding_payments`
     // -- see `UnifiedLoopConfig::funding_rate_bps` for why the real
@@ -667,6 +671,13 @@ pub async fn run_unified_event_loop(
                     // thrown away by `maybe_push_snapshot`'s own
                     // (redundant, but harmless) throttle check.
                     if handle.is_snapshot_due() {
+                        let mut open_orders: Vec<crate::control::OpenOrderView> = executor
+                            .open_orders()
+                            .await
+                            .values()
+                            .map(crate::control::OpenOrderView::from)
+                            .collect();
+                        open_orders.sort_by_key(|o| o.created_at);
                         let snapshot = SessionSnapshot {
                             positions: ledger.positions().clone(),
                             balances: ledger.balances().clone(),
@@ -675,6 +686,7 @@ pub async fn run_unified_event_loop(
                             margin_status: margin_status.clone(),
                             params: strategy.current_params(),
                             paused: handle.is_paused(),
+                            open_orders,
                             timestamp,
                         };
                         handle.maybe_push_snapshot(snapshot);
@@ -1078,6 +1090,7 @@ mod tests {
         UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
@@ -1345,6 +1358,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps: None,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
@@ -1388,6 +1402,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             instruments: vec![btcusdt_perpetual_instrument()],
             initial_balances,
+            initial_positions: HashMap::new(),
             funding_rate_bps: None,
             risk_free_return: Decimal::ZERO,
             risk_checker: None,
@@ -1456,6 +1471,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

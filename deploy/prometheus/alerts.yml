@@ -1,0 +1,95 @@
+# Alert rules for the Apexes engine. Load with `rule_files:` in prometheus.yml
+# and scrape the engine with its bearer token:
+#
+#   scrape_configs:
+#     - job_name: apexes-engine
+#       authorization: { credentials: <APEXES_CONTROL_TOKEN> }
+#       static_configs: [{ targets: ["engine:9100"] }]
+#
+# Thresholds mirror docs/RUNBOOK.md; tune to your venue and strategy.
+groups:
+  - name: apexes-engine
+    rules:
+      - alert: ApexesKillSwitchEngaged
+        expr: apexes_kill_switch_engaged == 1
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Apexes kill switch engaged: no new orders, orders cancelled"
+          description: "Check the engine log/audit for the reason, then send ResumeTrading once understood."
+
+      - alert: ApexesPositionsLeftOpenAfterFlatten
+        expr: apexes_unflattened_positions > 0 and apexes_kill_switch_engaged == 1
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Flatten left positions open"
+          description: "Close the remaining positions manually; see 'flatten INCOMPLETE' in the engine log."
+
+      - alert: ApexesUserStreamDown
+        expr: apexes_stream_connected == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Exchange user-data stream ({{ $labels.family }}) disconnected"
+          description: "Fills arrive via polling only until it reconnects."
+
+      - alert: ApexesStreamReconnectStorm
+        expr: rate(apexes_stream_reconnects_total[10m]) * 600 > 3
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "User-data stream ({{ $labels.family }}) reconnecting repeatedly"
+
+      - alert: ApexesMarketDataStale
+        expr: apexes_market_data_idle_seconds > 15
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "No market data for {{ $value | humanizeDuration }}"
+          description: "The stale-data watchdog halts trading at stale_data_timeout_secs."
+
+      - alert: ApexesReconcileFoundMissedState
+        expr: increase(apexes_reconcile_changes_total[1h]) > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "Reconcile corrected order state the push stream missed"
+          description: "Expected after a reconnect; investigate if frequent."
+
+      - alert: ApexesReconcileFailing
+        expr: increase(apexes_reconcile_runs_total{result="error"}[10m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Order reconcile is failing"
+          description: "Local order state may be diverging from the exchange."
+
+      - alert: ApexesOrdersRejectedOrUncertain
+        expr: sum(rate(apexes_orders_submitted_total{result=~"rejected|uncertain"}[10m])) * 600 > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "Orders rejected or with unknown outcome in the last 10 minutes"
+
+      - alert: ApexesExchangeRateLimited
+        expr: increase(apexes_rest_rate_limited_total[10m]) > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "Exchange rate limiting (429/418) hit"
+          description: "Requests are being held back; order calls fail fast while gated."
+
+      - alert: ApexesOrderLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(apexes_order_submit_latency_seconds_bucket[10m])) by (le)) > 1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "p99 order submit latency above 1s"
+
+      - alert: ApexesEngineDown
+        expr: up{job="apexes-engine"} == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Apexes engine is not being scraped (down or auth failing)"

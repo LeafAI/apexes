@@ -1,5 +1,8 @@
 pub mod app_state;
 pub mod chart_state;
 pub mod client;
+pub mod operator;
+pub mod operator_client;
+pub mod operator_view;
 pub mod server;
 pub mod ui;

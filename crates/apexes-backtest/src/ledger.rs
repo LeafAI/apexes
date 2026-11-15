@@ -38,6 +38,14 @@ impl PortfolioLedger {
         }
     }
 
+    /// Seeds pre-existing positions (e.g. recovered from the exchange at
+    /// live startup). Balances are NOT adjusted: callers pass balances
+    /// that already reflect these positions.
+    pub fn with_positions(mut self, positions: HashMap<String, Position>) -> Self {
+        self.positions = positions;
+        self
+    }
+
     pub fn balances(&self) -> &HashMap<String, Decimal> {
         &self.balances
     }
@@ -846,6 +854,29 @@ mod tests {
         let mut initial_balances = HashMap::new();
         initial_balances.insert("USDT".to_string(), dec!(10000));
         PortfolioLedger::new(instruments, initial_balances)
+    }
+
+    #[test]
+    fn seeded_position_is_reduced_by_a_subsequent_sell() {
+        let seeded = Position {
+            symbol: "BTCUSDT".to_string(),
+            quantity: dec!(0.5),
+            average_entry_price: dec!(60000),
+            leverage: None,
+            margin_mode: None,
+            allocated_margin: Decimal::ZERO,
+        };
+        let mut ledger =
+            ledger_with_10k_usdt().with_positions(HashMap::from([("BTCUSDT".to_string(), seeded)]));
+        ledger.credit("BTC", dec!(0.5)); // balances reflect the seeded position
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(65000), dec!(0.2), dec!(0)))
+            .unwrap();
+
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.3));
+        assert_eq!(ledger.realized_pnl()["BTCUSDT"], dec!(1000));
     }
 
     #[test]

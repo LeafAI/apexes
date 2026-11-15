@@ -1,0 +1,37 @@
+{
+  "session_id": "live-1",
+  "mode": {
+    "Live": {
+      "credentials_ref": "binance-main",
+      "auto_derisk_live": false,
+      "reconcile_interval": 30000,
+      "ems_postgres_url": "postgres://apexes:apexes@postgres:5432/apexes",
+      "stale_data_timeout_secs": 30
+    }
+  },
+  "strategy_ref": {
+    "DriftScript": {
+      "path": "/etc/apexes/strategy.drift"
+    }
+  },
+  "instruments": [
+    {
+      "symbol": "BTCUSDT",
+      "market_type": "Crypto",
+      "venue": "Binance",
+      "asset_class": "Spot",
+      "base_currency": "BTC",
+      "quote_currency": "USDT",
+      "tick_size": "0.01",
+      "lot_size": "0.0001",
+      "multiplier": "1"
+    }
+  ],
+  "initial_balances": {},
+  "cpu_cores": null,
+  "snapshot_min_interval": 500,
+  "margin_tiers": {},
+  "market_condition_config": null,
+  "risk_free_return": "0.02",
+  "gateway_url": "ws://market-data-gateway:9001/market"
+}

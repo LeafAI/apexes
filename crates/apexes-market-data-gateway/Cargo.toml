@@ -13,6 +13,8 @@ name = "apexes-market-data-gateway"
 path = "src/main.rs"
 
 [dependencies]
+apexes-security = { path = "../apexes-security" }
+apexes-telemetry = { path = "../apexes-telemetry" }
 apexes-core = { path = "../apexes-core" }
 apexes-market-data = { path = "../apexes-market-data" }
 apexes-message-bus = { path = "../apexes-message-bus" }

@@ -158,6 +158,9 @@ pub struct LiveSupplementalFillSource<S> {
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
     exchange_updates: S,
     reconcile_interval: tokio::time::Interval,
+    /// Optional "the push stream just (re)connected" signal: triggers an
+    /// immediate `reconcile()` instead of waiting for the next tick.
+    resync: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<S> LiveSupplementalFillSource<S>
@@ -173,7 +176,15 @@ where
             order_manager,
             exchange_updates,
             reconcile_interval: tokio::time::interval(reconcile_interval),
+            resync: None,
         }
+    }
+
+    /// Reconcile immediately whenever `resync` is notified (see
+    /// `UserDataStreamHandle::resync_notifier`).
+    pub fn with_resync(mut self, resync: Arc<tokio::sync::Notify>) -> Self {
+        self.resync = Some(resync);
+        self
     }
 }
 
@@ -186,6 +197,7 @@ where
             Arc::clone(&self.order_manager),
             &mut self.exchange_updates,
             &mut self.reconcile_interval,
+            self.resync.clone(),
         );
 
         // Boxed so the resulting stream is unconditionally `Unpin`
@@ -194,7 +206,7 @@ where
         // the boxed value, satisfying this trait method's signature).
         Box::pin(futures::stream::unfold(
             state,
-            |(order_manager, exchange_updates, reconcile_interval)| async move {
+            |(order_manager, exchange_updates, reconcile_interval, resync)| async move {
                 loop {
                     tokio::select! {
                         update = exchange_updates.next() => {
@@ -226,7 +238,26 @@ where
                             if fills.is_empty() {
                                 continue;
                             }
-                            return Some((fills, (order_manager, exchange_updates, reconcile_interval)));
+                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
+                        }
+                        _ = async {
+                            match &resync {
+                                Some(notify) => notify.notified().await,
+                                None => futures::future::pending::<()>().await,
+                            }
+                        } => {
+                            tracing::info!("LiveSupplementalFillSource: push stream (re)connected; reconciling now");
+                            let fills: Vec<Fill> = match order_manager.lock().await.reconcile().await {
+                                Ok(changes) => changes.into_iter().flat_map(|(_, fills)| fills).collect(),
+                                Err(error) => {
+                                    tracing::warn!(?error, "LiveSupplementalFillSource: resync reconcile() failed");
+                                    Vec::new()
+                                }
+                            };
+                            if fills.is_empty() {
+                                continue;
+                            }
+                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
                         }
                         _ = reconcile_interval.tick() => {
                             let fills: Vec<Fill> = match order_manager.lock().await.reconcile().await {
@@ -242,7 +273,7 @@ where
                             if fills.is_empty() {
                                 continue;
                             }
-                            return Some((fills, (order_manager, exchange_updates, reconcile_interval)));
+                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
                         }
                     }
                 }
@@ -482,5 +513,56 @@ mod tests {
             fills[0].order_id, order_id,
             "OrderId must be preserved through the reconcile/exchange-update flattening"
         );
+    }
+
+    #[tokio::test]
+    async fn resync_notification_triggers_an_immediate_reconcile() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut order_manager =
+            fresh_order_manager(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>).await;
+        let order_id = order_manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        let order_manager = Arc::new(tokio::sync::Mutex::new(order_manager));
+
+        let resync = Arc::new(tokio::sync::Notify::new());
+        // No push updates and a one-hour reconcile interval: only the
+        // resync signal can cause a reconcile after the first tick.
+        let mut source = LiveSupplementalFillSource::new(
+            Arc::clone(&order_manager),
+            futures::stream::pending::<ExchangeUpdate>(),
+            Duration::from_secs(3600),
+        )
+        .with_resync(Arc::clone(&resync));
+
+        // Consume interval's immediate first tick (reconciles nothing).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), source.stream().next())
+                .await
+                .is_err()
+        );
+
+        // While "disconnected" the order fills on the exchange.
+        gateway.set_exchange_state(order_id, OrderStatus::Filled);
+        gateway.set_fills_for_order(
+            order_id,
+            vec![ExchangeFill {
+                exchange_trade_id: "T-resync".to_string(),
+                price: dec!(100),
+                quantity: dec!(1),
+                fee: dec!(0),
+                fee_currency: None,
+                filled_at: Utc::now(),
+            }],
+        );
+        resync.notify_one();
+
+        let fills = tokio::time::timeout(Duration::from_millis(2000), source.stream().next())
+            .await
+            .expect("resync must trigger a reconcile promptly")
+            .expect("stream must not end");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, order_id);
     }
 }

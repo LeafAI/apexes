@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# The Rust toolchain is pinned (see the dtolnay/rust-toolchain refs below and
+# the Dockerfile's RUST_VERSION): a floating `stable` turns every new clippy
+# lint into a red build under -D warnings. Bump deliberately, with the fixes.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Full debuginfo across the wgpu/egui dependency tree fills a hosted
+  # runner's disk ("No space left on device"); nothing here needs it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: apexes
+          POSTGRES_USER: apexes
+          POSTGRES_PASSWORD: apexes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apexes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # Same image and settings as docker-compose.yml.
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.12
+        env:
+          CLICKHOUSE_DB: apexes
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ""
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -q --spider http://localhost:8123/ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      # Postgres-backed packages share ONE database that their tests
+      # TRUNCATE, so they run serially, OMS first (it creates the tables the
+      # others truncate). Their #[ignore]d tests are included here.
+      - name: Postgres-backed tests
+        run: |
+          cargo test -p apexes-oms --locked -- --include-ignored --test-threads=1
+          cargo test -p apexes-ems --locked -- --include-ignored --test-threads=1
+          cargo test -p apexes-live-trading --locked -- --include-ignored --test-threads=1
+      # ClickHouse-backed tests (also #[ignore]d by default). The Binance
+      # live-network tests (apexes-market-data live_ingestion, testnet) are
+      # deliberately not run: they need credentials/exchange reachability.
+      - name: ClickHouse-backed tests
+        run: |
+          cargo test -p apexes-storage --locked -- --ignored --test-threads=1
+          cargo test -p apexes-strategy-registry --locked -- --ignored --test-threads=1
+          cargo test -p apexes-backtest --locked --test live_storage_backtest -- --ignored --test-threads=1
+          cargo test -p apexes-market-data-gateway --locked --test live_clickhouse -- --ignored --test-threads=1
+          cargo test -p apexes-engine --locked --test backtest_subprocess -- --ignored --test-threads=1
+      # Everything else: hermetic. apexes-chart's render tests need a GPU
+      # adapter, which hosted runners lack.
+      - name: Remaining workspace tests
+        run: >-
+          cargo test --workspace --locked
+          --exclude apexes-chart --exclude apexes-oms --exclude apexes-ems
+          --exclude apexes-live-trading
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build engine image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: engine
+          push: false
+          cache-from: type=gha,scope=engine
+          cache-to: type=gha,mode=max,scope=engine
+      - name: Build gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: gateway
+          push: false
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway

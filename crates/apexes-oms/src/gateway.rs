@@ -82,6 +82,22 @@ pub trait ExecutionGateway: Send + Sync {
     /// "query failed" -- that's `Err`).
     async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String>;
 
+    /// Looks an order up by OUR client order id (`order.id`) -- the only
+    /// handle available for an order whose submission outcome was
+    /// `Uncertain` or whose acknowledgement was lost in a crash, so its
+    /// exchange id was never recorded. Returns `(exchange_order_id,
+    /// status)` if the exchange knows the order, `Ok(None)` ONLY if the
+    /// exchange definitively has no such order, `Err` if that cannot be
+    /// determined. The default is `Err`: gateways that cannot do this
+    /// lookup must not let `OrderManager` conclude an order never
+    /// reached the exchange.
+    async fn query_order_by_client_id(
+        &self,
+        _order: &Order,
+    ) -> Result<Option<(String, OrderStatus)>, String> {
+        Err("query_order_by_client_id is not supported by this gateway".to_string())
+    }
+
     /// Queries the exchange for every currently open (not Filled/
     /// Cancelled/Rejected) order within ONE asset class -- used by
     /// `OrderManager::reconcile` after a reconnect. Callers needing
@@ -101,6 +117,15 @@ pub trait ExecutionGateway: Send + Sync {
         &self,
         asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String>;
+
+    /// Number of open orders in `asset_class` that were NOT placed through
+    /// this system (e.g. entered by hand in the exchange UI), which
+    /// `query_all_open_orders` cannot report because it has no `OrderId` for
+    /// them. Startup recovery refuses to run beside such orders. The default
+    /// `Ok(0)` is for gateways with no way to tell.
+    async fn count_foreign_open_orders(&self, _asset_class: AssetClass) -> Result<usize, String> {
+        Ok(0)
+    }
 
     /// Returns every trade execution the exchange has recorded for
     /// `order` (identified by `order.exchange_order_id`, which the

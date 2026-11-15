@@ -19,13 +19,50 @@ use uuid::Uuid;
 
 use crate::error::OmsError;
 use crate::gateway::{ExecutionGateway, GatewayOutcome};
+use crate::kill_switch::KillSwitch;
 use crate::store::OrderStore;
+
+/// Outcome of [`OrderManager::cancel_all_open`].
+#[derive(Debug, Default)]
+pub struct CancelAllReport {
+    /// Orders whose cancellation the exchange accepted.
+    pub cancelled: Vec<OrderId>,
+    /// Orders whose cancellation failed (rejected / query error); still
+    /// believed open, worth retrying.
+    pub failed: Vec<(OrderId, String)>,
+    /// Orders with no known exchange id even after a reconcile attempt
+    /// (submission outcome still unknown); cannot be cancelled yet.
+    pub unresolved: Vec<OrderId>,
+}
+
+impl CancelAllReport {
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.unresolved.is_empty()
+    }
+}
+
+/// Statuses whose transition may have produced fills that must be
+/// fetched: partial/full fills, and a cancel (which can follow partial
+/// fills).
+fn status_carries_fills(status: OrderStatus) -> bool {
+    matches!(
+        status,
+        OrderStatus::PartiallyFilled | OrderStatus::Filled | OrderStatus::Cancelled
+    )
+}
+
+/// Default for [`OrderManager::with_unsent_order_grace`].
+const DEFAULT_UNSENT_ORDER_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct OrderManager {
     store: OrderStore,
     gateway: Arc<dyn ExecutionGateway>,
     risk_checker: Option<Arc<CompositeRiskChecker>>,
     open_orders: HashMap<OrderId, Order>,
+    kill_switch: Option<Arc<KillSwitch>>,
+    /// How long an order with no exchange id may be reported unknown by
+    /// the exchange before `reconcile` concludes it never arrived there.
+    unsent_order_grace: std::time::Duration,
 }
 
 impl OrderManager {
@@ -55,7 +92,25 @@ impl OrderManager {
             gateway,
             risk_checker,
             open_orders,
+            kill_switch: None,
+            unsent_order_grace: DEFAULT_UNSENT_ORDER_GRACE,
         })
+    }
+
+    /// Sets how old an order with no exchange id must be before an
+    /// exchange "no such order" answer is trusted to mean it was never
+    /// sent (a crash between persisting and submitting). Younger orders
+    /// are left alone: their submit may still be in flight.
+    pub fn with_unsent_order_grace(mut self, grace: std::time::Duration) -> Self {
+        self.unsent_order_grace = grace;
+        self
+    }
+
+    /// Attaches a [`KillSwitch`]: while engaged, `submit_order` fails
+    /// with `OmsError::TradingHalted` (cancels remain allowed).
+    pub fn with_kill_switch(mut self, kill_switch: Arc<KillSwitch>) -> Self {
+        self.kill_switch = Some(kill_switch);
+        self
     }
 
     /// Submits a new order:
@@ -88,15 +143,46 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
+        if let Some(kill_switch) = &self.kill_switch
+            && kill_switch.is_engaged()
+        {
+            apexes_telemetry::metrics()
+                .orders_submitted
+                .with_label_values(&[apexes_telemetry::order_result::HALTED])
+                .inc();
+            return Err(OmsError::TradingHalted {
+                reason: kill_switch.reason().unwrap_or_default(),
+            });
+        }
         if let Some(checker) = &self.risk_checker {
             let empty_open_orders = HashMap::new();
             if let Err(violations) =
                 checker.check(&intent, positions, balances, &empty_open_orders, Utc::now())
             {
+                apexes_telemetry::metrics()
+                    .orders_submitted
+                    .with_label_values(&[apexes_telemetry::order_result::RISK_REJECTED])
+                    .inc();
                 return Err(OmsError::RiskCheckFailed { violations });
             }
         }
 
+        self.place_order(intent).await
+    }
+
+    /// Submits a position-closing order for the kill switch's flatten
+    /// step. Deliberately bypasses the kill switch (it is engaged by
+    /// definition) AND the pre-trade risk checks (they exist to stop risk
+    /// being added; a closing order must not be blocked by, say, a position
+    /// limit). Callers must only pass orders that reduce exposure.
+    pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
+        tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
+        self.place_order(intent).await
+    }
+
+    /// Persists, then sends, one order. Shared tail of `submit_order` and
+    /// `submit_flatten_order`; applies no gating of its own.
+    async fn place_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         let now = Utc::now();
         let mut order = Order {
             id: OrderId(Uuid::new_v4()),
@@ -118,7 +204,19 @@ impl OrderManager {
         };
         self.store.upsert_order(&order).await?;
 
-        match self.gateway.submit_order(&order).await {
+        let submit_started = std::time::Instant::now();
+        let outcome = self.gateway.submit_order(&order).await;
+        let telemetry = apexes_telemetry::metrics();
+        telemetry.observe_submit_latency(submit_started.elapsed());
+        telemetry
+            .orders_submitted
+            .with_label_values(&[match &outcome {
+                GatewayOutcome::Accepted { .. } => apexes_telemetry::order_result::ACCEPTED,
+                GatewayOutcome::Rejected { .. } => apexes_telemetry::order_result::REJECTED,
+                GatewayOutcome::Uncertain { .. } => apexes_telemetry::order_result::UNCERTAIN,
+            }])
+            .inc();
+        let result = match outcome {
             GatewayOutcome::Accepted { exchange_order_id } => {
                 order.exchange_order_id = Some(exchange_order_id);
                 order.updated_at = Utc::now();
@@ -143,7 +241,9 @@ impl OrderManager {
                 self.open_orders.insert(order_id, order);
                 Ok(order_id)
             }
-        }
+        };
+        telemetry.open_orders.set(self.open_orders.len() as i64);
+        result
     }
 
     /// Cancels an existing order:
@@ -252,40 +352,49 @@ impl OrderManager {
         };
 
         let status_changed = previous_status != status;
-        let mut exchange_order_id_changed = false;
-
-        if let Some(order) = self.open_orders.get_mut(&client_order_id) {
-            if exchange_order_id.is_some() && order.exchange_order_id != exchange_order_id {
-                order.exchange_order_id = exchange_order_id;
-                exchange_order_id_changed = true;
-            }
-            if status_changed {
-                order.status = status;
-                order.updated_at = Utc::now();
-            }
-        }
+        let exchange_order_id_changed = exchange_order_id.is_some()
+            && self
+                .open_orders
+                .get(&client_order_id)
+                .is_some_and(|order| order.exchange_order_id != exchange_order_id);
 
         if !status_changed && !exchange_order_id_changed {
             return Ok(Vec::new());
         }
 
-        let order_snapshot = self.open_orders.get(&client_order_id).unwrap().clone();
-        self.store.upsert_order(&order_snapshot).await?;
+        // Work on a candidate copy and only commit it to `open_orders`
+        // once everything it depends on is durably stored. Ordering is
+        // what makes this crash-safe: FILLS are persisted BEFORE the
+        // order's new status, so no crash window leaves an order marked
+        // Filled/Cancelled with its fills unrecorded (such an order is no
+        // longer "open" and would never be re-examined: its fills would be
+        // lost for good). The reverse window (fills stored, status not) is
+        // harmless: the next reconcile re-applies the status and every
+        // fill dedups on `(order_id, exchange_trade_id)`.
+        let mut candidate = self.open_orders.get(&client_order_id).unwrap().clone();
+        if exchange_order_id_changed {
+            candidate.exchange_order_id = exchange_order_id;
+        }
 
         let mut new_fills = Vec::new();
-        if status_changed
-            && matches!(status, OrderStatus::PartiallyFilled | OrderStatus::Filled)
-            && order_snapshot.exchange_order_id.is_some()
-        {
-            match self.gateway.query_fills_for_order(&order_snapshot).await {
+        if status_changed && status_carries_fills(status) {
+            if candidate.exchange_order_id.is_none() {
+                tracing::warn!(
+                    order_id = ?client_order_id,
+                    ?status,
+                    "apply_exchange_update: cannot fetch fills without an exchange_order_id; leaving order open for reconcile"
+                );
+                return Ok(Vec::new());
+            }
+            match self.gateway.query_fills_for_order(&candidate).await {
                 Ok(exchange_fills) => {
                     for exchange_fill in exchange_fills {
                         let fill = Fill {
                             id: FillId(Uuid::new_v4()),
                             order_id: client_order_id,
-                            symbol: order_snapshot.symbol.clone(),
-                            venue: order_snapshot.venue,
-                            side: order_snapshot.side,
+                            symbol: candidate.symbol.clone(),
+                            venue: candidate.venue,
+                            side: candidate.side,
                             price: exchange_fill.price,
                             quantity: exchange_fill.quantity,
                             fee: exchange_fill.fee,
@@ -293,12 +402,12 @@ impl OrderManager {
                             filled_at: exchange_fill.filled_at,
                             // Binance's fill/trade responses don't repeat an
                             // order's leverage, so thread it from the order
-                            // snapshot instead -- without this, a leveraged
-                            // position opened via run_live_trading would
-                            // silently degrade to spot accounting the moment
-                            // its fills came back from the exchange.
-                            leverage: order_snapshot.leverage,
-                            margin_mode: order_snapshot.margin_mode,
+                            // instead -- without this, a leveraged position
+                            // opened via run_live_trading would silently
+                            // degrade to spot accounting the moment its fills
+                            // came back from the exchange.
+                            leverage: candidate.leverage,
+                            margin_mode: candidate.margin_mode,
                         };
                         let inserted = self
                             .store
@@ -310,40 +419,53 @@ impl OrderManager {
                     }
                 }
                 Err(reason) => {
+                    // Do NOT advance the status without the fills (see
+                    // above). The local order stays as it was, so the next
+                    // reconcile pass sees the same transition and retries.
                     tracing::warn!(
                         order_id = ?client_order_id,
                         reason,
-                        "apply_exchange_update: query_fills_for_order failed; fills for this transition may be recovered on a later call"
+                        "apply_exchange_update: query_fills_for_order failed; status NOT advanced, will retry on next reconcile"
                     );
+                    if exchange_order_id_changed {
+                        // Still worth keeping a newly learnt exchange id.
+                        candidate.status = previous_status;
+                        self.store.upsert_order(&candidate).await?;
+                        self.open_orders.insert(client_order_id, candidate);
+                    }
+                    return Ok(Vec::new());
                 }
             }
+            // Recomputed from the store rather than incremented, so it is
+            // correct however many times / after however many crashes the
+            // fills were recorded.
+            candidate.filled_quantity = self
+                .store
+                .get_fills_for_order(client_order_id)
+                .await?
+                .iter()
+                .map(|fill| fill.quantity)
+                .sum();
         }
 
-        // Keep `filled_quantity` in sync with the fills actually
-        // recorded for this transition, mirroring
-        // `apexes_backtest::unified_loop::run_unified_event_loop`'s
-        // equivalent increment -- without this, `filled_quantity` would stay at
-        // its `submit_order`-time value of zero for the entire life of
-        // every live-traded order, even after Binance reports
-        // PartiallyFilled/Filled, silently misrepresenting the
-        // persisted `orders` row to any future consumer of this field.
-        if !new_fills.is_empty()
-            && let Some(order) = self.open_orders.get_mut(&client_order_id)
-        {
-            order.filled_quantity += new_fills.iter().map(|fill| fill.quantity).sum::<Decimal>();
-            order.updated_at = Utc::now();
-            self.store
-                .upsert_order(self.open_orders.get(&client_order_id).unwrap())
-                .await?;
+        if status_changed {
+            candidate.status = status;
         }
+        candidate.updated_at = Utc::now();
+        self.store.upsert_order(&candidate).await?;
 
         if matches!(
             status,
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
         ) {
             self.open_orders.remove(&client_order_id);
+        } else {
+            self.open_orders.insert(client_order_id, candidate);
         }
 
+        let telemetry = apexes_telemetry::metrics();
+        telemetry.fills.inc_by(new_fills.len() as u64);
+        telemetry.open_orders.set(self.open_orders.len() as i64);
         Ok(new_fills)
     }
 
@@ -377,6 +499,20 @@ impl OrderManager {
     /// what changed and apply any new `Fill`s to its own portfolio
     /// tracking.
     pub async fn reconcile(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
+        let telemetry = apexes_telemetry::metrics();
+        let result = self.reconcile_inner().await;
+        match &result {
+            Ok(changes) => {
+                telemetry.reconcile_runs.with_label_values(&["ok"]).inc();
+                telemetry.reconcile_changes.inc_by(changes.len() as u64);
+            }
+            Err(_) => telemetry.reconcile_runs.with_label_values(&["error"]).inc(),
+        }
+        telemetry.open_orders.set(self.open_orders.len() as i64);
+        result
+    }
+
+    async fn reconcile_inner(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
         let asset_classes: HashSet<AssetClass> = self
             .open_orders
             .values()
@@ -443,10 +579,41 @@ impl OrderManager {
             };
             let previous_status = order.status;
             let Some(exchange_order_id) = order.exchange_order_id.clone() else {
-                tracing::warn!(
-                    order_id = ?client_order_id,
-                    "reconcile: local order still open with no known exchange_order_id and not reported as open by the exchange -- cannot resolve"
-                );
+                // No exchange id: submission outcome was Uncertain, or the
+                // acknowledgement was lost in a crash. Resolve by OUR id.
+                let order_snapshot = order.clone();
+                match self.gateway.query_order_by_client_id(&order_snapshot).await {
+                    Ok(Some((exchange_order_id, status))) => {
+                        let new_fills = self
+                            .apply_exchange_update(client_order_id, Some(exchange_order_id), status)
+                            .await?;
+                        results.push((client_order_id, new_fills));
+                    }
+                    Ok(None) => {
+                        let age = Utc::now() - order_snapshot.created_at;
+                        let grace = chrono::Duration::from_std(self.unsent_order_grace)
+                            .unwrap_or(chrono::Duration::MAX);
+                        if age >= grace {
+                            tracing::error!(
+                                order_id = ?client_order_id,
+                                ?age,
+                                "reconcile: exchange has no record of this order and it is older than the grace period; it never reached the exchange. Marking Rejected"
+                            );
+                            let mut order = self.open_orders.remove(&client_order_id).unwrap();
+                            order.status = OrderStatus::Rejected;
+                            order.updated_at = Utc::now();
+                            self.store.upsert_order(&order).await?;
+                            results.push((client_order_id, Vec::new()));
+                        }
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            order_id = ?client_order_id,
+                            reason,
+                            "reconcile: cannot resolve order with no exchange_order_id (client-id lookup failed/unsupported); will retry"
+                        );
+                    }
+                }
                 continue;
             };
             let order_snapshot = order.clone();
@@ -480,8 +647,88 @@ impl OrderManager {
         Ok(results)
     }
 
+    /// Open orders on the exchange (across `asset_classes`) that this system
+    /// did not place and therefore cannot track. See
+    /// `ExecutionGateway::count_foreign_open_orders`.
+    pub async fn foreign_open_order_count(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<usize, OmsError> {
+        let mut total = 0;
+        for asset_class in asset_classes {
+            total += self
+                .gateway
+                .count_foreign_open_orders(*asset_class)
+                .await
+                .map_err(|reason| OmsError::QueryFailed { reason })?;
+        }
+        Ok(total)
+    }
+
+    /// Best-effort cancel of every open order. Runs `reconcile()` first
+    /// so orders whose submission outcome was `Uncertain` learn their
+    /// exchange id (and orders that already filled/cancelled drop out).
+    /// Never returns early on a per-order failure: every order is
+    /// attempted and the report says what is left, so the caller (the
+    /// kill-switch task) can retry until `is_complete()`.
+    pub async fn cancel_all_open(&mut self) -> CancelAllReport {
+        if let Err(error) = self.reconcile().await {
+            tracing::warn!(
+                ?error,
+                "cancel_all_open: pre-cancel reconcile failed; continuing"
+            );
+        }
+        let mut report = CancelAllReport::default();
+        let ids: Vec<OrderId> = self.open_orders.keys().copied().collect();
+        for id in ids {
+            match self.cancel_order(id).await {
+                Ok(()) => {
+                    // `Uncertain` cancels return Ok but leave the order open.
+                    if self.open_orders.contains_key(&id) {
+                        report
+                            .failed
+                            .push((id, "cancel outcome uncertain".to_string()));
+                    } else {
+                        report.cancelled.push(id);
+                    }
+                }
+                Err(OmsError::ExchangeOrderIdUnknown { .. }) => report.unresolved.push(id),
+                Err(OmsError::OrderNotCancellable { .. }) => {}
+                Err(error) => report.failed.push((id, error.to_string())),
+            }
+        }
+        report
+    }
+
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {
         &self.open_orders
+    }
+
+    /// Queries the exchange's open orders for each of `asset_classes`
+    /// and returns the client order IDs we have NO local record of
+    /// (orphans: e.g. placed manually or by another process).
+    /// `reconcile()` only logs these and only looks at asset classes
+    /// with local open orders, so startup recovery calls this
+    /// explicitly to refuse to start on an account it cannot account for.
+    pub async fn unknown_exchange_orders(
+        &self,
+        asset_classes: &[AssetClass],
+    ) -> Result<Vec<OrderId>, OmsError> {
+        let mut unknown = Vec::new();
+        for asset_class in asset_classes {
+            let exchange_orders = self
+                .gateway
+                .query_all_open_orders(*asset_class)
+                .await
+                .map_err(|reason| OmsError::QueryFailed { reason })?;
+            unknown.extend(
+                exchange_orders
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .filter(|id| !self.open_orders.contains_key(id)),
+            );
+        }
+        Ok(unknown)
     }
 }
 
@@ -577,6 +824,60 @@ mod tests {
         clean_db(&store).await;
         let registry = registry_with_gateway(gateway);
         OrderManager::new(store, &registry).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn engaged_kill_switch_blocks_submit_but_not_after_release() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let kill_switch = Arc::new(KillSwitch::new());
+        let mut manager = fresh_manager(gateway)
+            .await
+            .with_kill_switch(Arc::clone(&kill_switch));
+
+        let halted_before = apexes_telemetry::metrics()
+            .orders_submitted
+            .with_label_values(&[apexes_telemetry::order_result::HALTED])
+            .get();
+        kill_switch.engage("test halt");
+        let err = manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmsError::TradingHalted { ref reason } if reason == "test halt"));
+        assert!(manager.open_orders().is_empty());
+        assert!(
+            apexes_telemetry::metrics()
+                .orders_submitted
+                .with_label_values(&[apexes_telemetry::order_result::HALTED])
+                .get()
+                > halted_before
+        );
+
+        kill_switch.release();
+        manager
+            .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cancel_all_open_cancels_every_open_order() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let mut manager = fresh_manager(gateway).await;
+        for _ in 0..3 {
+            manager
+                .submit_order(sample_intent(), &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(manager.open_orders().len(), 3);
+
+        let report = manager.cancel_all_open().await;
+        assert_eq!(report.cancelled.len(), 3);
+        assert!(report.is_complete());
+        assert!(manager.open_orders().is_empty());
     }
 
     #[tokio::test]

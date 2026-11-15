@@ -105,6 +105,10 @@ pub enum SessionMode {
         reconcile_interval: Duration,
         /// Maps directly to `LiveTradingConfig.ems_postgres_url`.
         ems_postgres_url: String,
+        /// Engage the kill switch automatically if no market event
+        /// arrives for this many seconds. `None` (default) disables.
+        #[serde(default)]
+        stale_data_timeout_secs: Option<u64>,
     },
 }
 
@@ -230,6 +234,7 @@ mod tests {
                 auto_derisk_live: false,
                 reconcile_interval: Duration::from_secs(30),
                 ems_postgres_url: "postgres://localhost/apexes_ems".to_string(),
+                stale_data_timeout_secs: Some(20),
             },
             strategy_ref: StrategyRef::RustNative {
                 name: "example".to_string(),
@@ -243,6 +248,24 @@ mod tests {
             risk_free_return: dec!(0.02),
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
+    }
+
+    /// `deploy/launch-config.example.json` is what the container
+    /// deployment mounts; keep it parseable as the types evolve.
+    #[test]
+    fn deploy_example_launch_config_parses_as_a_live_session() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/launch-config.example.json"
+        );
+        let json = std::fs::read_to_string(path).unwrap();
+        let config: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(config.mode, SessionMode::Live { .. }));
+        assert!(matches!(
+            config.strategy_ref,
+            StrategyRef::DriftScript { .. }
+        ));
+        assert!(!config.instruments.is_empty());
     }
 
     #[test]
@@ -280,7 +303,9 @@ mod tests {
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
+                stale_data_timeout_secs,
             } => {
+                assert_eq!(stale_data_timeout_secs, Some(20));
                 assert_eq!(credentials_ref, "binance-main");
                 assert!(!auto_derisk_live);
                 assert_eq!(reconcile_interval, Duration::from_secs(30));

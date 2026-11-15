@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 /// `apexes_engine::protocol::SessionMessage::Command` and sent over
 /// `/session/ws` -- Task 2 (this crate) had no serialization consumer
 /// of its own, so these derives were not required until now.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionCommand {
     /// Hot-updates one tunable strategy parameter. Applied via
     /// `Strategy::set_param`; an unknown parameter name logs a warning
@@ -38,6 +38,20 @@ pub enum SessionCommand {
     /// Requests the unified loop exit after this tick, equivalent to
     /// `stop_signal` firing.
     Stop,
+    /// Engages the live kill switch (blocks new orders, cancels all open
+    /// orders) and pauses strategy dispatch. The switch itself is engaged
+    /// by the engine's control endpoint directly -- this loop only drains
+    /// commands on market ticks, which is exactly when a halt cannot be
+    /// relied upon -- so the loop-side effect is just the pause.
+    /// With `flatten`, the live runner also closes open positions after
+    /// cancelling orders. Absent on the wire = `false`.
+    Halt {
+        reason: String,
+        #[serde(default)]
+        flatten: bool,
+    },
+    /// Releases the kill switch and resumes strategy dispatch.
+    ResumeTrading,
 }
 
 /// A point-in-time view of a running session's state, pushed by the
@@ -46,6 +60,50 @@ pub enum SessionCommand {
 ///
 /// Derives `Serialize`/`Deserialize` for the same reason
 /// [`SessionCommand`] does -- see that type's doc comment.
+/// One open order as shown to an operator: plain strings/decimals so a UI
+/// needs no knowledge of the core order types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenOrderView {
+    pub id: String,
+    pub symbol: String,
+    /// `"Buy"` / `"Sell"`.
+    pub side: String,
+    /// `"Market"`, `"Limit"`, ...
+    pub order_type: String,
+    pub quantity: Decimal,
+    pub filled_quantity: Decimal,
+    pub price: Option<Decimal>,
+    /// `"New"` / `"PartiallyFilled"` / ...
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl SessionSnapshot {
+    /// True for the initial value a `ControlHandle` is created with (stamped
+    /// with the UNIX epoch) before the trading loop has pushed a real
+    /// snapshot. Consumers must treat it as "no data yet", not as a flat,
+    /// zero-equity account.
+    pub fn is_placeholder(&self) -> bool {
+        self.timestamp.timestamp() == 0
+    }
+}
+
+impl From<&apexes_core::Order> for OpenOrderView {
+    fn from(order: &apexes_core::Order) -> Self {
+        Self {
+            id: order.id.0.to_string(),
+            symbol: order.symbol.clone(),
+            side: format!("{:?}", order.side),
+            order_type: format!("{:?}", order.order_type),
+            quantity: order.quantity,
+            filled_quantity: order.filled_quantity,
+            price: order.price,
+            status: format!("{:?}", order.status),
+            created_at: order.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub positions: HashMap<String, Position>,
@@ -55,6 +113,10 @@ pub struct SessionSnapshot {
     pub margin_status: HashMap<String, PositionMarginStatus>,
     pub params: HashMap<String, Decimal>,
     pub paused: bool,
+    /// Orders currently working (live: the order manager's open orders;
+    /// backtest/paper: the simulated book's). Absent in older engines.
+    #[serde(default)]
+    pub open_orders: Vec<OpenOrderView>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -130,6 +192,8 @@ impl ControlHandle {
                     SessionCommand::Pause => self.paused = true,
                     SessionCommand::Resume => self.paused = false,
                     SessionCommand::Stop => stop_requested = true,
+                    SessionCommand::Halt { .. } => self.paused = true,
+                    SessionCommand::ResumeTrading => self.paused = false,
                 },
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -193,6 +257,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

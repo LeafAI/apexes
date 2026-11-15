@@ -28,6 +28,8 @@ pub struct MockExecutionGateway {
     /// Programmable fills returned by `query_fills_for_order`, keyed by
     /// client order ID. Tests populate this via `set_fills_for_order`.
     fills: Mutex<HashMap<OrderId, Vec<crate::gateway::ExchangeFill>>>,
+    /// Number of upcoming `query_fills_for_order` calls that must fail.
+    failing_fill_queries: Mutex<u32>,
 }
 
 impl Default for MockExecutionGateway {
@@ -43,11 +45,17 @@ impl MockExecutionGateway {
             next_cancel_outcome: Mutex::new(None),
             exchange_state: Mutex::new(HashMap::new()),
             fills: Mutex::new(HashMap::new()),
+            failing_fill_queries: Mutex::new(0),
         }
     }
 
     pub fn program_next_submit_outcome(&self, outcome: GatewayOutcome) {
         *self.next_submit_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    /// Makes the next `n` `query_fills_for_order` calls return `Err`.
+    pub fn fail_next_fill_queries(&self, n: u32) {
+        *self.failing_fill_queries.lock().unwrap() = n;
     }
 
     pub fn program_next_cancel_outcome(&self, outcome: GatewayOutcome) {
@@ -160,6 +168,18 @@ impl ExecutionGateway for MockExecutionGateway {
             .map(|(_, status, _)| *status))
     }
 
+    async fn query_order_by_client_id(
+        &self,
+        order: &Order,
+    ) -> Result<Option<(String, OrderStatus)>, String> {
+        Ok(self
+            .exchange_state
+            .lock()
+            .unwrap()
+            .get(&order.id)
+            .map(|(exchange_order_id, status, _)| (exchange_order_id.clone(), *status)))
+    }
+
     async fn query_all_open_orders(
         &self,
         asset_class: AssetClass,
@@ -181,6 +201,13 @@ impl ExecutionGateway for MockExecutionGateway {
         &self,
         order: &Order,
     ) -> Result<Vec<crate::gateway::ExchangeFill>, String> {
+        {
+            let mut failing = self.failing_fill_queries.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err("injected fill query failure".to_string());
+            }
+        }
         Ok(self
             .fills
             .lock()

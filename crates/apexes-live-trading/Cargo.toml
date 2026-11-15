@@ -12,12 +12,14 @@ apexes-oms = { path = "../apexes-oms" }
 apexes-backtest = { path = "../apexes-backtest" }
 apexes-strategy = { path = "../apexes-strategy" }
 apexes-risk = { path = "../apexes-risk" }
+apexes-telemetry = { path = "../apexes-telemetry" }
 tokio = { workspace = true, features = ["time", "sync"] }
 futures = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = "1.40"

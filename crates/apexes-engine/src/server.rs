@@ -35,12 +35,18 @@
 //! immediately, rather than sitting queued until the next tick
 //! happens to arrive.
 
-use crate::protocol::SessionMessage;
+use crate::protocol::{EngineStatus, SessionMessage};
 use apexes_backtest::{SessionCommand, SessionSnapshot};
+use apexes_oms::KillSwitch;
+use apexes_security::{AuditLog, Identity, Role, TokenSet};
+use axum::Extension;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -60,49 +66,233 @@ struct AppState {
     command_tx: mpsc::UnboundedSender<SessionCommand>,
     snapshot_rx: watch::Receiver<SessionSnapshot>,
     stop_tx: SharedStopSender,
+    kill_switch: Option<Arc<KillSwitch>>,
+    security: ServerSecurity,
 }
 
-/// Builds the `axum::Router` `apexes-engine`'s `main.rs` serves.
-/// Callers are responsible for binding a listener and calling
-/// `axum::serve` themselves -- this function's only job is producing
-/// the router, so it stays testable without a real network bind
-/// (mirroring `apexes-market-data-gateway`'s own `build_app`
-/// precedent).
-///
-/// `stop_tx` is the oneshot sender half `run_inner` holds alongside
-/// the `stop_rx` it hands to `run_paper_mode`/`run_live_mode` -- a
-/// received `SessionCommand::Stop` triggers it (see this module's
-/// top-level doc comment).
+/// Authentication and audit configuration for the HTTP/WS surface.
+/// `Default` is open and unaudited (tests, backtest/paper on loopback).
+#[derive(Clone, Default)]
+pub struct ServerSecurity {
+    /// When set, `/session/ws` and `/metrics` require
+    /// `Authorization: Bearer <token>` matching one of the named tokens;
+    /// the caller's name and role come from the matching entry.
+    /// `/healthz` and `/readyz` stay open for supervisors and carry no
+    /// sensitive data.
+    pub tokens: Option<Arc<TokenSet>>,
+    /// When set, every connection, rejected request and control command is
+    /// appended to it.
+    pub audit: Option<Arc<AuditLog>>,
+}
+
+impl ServerSecurity {
+    fn audit(&self, actor: &str, action: &str, detail: serde_json::Value) {
+        if let Some(audit) = &self.audit {
+            audit.record(actor, action, detail);
+        }
+    }
+}
+
+/// Identity assumed when the engine runs without tokens.
+fn unauthenticated_identity() -> Identity {
+    Identity {
+        name: "unauthenticated".to_string(),
+        role: Role::Operator,
+    }
+}
+
+async fn require_auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let identity = match &state.security.tokens {
+        None => unauthenticated_identity(),
+        Some(tokens) => match tokens.identify_headers(request.headers()) {
+            Some(identity) => identity.clone(),
+            None => {
+                state.security.audit(
+                    "anonymous",
+                    "unauthorized_request",
+                    serde_json::json!({ "path": request.uri().path() }),
+                );
+                return apexes_security::unauthorized();
+            }
+        },
+    };
+    request.extensions_mut().insert(identity);
+    next.run(request).await
+}
+
 pub fn build_app(
     command_tx: mpsc::UnboundedSender<SessionCommand>,
     snapshot_rx: watch::Receiver<SessionSnapshot>,
     stop_tx: oneshot::Sender<()>,
 ) -> Router {
+    build_app_with_kill_switch(command_tx, snapshot_rx, stop_tx, None)
+}
+
+/// Like [`build_app`], but `Halt`/`ResumeTrading` commands also
+/// engage/release `kill_switch` immediately, on the connection task
+/// itself -- not via the command channel, whose consumer (the trading
+/// loop) only drains it on market ticks.
+pub fn build_app_with_kill_switch(
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    snapshot_rx: watch::Receiver<SessionSnapshot>,
+    stop_tx: oneshot::Sender<()>,
+    kill_switch: Option<Arc<KillSwitch>>,
+) -> Router {
+    build_app_secured(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        kill_switch,
+        ServerSecurity::default(),
+    )
+}
+
+/// Full constructor: like [`build_app_with_kill_switch`] plus
+/// authentication and audit logging per [`ServerSecurity`].
+pub fn build_app_secured(
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    snapshot_rx: watch::Receiver<SessionSnapshot>,
+    stop_tx: oneshot::Sender<()>,
+    kill_switch: Option<Arc<KillSwitch>>,
+    security: ServerSecurity,
+) -> Router {
     let state = AppState {
         command_tx,
         snapshot_rx,
         stop_tx: Arc::new(Mutex::new(Some(stop_tx))),
+        kill_switch,
+        security,
     };
-    Router::new()
+    let protected = Router::new()
         .route("/session/ws", get(session_ws_handler))
-        .with_state(state)
+        .route("/metrics", get(metrics_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
+    let open = Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler));
+    protected.merge(open).with_state(state)
+}
+
+/// Prometheus scrape endpoint.
+async fn metrics_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        apexes_telemetry::render(),
+    )
+}
+
+fn health_body(state: &AppState) -> (bool, serde_json::Value) {
+    let halt_reason = state
+        .kill_switch
+        .as_ref()
+        .filter(|ks| ks.is_engaged())
+        .map(|ks| ks.reason().unwrap_or_default());
+    let halted = halt_reason.is_some();
+    (
+        halted,
+        serde_json::json!({
+            "status": if halted { "halted" } else { "ok" },
+            "halt_reason": halt_reason,
+        }),
+    )
+}
+
+/// Liveness: 200 whenever the process is serving, with halt state in the
+/// body (a halted engine is alive and must not be restarted by a
+/// supervisor, which would only lose the halt).
+async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let (_, body) = health_body(&state);
+    (StatusCode::OK, axum::Json(body))
+}
+
+/// Readiness: 503 while the kill switch is engaged.
+async fn readyz_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let (halted, body) = health_body(&state);
+    let code = if halted {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, axum::Json(body))
 }
 
 async fn session_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, identity))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+/// How often connection-level status (halt state) is re-checked.
+const STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn engine_status(identity: &Identity, kill_switch: Option<&KillSwitch>) -> EngineStatus {
+    let halted = kill_switch.is_some_and(KillSwitch::is_engaged);
+    EngineStatus {
+        actor: identity.name.clone(),
+        role: identity.role.as_str().to_string(),
+        halted,
+        halt_reason: kill_switch.filter(|_| halted).and_then(KillSwitch::reason),
+        flatten_requested: kill_switch.is_some_and(KillSwitch::flatten_requested),
+    }
+}
+
+async fn send_message(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    message: &SessionMessage,
+) -> bool {
+    let Ok(json) = serde_json::to_string(message) else {
+        return true;
+    };
+    sender.send(Message::Text(json.into())).await.is_ok()
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, identity: Identity) {
     let (mut sender, mut receiver) = socket.split();
     let mut snapshot_rx = state.snapshot_rx;
     let command_tx = state.command_tx;
     let stop_tx = state.stop_tx;
+    let kill_switch = state.kill_switch;
+    let security = state.security;
+    let actor = identity.name.clone();
+    security.audit(
+        &actor,
+        "ws_connect",
+        serde_json::json!({ "role": identity.role.as_str() }),
+    );
+
+    // A client that connects LATE (typically during an incident, to an engine
+    // whose feed has stalled and so pushes no new snapshots) must still see
+    // the last known state straight away, not only after the next change.
+    // `borrow_and_update` also marks it seen so it is not sent twice.
+    let current = snapshot_rx.borrow_and_update().clone();
+    if !send_snapshot(&mut sender, &current).await {
+        return;
+    }
+
+    let mut status_tick = tokio::time::interval(STATUS_POLL);
+    let mut last_status: Option<EngineStatus> = None;
 
     loop {
         tokio::select! {
+            _ = status_tick.tick() => {
+                // First tick fires immediately: the client learns its
+                // identity/role and the halt state on connect.
+                let status = engine_status(&identity, kill_switch.as_deref());
+                if last_status.as_ref() != Some(&status) {
+                    if !send_message(&mut sender, &SessionMessage::Status(status.clone())).await {
+                        break;
+                    }
+                    last_status = Some(status);
+                }
+            }
             changed = snapshot_rx.changed() => {
                 if changed.is_err() {
                     tracing::info!(
@@ -119,13 +309,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !forward_command(&text, &command_tx, &stop_tx).await {
-                            // Not a fatal error for this connection --
-                            // an unparseable frame is logged and
-                            // skipped, matching
-                            // `apexes-market-data-gateway`'s own
-                            // "skip, don't disconnect" convention for
-                            // malformed individual frames.
+                        // A skipped frame is not fatal to the connection
+                        // (matching `apexes-market-data-gateway`'s "skip,
+                        // don't disconnect" convention); a denied command
+                        // is reported back to this client only.
+                        if let Forwarded::Denied(message) = forward_command(
+                            &text,
+                            &command_tx,
+                            &stop_tx,
+                            kill_switch.as_deref(),
+                            &security,
+                            &identity,
+                        )
+                        .await
+                            && !send_message(&mut sender, &SessionMessage::Error { message }).await
+                        {
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -187,11 +386,25 @@ async fn send_snapshot(
 /// `ControlHandle::drain_commands` to next be polled. Returns `false`
 /// if parsing failed or the frame was not a `Command` (logged, not
 /// fatal to the connection).
+/// What became of one incoming frame.
+enum Forwarded {
+    /// Parsed and acted on.
+    Applied,
+    /// Unparseable, not a command, or the loop is gone: logged, ignored.
+    Skipped,
+    /// The caller's role may not send commands.
+    Denied(String),
+}
+
 async fn forward_command(
     text: &str,
     command_tx: &mpsc::UnboundedSender<SessionCommand>,
     stop_tx: &SharedStopSender,
-) -> bool {
+    kill_switch: Option<&KillSwitch>,
+    security: &ServerSecurity,
+    identity: &Identity,
+) -> Forwarded {
+    let actor = identity.name.as_str();
     let message: SessionMessage = match serde_json::from_str(text) {
         Ok(message) => message,
         Err(error) => {
@@ -200,30 +413,66 @@ async fn forward_command(
                 "apexes-engine server: failed to parse incoming /session/ws frame as \
                  SessionMessage, skipping"
             );
-            return false;
+            return Forwarded::Skipped;
         }
     };
     match message {
         SessionMessage::Command(command) => {
+            if !identity.role.can_command() {
+                security.audit(
+                    actor,
+                    "command_denied",
+                    serde_json::to_value(&command).unwrap_or(serde_json::Value::Null),
+                );
+                return Forwarded::Denied(format!(
+                    "{actor} is a {} and may not send commands",
+                    identity.role.as_str()
+                ));
+            }
             let is_stop = matches!(command, SessionCommand::Stop);
+            // Audited BEFORE it takes effect, so the record exists even if
+            // acting on it crashes the process.
+            security.audit(
+                actor,
+                "command",
+                serde_json::to_value(&command).unwrap_or(serde_json::Value::Null),
+            );
+            // Engage/release BEFORE forwarding: the halt must take effect
+            // even if the trading loop is stalled or already gone.
+            match (&command, kill_switch) {
+                (SessionCommand::Halt { reason, flatten }, Some(ks)) => {
+                    // Request first: the runner reads it when `engage` wakes it.
+                    if *flatten {
+                        ks.request_flatten();
+                    }
+                    ks.engage(reason.clone());
+                }
+                (SessionCommand::ResumeTrading, Some(ks)) => ks.release(),
+                (SessionCommand::Halt { .. } | SessionCommand::ResumeTrading, None) => {
+                    tracing::warn!(
+                        "apexes-engine server: halt/resume received but no kill switch is configured (non-live session)"
+                    );
+                }
+                _ => {}
+            }
             if command_tx.send(command).is_err() {
                 tracing::warn!(
                     "apexes-engine server: command_tx receiver dropped (trading loop ended), \
                      dropping command"
                 );
-                return false;
+                return Forwarded::Skipped;
             }
             if is_stop {
                 fire_stop_signal(stop_tx).await;
             }
-            true
+            Forwarded::Applied
         }
-        SessionMessage::Snapshot(_) => {
+        SessionMessage::Snapshot(_) | SessionMessage::Status(_) | SessionMessage::Error { .. } => {
             tracing::warn!(
-                "apexes-engine server: received a Snapshot frame on /session/ws (clients should \
-                 only send Command frames), ignoring"
+                "apexes-engine server: received an engine->client frame on /session/ws (clients \
+                 should only send Command frames), ignoring"
             );
-            false
+            Forwarded::Skipped
         }
     }
 }
@@ -261,6 +510,7 @@ mod tests {
             margin_status: HashMap::new(),
             params: HashMap::new(),
             paused: false,
+            open_orders: Vec::new(),
             timestamp: Utc::now(),
         }
     }

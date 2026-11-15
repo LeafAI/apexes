@@ -41,7 +41,7 @@ use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
 use apexes_engine::launch_config::{LaunchConfig, SessionMode};
-use apexes_engine::{build_app, credentials, resolve_binance_credentials};
+use apexes_engine::{ServerSecurity, build_app_secured, credentials, resolve_binance_credentials};
 use apexes_live_trading::{LiveTradingConfig, run_live_trading};
 use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExecutionGateway, OrderManager, OrderStore};
@@ -89,8 +89,21 @@ enum EngineError {
     OrderStore(#[from] apexes_oms::OmsError),
     #[error("failed to start Binance User Data Stream: {reason}")]
     UserDataStream { reason: String },
-    #[error("failed to bind /session/ws listener on 127.0.0.1:0: {0}")]
+    #[error("failed to bind /session/ws listener (APEXES_ENGINE_BIND or 127.0.0.1:0): {0}")]
     BindSessionWs(std::io::Error),
+    #[error("live startup recovery failed: {0}")]
+    Recovery(#[from] apexes_live_trading::RecoveryError),
+    #[error(
+        "live sessions require control tokens and an audit log: set APEXES_CONTROL_TOKEN and/or APEXES_CONTROL_TOKENS (and APEXES_AUDIT_LOG, or provide a writable $HOME)"
+    )]
+    MissingControlToken,
+    #[error("invalid control tokens: {0}")]
+    ControlTokens(String),
+    #[error("failed to open audit log {path:?}: {source}")]
+    AuditLog {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("run_backtest/run_paper_trading/run_live_trading failed: {0}")]
     Run(#[from] ApexesError),
 }
@@ -115,7 +128,11 @@ fn build_control_handle(
         margin_status: HashMap::new(),
         params: HashMap::new(),
         paused: false,
-        timestamp: chrono::Utc::now(),
+        open_orders: Vec::new(),
+        // The UNIX epoch marks "no real snapshot pushed yet" (see
+        // `apexes_backtest::SessionSnapshot::is_placeholder`): clients must
+        // not present this all-zero state as real.
+        timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
     };
     apexes_backtest::ControlHandle::new(snapshot_min_interval, initial_snapshot)
 }
@@ -269,7 +286,7 @@ fn pin_current_thread_round_robin(
 /// comment (Task 5) for the full rationale against "simplifying" this
 /// back to `#[tokio::main]` + a single call.
 fn main() {
-    tracing_subscriber::fmt::init();
+    apexes_telemetry::init_tracing();
 
     let cli = Cli::parse();
 
@@ -376,7 +393,19 @@ async fn run_inner(
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+    // Before binding anything: a live session must not start without
+    // authentication and an audit trail on its control endpoint.
+    let security = build_server_security(&launch_config)?;
+
+    // Loopback + ephemeral port by default (UI-spawned sessions find the
+    // port via the PID file). Containers/supervised deployments set
+    // `APEXES_ENGINE_BIND` (e.g. `0.0.0.0:9100`) for a fixed, reachable
+    // port; a live session is then protected by its mandatory token.
+    let bind_addr = std::env::var("APEXES_ENGINE_BIND")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+    let listener = TcpListener::bind(&bind_addr)
         .await
         .map_err(EngineError::BindSessionWs)?;
     let bound_port = listener
@@ -398,7 +427,15 @@ async fn run_inner(
     // rationale).
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
-    let app = build_app(command_tx, snapshot_rx, stop_tx);
+    let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
+    spawn_snapshot_gauges(snapshot_rx.clone());
+    let app = build_app_secured(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(Arc::clone(&kill_switch)),
+        security,
+    );
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::error!(
@@ -436,12 +473,15 @@ async fn run_inner(
             auto_derisk_live,
             reconcile_interval,
             ems_postgres_url,
+            stale_data_timeout_secs,
         } => {
             let live_params = LiveModeParams {
                 credentials_ref,
                 auto_derisk_live,
                 reconcile_interval,
                 ems_postgres_url,
+                kill_switch,
+                stale_data_timeout: stale_data_timeout_secs.map(std::time::Duration::from_secs),
             };
             run_live_mode(
                 &launch_config,
@@ -454,6 +494,100 @@ async fn run_inner(
             .await
         }
     }
+}
+
+/// Control-endpoint authentication/audit from the environment:
+/// `APEXES_CONTROL_TOKEN` (bearer token) and `APEXES_AUDIT_LOG` (path;
+/// default `$HOME/.apexes/audit-<session_id>.jsonl`).
+fn build_server_security(launch_config: &LaunchConfig) -> Result<ServerSecurity, EngineError> {
+    let default_path = std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".apexes")
+            .join(format!("audit-{}.jsonl", launch_config.session_id))
+    });
+    let audit_path = std::env::var_os("APEXES_AUDIT_LOG")
+        .map(PathBuf::from)
+        .or(default_path);
+    let tokens =
+        apexes_security::TokenSet::from_env("APEXES_CONTROL_TOKEN", "APEXES_CONTROL_TOKENS")
+            .map_err(EngineError::ControlTokens)?;
+    security_from_parts(
+        matches!(launch_config.mode, SessionMode::Live { .. }),
+        tokens,
+        audit_path,
+    )
+}
+
+/// Policy: live sessions REQUIRE a token and a working audit log;
+/// backtest/paper sessions degrade to a loud warning.
+fn security_from_parts(
+    is_live: bool,
+    tokens: Option<apexes_security::TokenSet>,
+    audit_path: Option<PathBuf>,
+) -> Result<ServerSecurity, EngineError> {
+    if tokens.is_none() {
+        if is_live {
+            return Err(EngineError::MissingControlToken);
+        }
+        tracing::warn!(
+            "apexes-engine: no APEXES_CONTROL_TOKEN/APEXES_CONTROL_TOKENS set; /session/ws and /metrics are UNAUTHENTICATED"
+        );
+    }
+    let audit = match audit_path {
+        Some(path) => match apexes_security::AuditLog::open(&path) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(source) if is_live => return Err(EngineError::AuditLog { path, source }),
+            Err(error) => {
+                tracing::warn!(?error, ?path, "apexes-engine: audit log unavailable");
+                None
+            }
+        },
+        None if is_live => return Err(EngineError::MissingControlToken),
+        None => None,
+    };
+    Ok(ServerSecurity {
+        tokens: tokens.map(Arc::new),
+        audit,
+    })
+}
+
+/// Exchange-truth futures positions for the kill switch's flatten step
+/// (spot holdings are deliberately not positions to unwind).
+struct BinancePositionSource(Arc<apexes_gateway_binance::BinanceExecutionGateway>);
+
+#[async_trait::async_trait]
+impl apexes_live_trading::PositionSource for BinancePositionSource {
+    async fn open_positions(&self) -> Result<Vec<apexes_strategy::Position>, String> {
+        Ok(self.0.account_positions().await?.into_values().collect())
+    }
+}
+
+/// Mirrors each pushed `SessionSnapshot` into the Prometheus gauges
+/// (equity, realized PnL, open positions). Ends when the loop drops the
+/// snapshot sender.
+fn spawn_snapshot_gauges(
+    mut snapshot_rx: tokio::sync::watch::Receiver<apexes_backtest::SessionSnapshot>,
+) {
+    use rust_decimal::prelude::ToPrimitive;
+    tokio::spawn(async move {
+        let telemetry = apexes_telemetry::metrics();
+        while snapshot_rx.changed().await.is_ok() {
+            let snapshot = snapshot_rx.borrow_and_update().clone();
+            telemetry
+                .equity
+                .set(snapshot.equity.to_f64().unwrap_or(f64::NAN));
+            telemetry.realized_pnl.set(
+                snapshot
+                    .realized_pnl
+                    .values()
+                    .map(|v| v.to_f64().unwrap_or(0.0))
+                    .sum(),
+            );
+            telemetry
+                .open_positions
+                .set(snapshot.positions.len() as i64);
+        }
+    });
 }
 
 /// `SessionMode::Backtest`: `run_backtest` takes `impl
@@ -527,7 +661,8 @@ async fn run_paper_mode(
     control_handle: apexes_backtest::ControlHandle,
     stop_signal: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), EngineError> {
-    let provider = GatewayMarketDataProvider::new(launch_config.gateway_url.clone());
+    let provider = GatewayMarketDataProvider::new(launch_config.gateway_url.clone())
+        .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
     let bus = MarketEventBus::new(Box::new(provider));
 
     let config = PaperTradingConfig {
@@ -557,6 +692,8 @@ struct LiveModeParams {
     auto_derisk_live: bool,
     reconcile_interval: std::time::Duration,
     ems_postgres_url: String,
+    kill_switch: Arc<apexes_oms::KillSwitch>,
+    stale_data_timeout: Option<std::time::Duration>,
 }
 
 /// `SessionMode::Live`: `run_live_trading` takes no direct market-data
@@ -583,6 +720,8 @@ async fn run_live_mode(
         auto_derisk_live,
         reconcile_interval,
         ems_postgres_url,
+        kill_switch,
+        stale_data_timeout,
     } = live_params;
 
     let gateway_config = resolve_binance_credentials(&credentials_ref, |name| std::env::var(name))?;
@@ -604,7 +743,8 @@ async fn run_live_mode(
         .map_err(|reason| EngineError::UserDataStream { reason })?;
     let exchange_updates = Box::pin(exchange_updates);
 
-    let gateway: Arc<dyn ExecutionGateway> = Arc::new(binance_gateway);
+    let binance_gateway = Arc::new(binance_gateway);
+    let gateway: Arc<dyn ExecutionGateway> = binance_gateway.clone();
     registry.register::<Arc<dyn ExecutionGateway>, ()>((), gateway)?;
 
     register_gateway_bus_for_all_venues(
@@ -614,13 +754,39 @@ async fn run_live_mode(
     )?;
 
     let order_store = OrderStore::new(&ems_postgres_url).await?;
-    let order_manager = OrderManager::new(order_store, registry)
+    let mut order_manager = OrderManager::new(order_store, registry)
         .await
-        .map_err(EngineError::from)?;
+        .map_err(EngineError::from)?
+        .with_kill_switch(Arc::clone(&kill_switch));
+
+    // Seed the ledger from the exchange's real account state (not the
+    // operator-supplied `initial_balances`), and refuse to start if
+    // local/exchange order state cannot be brought into agreement.
+    if !launch_config.initial_balances.is_empty() {
+        tracing::warn!(
+            "apexes-engine: ignoring launch_config.initial_balances in live mode; \
+             balances are recovered from the exchange"
+        );
+    }
+    let recovered = apexes_live_trading::recover_live_state(
+        &mut order_manager,
+        &[
+            apexes_core::AssetClass::Spot,
+            apexes_core::AssetClass::Perpetual,
+        ],
+        async {
+            Ok(apexes_live_trading::ExchangeSnapshot {
+                balances: binance_gateway.account_balances().await?,
+                positions: binance_gateway.account_positions().await?,
+            })
+        },
+    )
+    .await?;
 
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
-        initial_balances: launch_config.initial_balances.clone(),
+        initial_balances: recovered.snapshot.balances,
+        initial_positions: recovered.snapshot.positions,
         cost_model: default_cost_model(),
         margin_tiers: launch_config.margin_tiers.clone(),
         market_condition_config: launch_config.market_condition_config.clone(),
@@ -629,6 +795,12 @@ async fn run_live_mode(
         reconcile_interval,
         ems_postgres_url,
         control: Some(control_handle),
+        kill_switch: Some(kill_switch),
+        stale_data_timeout,
+        resync: Some(_user_data_stream_handle.resync_notifier()),
+        position_source: Some(Arc::new(BinancePositionSource(Arc::clone(
+            &binance_gateway,
+        )))),
     };
 
     run_live_trading(
@@ -675,7 +847,8 @@ fn register_gateway_bus_for_all_venues(
     gateway_url: &str,
     instruments: &[Instrument],
 ) -> Result<(), EngineError> {
-    let provider = GatewayMarketDataProvider::new(gateway_url.to_string());
+    let provider = GatewayMarketDataProvider::new(gateway_url.to_string())
+        .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
     let bus = Arc::new(MarketEventBus::new(Box::new(provider)));
 
     let mut venues: Vec<Venue> = instruments.iter().map(|i| i.venue).collect();
@@ -694,6 +867,39 @@ mod tests {
     use apexes_core::{AssetClass, MarketType};
     use rust_decimal_macros::dec;
     use std::ops::Range;
+
+    #[test]
+    fn live_sessions_require_a_token_and_a_usable_audit_log() {
+        let dir = std::env::temp_dir().join(format!("apexes-engine-policy-{}", std::process::id()));
+        let good_path = dir.join("a.jsonl");
+        let token = || Some(apexes_security::TokenSet::single("t"));
+
+        // Live without token: refused.
+        assert!(matches!(
+            security_from_parts(true, None, Some(good_path.clone())),
+            Err(EngineError::MissingControlToken)
+        ));
+        // Live without audit path: refused.
+        assert!(matches!(
+            security_from_parts(true, token(), None),
+            Err(EngineError::MissingControlToken)
+        ));
+        // Live with an unopenable audit path (parent is a file): refused.
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(matches!(
+            security_from_parts(true, token(), Some(blocker.join("audit.jsonl"))),
+            Err(EngineError::AuditLog { .. })
+        ));
+        // Live with both: ok.
+        let ok = security_from_parts(true, token(), Some(good_path)).unwrap();
+        assert!(ok.tokens.is_some() && ok.audit.is_some());
+        // Paper/backtest degrade to warnings.
+        let open = security_from_parts(false, None, None).unwrap();
+        assert!(open.tokens.is_none() && open.audit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sample_instrument(symbol: &str, venue: Venue) -> Instrument {
         Instrument::new(

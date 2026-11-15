@@ -162,6 +162,22 @@ impl BinanceExecutionGateway {
         }
     }
 
+    /// Raw open-order entries for `asset_class`'s API family.
+    async fn fetch_open_order_entries(
+        &self,
+        asset_class: AssetClass,
+    ) -> Result<Vec<OpenOrderEntry>, String> {
+        let family = ApiFamily::from(asset_class);
+        let (status, body) = self
+            .rest
+            .signed_request("GET", family, Self::open_orders_path(family), "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).map_err(|error| format!("parse error: {error}; body={body}"))
+    }
+
     /// Starts the Binance User Data Stream (both Spot and Futures),
     /// returning a handle that must be kept alive for as long as the
     /// stream should keep running, plus the merged update stream
@@ -498,6 +514,12 @@ struct WithdrawHistoryEntry {
     apply_time: String,
 }
 
+/// Binance's definitive "no such order" answer (`-2013`), returned with
+/// HTTP 400.
+fn is_order_does_not_exist(body: &str) -> bool {
+    serde_json::from_str::<BinanceApiError>(body).is_ok_and(|e| e.code == -2013)
+}
+
 fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {
     match status {
         "NEW" => Ok(OrderStatus::New),
@@ -650,7 +672,7 @@ impl ExecutionGateway for BinanceExecutionGateway {
             .signed_request("GET", family, Self::order_path(family), &params)
             .await?;
 
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if status == reqwest::StatusCode::NOT_FOUND || is_order_does_not_exist(&body) {
             return Ok(None);
         }
         if !status.is_success() {
@@ -666,20 +688,45 @@ impl ExecutionGateway for BinanceExecutionGateway {
         Ok(Some(parse_binance_status(&parsed.status)?))
     }
 
+    /// Looks the order up by `origClientOrderId` (our `Order.id`, which
+    /// `submit_order` sent as `newClientOrderId`). Binance answers
+    /// `-2013 Order does not exist` for an order it never received.
+    async fn query_order_by_client_id(
+        &self,
+        order: &Order,
+    ) -> Result<Option<(String, OrderStatus)>, String> {
+        let family = ApiFamily::from(order.asset_class);
+        let params = format!("symbol={}&origClientOrderId={}", order.symbol, order.id.0);
+        let (status, body) = self
+            .rest
+            .signed_request("GET", family, Self::order_path(family), &params)
+            .await?;
+        if is_order_does_not_exist(&body) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {body}"));
+        }
+
+        #[derive(Deserialize)]
+        struct OrderByClientId {
+            #[serde(rename = "orderId")]
+            order_id: i64,
+            status: String,
+        }
+        let parsed: OrderByClientId = serde_json::from_str(&body)
+            .map_err(|error| format!("parse error: {error}; body={body}"))?;
+        Ok(Some((
+            parsed.order_id.to_string(),
+            parse_binance_status(&parsed.status)?,
+        )))
+    }
+
     async fn query_all_open_orders(
         &self,
         asset_class: AssetClass,
     ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
-        let family = ApiFamily::from(asset_class);
-        let (status, body) = self
-            .rest
-            .signed_request("GET", family, Self::open_orders_path(family), "")
-            .await?;
-        if !status.is_success() {
-            return Err(format!("HTTP {status}: {body}"));
-        }
-        let entries: Vec<OpenOrderEntry> = serde_json::from_str(&body)
-            .map_err(|error| format!("parse error: {error}; body={body}"))?;
+        let entries = self.fetch_open_order_entries(asset_class).await?;
 
         // A single entry this gateway can't parse (a non-UUID
         // clientOrderId from an order placed by something other than
@@ -708,6 +755,17 @@ impl ExecutionGateway for BinanceExecutionGateway {
                 }
             })
             .collect())
+    }
+
+    async fn count_foreign_open_orders(&self, asset_class: AssetClass) -> Result<usize, String> {
+        // "Foreign" = a clientOrderId that is not one of ours (a UUID). An
+        // entry with a UUID but an unmapped status is still our own order.
+        Ok(self
+            .fetch_open_order_entries(asset_class)
+            .await?
+            .iter()
+            .filter(|entry| entry.client_order_id.parse::<uuid::Uuid>().is_err())
+            .count())
     }
 
     async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {

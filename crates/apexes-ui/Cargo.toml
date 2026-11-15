@@ -13,6 +13,10 @@ apexes-core = { path = "../apexes-core" }
 apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-market-data = { path = "../apexes-market-data" }
 apexes-chart = { path = "../apexes-chart" }
+apexes-backtest = { path = "../apexes-backtest" }
+apexes-engine = { path = "../apexes-engine" }
+apexes-security = { path = "../apexes-security" }
+apexes-telemetry = { path = "../apexes-telemetry" }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 axum = { workspace = true, features = ["ws"] }
@@ -21,12 +25,14 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 eframe = { workspace = true }
 egui = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]
+apexes-strategy = { path = "../apexes-strategy" }
+apexes-oms = { path = "../apexes-oms" }
 egui_kittest = { workspace = true }
 rust_decimal_macros = "1.40"
 chrono = { workspace = true }

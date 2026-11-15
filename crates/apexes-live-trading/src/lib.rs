@@ -13,10 +13,17 @@
 //! temporary position/balance tracking, pending sub-project #11
 //! (account & fund management), which will supersede it.
 
+pub mod flatten;
+pub mod halt;
 pub mod order_executor_adapter;
 pub mod runner;
+pub mod startup_recovery;
 
+pub use flatten::{FlattenConfig, FlattenReport, FlattenSetup, PositionSource, flatten_positions};
 pub use order_executor_adapter::{
     LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
 };
 pub use runner::{LiveTradingConfig, LiveTradingReport, run_live_trading};
+pub use startup_recovery::{
+    ExchangeSnapshot, RecoveredState, RecoveryError, RecoveryOrders, recover_live_state,
+};

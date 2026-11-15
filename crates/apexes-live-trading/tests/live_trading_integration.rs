@@ -186,6 +186,7 @@ fn base_config() -> LiveTradingConfig {
     LiveTradingConfig {
         instruments: vec![btc_usdt_instrument()],
         initial_balances,
+        initial_positions: HashMap::new(),
         // Live trading never simulates fees itself; `cost_model` exists
         // only for `funding_rate_bps` (disabled here).
         cost_model: CostModel {
@@ -202,6 +203,10 @@ fn base_config() -> LiveTradingConfig {
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),
         control: None,
+        kill_switch: None,
+        stale_data_timeout: None,
+        resync: None,
+        position_source: None,
     }
 }
 

@@ -71,14 +71,34 @@ pub fn build_app(
     storage_reader: Option<Arc<StorageReader>>,
     instruments: Vec<Instrument>,
 ) -> Router {
+    build_app_secured(gateway, storage_reader, instruments, None)
+}
+
+/// Like [`build_app`], but when `token` is `Some`, `/market` requires
+/// `Authorization: Bearer <token>`.
+pub fn build_app_secured(
+    gateway: Arc<Gateway>,
+    storage_reader: Option<Arc<StorageReader>>,
+    instruments: Vec<Instrument>,
+    token: Option<Arc<apexes_security::BearerToken>>,
+) -> Router {
     let state = AppState {
         gateway,
         storage_reader,
         instruments: Arc::new(instruments),
     };
-    Router::new()
+    let market = Router::new()
         .route("/market", get(market_handler))
-        .with_state(state)
+        .with_state(state);
+    let market = match token {
+        Some(token) => market.route_layer(axum::middleware::from_fn_with_state(
+            token,
+            apexes_security::require_bearer,
+        )),
+        None => market,
+    };
+    // Unauthenticated liveness probe for supervisors (carries no data).
+    market.route("/healthz", get(|| async { "ok\n" }))
 }
 
 async fn market_handler(
@@ -208,5 +228,68 @@ mod tests {
         let mock = MockMarketDataProvider::new();
         let gateway = Arc::new(Gateway::new(Box::new(mock), 16));
         let _router = build_app(gateway, None, vec![btc_usdt()]);
+    }
+
+    #[tokio::test]
+    async fn market_endpoint_requires_the_bearer_token_when_configured() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let gateway = Arc::new(Gateway::new(Box::new(MockMarketDataProvider::new()), 16));
+        let token = Arc::new(apexes_security::BearerToken::new("gw-secret"));
+        let app = build_app_secured(gateway, None, vec![btc_usdt()], Some(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("ws://127.0.0.1:{port}/market");
+
+        // No token: handshake refused (HTTP 401).
+        let err = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+        assert!(
+            matches!(&err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401),
+            "{err:?}"
+        );
+
+        // Wrong token: refused.
+        let mut bad = url.as_str().into_client_request().unwrap();
+        bad.headers_mut()
+            .insert("Authorization", "Bearer wrong".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(bad).await.is_err());
+
+        // Right token: connects.
+        let mut good = url.as_str().into_client_request().unwrap();
+        good.headers_mut()
+            .insert("Authorization", "Bearer gw-secret".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(good).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn healthz_is_open_even_when_market_requires_a_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let gateway = Arc::new(Gateway::new(Box::new(MockMarketDataProvider::new()), 16));
+        let token = Arc::new(apexes_security::BearerToken::new("gw-secret"));
+        let app = build_app_secured(gateway, None, vec![btc_usdt()], Some(token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.0\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        assert!(
+            raw.starts_with("HTTP/1.0 200") || raw.starts_with("HTTP/1.1 200"),
+            "{raw}"
+        );
+        assert!(raw.contains("ok"));
     }
 }

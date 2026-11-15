@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
+    /// Address to bind on. Defaults to loopback; containers pass
+    /// `--host 0.0.0.0` (set `APEXES_GATEWAY_TOKEN` when doing so).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
     /// Comma-separated CPU core IDs to pin this process's main thread
     /// to (e.g. `--cpu-cores 2,3`). Omit to leave OS scheduling at its
     /// default (fully backward-compatible: this is a performance
@@ -296,7 +301,7 @@ async fn build_persistence(
 /// call without re-reading this comment; that regression has already
 /// been caught and fixed once.
 fn main() {
-    tracing_subscriber::fmt::init();
+    apexes_telemetry::init_tracing();
 
     let cli = Cli::parse();
     let port = resolve_port(&cli);
@@ -360,13 +365,26 @@ async fn run(cli: Cli, port: u16) {
 
     write_pid_file(port);
 
-    let app =
-        apexes_market_data_gateway::build_app(Arc::clone(&gateway), storage_reader, instruments);
+    let token = apexes_security::BearerToken::from_env("APEXES_GATEWAY_TOKEN").map(Arc::new);
+    if token.is_none() {
+        tracing::warn!(
+            "apexes-market-data-gateway: APEXES_GATEWAY_TOKEN not set; /market is UNAUTHENTICATED"
+        );
+    }
+    let app = apexes_market_data_gateway::build_app_secured(
+        Arc::clone(&gateway),
+        storage_reader,
+        instruments,
+        token,
+    );
 
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match TcpListener::bind((cli.host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("apexes-market-data-gateway: failed to bind 127.0.0.1:{port}: {error}");
+            eprintln!(
+                "apexes-market-data-gateway: failed to bind {}:{port}: {error}",
+                cli.host
+            );
             std::process::exit(1);
         }
     };
