@@ -1677,9 +1677,25 @@ subtraction by checking whether that exact string also appears in the
 legend and summary rows, the same way `✅ Done`/`🔲 Not Started` do —
 do not assume, verify).
 
+- [ ] **Step 3b: Refresh `docs/PLAN.md`, `README.md` and `AGENTS.md`**
+
+- `docs/PLAN.md`: mark Tasks 9-14 done with commit ranges, move the 13c
+  plan from "Now" to "Completed plans", set "Now" to the next
+  sub-project (or "none"), update `_Last updated_`, and resolve or
+  re-list every item under "Carry-forward technical debt" (the final
+  review's findings that were deferred belong there).
+- `README.md`: update the Status section (counts must equal the
+  recomputed `FEATURES.md` Summary table; move 9.3 and the 8.3 slice
+  into "Implemented"), and replace the "will start the other two itself
+  once the supervisor work lands" sentence with how to actually launch
+  the system.
+- `AGENTS.md`: re-read sections 4 and 6 against the final code. Add any
+  new architecture invariant this plan introduced (e.g. the supervisor's
+  respawn rule), and correct anything the implementation changed.
+
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/FEATURES.md
-git commit -S -s -m "docs: mark FEATURES.md row 9.3 (strategy monitoring & live tuning panel) Done, row 8.3 (message bus) In Progress"
+git add docs/FEATURES.md docs/PLAN.md README.md AGENTS.md
+git commit -S -s -m "docs: mark FEATURES.md row 9.3 (strategy monitoring & live tuning panel) Done, row 8.3 (message bus) In Progress; refresh PLAN/README/AGENTS"
 ```
