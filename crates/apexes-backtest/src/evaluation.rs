@@ -182,6 +182,11 @@ impl EvaluationTracker {
         if !priced {
             return;
         }
+        // Points must go forward in time. A back-dated one would stretch the
+        // timeline over the whole gap and fold the line back on itself.
+        if self.last_point.is_some_and(|(previous, _)| at < previous) {
+            return;
+        }
         if self.start_equity.is_none() {
             self.start_equity = Some(equity);
         }
@@ -485,6 +490,24 @@ mod tests {
         assert_eq!(s.total_pnl, dec!(100), "no phantom gain from the repricing");
         assert_eq!(s.max_drawdown, dec!(0));
         assert_eq!(t.equity_history().len(), 2);
+    }
+
+    #[test]
+    fn a_point_older_than_the_last_is_ignored_so_the_timeline_never_folds_back() {
+        let mut t = tracker();
+        t.record_equity(at(100), dec!(1000), false, true);
+        t.record_equity(at(110), dec!(1010), false, true);
+        // A back-dated point (e.g. from a daily bar stamped 00:00 UTC).
+        t.record_equity(at(-50_000), dec!(5000), false, true);
+        t.record_equity(at(120), dec!(1020), false, true);
+        let view = t.equity_history();
+        assert_eq!(view.len(), 3);
+        assert!(view.windows(2).all(|w| w[0].0 < w[1].0), "strictly forward");
+        assert_eq!(
+            t.summary(dec!(1020), dec!(0), dec!(0), dec!(0))
+                .max_drawdown,
+            dec!(0)
+        );
     }
 
     #[test]

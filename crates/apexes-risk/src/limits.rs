@@ -143,11 +143,10 @@ impl PreTradeCheck for LimitChecker {
                 });
             }
         }
-        // Market orders (intent.price == None) have no notional to
-        // check against here -- their actual fill price is unknown
-        // until the matching engine executes them. This is an accepted
-        // limitation: max_order_notional only applies to Limit/
-        // StopLimit orders where a price is known in advance.
+        // An intent with no price has no notional to check here. The unified
+        // loop fills the price in with the last trade price before asking, so
+        // market orders are covered in practice; a caller that does not (or
+        // before any trade has printed) leaves this limit unenforced.
 
         if let Some(max_position) = self.limits.max_position_per_symbol {
             let current = positions
@@ -204,16 +203,25 @@ impl PreTradeCheck for LimitChecker {
         }
 
         if violations.is_empty() {
-            let mut state = self
-                .daily_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.trade_count += 1;
-            state.traded_volume += intent.quantity;
             Ok(())
         } else {
             Err(violations)
         }
+    }
+
+    fn on_order_accepted(&self, intent: &OrderIntent, now: DateTime<Utc>) {
+        let today = now.date_naive();
+        let mut state = self
+            .daily_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.day != Some(today) {
+            state.day = Some(today);
+            state.trade_count = 0;
+            state.traded_volume = Decimal::ZERO;
+        }
+        state.trade_count += 1;
+        state.traded_volume += intent.quantity;
     }
 }
 
@@ -446,6 +454,100 @@ mod tests {
         );
     }
 
+    /// `check` is a pure question: asking again and again (the loop and the
+    /// order manager both ask about the same order) must not use up allowance,
+    /// and only an accepted order does.
+    #[test]
+    fn checking_does_not_count_only_accepted_orders_do() {
+        let checker = LimitChecker::new(RiskLimits {
+            max_daily_trade_count: Some(2),
+            ..Default::default()
+        });
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let intent = sample_intent("BTCUSDT", Side::Buy, dec!(1), None);
+        let ask = || {
+            checker.check(
+                &intent,
+                &empty_positions(),
+                &empty_balances(),
+                &empty_open_orders(),
+                now,
+            )
+        };
+
+        for _ in 0..100 {
+            assert!(ask().is_ok(), "asking never uses allowance");
+        }
+        checker.on_order_accepted(&intent, now);
+        assert!(ask().is_ok(), "1 of 2 used");
+        checker.on_order_accepted(&intent, now);
+        let error = ask().unwrap_err();
+        assert!(
+            error.iter().any(|v| matches!(
+                v,
+                RiskViolation::DailyTradeCountExceeded {
+                    actual: 3,
+                    limit: 2,
+                    ..
+                }
+            )),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn daily_volume_counts_only_accepted_quantity() {
+        let checker = LimitChecker::new(RiskLimits {
+            max_daily_volume: Some(dec!(10)),
+            ..Default::default()
+        });
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let six = sample_intent("BTCUSDT", Side::Buy, dec!(6), None);
+        let args = (empty_positions(), empty_balances(), empty_open_orders());
+        assert!(checker.check(&six, &args.0, &args.1, &args.2, now).is_ok());
+        assert!(
+            checker.check(&six, &args.0, &args.1, &args.2, now).is_ok(),
+            "a rejected-by-exchange 6 never counted"
+        );
+        checker.on_order_accepted(&six, now);
+        assert!(
+            checker.check(&six, &args.0, &args.1, &args.2, now).is_err(),
+            "6 + 6 exceeds 10 once the first was accepted"
+        );
+    }
+
+    #[test]
+    fn accepting_on_a_new_day_resets_the_counters_first() {
+        let checker = LimitChecker::new(RiskLimits {
+            max_daily_trade_count: Some(1),
+            ..Default::default()
+        });
+        let day1 = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 23, 59, 0).unwrap();
+        let day2 = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 0, 1, 0).unwrap();
+        let intent = sample_intent("BTCUSDT", Side::Buy, dec!(1), None);
+        checker.on_order_accepted(&intent, day1);
+        let args = (empty_positions(), empty_balances(), empty_open_orders());
+        assert!(
+            checker
+                .check(&intent, &args.0, &args.1, &args.2, day1)
+                .is_err()
+        );
+        // Accepting first thing on the next day must start a fresh count.
+        checker.on_order_accepted(&intent, day2);
+        assert!(
+            checker
+                .check(&intent, &args.0, &args.1, &args.2, day2)
+                .is_err(),
+            "1 of 1 used on day 2"
+        );
+        let day3 = chrono::Utc.with_ymd_and_hms(2026, 1, 3, 9, 0, 0).unwrap();
+        assert!(
+            checker
+                .check(&intent, &args.0, &args.1, &args.2, day3)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn daily_trade_count_resets_across_calendar_days() {
         let checker = LimitChecker::new(RiskLimits {
@@ -468,6 +570,7 @@ mod tests {
                 )
                 .is_ok()
         );
+        checker.on_order_accepted(&intent, day1);
         // Second trade on day 1: rejected (would be count 2, exceeds limit 1).
         assert!(
             checker
@@ -512,6 +615,8 @@ mod tests {
                 )
                 .is_ok()
         );
+        // The first order is accepted for execution, so it now counts.
+        checker.on_order_accepted(&intent, now());
         // Second call: 6 (already traded) + 6 (this intent) = 12 > 10 -> rejected.
         let result = checker.check(
             &intent,

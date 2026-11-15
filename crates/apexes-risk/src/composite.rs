@@ -107,6 +107,20 @@ impl CompositeRiskChecker {
         }
     }
 
+    /// Tells every pre-trade check that `intent` was accepted for execution,
+    /// so stateful limits (orders and volume per day) can advance. Call once
+    /// per accepted order, from the layer that owns the submission. See
+    /// `PreTradeCheck::on_order_accepted`.
+    pub fn on_order_accepted(&self, intent: &OrderIntent, now: DateTime<Utc>) {
+        let checks = self
+            .pre_trade_checks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for checker in checks.iter() {
+            checker.on_order_accepted(intent, now);
+        }
+    }
+
     /// Runs every registered `InTradeMonitor`'s `on_fill`, collecting
     /// every violation from every monitor into one combined `Vec`.
     pub fn on_fill(

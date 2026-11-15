@@ -228,6 +228,11 @@ mod tests {
             check(&checker, &intent).is_ok(),
             "first order of the day passes"
         );
+        assert!(
+            check(&checker, &intent).is_ok(),
+            "asking again uses no allowance: only an accepted order does"
+        );
+        checker.on_order_accepted(&intent, chrono::Utc::now());
         let violations = check(&checker, &intent).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
             v,

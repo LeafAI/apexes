@@ -29,4 +29,14 @@ pub trait PreTradeCheck: Send + Sync {
         open_orders: &HashMap<OrderId, Order>,
         now: DateTime<Utc>,
     ) -> Result<(), Vec<RiskViolation>>;
+
+    /// Called once when an order that passed every check was actually
+    /// accepted for execution. Stateful limits (orders and volume per day)
+    /// advance here and ONLY here.
+    ///
+    /// `check` must not change state: the same checker is consulted by more
+    /// than one layer for the same order, and an order the exchange then
+    /// rejects never used up any allowance. Counting inside `check` made each
+    /// order count twice and let rejected orders exhaust the daily cap.
+    fn on_order_accepted(&self, _intent: &OrderIntent, _now: DateTime<Utc>) {}
 }

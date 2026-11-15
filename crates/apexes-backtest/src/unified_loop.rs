@@ -567,9 +567,14 @@ pub async fn run_unified_event_loop(
                     // Querying the executor per intent reproduces that
                     // exactly.
                     let open_orders_for_check = executor.open_orders().await;
+                    // A market order has no price, so a notional limit could never
+                    // apply to it. For the check only, value it at the last trade
+                    // price (the order itself is sent unchanged).
+                    let checked_intent =
+                        priced_for_risk_check(&intent, &instruments_by_symbol, &last_prices);
                     if let Some(checker) = &risk_checker
                         && let Err(violations) = checker.check(
-                            &intent,
+                            &checked_intent,
                             ledger.positions(),
                             ledger.balances(),
                             &open_orders_for_check,
@@ -596,14 +601,14 @@ pub async fn run_unified_event_loop(
                         latency_model.apply().await;
                     }
 
-                    if let Some(execution_algo) = intent.execution_algo {
+                    if let Some(execution_algo) = intent.execution_algo.clone() {
                         let request = apexes_ems::AlgoOrderRequest {
                             symbol: intent.symbol.clone(),
                             venue: intent.venue,
                             side: intent.side,
                             quantity: intent.quantity,
                             execution_algo,
-                            routing: intent.routing,
+                            routing: intent.routing.clone(),
                             leverage: intent.leverage,
                             margin_mode: intent.margin_mode,
                         };
@@ -611,6 +616,12 @@ pub async fn run_unified_event_loop(
                             Ok(parent_id) => {
                                 open_parent_orders
                                     .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
+                                // The parent order is what the strategy asked for and
+                                // what counts against the daily allowance; its child
+                                // orders are the executor's business.
+                                if let Some(checker) = &risk_checker {
+                                    checker.on_order_accepted(&intent, timestamp);
+                                }
                             }
                             Err(error) => {
                                 tracing::warn!(?error, symbol = %intent.symbol, "algo order submission failed");
@@ -630,6 +641,15 @@ pub async fn run_unified_event_loop(
                         .await
                     {
                         Ok((_order, fills)) => {
+                            // Accepted for execution: only now does the order use up
+                            // daily allowance. An order the exchange rejects never does,
+                            // so a strategy sending rejected orders cannot exhaust the
+                            // daily cap and lock out valid ones. The loop is the one
+                            // layer that always checks first (live also re-checks inside
+                            // `OrderManager`), so it is the single owner of this signal.
+                            if let Some(checker) = &risk_checker {
+                                checker.on_order_accepted(&intent, timestamp);
+                            }
                             if !fills.is_empty() {
                                 apply_fills(
                                     &mut ledger,
@@ -656,14 +676,25 @@ pub async fn run_unified_event_loop(
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(?error, symbol = %intent.symbol, "order submission rejected");
+                            tracing::warn!(
+                                ?error,
+                                symbol = %intent.symbol,
+                                side = ?intent.side,
+                                quantity = %intent.quantity,
+                                "order submission rejected"
+                            );
                         }
                     }
                 }
 
                 let equity = ledger.equity(&last_prices)?;
                 overall_tracker.record_equity_point(timestamp, equity);
-                if let Some(tracker) = &mut evaluation {
+                // Bars carry no new price (equity only moves on trades) and are
+                // stamped with their OPEN time, which for a daily bar can be
+                // many hours ago: recording them would drag the timeline back.
+                if let Some(tracker) = &mut evaluation
+                    && !matches!(event, MarketEvent::Bar(_))
+                {
                     tracker.observe_fills(&all_fills);
                     tracker.record_equity(
                         timestamp,
@@ -795,6 +826,28 @@ pub async fn run_unified_event_loop(
         equity_curve: overall_tracker.equity_curve().to_vec(),
         trades: all_fills,
     })
+}
+
+/// `intent` as the risk checks should see it: a priceless order (market) gets
+/// the last trade price of its instrument so notional limits can apply. Used
+/// for the check only; the order is submitted unchanged. With no price known
+/// yet the intent is returned as is.
+fn priced_for_risk_check(
+    intent: &apexes_strategy::OrderIntent,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+    last_prices: &HashMap<String, Decimal>,
+) -> apexes_strategy::OrderIntent {
+    if intent.price.is_some() {
+        return intent.clone();
+    }
+    let reference = instruments_by_symbol
+        .get(&intent.symbol)
+        .and_then(|instrument| instrument.base_currency.as_ref())
+        .and_then(|base| last_prices.get(base).copied());
+    apexes_strategy::OrderIntent {
+        price: reference,
+        ..intent.clone()
+    }
 }
 
 /// True when every non-zero balance is either a quote currency of a traded
@@ -1525,6 +1578,148 @@ mod tests {
         assert_eq!(report.trades.len(), 2);
         assert_eq!(report.trades[0].side, Side::Buy);
         assert_eq!(report.trades[1].side, Side::Sell);
+    }
+
+    /// An executor the exchange always rejects (every order fails, as a real
+    /// exchange does for a notional below its minimum).
+    struct RejectingExecutor {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrderExecutor for RejectingExecutor {
+        async fn submit(
+            &self,
+            _intent: &OrderIntent,
+            _positions: &HashMap<String, Position>,
+            _balances: &HashMap<String, Decimal>,
+            _now: chrono::DateTime<Utc>,
+        ) -> Result<(apexes_core::Order, Vec<Fill>), ApexesError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ApexesError::OrderRejected {
+                reason: "Filter failure: NOTIONAL".to_string(),
+            })
+        }
+
+        fn on_market_event(&self, _event: &MarketEvent) -> Vec<(apexes_core::OrderId, Vec<Fill>)> {
+            Vec::new()
+        }
+
+        async fn open_orders(&self) -> HashMap<apexes_core::OrderId, apexes_core::Order> {
+            HashMap::new()
+        }
+    }
+
+    /// Regression: a strategy whose orders the exchange keeps rejecting must
+    /// not use up the daily trade allowance. Found on the real testnet: a
+    /// strategy sized below the exchange minimum was rejected 25 times and the
+    /// cap (50) was then hit, because the check counted every ATTEMPT, twice.
+    #[tokio::test]
+    async fn orders_the_exchange_rejects_do_not_use_up_the_daily_trade_cap() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events: Vec<MarketEvent> = (0..40)
+            .map(|i| trade_event(dec!(100), t0 + Duration::seconds(i)))
+            .collect();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor: Arc<dyn OrderExecutor> = Arc::new(RejectingExecutor {
+            attempts: Arc::clone(&attempts),
+        });
+        let checker = Arc::new(
+            apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+                apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+                    max_daily_trade_count: Some(5),
+                    ..Default::default()
+                }),
+            )),
+        );
+        let config = UnifiedLoopConfig {
+            risk_checker: Some(checker),
+            ..unified_loop_config(dec!(10000), None, HashMap::new())
+        };
+        let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(
+            zero_cost_model(None),
+            dec!(0.5),
+        )));
+        let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
+            crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+        );
+        let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+            child_order_sink,
+            Arc::new(apexes_strategy::PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        ));
+        run_unified_event_loop(
+            config,
+            futures::stream::iter(events),
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+            executor,
+            Arc::new(BacktestLiquidationPolicy),
+            NeverFillSupplementalFillSource,
+            ems,
+            AlwaysBuyStrategy,
+            None,
+            None,
+        )
+        .await
+        .expect("loop must not error");
+
+        // 40 events, a cap of 5: with the old counting the 6th order onward was
+        // blocked by the RISK CHECK and never reached the executor.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            40,
+            "every order must still reach the exchange: rejected orders use no allowance"
+        );
+    }
+
+    /// A market order must be held to `max_order_notional` like any other:
+    /// it has no price of its own, so the loop values it at the last trade.
+    /// Before this, the limit silently never applied to market orders, which is
+    /// all the demo strategy sends.
+    #[tokio::test]
+    async fn the_notional_limit_applies_to_market_orders_via_the_last_trade_price() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        // AlwaysBuyStrategy buys 0.01 BTC at market; at 100 that is 1 USDT.
+        let run_with_limit = |max_notional: Decimal, price: Decimal| async move {
+            let events = vec![
+                depth_snapshot(t0),
+                trade_event(price, t0 + Duration::seconds(1)),
+                trade_event(price, t0 + Duration::seconds(2)),
+            ];
+            let checker = Arc::new(
+                apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+                    apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+                        max_order_notional: Some(max_notional),
+                        ..Default::default()
+                    }),
+                )),
+            );
+            let config = UnifiedLoopConfig {
+                risk_checker: Some(checker),
+                ..unified_loop_config(dec!(100000), None, HashMap::new())
+            };
+            run(config, zero_cost_model(None), events, AlwaysBuyStrategy)
+                .await
+                .trades
+                .len()
+        };
+        // The strategy also fires on the opening depth event, before any trade
+        // has printed: that order has no reference price yet, so the limit
+        // cannot apply to it (documented in `priced_for_risk_check`). Every
+        // order AFTER the first trade is priced and must be held to the cap.
+        let within = run_with_limit(dec!(5), dec!(100)).await;
+        let blocked = run_with_limit(dec!(0.5), dec!(100)).await;
+        assert!(
+            within >= 2,
+            "under the cap every order trades, got {within}"
+        );
+        assert_eq!(
+            within - blocked,
+            2,
+            "both orders placed after a trade printed (1 USDT each) are blocked by a 0.5 cap"
+        );
     }
 
     /// Never trades.

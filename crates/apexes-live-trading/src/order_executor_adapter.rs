@@ -34,11 +34,48 @@ use rust_decimal::Decimal;
 /// shared `MatchingEngine`.
 pub struct OrderManagerExecutor {
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
+    /// The open orders as of the last time the manager's lock was obtained.
+    /// Served when the lock is busy, so the trading loop never stalls behind a
+    /// slow exchange query (see [`OrderManagerExecutor::open_orders`]).
+    last_open_orders: std::sync::Mutex<HashMap<OrderId, Order>>,
 }
+
+/// How long the loop waits for the order manager before using its last known
+/// view of the open orders. Uncontended acquisition is immediate; this only
+/// bites while a reconcile or submission is talking to the exchange.
+const OPEN_ORDERS_LOCK_WAIT: Duration = Duration::from_millis(50);
 
 impl OrderManagerExecutor {
     pub fn new(order_manager: Arc<tokio::sync::Mutex<OrderManager>>) -> Self {
-        Self { order_manager }
+        Self {
+            order_manager,
+            last_open_orders: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Runs `future` as its own task and waits for its result.
+///
+/// For work that holds the order manager's lock across network calls. Inside
+/// a stream polled only when the trading loop takes a turn, such a future is
+/// suspended mid-call while STILL HOLDING the lock whenever the loop does
+/// something else, and the loop's next need for the lock deadlocks against it
+/// (found on the real testnet: the engine froze after a reconcile, the
+/// stale-data halt fired, and it never logged again). As a task it keeps
+/// running to completion whether or not anyone is polling, so the lock is
+/// always released. It also finishes if the waiting side is dropped, rather
+/// than being cancelled half way through a reconcile.
+async fn run_detached<T, F>(future: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!(?error, "order-manager task failed");
+            None
+        }
     }
 }
 
@@ -91,8 +128,31 @@ impl OrderExecutor for OrderManagerExecutor {
         Vec::new()
     }
 
+    /// Waits at most [`OPEN_ORDERS_LOCK_WAIT`] for the order manager. While
+    /// it is busy (a reconcile or a submission waiting on the exchange) the
+    /// last known open orders are returned instead.
+    ///
+    /// Blocking here would stall market-event processing for as long as the
+    /// exchange takes to answer, and the stale-data watchdog would then halt a
+    /// session whose feed is fine. The cost of the shortcut is a view that can
+    /// lag by one exchange round trip: the strategy might not yet see an order
+    /// it just had accepted, which `submit` itself still guards (it takes the
+    /// real lock).
     async fn open_orders(&self) -> HashMap<OrderId, Order> {
-        self.order_manager.lock().await.open_orders().clone()
+        match tokio::time::timeout(OPEN_ORDERS_LOCK_WAIT, self.order_manager.lock()).await {
+            Ok(manager) => {
+                let fresh = manager.open_orders().clone();
+                if let Ok(mut cache) = self.last_open_orders.lock() {
+                    *cache = fresh.clone();
+                }
+                fresh
+            }
+            Err(_) => self
+                .last_open_orders
+                .lock()
+                .map(|cache| cache.clone())
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -131,6 +191,30 @@ impl LiquidationPolicy for LiveLiquidationPolicy {
             LiquidationReason::ExtremeMarketCondition => self.auto_derisk_live,
         }
     }
+}
+
+/// One `reconcile()` as its own task (see [`run_detached`]); the fills it
+/// found, or none (with a warning) if it failed.
+async fn reconcile_detached(
+    order_manager: &Arc<tokio::sync::Mutex<OrderManager>>,
+    why: &'static str,
+) -> Vec<Fill> {
+    let order_manager = Arc::clone(order_manager);
+    run_detached(async move { order_manager.lock().await.reconcile().await })
+        .await
+        .and_then(|result| {
+            result
+                .map(|changes| changes.into_iter().flat_map(|(_, fills)| fills).collect())
+                .map_err(|error| {
+                    tracing::warn!(
+                        ?error,
+                        why,
+                        "LiveSupplementalFillSource: reconcile() failed"
+                    );
+                })
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 /// Adapts live trading's real fill sources -- the exchange's push-based
@@ -219,22 +303,32 @@ where
                                 // risking a busy loop.
                                 return None;
                             };
-                            let fills = order_manager
-                                .lock()
-                                .await
-                                .apply_exchange_update(
-                                    update.client_order_id,
-                                    update.exchange_order_id,
-                                    update.status,
-                                )
-                                .await
-                                .unwrap_or_else(|error| {
-                                    tracing::warn!(
-                                        ?error,
-                                        "LiveSupplementalFillSource: apply_exchange_update failed"
-                                    );
-                                    Vec::new()
-                                });
+                            let fills = run_detached({
+                                let order_manager = Arc::clone(&order_manager);
+                                async move {
+                                    order_manager
+                                        .lock()
+                                        .await
+                                        .apply_exchange_update(
+                                            update.client_order_id,
+                                            update.exchange_order_id,
+                                            update.status,
+                                        )
+                                        .await
+                                }
+                            })
+                            .await
+                            .and_then(|result| {
+                                result
+                                    .map_err(|error| {
+                                        tracing::warn!(
+                                            ?error,
+                                            "LiveSupplementalFillSource: apply_exchange_update failed"
+                                        );
+                                    })
+                                    .ok()
+                            })
+                            .unwrap_or_default();
                             if fills.is_empty() {
                                 continue;
                             }
@@ -247,29 +341,14 @@ where
                             }
                         } => {
                             tracing::info!("LiveSupplementalFillSource: push stream (re)connected; reconciling now");
-                            let fills: Vec<Fill> = match order_manager.lock().await.reconcile().await {
-                                Ok(changes) => changes.into_iter().flat_map(|(_, fills)| fills).collect(),
-                                Err(error) => {
-                                    tracing::warn!(?error, "LiveSupplementalFillSource: resync reconcile() failed");
-                                    Vec::new()
-                                }
-                            };
+                            let fills = reconcile_detached(&order_manager, "resync").await;
                             if fills.is_empty() {
                                 continue;
                             }
                             return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
                         }
                         _ = reconcile_interval.tick() => {
-                            let fills: Vec<Fill> = match order_manager.lock().await.reconcile().await {
-                                Ok(changes) => changes.into_iter().flat_map(|(_, fills)| fills).collect(),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        ?error,
-                                        "LiveSupplementalFillSource: reconcile() failed"
-                                    );
-                                    Vec::new()
-                                }
-                            };
+                            let fills = reconcile_detached(&order_manager, "periodic").await;
                             if fills.is_empty() {
                                 continue;
                             }

@@ -795,3 +795,163 @@ async fn registering_a_market_event_bus_shares_one_upstream_connection() {
         "two subscribe() calls through the same registered MarketEventBus must share one upstream connection"
     );
 }
+
+/// A gateway whose order queries hang (a slow exchange, or a dead address
+/// waiting out its connect timeout). Everything else is the mock.
+struct HangingQueryGateway {
+    inner: MockExecutionGateway,
+    hang_for: Duration,
+}
+
+#[async_trait]
+impl ExecutionGateway for HangingQueryGateway {
+    async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+        self.inner.submit_order(order).await
+    }
+    async fn cancel_order(&self, order: &Order) -> GatewayOutcome {
+        self.inner.cancel_order(order).await
+    }
+    async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String> {
+        tokio::time::sleep(self.hang_for).await;
+        self.inner.query_order_status(order).await
+    }
+    async fn query_all_open_orders(
+        &self,
+        asset_class: AssetClass,
+    ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
+        tokio::time::sleep(self.hang_for).await;
+        self.inner.query_all_open_orders(asset_class).await
+    }
+    async fn query_fills_for_order(&self, order: &Order) -> Result<Vec<ExchangeFill>, String> {
+        self.inner.query_fills_for_order(order).await
+    }
+}
+
+/// A feed that ticks every 100 ms forever.
+struct SteadyFeed;
+
+#[async_trait]
+impl MarketDataProvider for SteadyFeed {
+    async fn subscribe(
+        &self,
+        _instruments: &[Instrument],
+    ) -> Result<BoxStream<'static, MarketEvent>, apexes_core::ApexesError> {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        Ok(Box::pin(futures::stream::unfold(
+            0i64,
+            move |n| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let event = MarketEvent::Trade(TradeEvent {
+                    symbol: "BTCUSDT".to_string(),
+                    venue: Venue::Binance,
+                    price: dec!(100),
+                    quantity: dec!(1),
+                    side: None,
+                    trade_id: None,
+                    timestamp: t0 + chrono::Duration::milliseconds(n * 100),
+                });
+                Some((event, n + 1))
+            },
+        )))
+    }
+}
+
+/// Reproduces the real-testnet halt: "market data stale: no events for 37.4s"
+/// while the feed was healthy. With an open order, every reconcile tick queries
+/// the exchange while HOLDING the order-manager lock, and the trading loop
+/// needs that same lock on every market event (it asks for the open orders).
+/// A slow or hanging exchange query therefore stalls event processing, the
+/// activity clock stops being touched, and the staleness watchdog halts a
+/// session whose feed is fine.
+#[tokio::test]
+#[ignore]
+async fn a_slow_exchange_query_must_not_stall_market_events_or_trip_the_stale_data_halt() {
+    clean_db().await;
+    let gateway = Arc::new(HangingQueryGateway {
+        inner: MockExecutionGateway::new(),
+        hang_for: Duration::from_secs(4),
+    });
+    let provider: Arc<dyn MarketDataProvider> = Arc::new(SteadyFeed);
+    let registry = registry_with(Arc::clone(&gateway) as Arc<dyn ExecutionGateway>, provider);
+    let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+    let mut order_manager = OrderManager::new(store, &registry).await.unwrap();
+    // One open order, so reconcile has something to query.
+    order_manager
+        .submit_order(
+            OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                quantity: dec!(1),
+                price: Some(dec!(1)),
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
+    let mut config = base_config();
+    config.reconcile_interval = Duration::from_millis(500);
+    config.kill_switch = Some(Arc::clone(&kill_switch));
+    // The feed ticks every 0.1 s, so 2 s without an event is unmistakably a stall.
+    config.stale_data_timeout = Some(Duration::from_secs(2));
+
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let _ = tx.send(());
+    });
+    let seen = Arc::new(AtomicUsize::new(0));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(40),
+        run_live_trading(
+            config,
+            &registry,
+            CountingStrategy {
+                seen: Arc::clone(&seen),
+            },
+            order_manager,
+            futures::stream::empty::<ExchangeUpdate>(),
+            rx,
+        ),
+    )
+    .await;
+
+    // The feed ticks every 0.1 s for 12 s: ~120 events if nothing stalls.
+    let processed = seen.load(Ordering::SeqCst);
+    println!("events processed by the strategy: {processed} (feed produced ~120)");
+    assert!(
+        outcome.is_ok(),
+        "the run did not stop within 40 s of the stop signal (only {processed} events processed): \
+         the trading loop is blocked behind exchange queries"
+    );
+    assert!(
+        !kill_switch.is_engaged(),
+        "the feed never went quiet, yet trading was halted: {:?} (strategy saw {processed} events)",
+        kill_switch.reason()
+    );
+}
+
+struct CountingStrategy {
+    seen: Arc<AtomicUsize>,
+}
+
+impl Strategy for CountingStrategy {
+    fn on_market_event(
+        &mut self,
+        _event: &MarketEvent,
+        _ctx: &StrategyContext,
+    ) -> Vec<OrderIntent> {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    }
+}
