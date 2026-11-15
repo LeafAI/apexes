@@ -54,16 +54,53 @@ if ! nc -z localhost 5432 2>/dev/null; then
 fi
 ok "Postgres reachable on localhost:5432"
 
+# Live sessions keep their orders in their own database. The test suites
+# TRUNCATE the shared `apexes` database and leave mock orders behind, which a
+# live engine would adopt as its own open orders.
+LIVE_DB="apexes_live"
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx apexes-postgres; then
+  if ! docker exec apexes-postgres psql -U apexes -d postgres -Atc "select 1 from pg_database where datname='$LIVE_DB'" | grep -q 1; then
+    docker exec apexes-postgres createdb -U apexes "$LIVE_DB" || fail "could not create database $LIVE_DB"
+    ok "created database $LIVE_DB"
+  else
+    ok "database $LIVE_DB present"
+  fi
+else
+  echo "  WARN Postgres is not the apexes-postgres container; make sure database '$LIVE_DB' exists (createdb -U apexes $LIVE_DB)"
+fi
+
 # 3. Binance testnet reachable, and the clock is close enough ----------------
+# The testnet's hostname resolves to several addresses and one of them can
+# accept no connections. A plain HTTP client waits ~30 s on it, so try each
+# address with a short timeout instead (the Rust client does the same).
 SKEW="$(python3 - <<'PY'
-import json, time, urllib.request
+import http.client, json, socket, ssl, time
+
+HOST = "testnet.binance.vision"
+ctx = ssl.create_default_context()
+last = "no address answered"
 try:
-    t0 = time.time()
-    r = json.load(urllib.request.urlopen("https://testnet.binance.vision/api/v3/time", timeout=60))
-    t1 = time.time()
-    print(int((t0 + t1) / 2 * 1000 - r["serverTime"]))
-except Exception as e:
-    print("ERR", e)
+    addrs = sorted({a[4][0] for a in socket.getaddrinfo(HOST, 443, socket.AF_INET)})
+except OSError as e:
+    addrs = []
+    last = f"cannot resolve {HOST}: {e}"
+for ip in addrs:
+    try:
+        sock = socket.create_connection((ip, 443), timeout=4)
+        tls = ctx.wrap_socket(sock, server_hostname=HOST)
+        tls.settimeout(8)
+        t0 = time.time()
+        conn = http.client.HTTPSConnection(HOST, 443, timeout=8)
+        conn.sock = tls
+        conn.request("GET", "/api/v3/time")
+        server = json.load(conn.getresponse())["serverTime"]
+        t1 = time.time()
+        print(int((t0 + t1) / 2 * 1000 - server))
+        break
+    except Exception as e:  # try the next address
+        last = f"{ip}: {type(e).__name__}"
+else:
+    print("ERR", last)
 PY
 )"
 case "$SKEW" in

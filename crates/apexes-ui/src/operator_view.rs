@@ -185,10 +185,10 @@ fn summary(ui: &mut egui::Ui, state: &OperatorState) {
     let realized: rust_decimal::Decimal = s.realized_pnl.values().copied().sum();
     ui.horizontal(|ui| {
         ui.strong("Equity");
-        ui.label(s.equity.to_string());
+        ui.label(s.equity.round_dp(2).to_string());
         ui.separator();
         ui.strong("Realized PnL");
-        ui.label(realized.to_string());
+        ui.label(realized.round_dp(2).to_string());
     });
 }
 

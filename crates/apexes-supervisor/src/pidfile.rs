@@ -101,13 +101,31 @@ mod tests {
         assert!(!pid_exists(0));
     }
 
+    /// A port nothing is listening on, without the race of "bind, drop, hope
+    /// nobody else takes it": while this guard is alive the port is bound but
+    /// never `listen`ed on... which still refuses connections, and, unlike a
+    /// released port, cannot be taken by a parallel test or another process.
+    fn reserved_closed_port() -> (std::net::TcpStream, u16) {
+        use std::net::TcpStream;
+        // Connect a client to a short-lived listener, then close the LISTENER:
+        // the client's ephemeral port is held by this process and nothing is
+        // accepting on it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let held = client.local_addr().unwrap().port();
+        drop(listener);
+        (client, held)
+    }
+
     #[test]
     fn port_open_reflects_a_real_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(port_open(port));
         drop(listener);
-        assert!(!port_open(port));
+        let (_guard, closed) = reserved_closed_port();
+        assert!(!port_open(closed), "nothing accepts on a reserved port");
     }
 
     #[test]
@@ -127,6 +145,13 @@ mod tests {
             "dead pid, open port"
         );
         drop(listener);
-        assert!(!is_serving(live), "live pid, closed port");
+        let (_guard, closed) = reserved_closed_port();
+        assert!(
+            !is_serving(PidFile {
+                pid: std::process::id(),
+                port: closed
+            }),
+            "live pid, closed port"
+        );
     }
 }
