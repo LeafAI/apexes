@@ -1,0 +1,39 @@
+[package]
+name = "apexes-supervisor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apexes-core = { path = "../apexes-core" }
+apexes-engine = { path = "../apexes-engine" }
+apexes-security = { path = "../apexes-security" }
+apexes-strategy-loader = { path = "../apexes-strategy-loader" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+apexes-backtest = { path = "../apexes-backtest" }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net", "macros"] }
+tokio-tungstenite = { workspace = true }
+rustix = { version = "1.1", features = ["process"] }
+uuid = { workspace = true }
+
+[[bin]]
+name = "fake-engine"
+path = "src/bin/fake-engine.rs"
+test = false
+
+[[bin]]
+name = "fake-gateway"
+path = "src/bin/fake-gateway.rs"
+test = false
+
+[dev-dependencies]
+uuid = { workspace = true }
+rust_decimal_macros = "1.40"
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }

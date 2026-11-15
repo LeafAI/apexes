@@ -782,6 +782,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "apexes-supervisor"
+version = "0.1.0"
+dependencies = [
+ "apexes-backtest",
+ "apexes-core",
+ "apexes-engine",
+ "apexes-security",
+ "apexes-strategy-loader",
+ "axum",
+ "chrono",
+ "futures",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "apexes-telemetry"
 version = "0.1.0"
 dependencies = [
@@ -803,6 +827,8 @@ dependencies = [
  "apexes-oms",
  "apexes-security",
  "apexes-strategy",
+ "apexes-strategy-loader",
+ "apexes-supervisor",
  "apexes-telemetry",
  "axum",
  "chrono",
@@ -819,6 +845,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

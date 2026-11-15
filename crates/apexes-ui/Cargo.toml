@@ -16,6 +16,8 @@ apexes-chart = { path = "../apexes-chart" }
 apexes-backtest = { path = "../apexes-backtest" }
 apexes-engine = { path = "../apexes-engine" }
 apexes-security = { path = "../apexes-security" }
+apexes-supervisor = { path = "../apexes-supervisor" }
+apexes-strategy-loader = { path = "../apexes-strategy-loader" }
 apexes-telemetry = { path = "../apexes-telemetry" }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -32,6 +34,7 @@ egui_plot = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]
+uuid = { workspace = true }
 apexes-strategy = { path = "../apexes-strategy" }
 apexes-oms = { path = "../apexes-oms" }
 egui_kittest = { workspace = true }
