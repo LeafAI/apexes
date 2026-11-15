@@ -5,18 +5,13 @@
 //! close a limit is to being hit, how a fraction is formatted. The egui
 //! drawing in [`show_evaluation`] only renders those decisions.
 
+use crate::theme::{Palette, palette_of};
 use apexes_backtest::{EvaluationSummary, LimitUsage, SessionIdentity, SessionSnapshot};
 use chrono::{DateTime, Utc};
-use egui::{Color32, RichText};
+use egui::Color32;
 use egui_plot::{Line, Plot, PlotPoints};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-
-const RED: Color32 = Color32::from_rgb(200, 40, 40);
-const GREEN: Color32 = Color32::from_rgb(40, 160, 70);
-const AMBER: Color32 = Color32::from_rgb(220, 150, 20);
-const BLUE: Color32 = Color32::from_rgb(60, 110, 190);
-const GREY: Color32 = Color32::from_rgb(110, 110, 110);
 
 /// Utilisation at which a limit turns amber / red.
 pub const LIMIT_WARN: Decimal = Decimal::from_parts(7, 0, 0, false, 1);
@@ -30,11 +25,11 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn color(self) -> Color32 {
+    pub fn color(self, palette: &Palette) -> Color32 {
         match self {
-            Self::Ok => GREEN,
-            Self::Warn => AMBER,
-            Self::Danger => RED,
+            Self::Ok => palette.good,
+            Self::Warn => palette.warn,
+            Self::Danger => palette.danger,
         }
     }
 }
@@ -70,12 +65,12 @@ pub enum EnvironmentKind {
 }
 
 impl EnvironmentKind {
-    pub fn color(self) -> Color32 {
+    pub fn color(self, palette: &Palette) -> Color32 {
         match self {
-            Self::RealFunds => RED,
-            Self::Testnet => BLUE,
-            Self::Simulated => GREY,
-            Self::Unknown => AMBER,
+            Self::RealFunds => palette.danger,
+            Self::Testnet => palette.info,
+            Self::Simulated => palette.muted,
+            Self::Unknown => palette.warn,
         }
     }
 }
@@ -179,29 +174,26 @@ pub fn peak_points(history: &[(DateTime<Utc>, Decimal)]) -> Vec<[f64; 2]> {
 }
 
 pub fn banner(ui: &mut egui::Ui, banner: &EnvironmentBanner) {
-    egui::Frame::new()
-        .fill(banner.kind.color())
-        .inner_margin(6.0)
-        .show(ui, |ui| {
-            ui.label(RichText::new(&banner.text).strong().color(Color32::WHITE));
-        });
+    let palette = palette_of(ui.ctx());
+    crate::theme::banner(ui, &palette, banner.kind.color(&palette), &banner.text);
 }
 
 fn limit_row(ui: &mut egui::Ui, usage: &LimitUsage) {
+    let palette = palette_of(ui.ctx());
     let fraction = usage.fraction();
     let severity = limit_severity(fraction);
     ui.horizontal(|ui| {
         ui.label(&usage.name);
         let bar = egui::ProgressBar::new(fraction.to_f32().unwrap_or(0.0).clamp(0.0, 1.0))
-            .fill(severity.color())
-            .desired_width(160.0)
-            .text(format!(
-                "{} / {}  ({})",
-                usage.used,
-                usage.limit,
-                percent(fraction)
-            ));
+            .fill(severity.color(&palette))
+            .desired_width(160.0);
         ui.add(bar);
+        ui.label(format!(
+            "{} / {}  ({})",
+            usage.used,
+            usage.limit,
+            percent(fraction)
+        ));
     });
 }
 
@@ -249,6 +241,7 @@ fn metrics_grid(ui: &mut egui::Ui, e: &EvaluationSummary) {
 /// Equity timeline with the running peak, and the metrics and limit
 /// utilisation underneath.
 pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
+    let palette = palette_of(ui.ctx());
     ui.heading("Evaluation");
     if snapshot.equity_history.len() < 2 {
         ui.weak("collecting equity history...");
@@ -263,10 +256,10 @@ pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new("peak", PlotPoints::from(peak))
-                        .color(Color32::from_gray(150))
+                        .color(palette.plot_peak)
                         .style(egui_plot::LineStyle::dashed_dense()),
                 );
-                plot_ui.line(Line::new("equity", PlotPoints::from(equity)).color(BLUE));
+                plot_ui.line(Line::new("equity", PlotPoints::from(equity)).color(palette.info));
             });
     }
 
@@ -320,7 +313,14 @@ mod tests {
             "{}",
             b.text
         );
-        assert_ne!(b.kind.color(), EnvironmentKind::RealFunds.color());
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let p = Palette::for_theme(theme);
+            assert_ne!(
+                b.kind.color(&p),
+                EnvironmentKind::RealFunds.color(&p),
+                "{theme:?}"
+            );
+        }
     }
 
     #[test]

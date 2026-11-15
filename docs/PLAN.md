@@ -42,6 +42,14 @@ _Last updated: 2026-11-15 (testnet MVP built; e2e run against the real testnet)_
 | — | Live equity: only the session's base/quote assets seed the ledger, and the evaluation starts only once holdings are priced (the ledger values an unpriced asset at 1.0; a pre-filled testnet account has 500+ assets) | unit tests + real run shows equity 75 210 (10 000 USDT + 1 BTC), not 10 500+ |
 | — | Binance REST client: 4 s connect timeout per address (one of the testnet's four IPs black-holes connections; a default client stalled ~30 s and then failed signed requests with `-1021`) | live test went from failing to passing |
 
+### Theme and window management (2026-11-16)
+
+| What | Evidence |
+|---|---|
+| Light / Dark / System theme in every window (`theme.rs`, `chrome.rs`), saved in `~/.apexes/ui.json` (`preferences.rs`); one palette for every status colour and banner, checked for WCAG contrast on both themes; Cmd/Ctrl+Shift+L cycles | 13 palette tests, headless tests drive the shortcut and read the saved file |
+| One window, many sessions: a tab per console (`tabs.rs`, `shell_app.rs`), each with its own connection; a launch opens its console; background tabs keep reading and show `(offline)`/`HALTED`; Cmd/Ctrl+1-9, [ ], W; window size and position remembered, minimum size enforced | 9 `ShellApp` tests through the real app, 9 pure tab-model tests |
+| Found by looking at rendered PNGs, not by tests: eframe clears to near-black and gives `ui()` no background, so the light theme drew white-on-black text on a dark window (and dark-theme text on white) until every app drew a themed page; the `●` glyph is missing from egui's fonts and drew as an empty box (now a painted circle); limit-bar text was unreadable on its own fill | `cargo test -p apexes-ui --test themes -- --include-ignored` writes the PNGs |
+
 ### Found by hand-testing a real session (2026-11-16) and fixed
 
 | Symptom (from a screenshot and the session log) | Root cause | Fix |
@@ -60,7 +68,7 @@ _Last updated: 2026-11-15 (testnet MVP built; e2e run against the real testnet)_
 
 ### Not yet verified or built (be honest about these)
 
-- **The GUI window driven by a human.** Only headless `egui_kittest` render tests exist; nobody has clicked through the real launcher and console.
+- **The GUI window driven by a human.** Only headless `egui_kittest` render tests exist; nobody has clicked through the real launcher and console. Specifically unverified for the theme/window work: that **System** follows the real OS setting (headless tests can only force Light or Dark), that the window position restores on a multi-monitor desk, and the look of the market dashboard (`apexes-ui`, wgpu candlesticks keep fixed colours).
 - **The sample strategy trading on testnet:** now seen (buys and sells filled on ETHUSDT, positions and PnL moving in the snapshot). Not seen: a losing streak, a partial fill, or a session left running for hours.
 - **`SetParam` taking effect on a running session** (sent and the parameter shown, but its effect on orders not observed), a **genuine** stale-feed halt (the one seen was the deadlock above, now fixed), **restart-and-reconcile**, an **unclean engine kill**, and behaviour across a **testnet reset**.
 - **Screenshots of the GUI from an automated session are not possible here** (no screen-recording permission), so the chart fix is verified from the snapshot data the console renders (155 points over 287 s, chronological), not by eye.

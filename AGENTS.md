@@ -67,6 +67,9 @@ These are load-bearing. A change that violates one needs a design discussion fir
 18. **Test suites and live sessions use different databases.** Tests TRUNCATE `apexes`; the launcher uses `apexes_live`. Live tests must cancel what they place on the shared testnet account (a stray resting order makes the next engine refuse to start).
 19. **Quantities and prices go to Binance through `wire_decimal`** (plain, at most 8 places, never zero). A float-derived value can carry 20+ digits and is refused with `-1100`.
 
+20. **Colours come from `theme::Palette`, never from a constant in a view.** A colour picked for a dark window is hard to read on a light one. Draw status text and banners with `palette_of(ctx)` and `theme::banner`, draw on `theme::page` (eframe's `ui()` has no background and clears to near-black), and use `theme::status_dot`, not a `●` character (egui's fonts lack it). **Look at rendered output**: `cargo test -p apexes-ui --test themes -- --include-ignored` writes PNGs; assertions did not catch any of the three theme bugs, a screenshot caught all of them.
+21. **Opening a session never replaces another.** The operator window is one tab per console (`tabs.rs` holds the rules and is tested without a window); closing a tab drops its connection, never the engine.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

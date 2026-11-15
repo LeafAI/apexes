@@ -9,20 +9,17 @@ use std::time::Duration;
 use apexes_backtest::SessionCommand;
 use apexes_engine::SessionMessage;
 use chrono::Utc;
-use egui::{Color32, RichText};
+use egui::Color32;
 use tokio::sync::{mpsc, watch};
 
 use crate::client::ConnectionStatus;
 use crate::operator::{OperatorAction, OperatorState, Requested};
+use crate::theme::palette_of;
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 /// A snapshot older than this is flagged: the engine only pushes them as
 /// market data arrives, so an old one is itself a warning sign.
 const STALE_SNAPSHOT_SECS: i64 = 5;
-
-const RED: Color32 = Color32::from_rgb(200, 40, 40);
-const GREEN: Color32 = Color32::from_rgb(40, 160, 70);
-const AMBER: Color32 = Color32::from_rgb(220, 150, 20);
 
 fn dash(value: Option<impl ToString>) -> String {
     value.map_or_else(|| "-".to_string(), |v| v.to_string())
@@ -45,7 +42,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
     controls(ui, state, &mut out);
     confirmation(ui, state, &mut out);
     if let Some(notice) = state.notice.clone() {
-        ui.colored_label(AMBER, notice);
+        ui.colored_label(palette_of(ui.ctx()).warn, notice);
     }
     ui.separator();
 
@@ -66,11 +63,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
 fn header(ui: &mut egui::Ui, state: &OperatorState) {
     ui.horizontal(|ui| {
         let (text, color) = match state.connection {
-            ConnectionStatus::Connected => ("Connected", GREEN),
-            ConnectionStatus::Reconnecting => ("Reconnecting...", AMBER),
-            ConnectionStatus::Disconnected => ("Disconnected", RED),
+            ConnectionStatus::Connected => ("Connected", palette_of(ui.ctx()).good),
+            ConnectionStatus::Reconnecting => ("Reconnecting...", palette_of(ui.ctx()).warn),
+            ConnectionStatus::Disconnected => ("Disconnected", palette_of(ui.ctx()).danger),
         };
-        ui.colored_label(color, "\u{25CF}");
+        crate::theme::status_dot(ui, color);
         ui.label(text);
         if let Some(status) = &state.status {
             ui.separator();
@@ -80,7 +77,11 @@ fn header(ui: &mut egui::Ui, state: &OperatorState) {
 
     // The one thing an operator must never have to hunt for.
     if !state.connected() {
-        banner(ui, AMBER, "NO CONNECTION - state below may be out of date");
+        banner(
+            ui,
+            palette_of(ui.ctx()).warn,
+            "NO CONNECTION - state below may be out of date",
+        );
     } else if state.halted() {
         let reason = state
             .status
@@ -93,18 +94,29 @@ fn header(ui: &mut egui::Ui, state: &OperatorState) {
         } else {
             ""
         };
-        banner(ui, RED, &format!("TRADING HALTED: {reason}{suffix}"));
+        banner(
+            ui,
+            palette_of(ui.ctx()).danger,
+            &format!("TRADING HALTED: {reason}{suffix}"),
+        );
     } else if state.paused() {
-        banner(ui, AMBER, "STRATEGY PAUSED (orders still live)");
+        banner(
+            ui,
+            palette_of(ui.ctx()).warn,
+            "STRATEGY PAUSED (orders still live)",
+        );
     } else {
-        banner(ui, GREEN, "TRADING");
+        banner(ui, palette_of(ui.ctx()).good, "TRADING");
     }
 
     if let Some(snapshot) = &state.snapshot {
         let age = (Utc::now() - snapshot.timestamp).num_seconds().max(0);
         let text = format!("snapshot {age}s old");
         if age > STALE_SNAPSHOT_SECS {
-            ui.colored_label(AMBER, format!("{text} - no recent market data?"));
+            ui.colored_label(
+                palette_of(ui.ctx()).warn,
+                format!("{text} - no recent market data?"),
+            );
         } else {
             ui.weak(text);
         }
@@ -114,12 +126,8 @@ fn header(ui: &mut egui::Ui, state: &OperatorState) {
 }
 
 fn banner(ui: &mut egui::Ui, color: Color32, text: &str) {
-    egui::Frame::new()
-        .fill(color)
-        .inner_margin(6.0)
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).strong().color(Color32::WHITE));
-        });
+    let palette = palette_of(ui.ctx());
+    crate::theme::banner(ui, &palette, color, text);
 }
 
 fn controls(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<SessionCommand>) {
@@ -166,7 +174,7 @@ fn confirmation(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<Sess
         return;
     };
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.colored_label(AMBER, pending.warning());
+        ui.colored_label(palette_of(ui.ctx()).warn, pending.warning());
         ui.horizontal(|ui| {
             if ui.button("Confirm").clicked()
                 && let Some(command) = state.confirm()
@@ -356,7 +364,10 @@ impl OperatorApp {
         &self.state
     }
 
-    fn drain(&mut self) {
+    /// Takes in whatever the client task has delivered. Called every frame
+    /// for every open console, shown or not, so a background tab is never
+    /// behind and its health is current.
+    pub fn pump(&mut self) {
         if let Some(status_rx) = &mut self.status_rx {
             let current = *status_rx.borrow_and_update();
             if current != self.state.connection {
@@ -375,7 +386,7 @@ impl OperatorApp {
     /// Draws the console and forwards the operator's commands. Used by the
     /// standalone binary (via `eframe::App`) and by the launcher shell.
     pub fn render(&mut self, ui: &mut egui::Ui) {
-        self.drain();
+        self.pump();
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         ui.horizontal(|ui| {
             ui.heading("Apexes operator console");
@@ -387,6 +398,37 @@ impl OperatorApp {
                 let _ = tx.send(command);
             }
         }
+    }
+}
+
+/// The standalone console (`--engine`): an [`OperatorApp`] in its own window,
+/// with the theme chrome the launcher shell also has.
+pub struct StandaloneConsole {
+    app: OperatorApp,
+    chrome: crate::chrome::Chrome,
+}
+
+impl StandaloneConsole {
+    pub fn new(app: OperatorApp, chrome: crate::chrome::Chrome) -> Self {
+        Self { app, chrome }
+    }
+}
+
+impl eframe::App for StandaloneConsole {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.chrome.update(ui.ctx());
+        crate::theme::page(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.chrome.selector(ui);
+                });
+            });
+            self.app.render(ui);
+        });
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        crate::theme::clear_color(visuals)
     }
 }
 

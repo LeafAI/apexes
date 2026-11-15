@@ -22,7 +22,18 @@ scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability
 scripts/run-testnet.sh           # starts Postgres if needed, builds if needed, opens the app
 ```
 
-The app has two tabs. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first). When the status turns green, press **Open console**.
+The window has a **Launcher** tab and one tab per open session. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first); the new session's console then opens by itself.
+
+**Windows and tabs.** Open as many sessions as you like (**Open console** in the Launcher list); each keeps its own connection, and switching tabs loses nothing. A coloured dot on each tab shows its health, and a tab says `(offline)` or `HALTED` without you opening it. Closing a tab (the x, middle-click, or Cmd/Ctrl+W) only disconnects the console: the session keeps running.
+
+| Keys (Ctrl instead of Cmd off macOS) | Does |
+|---|---|
+| Cmd+1 ... Cmd+9 | Go to tab N (1 is the Launcher) |
+| Cmd+[ / Cmd+] | Previous / next tab, wrapping |
+| Cmd+W | Close the console in front (never the Launcher) |
+| Cmd+Shift+L | Cycle the theme: System, Light, Dark |
+
+**Theme.** The **Theme** menu at the top right (every window) picks System (follows your OS), Light or Dark; the choice is remembered in `~/.apexes/ui.json`. The environment banner stays loud in both: MAINNET red, TESTNET blue. The window remembers its size and position, and will not shrink below a readable size.
 
 You should see a blue banner `TESTNET (virtual funds)`, equity of roughly 10 000 USDT plus the value of the base asset you trade (about 12 000 for ETHUSDT, about 75 000 for BTCUSDT), and the strategy's three parameters `notional`, `step` and `enabled`.
 

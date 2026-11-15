@@ -17,10 +17,11 @@
 //! processes, so closing this window never stops a running session.
 
 use apexes_supervisor::Supervisor;
+use apexes_ui::chrome::Chrome;
 use apexes_ui::client::ConnectionStatus;
 use apexes_ui::operator_client::{OperatorClientConfig, run};
-use apexes_ui::operator_view::OperatorApp;
-use apexes_ui::shell::app::ShellApp;
+use apexes_ui::operator_view::{OperatorApp, StandaloneConsole};
+use apexes_ui::shell_app::ShellApp;
 use clap::Parser;
 use tokio::sync::{mpsc, watch};
 
@@ -63,7 +64,7 @@ fn run_launcher(runtime: tokio::runtime::Runtime) -> eframe::Result {
     let _runtime = runtime;
     eframe::run_native(
         "Apexes",
-        eframe::NativeOptions::default(),
+        apexes_ui::chrome::native_options(),
         Box::new(move |_cc| Ok(Box::new(ShellApp::new(supervisor, handle)))),
     )
 }
@@ -94,10 +95,11 @@ fn run_console_only(
     let _runtime = runtime;
     eframe::run_native(
         "Apexes operator console",
-        eframe::NativeOptions::default(),
+        apexes_ui::chrome::native_options(),
         Box::new(move |_cc| {
-            Ok(Box::new(OperatorApp::new(
-                engine, event_rx, status_rx, command_tx,
+            Ok(Box::new(StandaloneConsole::new(
+                OperatorApp::new(engine, event_rx, status_rx, command_tx),
+                Chrome::from_home(),
             )))
         }),
     )

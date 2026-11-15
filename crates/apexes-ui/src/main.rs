@@ -125,7 +125,7 @@ fn main() -> eframe::Result {
     let client_url = format!("ws://127.0.0.1:{port}/ws");
     runtime.spawn(apexes_ui::client::run(client_url, event_tx, status_tx));
 
-    let options = eframe::NativeOptions::default();
+    let options = apexes_ui::chrome::native_options();
     eframe::run_native(
         "Apexes Dashboard",
         options,

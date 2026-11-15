@@ -1,5 +1,6 @@
 pub mod app_state;
 pub mod chart_state;
+pub mod chrome;
 pub mod client;
 pub mod evaluation_view;
 pub mod launcher;
@@ -7,6 +8,10 @@ pub mod launcher_view;
 pub mod operator;
 pub mod operator_client;
 pub mod operator_view;
+pub mod preferences;
 pub mod server;
 pub mod shell;
+pub mod shell_app;
+pub mod tabs;
+pub mod theme;
 pub mod ui;
