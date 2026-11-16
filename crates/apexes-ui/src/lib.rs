@@ -14,4 +14,5 @@ pub mod shell;
 pub mod shell_app;
 pub mod tabs;
 pub mod theme;
+pub mod time_axis;
 pub mod ui;

@@ -18,11 +18,19 @@ use egui_kittest::kittest::Queryable;
 use rust_decimal_macros::dec;
 
 fn snapshot(network: &str) -> SessionSnapshot {
-    let start = Utc::now() - Duration::minutes(40);
-    let equity_history = (0..40)
+    snapshot_spanning(network, Duration::minutes(40), 40)
+}
+
+/// `points` equity samples spread evenly over `span`, ending now.
+fn snapshot_spanning(network: &str, span: Duration, points: i64) -> SessionSnapshot {
+    let start = Utc::now() - span;
+    let equity_history = (0..points)
         .map(|i| {
             let wiggle = rust_decimal::Decimal::from((i * 7 % 13) - 4);
-            (start + Duration::minutes(i), dec!(10000) + wiggle * dec!(3))
+            (
+                start + span / points as i32 * i as i32,
+                dec!(10000) + wiggle * dec!(3),
+            )
         })
         .collect();
     SessionSnapshot {
@@ -158,6 +166,30 @@ fn a_halted_mainnet_console_renders_in_both_themes_without_panicking() {
         h.step();
         assert!(h.query_all_by_label_contains("HALTED").next().is_some());
         assert!(h.query_all_by_label_contains("MAINNET").next().is_some());
+    }
+}
+
+/// The chart's x-axis in a real window, for a human to look at: a quarter of
+/// an hour (seconds on the axis), an afternoon (hours and minutes), and a
+/// span across local midnight (the date appears at the day change).
+#[test]
+#[ignore = "writes PNG files for manual inspection"]
+fn renders_the_time_axis_at_three_scales() {
+    let dir = std::env::var("APEXES_SHOTS").unwrap_or_else(|_| "/tmp/shots".to_string());
+    for (name, span, points) in [
+        ("axis-12min", Duration::minutes(12), 60),
+        ("axis-5h", Duration::hours(5), 120),
+        ("axis-30h", Duration::hours(30), 150),
+    ] {
+        let mut state = OperatorState::default();
+        state.set_connection(ConnectionStatus::Connected);
+        state.apply(SessionMessage::Snapshot(snapshot_spanning(
+            "testnet", span, points,
+        )));
+        let mut h = console(ThemeChoice::Light, state);
+        h.step();
+        h.step();
+        render_to(&dir, name, &mut h);
     }
 }
 

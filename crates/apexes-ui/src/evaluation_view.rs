@@ -6,6 +6,7 @@
 //! drawing in [`show_evaluation`] only renders those decisions.
 
 use crate::theme::{Palette, palette_of};
+use crate::time_axis;
 use apexes_backtest::{EvaluationSummary, LimitUsage, SessionIdentity, SessionSnapshot};
 use chrono::{DateTime, Utc};
 use egui::Color32;
@@ -136,28 +137,18 @@ pub fn signed(value: Decimal) -> String {
     }
 }
 
-/// Points for the equity line: seconds since the first point on x.
+/// Points for the equity line: Unix seconds on x (shown as local time by
+/// `crate::time_axis`), equity on y.
 pub fn plot_points(history: &[(DateTime<Utc>, Decimal)]) -> Vec<[f64; 2]> {
-    let Some((start, _)) = history.first() else {
-        return Vec::new();
-    };
     history
         .iter()
-        .map(|(at, equity)| {
-            [
-                (*at - *start).num_milliseconds() as f64 / 1000.0,
-                equity.to_f64().unwrap_or(0.0),
-            ]
-        })
+        .map(|(at, equity)| [time_axis::to_x(*at), equity.to_f64().unwrap_or(0.0)])
         .collect()
 }
 
 /// Running peak at each point, so drawdown can be drawn as the gap
 /// between the peak line and the equity line.
 pub fn peak_points(history: &[(DateTime<Utc>, Decimal)]) -> Vec<[f64; 2]> {
-    let Some((start, _)) = history.first() else {
-        return Vec::new();
-    };
     let mut peak = Decimal::MIN;
     history
         .iter()
@@ -165,10 +156,7 @@ pub fn peak_points(history: &[(DateTime<Utc>, Decimal)]) -> Vec<[f64; 2]> {
             if *equity > peak {
                 peak = *equity;
             }
-            [
-                (*at - *start).num_milliseconds() as f64 / 1000.0,
-                peak.to_f64().unwrap_or(0.0),
-            ]
+            [time_axis::to_x(*at), peak.to_f64().unwrap_or(0.0)]
         })
         .collect()
 }
@@ -248,11 +236,42 @@ pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
     } else {
         let equity = plot_points(&snapshot.equity_history);
         let peak = peak_points(&snapshot.equity_history);
+        let zone = time_axis::local_zone();
+        let title = snapshot
+            .equity_history
+            .last()
+            .map(|(at, _)| time_axis::axis_title(&zone, *at))
+            .unwrap_or_default();
         Plot::new("equity_timeline")
             .height(180.0)
             .allow_scroll(false)
-            .x_axis_label("seconds since first point")
-            .y_axis_label("equity")
+            .x_axis_label(title)
+            .y_axis_label("equity (USDT)")
+            .x_grid_spacer(move |input| {
+                time_axis::grid_marks(&zone, input.bounds, input.base_step_size)
+            })
+            .x_axis_formatter(move |mark, range| {
+                let bounds = (*range.start(), *range.end());
+                time_axis::label_for_mark(&zone, mark.value, bounds)
+            })
+            .label_formatter(move |hover| {
+                use egui_plot::HoverPosition;
+                match hover {
+                    HoverPosition::NearDataPoint {
+                        plot_name,
+                        position,
+                        ..
+                    } if !plot_name.is_empty() => Some(format!(
+                        "{plot_name}\n{}\n{:.2}",
+                        time_axis::hover_label(&zone, position.x),
+                        position.y
+                    )),
+                    HoverPosition::Elsewhere { position } => {
+                        Some(time_axis::hover_label(&zone, position.x))
+                    }
+                    HoverPosition::NearDataPoint { .. } => None,
+                }
+            })
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new("peak", PlotPoints::from(peak))
@@ -374,13 +393,24 @@ mod tests {
     }
 
     #[test]
-    fn plot_points_are_seconds_since_the_first_point() {
+    fn plot_points_are_unix_seconds_so_the_axis_can_show_clock_time() {
         let history = vec![(at(0), dec!(100)), (at(10), dec!(110)), (at(25), dec!(90))];
         assert_eq!(
             plot_points(&history),
-            vec![[0.0, 100.0], [10.0, 110.0], [25.0, 90.0]]
+            vec![
+                [1_700_000_000.0, 100.0],
+                [1_700_000_010.0, 110.0],
+                [1_700_000_025.0, 90.0]
+            ]
         );
         assert!(plot_points(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_peak_line_shares_the_equity_line_x_values() {
+        let history = vec![(at(0), dec!(100)), (at(7), dec!(120))];
+        let xs = |p: Vec<[f64; 2]>| p.iter().map(|v| v[0]).collect::<Vec<_>>();
+        assert_eq!(xs(plot_points(&history)), xs(peak_points(&history)));
     }
 
     #[test]
