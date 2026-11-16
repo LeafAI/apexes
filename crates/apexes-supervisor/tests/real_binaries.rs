@@ -620,3 +620,121 @@ fn a_preexisting_holding_is_separated_from_the_strategy_in_the_real_evaluation()
     std::fs::remove_dir_all(&home).ok();
     outcome.expect("the real evaluation separates the holding from the strategy");
 }
+
+/// The console's "Recent orders" with the real engine: a session that trades
+/// must list its orders, newest first, each with the price it really filled at.
+/// The prices are then compared with Binance's own trade history, which is the
+/// independent record.
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn the_real_engines_snapshot_lists_its_orders_with_their_real_fill_prices() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("orders");
+    let sup = supervisor(&home, &key, &secret);
+    // Buys 0.0007 BTC on the first trade it sees and sells it on the next: two
+    // real orders a few seconds apart, however quiet the market is.
+    let script = home.join("two_orders.drift");
+    std::fs::write(
+        &script,
+        r#"let sent = 0;
+function on_market_event(event, ctx) {
+  if (event.type != "trade") { return []; }
+  if (sent >= 2) { return []; }
+  if (ctx.has_open_order(event.symbol)) { return []; }
+  let held = ctx.get_position(event.symbol).quantity;
+  let side = "buy";
+  if (sent == 1) { side = "sell"; }
+  if (sent == 1 && held <= 0) { return []; }
+  sent = sent + 1;
+  return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot", side: side, order_type: "market", quantity: 0.0007 }];
+}
+"#,
+    )
+    .unwrap();
+    let mut req = request("t-orders");
+    req.strategy = StrategyRef::DriftScript { path: script };
+    let launched = match sup.launch(req) {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome: Result<Vec<apexes_backtest::OrderRecord>, String> = runtime.block_on(async {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        req.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(&token)
+                .parse()
+                .map_err(|_| "header")?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut best: Vec<apexes_backtest::OrderRecord> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(deadline, socket.next()).await
+        {
+            if let Ok(SessionMessage::Snapshot(s)) = serde_json::from_str::<SessionMessage>(&text)
+                && !s.is_placeholder()
+                && s.recent_orders.len() >= best.len()
+            {
+                best = s.recent_orders.clone();
+                if best.len() >= 2 && best.iter().all(|o| o.status == "Filled") {
+                    break;
+                }
+            }
+        }
+        Ok(best)
+    });
+    let orders = outcome.clone();
+    println!("--- {orders:#?}");
+    let _ = sup.request_stop(
+        &SessionId::parse("t-orders").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+
+    let orders = orders.expect("the console connection");
+    assert!(orders.len() >= 2, "both orders are listed: {orders:?}");
+    assert!(
+        orders.windows(2).all(|w| w[0].at >= w[1].at),
+        "newest first: {orders:?}"
+    );
+    for o in &orders {
+        assert_eq!(o.status, "Filled", "{o:?}");
+        assert!(o.avg_fill_price.is_some(), "a fill price is shown: {o:?}");
+        assert_eq!(o.filled_quantity, o.quantity, "{o:?}");
+    }
+    let sides: Vec<&str> = orders.iter().rev().map(|o| o.side.as_str()).collect();
+    assert_eq!(sides, ["Buy", "Sell"], "in the order they were sent");
+    // Printed for the independent check against Binance's own history.
+    for o in &orders {
+        println!(
+            "ORDER {} {} {} @ {}",
+            o.at.format("%H:%M:%S"),
+            o.side,
+            o.quantity,
+            o.avg_fill_price.unwrap()
+        );
+    }
+}

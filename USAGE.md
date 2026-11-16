@@ -35,6 +35,8 @@ The window has a **Launcher** tab and one tab per open session. In **Launcher**:
 | Cmd+W | Close the console in front (never the Launcher) |
 | Cmd+Shift+L | Cycle the theme: System, Light, Dark |
 
+**Recent orders.** Every order the strategy sends is listed, newest first, with its time, side, quantity, the price it filled at and its outcome: *Filled*, *Partially filled*, *Working*, *Rejected* (a risk limit or the exchange refused it; the reason is printed under the row) or *Closed* (it stopped working without filling). It sits in the empty space to the right of the tables when the window is wide, and under them when it is narrow; drag its left edge to resize. The last 100 are kept; `Show N older` reveals the ones beyond the newest 30.
+
 **Theme.** The **Theme** menu at the top right (every window) picks System (follows your OS), Light or Dark; the choice is remembered in `~/.apexes/ui.json`. The environment banner stays loud in both: MAINNET red, TESTNET blue. The window remembers its size and position, and will not shrink below a readable size.
 
 You should see a blue banner `TESTNET (virtual funds)`, equity of roughly 10 000 USDT plus the value of the base asset you trade (about 12 000 for ETHUSDT, about 75 000 for BTCUSDT), and the strategy's three parameters `notional`, `step` and `enabled`.

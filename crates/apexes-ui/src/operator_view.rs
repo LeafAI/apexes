@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch};
 use crate::client::ConnectionStatus;
 use crate::number_format;
 use crate::operator::{OperatorAction, OperatorState, Requested};
+use crate::orders_view::{self, Placement};
 use crate::theme::palette_of;
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
@@ -47,6 +48,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
     }
     ui.separator();
 
+    // The recent-orders panel sits in the whitespace beside the tables when
+    // the window is wide, and under them when it is not. Never a modal: HALT
+    // must stay reachable, and this keeps it in view in both layouts.
+    let placement = orders_view::placement(ui.available_width());
+    if placement == Placement::Side {
+        egui::Panel::right("recent_orders_panel")
+            .resizable(true)
+            .default_size(orders_view::SIDE_PANEL_DEFAULT_WIDTH)
+            .size_range(orders_view::SIDE_PANEL_MIN_WIDTH..=orders_view::SIDE_PANEL_MAX_WIDTH)
+            .show(ui, |ui| {
+                if let Some(snapshot) = &state.snapshot {
+                    orders_view::show(ui, snapshot, &mut state.show_all_orders);
+                } else {
+                    ui.weak("waiting for the first snapshot...");
+                }
+            });
+    }
+
     egui::ScrollArea::vertical().show(ui, |ui| {
         summary(ui, state);
         if let Some(snapshot) = &state.snapshot {
@@ -55,6 +74,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
         }
         positions(ui, state);
         open_orders(ui, state);
+        if placement == Placement::Below
+            && let Some(snapshot) = &state.snapshot
+        {
+            ui.add_space(6.0);
+            orders_view::show(ui, snapshot, &mut state.show_all_orders);
+        }
         balances(ui, state);
         params(ui, state, &mut out);
     });

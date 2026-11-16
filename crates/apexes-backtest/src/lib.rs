@@ -17,6 +17,7 @@ pub mod error;
 
 pub mod control;
 pub mod evaluation;
+pub mod order_log;
 
 pub mod ems_adapter;
 
@@ -67,6 +68,7 @@ pub use market_data_source::{
     HistoricalMarketDataSource, InMemoryMarketDataSource, StorageMarketDataSource,
 };
 pub use matching_engine::MatchingEngine;
+pub use order_log::{OrderLog, OrderRecord};
 pub use performance::{PerformanceSummary, PerformanceTracker};
 pub use report::BacktestReport;
 pub use runner::{BacktestConfig, run_backtest};

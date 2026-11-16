@@ -126,6 +126,7 @@ fn build_control_handle(
         identity: None,
         evaluation: None,
         equity_history: Vec::new(),
+        recent_orders: Vec::new(),
         positions: HashMap::new(),
         balances: HashMap::new(),
         equity: rust_decimal::Decimal::ZERO,

@@ -72,6 +72,7 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,

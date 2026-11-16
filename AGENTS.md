@@ -80,6 +80,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 26. **`scripts/run-testnet.sh` always rebuilds before it starts anything.** It once built only when a binary was missing, so after a code change it launched stale binaries and a fix looked like it had not worked. It now runs `cargo build --release` every time (about 1 s when nothing changed) and stops on a failed build. Already-running engines and gateways keep their old code, and the script warns about them but never stops them; a new session on symbols an old gateway carries *reuses that old gateway*, so stop it too after a gateway change.
 
+27. **Anything an operator must be able to reach during a bad moment is a panel, never a modal.** HALT, the order list and the evaluation share one window; a dialog would put a click between the operator and the kill switch. Use side or inline panels (`orders_view::placement`). The order list comes from the trading loop's own `OrderLog`, not from the order manager (which only holds *working* orders). When a layout is wrong, render it (`egui_kittest` PNG) rather than guess: two layout bugs here were invisible to every assertion.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

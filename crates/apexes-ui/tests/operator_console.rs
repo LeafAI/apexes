@@ -32,6 +32,7 @@ fn snapshot() -> SessionSnapshot {
         identity: None,
         evaluation: None,
         equity_history: Vec::new(),
+        recent_orders: Vec::new(),
         positions,
         balances: HashMap::from([("USDT".to_string(), dec!(1234.5))]),
         equity: dec!(10500),
@@ -505,5 +506,152 @@ fn an_open_position_is_still_shown_with_clean_numbers() {
     assert!(
         h.query_by_label("flat").is_none(),
         "a held position is not reported as flat"
+    );
+}
+
+// ---- Recent orders panel ---------------------------------------------------
+
+fn order(
+    secs_ago: i64,
+    side: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> apexes_backtest::OrderRecord {
+    apexes_backtest::OrderRecord {
+        id: format!("o{secs_ago}{side}"),
+        at: Utc::now() - chrono::Duration::seconds(secs_ago),
+        symbol: "BTCUSDT".to_string(),
+        side: side.to_string(),
+        order_type: "Market".to_string(),
+        quantity: dec!(0.00070000),
+        limit_price: None,
+        filled_quantity: if status == "Filled" {
+            dec!(0.0007)
+        } else {
+            dec!(0)
+        },
+        avg_fill_price: (status == "Filled").then_some(dec!(64401.85000000)),
+        status: status.to_string(),
+        detail: detail.map(str::to_string),
+    }
+}
+
+fn state_with_orders(orders: Vec<apexes_backtest::OrderRecord>) -> OperatorState {
+    let mut snap = screenshot_snapshot();
+    snap.recent_orders = orders;
+    state_with(snap)
+}
+
+fn wide_harness(state: OperatorState, width: f32) -> Harness<'static, Fixture> {
+    Harness::builder()
+        .with_size(egui::vec2(width, 900.0))
+        .build_ui_state(
+            |ui, (state, sent): &mut Fixture| sent.extend(show(ui, state)),
+            (state, Vec::new()),
+        )
+}
+
+#[test]
+fn the_first_order_and_every_one_after_it_are_listed_newest_first() {
+    let orders = vec![
+        order(20, "Sell", "Filled", None),
+        order(60, "Buy", "Filled", None),
+    ];
+    let mut h = wide_harness(state_with_orders(orders), 1180.0);
+    h.run();
+    assert!(has_text(&h, "Recent orders"));
+    assert!(has_text(&h, "2 orders, 2 filled"));
+    assert!(has_text(&h, "64401.85"), "the fill price is shown");
+    assert!(
+        has_text(&h, "0.0007"),
+        "the quantity, without trailing zeros"
+    );
+}
+
+#[test]
+fn a_refused_order_shows_its_reason_in_the_panel() {
+    let orders = vec![order(
+        10,
+        "Buy",
+        "Rejected",
+        Some("order notional 45.6 exceeds per-order notional limit 40"),
+    )];
+    let mut h = wide_harness(state_with_orders(orders), 1180.0);
+    h.run();
+    assert!(has_text(&h, "Rejected"));
+    assert!(has_text(&h, "exceeds per-order notional limit 40"));
+}
+
+#[test]
+fn with_no_orders_yet_the_panel_says_what_it_is_for() {
+    let mut h = wide_harness(state_with_orders(Vec::new()), 1180.0);
+    h.run();
+    assert!(has_text(&h, "Recent orders"));
+    assert!(has_text(&h, "no orders yet"));
+    assert!(has_text(&h, "appear here"));
+}
+
+#[test]
+fn the_panel_is_present_in_a_wide_window_and_in_a_narrow_one() {
+    for width in [1180.0, 760.0] {
+        let mut h = wide_harness(
+            state_with_orders(vec![order(5, "Buy", "Filled", None)]),
+            width,
+        );
+        h.run();
+        assert!(has_text(&h, "Recent orders"), "missing at width {width}");
+        assert!(
+            has_text(&h, "HALT TRADING"),
+            "HALT must stay reachable at width {width}"
+        );
+    }
+}
+
+/// The panel once grew by a few pixels on every frame because each row asked
+/// for slightly more than the width it was given. A resizable panel must settle.
+#[test]
+fn the_panel_settles_and_does_not_grow_frame_after_frame() {
+    let orders: Vec<_> = (0..12)
+        .map(|i| {
+            order(
+                10 + i,
+                if i % 2 == 0 { "Buy" } else { "Sell" },
+                "Filled",
+                None,
+            )
+        })
+        .collect();
+    let mut h = wide_harness(state_with_orders(orders), 1180.0);
+    for _ in 0..3 {
+        h.step();
+    }
+    let x_of_panel = |h: &Harness<'static, Fixture>| h.get_by_label("Recent orders").rect().min.x;
+    let settled = x_of_panel(&h);
+    for _ in 0..20 {
+        h.step();
+    }
+    assert_eq!(
+        x_of_panel(&h),
+        settled,
+        "the panel moved across frames, so it is still growing"
+    );
+}
+
+#[test]
+fn only_the_newest_orders_are_drawn_until_the_operator_asks_for_more() {
+    let orders: Vec<_> = (0..45)
+        .map(|i| order(10 + i, "Buy", "Filled", None))
+        .collect();
+    let mut h = wide_harness(state_with_orders(orders), 1180.0);
+    h.run();
+    assert!(has_text(&h, "45 orders"));
+    assert!(has_text(&h, "Show 15 older"));
+    h.get_by_label_contains("Show 15 older").click();
+    h.run();
+    assert!(!has_text(&h, "Show 15 older"));
+    assert!(has_text(&h, "Show fewer"));
+    assert!(
+        h.state().0.show_all_orders,
+        "the choice is kept in the state"
     );
 }

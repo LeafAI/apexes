@@ -105,6 +105,9 @@ pub struct OperatorState {
     pub pending: Option<OperatorAction>,
     /// Text being typed into each parameter's edit box.
     pub param_edits: BTreeMap<String, String>,
+    /// The operator asked for every recorded order, not just the newest.
+    /// Kept here, not in the drawing code, so it survives tab switches.
+    pub show_all_orders: bool,
 }
 
 impl OperatorState {
@@ -235,6 +238,7 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: dec!(100),

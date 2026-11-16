@@ -130,6 +130,11 @@ pub struct SessionSnapshot {
     /// timeline. Bounded (see `evaluation::SNAPSHOT_HISTORY_POINTS`).
     #[serde(default)]
     pub equity_history: Vec<(DateTime<Utc>, Decimal)>,
+    /// The most recent orders this session sent, newest first, whether they
+    /// filled, are still working, or were refused. Bounded (see
+    /// `order_log::ORDER_LOG_CAP`). Empty from older engines.
+    #[serde(default)]
+    pub recent_orders: Vec<crate::order_log::OrderRecord>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -306,6 +311,7 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,

@@ -76,6 +76,7 @@ fn snapshot_spanning(network: &str, span: Duration, points: i64) -> SessionSnaps
             ],
         }),
         equity_history,
+        recent_orders: Vec::new(),
         positions: HashMap::new(),
         balances: HashMap::from([("USDT".to_string(), dec!(9987.5))]),
         equity: dec!(9987.5),

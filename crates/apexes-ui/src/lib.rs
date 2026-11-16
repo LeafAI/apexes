@@ -9,6 +9,7 @@ pub mod number_format;
 pub mod operator;
 pub mod operator_client;
 pub mod operator_view;
+pub mod orders_view;
 pub mod preferences;
 pub mod server;
 pub mod shell;

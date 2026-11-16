@@ -199,6 +199,11 @@ pub async fn run_unified_event_loop(
     let mut control = config.control;
     // Only built for sessions with a control handle: `control: None` stays
     // a true no-op (no extra state, no extra work per tick).
+    // What the operator sees under "Recent orders". Only kept when a console
+    // can be watching (a `control` handle), like the evaluation tracker.
+    let mut order_log = control
+        .as_ref()
+        .map(|_| crate::order_log::OrderLog::default());
     let mut evaluation = control
         .as_ref()
         .map(|handle| crate::evaluation::EvaluationTracker::new(handle.limit_spec()));
@@ -280,6 +285,9 @@ pub async fn run_unified_event_loop(
                     }
                 })?;
                 if !ems_fills.is_empty() {
+                    if let Some(log) = &mut order_log {
+                        log.filled(&ems_fills);
+                    }
                     apply_fills(
                         &mut ledger,
                         &mut overall_tracker,
@@ -586,6 +594,9 @@ pub async fn run_unified_event_loop(
                         )
                     {
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+                        if let Some(log) = &mut order_log {
+                            record_refusal(log, &intent, timestamp, &join_violations(&violations));
+                        }
                         continue;
                     }
                     if let Some((pre_trade, _, _)) = &market_condition_monitor
@@ -598,6 +609,9 @@ pub async fn run_unified_event_loop(
                         )
                     {
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
+                        if let Some(log) = &mut order_log {
+                            record_refusal(log, &intent, timestamp, &join_violations(&violations));
+                        }
                         continue;
                     }
 
@@ -644,7 +658,11 @@ pub async fn run_unified_event_loop(
                         .submit(&intent, ledger.positions(), ledger.balances(), timestamp)
                         .await
                     {
-                        Ok((_order, fills)) => {
+                        Ok((order, fills)) => {
+                            if let Some(log) = &mut order_log {
+                                log.submitted(&order);
+                                log.filled(&fills);
+                            }
                             // Accepted for execution: only now does the order use up
                             // daily allowance. An order the exchange rejects never does,
                             // so a strategy sending rejected orders cannot exhaust the
@@ -687,6 +705,9 @@ pub async fn run_unified_event_loop(
                                 quantity = %intent.quantity,
                                 "order submission rejected"
                             );
+                            if let Some(log) = &mut order_log {
+                                record_refusal(log, &intent, timestamp, &error.to_string());
+                            }
                         }
                     }
                 }
@@ -765,6 +786,15 @@ pub async fn run_unified_event_loop(
                             }
                             None => (None, Vec::new()),
                         };
+                        let recent_orders = match &mut order_log {
+                            Some(log) => {
+                                let open_ids: std::collections::HashSet<String> =
+                                    open_orders.iter().map(|o| o.id.clone()).collect();
+                                log.sync_open(timestamp, &open_ids);
+                                log.view(crate::order_log::ORDER_LOG_CAP)
+                            }
+                            None => Vec::new(),
+                        };
                         let snapshot = SessionSnapshot {
                             identity: handle.identity(),
                             evaluation: evaluation_summary,
@@ -777,6 +807,7 @@ pub async fn run_unified_event_loop(
                             params: strategy.current_params(),
                             paused: handle.is_paused(),
                             open_orders,
+                            recent_orders,
                             timestamp,
                         };
                         handle.maybe_push_snapshot(snapshot);
@@ -808,6 +839,9 @@ pub async fn run_unified_event_loop(
                 // future implementation that doesn't uphold that contract.
                 if fills.is_empty() {
                     continue;
+                }
+                if let Some(log) = &mut order_log {
+                    log.filled(&fills);
                 }
                 apply_supplemental_fills(
                     &mut ledger,
@@ -895,6 +929,34 @@ fn holdings_priced(
                 .values()
                 .any(|i| i.quote_currency.as_deref() == Some(asset.as_str()))
     })
+}
+
+/// Records an order that was refused, with its reason. The refused intent never
+/// became an `Order`, so it gets an id of its own to be listed by.
+fn record_refusal(
+    log: &mut crate::order_log::OrderLog,
+    intent: &apexes_strategy::OrderIntent,
+    at: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) {
+    log.rejected(
+        uuid::Uuid::new_v4().to_string(),
+        at,
+        &intent.symbol,
+        &format!("{:?}", intent.side),
+        &format!("{:?}", intent.order_type),
+        intent.quantity,
+        intent.price,
+        reason.to_string(),
+    );
+}
+
+fn join_violations(violations: &[apexes_risk::RiskViolation]) -> String {
+    violations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The non-cash assets the account holds, with the price each has now.
@@ -1900,6 +1962,74 @@ mod tests {
         );
     }
 
+    /// The console's order list: every order the loop sends shows up in the
+    /// snapshot with what became of it, newest first. (The order manager only
+    /// holds WORKING orders, and a market order works for under a second, so
+    /// before this the console could never show what the strategy had done.)
+    #[tokio::test]
+    async fn the_snapshot_lists_the_orders_the_strategy_sent_and_how_they_ended() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(101), dec!(102)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let orders = &snapshot.recent_orders;
+        assert!(orders.len() >= 3, "one order per event: {}", orders.len());
+        assert!(
+            orders.windows(2).all(|w| w[0].at >= w[1].at),
+            "newest first"
+        );
+        let first = orders.last().expect("an order");
+        assert_eq!(first.side, "Buy");
+        assert_eq!(first.order_type, "Market");
+        assert_eq!(first.quantity, dec!(0.01));
+        let filled = orders
+            .iter()
+            .find(|o| o.status == crate::order_log::FILLED)
+            .expect("a market order fills at once in the simulator");
+        assert_eq!(filled.filled_quantity, dec!(0.01));
+        assert!(filled.avg_fill_price.is_some(), "the fill price is shown");
+    }
+
+    /// An order refused by a risk limit never reaches the exchange, so there is
+    /// nothing to look up afterwards: the console must be able to say why.
+    #[tokio::test]
+    async fn an_order_refused_by_a_risk_limit_is_listed_with_the_reason() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(100), t0 + Duration::seconds(2)),
+        ];
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let checker = Arc::new(
+            apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+                apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+                    max_order_notional: Some(dec!(0.5)),
+                    ..Default::default()
+                }),
+            )),
+        );
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            risk_checker: Some(checker),
+            ..unified_loop_config(dec!(100000), None, HashMap::new())
+        };
+        run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
+        let snapshot = snapshot_rx.borrow().clone();
+        let refused: Vec<_> = snapshot
+            .recent_orders
+            .iter()
+            .filter(|o| o.status == crate::order_log::REJECTED)
+            .collect();
+        assert!(!refused.is_empty(), "{:?}", snapshot.recent_orders);
+        let reason = refused[0].detail.as_deref().expect("a reason");
+        assert!(reason.contains("notional"), "{reason}");
+        assert_eq!(refused[0].filled_quantity, dec!(0));
+    }
+
     /// Never trades.
     struct NoopStrategy;
 
@@ -1946,6 +2076,7 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,
