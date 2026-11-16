@@ -5,8 +5,10 @@
 //! close a limit is to being hit, how a fraction is formatted. The egui
 //! drawing in [`show_evaluation`] only renders those decisions.
 
+use crate::number_format;
 use crate::theme::{Palette, palette_of};
 use crate::time_axis;
+use crate::value_axis;
 use apexes_backtest::{EvaluationSummary, LimitUsage, SessionIdentity, SessionSnapshot};
 use chrono::{DateTime, Utc};
 use egui::Color32;
@@ -185,6 +187,54 @@ fn limit_row(ui: &mut egui::Ui, usage: &LimitUsage) {
     });
 }
 
+/// The PnL rows.
+///
+/// An account that started flat has one PnL, shown as before ("Total PnL",
+/// "Realized PnL", "Unrealized PnL"). When the account held assets before the
+/// session started, the market's effect on them is shown on its own line and
+/// the strategy's result on another, so a price move on a balance the strategy
+/// never traded is not read as the strategy losing money.
+pub fn pnl_rows(e: &EvaluationSummary) -> Vec<(&'static str, String)> {
+    if has_starting_holdings(e) {
+        vec![
+            ("Account PnL", signed(e.total_pnl)),
+            ("  from holdings", signed(e.holdings_pnl)),
+            ("Strategy PnL", signed(e.strategy_pnl)),
+            ("  Realized", signed(e.realized_pnl)),
+            ("  Unrealized", signed(e.unrealized_pnl)),
+        ]
+    } else {
+        vec![
+            ("Total PnL", signed(e.total_pnl)),
+            ("Realized PnL", signed(e.realized_pnl)),
+            ("Unrealized PnL", signed(e.unrealized_pnl)),
+        ]
+    }
+}
+
+fn has_starting_holdings(e: &EvaluationSummary) -> bool {
+    e.holdings_value_at_start > Decimal::ZERO
+}
+
+/// The drawdown that judges the strategy: its own when the account started
+/// with holdings (the account's would be the market's swing), else the
+/// account's, which is the same thing.
+pub fn drawdown_now(e: &EvaluationSummary) -> Decimal {
+    if has_starting_holdings(e) {
+        e.strategy_current_drawdown
+    } else {
+        e.current_drawdown
+    }
+}
+
+pub fn drawdown_max(e: &EvaluationSummary) -> Decimal {
+    if has_starting_holdings(e) {
+        e.strategy_max_drawdown
+    } else {
+        e.max_drawdown
+    }
+}
+
 fn metrics_grid(ui: &mut egui::Ui, e: &EvaluationSummary) {
     egui::Grid::new("evaluation_metrics")
         .num_columns(2)
@@ -195,34 +245,17 @@ fn metrics_grid(ui: &mut egui::Ui, e: &EvaluationSummary) {
                 ui.label(value);
                 ui.end_row();
             };
-            row("Start equity", e.start_equity.round_dp(2).to_string());
-            row("Total PnL", signed(e.total_pnl));
-            row("Realized PnL", signed(e.realized_pnl));
-            row("Unrealized PnL", signed(e.unrealized_pnl));
-            row("Drawdown (now)", percent(e.current_drawdown));
-            row("Drawdown (max)", percent(e.max_drawdown));
+            row("Start equity", number_format::money(e.start_equity));
+            for (name, value) in pnl_rows(e) {
+                row(name, value);
+            }
+            row("Drawdown (now)", percent(drawdown_now(e)));
+            row("Drawdown (max)", percent(drawdown_max(e)));
             row("Gross exposure", percent(e.gross_exposure_fraction));
             row("Time in market", percent(e.time_in_market_fraction));
             row("Trades", e.trade_count.to_string());
-            row("Turnover", e.turnover.round_dp(2).to_string());
-            let mut fees: Vec<_> = e.fees_paid.iter().collect();
-            fees.sort_by(|a, b| a.0.cmp(b.0));
-            let fees_text = if fees.is_empty() {
-                "-".to_string()
-            } else {
-                fees.iter()
-                    .map(|(currency, amount)| {
-                        let label = if currency.is_empty() {
-                            "?"
-                        } else {
-                            currency.as_str()
-                        };
-                        format!("{} {label}", amount.round_dp(8))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            row("Fees paid", fees_text);
+            row("Turnover", number_format::money(e.turnover));
+            row("Fees paid", number_format::fees(&e.fees_paid));
         });
 }
 
@@ -247,6 +280,10 @@ pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
             .allow_scroll(false)
             .x_axis_label(title)
             .y_axis_label("equity (USDT)")
+            .y_grid_spacer(|input| value_axis::grid_marks(input.bounds, input.base_step_size))
+            .y_axis_formatter(|mark, range| {
+                value_axis::label(mark.value, (*range.start(), *range.end()))
+            })
             .x_grid_spacer(move |input| {
                 time_axis::grid_marks(&zone, input.bounds, input.base_step_size)
             })
@@ -390,6 +427,60 @@ mod tests {
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    fn summary_with(holdings_value: Decimal) -> EvaluationSummary {
+        EvaluationSummary {
+            start_equity: dec!(74350.26),
+            total_pnl: dec!(-271.99),
+            realized_pnl: dec!(-0.07),
+            strategy_pnl: dec!(-0.08),
+            holdings_pnl: dec!(-271.91),
+            holdings_value_at_start: holdings_value,
+            unrealized_pnl: dec!(-0.01),
+            current_drawdown: dec!(0.0092),
+            max_drawdown: dec!(0.0116),
+            strategy_current_drawdown: dec!(0.000001),
+            strategy_max_drawdown: dec!(0.000002),
+            gross_exposure_fraction: dec!(0.87),
+            fees_paid: std::collections::HashMap::new(),
+            trade_count: 2,
+            turnover: dec!(90.45),
+            time_in_market_fraction: dec!(0.0136),
+            limit_usage: Vec::new(),
+        }
+    }
+
+    /// The screenshot: the loss was the market's, and the panel now says so.
+    #[test]
+    fn with_starting_holdings_the_market_and_the_strategy_are_separate_lines() {
+        let rows = pnl_rows(&summary_with(dec!(64000)));
+        let get = |name: &str| {
+            rows.iter()
+                .find(|(n, _)| n.trim() == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("Account PnL").as_deref(), Some("-271.99"));
+        assert_eq!(get("from holdings").as_deref(), Some("-271.91"));
+        assert_eq!(get("Strategy PnL").as_deref(), Some("-0.08"));
+        assert_eq!(get("Realized").as_deref(), Some("-0.07"));
+    }
+
+    #[test]
+    fn a_flat_start_keeps_the_original_labels() {
+        let rows = pnl_rows(&summary_with(dec!(0)));
+        let names: Vec<_> = rows.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["Total PnL", "Realized PnL", "Unrealized PnL"]);
+    }
+
+    #[test]
+    fn the_drawdown_shown_is_the_strategys_when_there_were_holdings() {
+        let with = summary_with(dec!(64000));
+        assert_eq!(drawdown_max(&with), dec!(0.000002));
+        assert_eq!(drawdown_now(&with), dec!(0.000001));
+        let flat = summary_with(dec!(0));
+        assert_eq!(drawdown_max(&flat), dec!(0.0116));
+        assert_eq!(drawdown_now(&flat), dec!(0.0092));
     }
 
     #[test]

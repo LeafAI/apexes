@@ -497,3 +497,126 @@ fn a_btc_session_and_an_eth_session_run_side_by_side_on_the_real_testnet() {
     std::fs::remove_dir_all(&home).ok();
     result.expect("both sessions run side by side");
 }
+
+/// The screenshot's situation with the real engine: the testnet account
+/// already holds BTC, the demo strategy is not trading, and the console's
+/// evaluation must (a) price the holding, (b) report the market's effect on it
+/// as `holdings_pnl` and not as the strategy's, and (c) count it as exposure.
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn a_preexisting_holding_is_separated_from_the_strategy_in_the_real_evaluation() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("holdings");
+    let sup = supervisor(&home, &key, &secret);
+    // A strategy that never trades, so any strategy PnL would be a bug.
+    let idle = home.join("idle.drift");
+    std::fs::write(
+        &idle,
+        "function on_market_event(event, ctx) {\n  return [];\n}\n",
+    )
+    .unwrap();
+    let mut req = request("t-holdings");
+    req.strategy = StrategyRef::DriftScript { path: idle };
+    let launched = sup.launch(req);
+    let log = std::fs::read_to_string(
+        sup.paths()
+            .session_log(&SessionId::parse("t-holdings").unwrap()),
+    )
+    .unwrap_or_default();
+    let launched = match launched {
+        Ok(l) => l,
+        Err(e) => {
+            println!("{log}");
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome: Result<String, String> = runtime.block_on(async {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        req.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(&token)
+                .parse()
+                .map_err(|_| "header")?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Wait for a snapshot whose evaluation has a priced baseline, then a
+        // few more so the price has moved at least once.
+        let mut last = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(deadline, socket.next()).await
+        {
+            if let Ok(SessionMessage::Snapshot(s)) = serde_json::from_str::<SessionMessage>(&text)
+                && !s.is_placeholder()
+                && s.evaluation
+                    .as_ref()
+                    .is_some_and(|e| e.holdings_value_at_start > dec!(0))
+            {
+                last = Some(s);
+            }
+        }
+        let s = last.ok_or("no snapshot with a priced holding")?;
+        let e = s.evaluation.ok_or("no evaluation")?;
+        let btc = s.balances.get("BTC").copied().unwrap_or_default();
+        let line = format!(
+            "BTC held {btc}; start equity {}; total {} = holdings {} + strategy {}; \
+             exposure {}; drawdown strat/account {}/{}; positions open: {}",
+            e.start_equity,
+            e.total_pnl,
+            e.holdings_pnl,
+            e.strategy_pnl,
+            e.gross_exposure_fraction,
+            e.strategy_max_drawdown,
+            e.max_drawdown,
+            s.positions
+                .values()
+                .filter(|p| !p.quantity.is_zero())
+                .count()
+        );
+        if e.holdings_value_at_start <= dec!(0) {
+            return Err(format!("holding not seen as a baseline: {line}"));
+        }
+        if e.strategy_pnl != dec!(0) || e.strategy_max_drawdown != dec!(0) {
+            return Err(format!("an idle strategy reported its own PnL: {line}"));
+        }
+        // The split is rounded to 8 places, `total_pnl` is not: equal to within that.
+        if (e.strategy_pnl + e.holdings_pnl - e.total_pnl).abs() > dec!(0.000001) {
+            return Err(format!("the parts do not add up: {line}"));
+        }
+        if e.gross_exposure_fraction < dec!(0.5) {
+            return Err(format!(
+                "a large holding is not counted as exposure: {line}"
+            ));
+        }
+        Ok(line)
+    });
+    println!("--- {outcome:?}");
+    let _ = sup.request_stop(
+        &SessionId::parse("t-holdings").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+    outcome.expect("the real evaluation separates the holding from the strategy");
+}

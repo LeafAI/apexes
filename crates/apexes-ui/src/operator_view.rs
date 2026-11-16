@@ -13,6 +13,7 @@ use egui::Color32;
 use tokio::sync::{mpsc, watch};
 
 use crate::client::ConnectionStatus;
+use crate::number_format;
 use crate::operator::{OperatorAction, OperatorState, Requested};
 use crate::theme::palette_of;
 
@@ -193,23 +194,37 @@ fn summary(ui: &mut egui::Ui, state: &OperatorState) {
     let realized: rust_decimal::Decimal = s.realized_pnl.values().copied().sum();
     ui.horizontal(|ui| {
         ui.strong("Equity");
-        ui.label(s.equity.round_dp(2).to_string());
+        ui.label(number_format::money(s.equity));
         ui.separator();
         ui.strong("Realized PnL");
-        ui.label(realized.round_dp(2).to_string());
+        ui.label(number_format::money(realized));
     });
+}
+
+/// Positions that still hold something, by symbol.
+pub fn open_positions(
+    snapshot: &apexes_backtest::SessionSnapshot,
+) -> Vec<&apexes_backtest::Position> {
+    let mut rows: Vec<_> = snapshot
+        .positions
+        .values()
+        .filter(|p| !p.quantity.is_zero())
+        .collect();
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    rows
 }
 
 fn positions(ui: &mut egui::Ui, state: &OperatorState) {
     let Some(s) = &state.snapshot else { return };
     ui.add_space(6.0);
     ui.heading("Positions");
-    if s.positions.is_empty() {
+    // A position closed back to zero stays in the ledger with its old entry
+    // price; showing it as a row reads as still holding something.
+    let rows = open_positions(s);
+    if rows.is_empty() {
         ui.weak("flat");
         return;
     }
-    let mut rows: Vec<_> = s.positions.values().collect();
-    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     egui::Grid::new("positions").striped(true).show(ui, |ui| {
         for h in [
             "Symbol",
@@ -225,8 +240,8 @@ fn positions(ui: &mut egui::Ui, state: &OperatorState) {
         for p in rows {
             let margin = s.margin_status.get(&p.symbol);
             ui.label(&p.symbol);
-            ui.label(p.quantity.to_string());
-            ui.label(p.average_entry_price.to_string());
+            ui.label(number_format::amount(p.quantity));
+            ui.label(number_format::price(p.average_entry_price));
             ui.label(dash(p.leverage));
             ui.label(dash(margin.and_then(|m| m.margin_ratio)));
             ui.label(dash(margin.and_then(|m| m.liquidation_price)));
@@ -255,9 +270,12 @@ fn open_orders(ui: &mut egui::Ui, state: &OperatorState) {
             ui.label(&o.symbol);
             ui.label(&o.side);
             ui.label(&o.order_type);
-            ui.label(o.quantity.to_string());
-            ui.label(o.filled_quantity.to_string());
-            ui.label(dash(o.price));
+            ui.label(number_format::amount(o.quantity));
+            ui.label(number_format::amount(o.filled_quantity));
+            ui.label(
+                o.price
+                    .map_or_else(|| "-".to_string(), number_format::price),
+            );
             ui.label(&o.status);
             ui.label(format!("{age}s"));
             ui.end_row();
@@ -278,7 +296,7 @@ fn balances(ui: &mut egui::Ui, state: &OperatorState) {
     egui::Grid::new("balances").striped(true).show(ui, |ui| {
         for (asset, amount) in rows {
             ui.label(asset);
-            ui.label(amount.to_string());
+            ui.label(number_format::amount(*amount));
             ui.end_row();
         }
     });

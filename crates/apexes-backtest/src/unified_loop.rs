@@ -167,6 +167,10 @@ pub async fn run_unified_event_loop(
         .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
         .collect();
 
+    // What the account held before the session traded: the baseline the
+    // strategy's PnL is separated from. Taken here, before any fill moves a
+    // balance (the start equity is fixed after the first event's fills).
+    let starting_balances = config.initial_balances.clone();
     let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances)
         .with_positions(config.initial_positions);
     // A minimal, zero-fee `CostModel` existing solely to carry
@@ -696,12 +700,20 @@ pub async fn run_unified_event_loop(
                     && !matches!(event, MarketEvent::Bar(_))
                 {
                     tracker.observe_fills(&all_fills);
-                    tracker.record_equity(
+                    let started = tracker.record_equity_at(
                         timestamp,
                         equity,
                         ledger.positions().values().any(|p| !p.quantity.is_zero()),
                         holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                        &last_prices,
                     );
+                    if started {
+                        tracker.set_baseline(starting_holdings(
+                            &starting_balances,
+                            &last_prices,
+                            &instruments_by_symbol,
+                        ));
+                    }
                 }
 
                 if let Some(handle) = &mut control {
@@ -725,18 +737,28 @@ pub async fn run_unified_event_loop(
                         open_orders.sort_by_key(|o| o.created_at);
                         let (evaluation_summary, equity_history) = match &evaluation {
                             Some(tracker) => {
-                                let (gross_exposure, max_abs_position) = exposure_inputs(
+                                let (position_exposure, max_abs_position) = exposure_inputs(
                                     ledger.positions(),
                                     &last_prices,
                                     &instruments_by_symbol,
                                 );
+                                // Exposure is what the account has at risk to
+                                // price moves: its non-cash holdings, which
+                                // include a pre-existing balance the strategy
+                                // never traded (the positions alone miss it).
+                                let gross_exposure = position_exposure.max(holdings_value(
+                                    ledger.balances(),
+                                    &last_prices,
+                                    &instruments_by_symbol,
+                                ));
                                 let realized: Decimal = ledger.realized_pnl().values().copied().sum();
                                 (
-                                    Some(tracker.summary(
+                                    Some(tracker.summary_at(
                                         equity,
                                         realized,
                                         gross_exposure,
                                         max_abs_position,
+                                        &last_prices,
                                     )),
                                     tracker.equity_history(),
                                 )
@@ -802,12 +824,20 @@ pub async fn run_unified_event_loop(
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {
                     tracker.observe_fills(&all_fills);
-                    tracker.record_equity(
+                    let started = tracker.record_equity_at(
                         now,
                         equity,
                         ledger.positions().values().any(|p| !p.quantity.is_zero()),
                         holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                        &last_prices,
                     );
+                    if started {
+                        tracker.set_baseline(starting_holdings(
+                            &starting_balances,
+                            &last_prices,
+                            &instruments_by_symbol,
+                        ));
+                    }
                 }
             }
         }
@@ -865,6 +895,48 @@ fn holdings_priced(
                 .values()
                 .any(|i| i.quote_currency.as_deref() == Some(asset.as_str()))
     })
+}
+
+/// The non-cash assets the account holds, with the price each has now.
+/// A quote currency of a traded instrument is cash; so is anything without a
+/// price (its value is unknown, so it cannot be attributed a PnL).
+fn starting_holdings(
+    balances: &HashMap<String, Decimal>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> Vec<crate::evaluation::BaselineHolding> {
+    let is_cash = |asset: &str| {
+        instruments_by_symbol
+            .values()
+            .any(|i| i.quote_currency.as_deref() == Some(asset))
+    };
+    let mut holdings: Vec<_> = balances
+        .iter()
+        .filter(|(asset, balance)| !balance.is_zero() && !is_cash(asset))
+        .filter_map(|(asset, balance)| {
+            last_prices
+                .get(asset)
+                .map(|price| crate::evaluation::BaselineHolding {
+                    asset: asset.clone(),
+                    quantity: *balance,
+                    price: *price,
+                })
+        })
+        .collect();
+    holdings.sort_by(|a, b| a.asset.cmp(&b.asset));
+    holdings
+}
+
+/// Current value, in quote currency, of the non-cash assets held.
+fn holdings_value(
+    balances: &HashMap<String, Decimal>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> Decimal {
+    starting_holdings(balances, last_prices, instruments_by_symbol)
+        .iter()
+        .map(|h| h.quantity * h.price)
+        .sum()
 }
 
 /// Gross exposure (sum of |position value| in quote currency) and the
@@ -2040,6 +2112,85 @@ mod tests {
             evaluation.total_pnl
         );
         assert_eq!(evaluation.max_drawdown, dec!(0));
+    }
+
+    /// Runs the loop with a control handle and returns the last snapshot.
+    async fn snapshot_after(
+        balances: &[(&str, Decimal)],
+        prices: &[Decimal],
+        strategy: impl Strategy,
+    ) -> crate::control::SessionSnapshot {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut events = vec![depth_snapshot(t0)];
+        for (i, price) in prices.iter().enumerate() {
+            events.push(trade_event(*price, t0 + Duration::seconds(1 + i as i64)));
+        }
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(config, zero_cost_model(None), events, strategy).await;
+        let snapshot = snapshot_rx.borrow();
+        snapshot.clone()
+    }
+
+    /// The screenshot's case end to end: 1 BTC already in the account, a
+    /// strategy that never trades, and BTC falling. The whole loss is the
+    /// market's, and exposure must show the holding even though the strategy
+    /// is flat.
+    #[tokio::test]
+    async fn a_session_that_never_trades_has_no_strategy_pnl_when_a_held_asset_moves() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100), dec!(95), dec!(90)],
+            NoopStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        assert_eq!(e.start_equity, dec!(10100));
+        assert_eq!(e.total_pnl, dec!(-10));
+        assert_eq!(e.holdings_pnl, dec!(-10), "1 BTC fell by 10");
+        assert_eq!(e.strategy_pnl, dec!(0));
+        assert_eq!(e.unrealized_pnl, dec!(0));
+        assert_eq!(e.holdings_value_at_start, dec!(100));
+        assert!(
+            e.gross_exposure_fraction > dec!(0.008),
+            "a 1 BTC holding is exposure even while the strategy is flat: {}",
+            e.gross_exposure_fraction
+        );
+    }
+
+    /// A strategy's own trades land in the strategy line and not the holdings one.
+    #[tokio::test]
+    async fn the_strategys_trades_are_attributed_to_the_strategy_not_the_holdings() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100), dec!(110)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        // The 1 BTC held from the start gained +10 whatever the strategy did.
+        assert_eq!(e.holdings_pnl, dec!(10));
+        assert_eq!(e.strategy_pnl + e.holdings_pnl, e.total_pnl);
+    }
+
+    /// A flat account has nothing to separate: the two views agree.
+    #[tokio::test]
+    async fn a_session_that_starts_flat_reports_no_holdings_pnl() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(110)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        assert_eq!(e.holdings_pnl, dec!(0));
+        assert_eq!(e.holdings_value_at_start, dec!(0));
+        assert_eq!(e.strategy_pnl, e.total_pnl);
     }
 
     /// `control: None` must stay free of evaluation work: no handle, no

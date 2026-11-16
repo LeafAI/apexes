@@ -247,9 +247,14 @@ fn evaluation() -> apexes_backtest::EvaluationSummary {
         start_equity: dec!(10000),
         total_pnl: dec!(500),
         realized_pnl: dec!(120),
+        strategy_pnl: dec!(500),
+        holdings_pnl: dec!(0),
+        holdings_value_at_start: dec!(0),
         unrealized_pnl: dec!(380),
         current_drawdown: dec!(0.02),
         max_drawdown: dec!(0.05),
+        strategy_current_drawdown: dec!(0.02),
+        strategy_max_drawdown: dec!(0.05),
         gross_exposure_fraction: dec!(0.3),
         fees_paid: HashMap::from([("USDT".to_string(), dec!(1.25))]),
         trade_count: 7,
@@ -366,5 +371,139 @@ fn an_engine_without_evaluation_data_does_not_break_the_console() {
     assert!(
         has_text(&h, "BTCUSDT"),
         "the rest of the console still renders"
+    );
+}
+
+// ---- What the screenshot showed -------------------------------------------
+
+fn closed_btc_position() -> apexes_strategy::Position {
+    apexes_strategy::Position {
+        symbol: "BTCUSDT".to_string(),
+        quantity: dec!(0.00000000),
+        average_entry_price: dec!(64657.62000000),
+        leverage: None,
+        margin_mode: None,
+        allocated_margin: dec!(0),
+    }
+}
+
+/// The session from the screenshot: 1.0006 BTC held since before it started,
+/// a flat strategy position, and BTC down about 272.
+fn screenshot_snapshot() -> SessionSnapshot {
+    let mut snap = snapshot();
+    snap.identity = Some(identity("live", Some("testnet")));
+    snap.positions = HashMap::from([("BTCUSDT".to_string(), closed_btc_position())]);
+    snap.open_orders = Vec::new();
+    snap.balances = HashMap::from([
+        ("BTC".to_string(), dec!(1.00060000)),
+        (
+            "USDT".to_string(),
+            rust_decimal::Decimal::from_str_exact("9940.9058680000000000").unwrap(),
+        ),
+    ]);
+    snap.equity = dec!(74078.28);
+    snap.realized_pnl = HashMap::from([("BTCUSDT".to_string(), dec!(-0.0727))]);
+    let mut e = evaluation();
+    e.start_equity = dec!(74350.26);
+    e.total_pnl = dec!(-271.99);
+    e.realized_pnl = dec!(-0.0727);
+    e.strategy_pnl = dec!(-0.08);
+    e.holdings_pnl = dec!(-271.91);
+    e.holdings_value_at_start = dec!(64423);
+    e.unrealized_pnl = dec!(-0.01);
+    e.current_drawdown = dec!(0.0092);
+    e.max_drawdown = dec!(0.0116);
+    e.strategy_current_drawdown = dec!(0);
+    e.strategy_max_drawdown = dec!(0.000001);
+    e.gross_exposure_fraction = dec!(0.87);
+    e.fees_paid = HashMap::from([
+        ("BTC".to_string(), dec!(0.00000000)),
+        ("USDT".to_string(), dec!(0.00000000)),
+    ]);
+    snap.evaluation = Some(e);
+    snap
+}
+
+#[test]
+fn a_closed_position_is_flat_not_a_row_with_a_stale_entry_price() {
+    let mut h = harness(state_with(screenshot_snapshot()));
+    h.run();
+    assert!(
+        h.query_by_label("flat").is_some(),
+        "the positions section says flat"
+    );
+    assert!(
+        !has_text(&h, "64657.62"),
+        "the old entry price of a closed position is not shown"
+    );
+}
+
+#[test]
+fn balances_show_only_the_digits_that_mean_something() {
+    let mut h = harness(state_with(screenshot_snapshot()));
+    h.run();
+    assert!(has_text(&h, "9940.905868"), "USDT, trailing zeros dropped");
+    assert!(has_text(&h, "1.0006"));
+    assert!(
+        !has_text(&h, "9940.9058680000000000"),
+        "the decimal's internal scale must not leak into the display"
+    );
+    assert!(!has_text(&h, "1.00060000"));
+}
+
+#[test]
+fn zero_fees_read_as_a_single_zero_not_a_list_of_zero_currencies() {
+    let mut h = harness(state_with(screenshot_snapshot()));
+    h.run();
+    assert!(has_text(&h, "Fees paid"));
+    assert!(
+        !has_text(&h, "0.00000000 BTC"),
+        "no `0.00000000 BTC, 0.00000000 USDT`"
+    );
+}
+
+#[test]
+fn the_market_move_on_held_assets_is_labelled_as_such_and_apart_from_the_strategy() {
+    let mut h = harness(state_with(screenshot_snapshot()));
+    h.run();
+    for text in [
+        "Account PnL",
+        "-271.99",
+        "from holdings",
+        "-271.91",
+        "Strategy PnL",
+        "-0.08",
+    ] {
+        assert!(has_text(&h, text), "missing {text:?}");
+    }
+}
+
+#[test]
+fn the_drawdown_shown_is_the_strategys_not_the_markets() {
+    let mut h = harness(state_with(screenshot_snapshot()));
+    h.run();
+    assert!(
+        !has_text(&h, "1.16%"),
+        "the 1.16% was BTC's price swing on a holding the strategy never traded"
+    );
+}
+
+#[test]
+fn an_open_position_is_still_shown_with_clean_numbers() {
+    let mut snap = screenshot_snapshot();
+    snap.positions = HashMap::from([(
+        "BTCUSDT".to_string(),
+        apexes_strategy::Position {
+            quantity: dec!(0.00070000),
+            ..closed_btc_position()
+        },
+    )]);
+    let mut h = harness(state_with(snap));
+    h.run();
+    assert!(has_text(&h, "0.0007"));
+    assert!(has_text(&h, "64657.62"));
+    assert!(
+        h.query_by_label("flat").is_none(),
+        "a held position is not reported as flat"
     );
 }

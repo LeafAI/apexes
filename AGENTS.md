@@ -76,6 +76,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 24. **The testnet charges no fees, so it cannot test fee handling.** A ledger change must be checked with mainnet-style fills: a fee in the asset *received* (base on a buy, quote on a sell), a fee in an asset the session does not hold (BNB), and a fee in a held asset. A fill the exchange reports must reach the ledger; skipping one (the live loop logs and continues) silently desynchronises the session from the account.
 
+25. **Report the strategy's result separately from the market's effect on what the account already held.** A testnet (or any live) account is rarely flat, and "PnL", "drawdown" and "exposure" computed from account equity alone credit or blame the strategy for a price move on assets it never traded. Keep the baseline split (`EvaluationTracker::set_baseline`, `strategy_pnl`/`holdings_pnl`). Prices arrive as `f64`; round derived differences (`PNL_DP`) so noise is not shown as a result. Format numbers for people with `number_format`, never `to_string()` on a `Decimal`.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.
