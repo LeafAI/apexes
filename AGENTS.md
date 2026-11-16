@@ -78,6 +78,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 25. **Report the strategy's result separately from the market's effect on what the account already held.** A testnet (or any live) account is rarely flat, and "PnL", "drawdown" and "exposure" computed from account equity alone credit or blame the strategy for a price move on assets it never traded. Keep the baseline split (`EvaluationTracker::set_baseline`, `strategy_pnl`/`holdings_pnl`). Prices arrive as `f64`; round derived differences (`PNL_DP`) so noise is not shown as a result. Format numbers for people with `number_format`, never `to_string()` on a `Decimal`.
 
+26. **`scripts/run-testnet.sh` always rebuilds before it starts anything.** It once built only when a binary was missing, so after a code change it launched stale binaries and a fix looked like it had not worked. It now runs `cargo build --release` every time (about 1 s when nothing changed) and stops on a failed build. Already-running engines and gateways keep their old code, and the script warns about them but never stops them; a new session on symbols an old gateway carries *reuses that old gateway*, so stop it too after a gateway change.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

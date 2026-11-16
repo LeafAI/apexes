@@ -18,8 +18,8 @@ A short guide to getting one real session running and testing it by hand. Testne
 ## 2. Start
 
 ```sh
-scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability, clock; starts nothing
-scripts/run-testnet.sh           # starts Postgres if needed, builds if needed, opens the app
+scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability, clock and rebuilds; starts nothing
+scripts/run-testnet.sh           # starts Postgres if needed, rebuilds the latest code, opens the app
 ```
 
 To start with a different strategy, pass it: `scripts/run-testnet.sh --strategy ~/Downloads/strategy.trend_guard.drift` (any readable file; a relative path is taken from where you run the script). It only pre-fills the Launcher's **Strategy file** box. You still press Launch, and can change the file there. Typos are caught before anything starts.
