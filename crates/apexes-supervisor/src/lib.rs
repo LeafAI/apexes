@@ -19,7 +19,7 @@ pub mod supervisor;
 
 pub use error::{RequestError, SupervisorError};
 pub use gateway::{GatewayHandle, GatewayMeta};
-pub use paths::{SessionId, SupervisorPaths};
+pub use paths::{GatewayFiles, GatewayKey, SessionId, SupervisorPaths};
 pub use request::{LaunchRequest, MAINNET_CONFIRMATION, ValidRequest};
 pub use session::{LaunchedSession, SessionInfo};
 pub use supervisor::Supervisor;

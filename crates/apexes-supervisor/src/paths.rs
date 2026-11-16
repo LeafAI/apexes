@@ -45,6 +45,28 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// A gateway slot is part of file names, so it is restricted to a safe set.
+pub fn valid_slot(slot: &str) -> bool {
+    !slot.is_empty() && slot.len() <= 16 && slot.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Which gateway process. A network can have several, each streaming its own
+/// instruments; `slot: None` is the single gateway older builds kept in flat
+/// files, which is still found (and stopped) but never started again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayKey {
+    pub network: BinanceNetwork,
+    pub slot: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayFiles {
+    pub pid: PathBuf,
+    pub meta: PathBuf,
+    pub token: PathBuf,
+    pub log: PathBuf,
+}
+
 /// Layout under the supervisor's root (normally `~/.apexes`). The engine
 /// and gateway write their PID files to the same places, so these names are
 /// shared contracts, not private choices.
@@ -76,22 +98,55 @@ impl SupervisorPaths {
         self.root.join("sessions")
     }
 
-    fn gateway_file(&self, network: BinanceNetwork, extension: &str) -> PathBuf {
-        self.root
-            .join(format!("market-data-gateway-{network}.{extension}"))
+    /// Where gateways started by this supervisor keep their files.
+    pub fn gateways_dir(&self) -> PathBuf {
+        self.root.join("gateways")
     }
 
-    pub fn gateway_pid(&self, network: BinanceNetwork) -> PathBuf {
-        self.gateway_file(network, "pid")
+    /// The files of one gateway: its PID file, the supervisor's record of
+    /// what it streams, its bearer token and its log.
+    pub fn gateway_files(&self, key: &GatewayKey) -> GatewayFiles {
+        let file = |extension: &str| match &key.slot {
+            // Older builds ran one gateway per network, in flat files.
+            None => self
+                .root
+                .join(format!("market-data-gateway-{}.{extension}", key.network)),
+            Some(slot) => self
+                .gateways_dir()
+                .join(format!("{}-{slot}.{extension}", key.network)),
+        };
+        GatewayFiles {
+            pid: file("pid"),
+            meta: file("json"),
+            token: file("token"),
+            log: file("log"),
+        }
     }
-    pub fn gateway_token(&self, network: BinanceNetwork) -> PathBuf {
-        self.gateway_file(network, "token")
-    }
-    pub fn gateway_meta(&self, network: BinanceNetwork) -> PathBuf {
-        self.gateway_file(network, "json")
-    }
-    pub fn gateway_log(&self, network: BinanceNetwork) -> PathBuf {
-        self.gateway_file(network, "log")
+
+    /// Every gateway of `network` that has a record on disk, running or not:
+    /// the one an older build left, then those in `gateways/`, by slot.
+    pub fn gateway_keys(&self, network: BinanceNetwork) -> Vec<GatewayKey> {
+        let mut keys = vec![GatewayKey {
+            network,
+            slot: None,
+        }];
+        let prefix = format!("{network}-");
+        let mut slots: Vec<String> = std::fs::read_dir(self.gateways_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let slot = name.strip_prefix(&prefix)?.strip_suffix(".json")?;
+                valid_slot(slot).then(|| slot.to_string())
+            })
+            .collect();
+        slots.sort();
+        keys.extend(slots.into_iter().map(|slot| GatewayKey {
+            network,
+            slot: Some(slot),
+        }));
+        keys
     }
 
     fn session_file(&self, id: &SessionId, extension: &str) -> PathBuf {
@@ -158,14 +213,75 @@ mod tests {
             paths.session_pid(&id),
             PathBuf::from("/h/.apexes/sessions/s-1.pid")
         );
+        let key = |network, slot: Option<&str>| GatewayKey {
+            network,
+            slot: slot.map(str::to_string),
+        };
         assert_eq!(
-            paths.gateway_pid(BinanceNetwork::Testnet),
-            PathBuf::from("/h/.apexes/market-data-gateway-testnet.pid")
+            paths.gateway_files(&key(BinanceNetwork::Testnet, None)).pid,
+            PathBuf::from("/h/.apexes/market-data-gateway-testnet.pid"),
+            "the file an older build's gateway wrote"
+        );
+        assert_eq!(
+            paths
+                .gateway_files(&key(BinanceNetwork::Testnet, Some("ab12")))
+                .pid,
+            PathBuf::from("/h/.apexes/gateways/testnet-ab12.pid")
         );
         assert_ne!(
-            paths.gateway_pid(BinanceNetwork::Testnet),
-            paths.gateway_pid(BinanceNetwork::Mainnet),
+            paths
+                .gateway_files(&key(BinanceNetwork::Testnet, Some("ab12")))
+                .pid,
+            paths
+                .gateway_files(&key(BinanceNetwork::Mainnet, Some("ab12")))
+                .pid,
             "networks must not share a PID file"
         );
+        assert_ne!(
+            paths
+                .gateway_files(&key(BinanceNetwork::Testnet, Some("a")))
+                .pid,
+            paths
+                .gateway_files(&key(BinanceNetwork::Testnet, Some("b")))
+                .pid,
+            "gateways on one network must not share a PID file"
+        );
+    }
+
+    #[test]
+    fn slots_are_filename_safe() {
+        assert!(valid_slot("ab12CD"));
+        for bad in ["", "a/b", "../x", "a.b", "a b", "ÿ", &"x".repeat(17)] {
+            assert!(!valid_slot(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn keys_list_the_legacy_gateway_first_then_slots_in_order_ignoring_strays() {
+        let home =
+            std::env::temp_dir().join(format!("apexes-paths-{}", uuid::Uuid::new_v4().simple()));
+        let paths = SupervisorPaths::from_home(&home);
+        std::fs::create_dir_all(paths.gateways_dir()).unwrap();
+        for name in [
+            "testnet-bb.json",
+            "testnet-aa.json",
+            "mainnet-cc.json",
+            "testnet-bad.slot.json",
+            "testnet-aa.pid",
+            "testnet-.json",
+            "notes.json",
+        ] {
+            std::fs::write(paths.gateways_dir().join(name), "{}").unwrap();
+        }
+        let slots: Vec<Option<String>> = paths
+            .gateway_keys(BinanceNetwork::Testnet)
+            .into_iter()
+            .map(|k| k.slot)
+            .collect();
+        assert_eq!(
+            slots,
+            vec![None, Some("aa".to_string()), Some("bb".to_string())]
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

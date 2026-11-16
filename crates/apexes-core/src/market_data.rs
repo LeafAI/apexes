@@ -16,6 +16,29 @@ pub enum MarketEvent {
     MarkPrice(MarkPriceUpdate),
 }
 
+impl MarketEvent {
+    /// The symbol this event is about, whichever kind it is.
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Tick(e) => &e.symbol,
+            Self::Depth(e) => &e.symbol,
+            Self::Bar(e) => &e.symbol,
+            Self::Trade(e) => &e.symbol,
+            Self::MarkPrice(e) => &e.symbol,
+        }
+    }
+
+    pub fn venue(&self) -> Venue {
+        match self {
+            Self::Tick(e) => e.venue,
+            Self::Depth(e) => e.venue,
+            Self::Bar(e) => e.venue,
+            Self::Trade(e) => e.venue,
+            Self::MarkPrice(e) => e.venue,
+        }
+    }
+}
+
 /// A best bid/ask quote update for a symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tick {
@@ -122,6 +145,38 @@ pub trait MarketDataProvider: Send + Sync {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn every_event_kind_reports_its_symbol_and_venue() {
+        let tick = MarketEvent::Tick(Tick {
+            symbol: "ETHUSDT".to_string(),
+            venue: Venue::Binance,
+            bid_price: dec!(1),
+            bid_size: dec!(1),
+            ask_price: dec!(2),
+            ask_size: dec!(1),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(tick.symbol(), "ETHUSDT");
+        assert_eq!(tick.venue(), Venue::Binance);
+        let trade = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".to_string(),
+            venue: Venue::Binance,
+            price: dec!(1),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        assert_eq!(trade.symbol(), "BTCUSDT");
+        let mark = MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "SOLUSDT".to_string(),
+            venue: Venue::Binance,
+            mark_price: dec!(1),
+            timestamp: Utc::now(),
+        });
+        assert_eq!(mark.symbol(), "SOLUSDT");
+    }
 
     #[test]
     fn tick_event_serde_round_trip() {

@@ -62,7 +62,7 @@ The risk limits default to: order value â‰¤ 100 USDT, order and position size â‰
 | What | Where |
 |---|---|
 | Session log | `~/.apexes/sessions/<id>.log` (the first place to look when something fails) |
-| Gateway log | `~/.apexes/market-data-gateway-testnet.log` |
+| Gateway logs | `~/.apexes/gateways/testnet-<id>.log`, one per gateway (a session on a symbol no running gateway carries starts its own; `ls ~/.apexes/gateways`). Gateways from an older build are in `~/.apexes/market-data-gateway-testnet.log` |
 | Audit log (commands, logins) | `~/.apexes/sessions/<id>.audit.jsonl` |
 | Per-session control token | `~/.apexes/sessions/<id>.token` (mode 600; generated for you) |
 | Orders in Postgres | `docker exec apexes-postgres psql -U apexes -d apexes_live -c "select id,symbol,status from orders order by created_at desc limit 10;"` (live sessions use `apexes_live`; the test suites use and wipe `apexes`) |
@@ -72,7 +72,7 @@ Metrics and health are on the engine's port (shown in the launcher): `/healthz`,
 ## 5. Stopping everything
 
 - A session: **Stop** in the Launcher (clean). Closing the window does **not** stop it.
-- The gateway, once no session uses it: `pkill -f apexes-market-data-gateway`.
+- The gateways, once no session uses them: `pkill -f apexes-market-data-gateway`.
 - Postgres: `docker compose stop postgres`.
 
 ## 6. If something goes wrong

@@ -29,6 +29,13 @@ has passed startup recovery; if it refuses, the launcher shows its log.
 Everything the app starts is logged under `~/.apexes/` (`*.log`, mode 0600),
 alongside a per-session control token it generates itself.
 
+Gateways are per symbol set, not one per network: a session reuses a running
+gateway that carries all its symbols (the smallest such one), otherwise a new
+gateway starts for exactly its symbols, so a BTCUSDT session and an ETHUSDT
+session run side by side and neither is restarted. Each engine receives only its
+own symbols. Gateway files live in `~/.apexes/gateways/<network>-<id>.*`; files
+of a gateway that has been dead for 10 minutes are tidied at the next launch.
+
 **Mainnet** is the same flow with the Network switched and the word `MAINNET`
 typed to confirm. It trades real funds; do not use it until a testnet run has
 behaved the way you expect.

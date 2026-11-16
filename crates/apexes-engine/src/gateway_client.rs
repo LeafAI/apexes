@@ -61,22 +61,41 @@ impl BackoffState {
 }
 
 /// Adapts one gateway `/market` WebSocket connection into an
-/// `apexes_core::MarketDataProvider`. `subscribe`'s `instruments`
-/// parameter is intentionally ignored: the underlying gateway process
-/// is already configured (via its own `--instruments` CLI flag) with
-/// whatever fixed instrument set it broadcasts, and this adapter's one
-/// WS connection carries all of it regardless of what any individual
-/// caller passes here -- matching `MarketEventBus::subscribe`'s own
-/// documented behavior of calling the wrapped provider's `subscribe`
-/// exactly once (on the first subscribe call transitioning
-/// `NotConnected` -> `Connected`), so this parameter is in practice
-/// only ever read by that one caller anyway.
+/// `apexes_core::MarketDataProvider`.
+///
+/// A gateway process streams a fixed instrument set (its own
+/// `--instruments` flag) and may be shared by several sessions, so its
+/// connection can carry symbols this session never asked for. `subscribe`
+/// therefore keeps only events for the instruments it is given: a session
+/// must never be fed another symbol's prices (the ledger would value its
+/// position at the wrong price). An empty instrument list means "no
+/// filter", which keeps the paper-mode and test callers that pass none
+/// working. [`MarketEventBus::subscribe`] calls this exactly once.
 pub struct GatewayMarketDataProvider {
     gateway_url: String,
     token: Option<String>,
     /// When set, the gateway must announce this network in its
     /// `x-apexes-network` response header on every connect.
     expected_network: Option<BinanceNetwork>,
+}
+
+/// Keeps only events for a set of symbols. `None`: keep everything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolFilter(Option<std::collections::HashSet<String>>);
+
+impl SymbolFilter {
+    pub fn for_instruments(instruments: &[Instrument]) -> Self {
+        if instruments.is_empty() {
+            return Self(None);
+        }
+        Self(Some(instruments.iter().map(|i| i.symbol.clone()).collect()))
+    }
+
+    pub fn allows(&self, event: &MarketEvent) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|symbols| symbols.contains(event.symbol()))
+    }
 }
 
 /// Response header a gateway uses to announce its Binance network. Kept in
@@ -154,8 +173,9 @@ impl GatewayMarketDataProvider {
 impl MarketDataProvider for GatewayMarketDataProvider {
     async fn subscribe(
         &self,
-        _instruments: &[Instrument],
+        instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
+        let filter = SymbolFilter::for_instruments(instruments);
         let (tx, rx) = mpsc::unbounded_channel();
         // With an expected network, connect once up front so a mismatch is
         // a `subscribe` error rather than something found in a log later.
@@ -177,6 +197,7 @@ impl MarketDataProvider for GatewayMarketDataProvider {
             self.token.clone(),
             self.expected_network,
             first_socket,
+            filter,
             tx,
         ));
 
@@ -253,6 +274,7 @@ async fn run_connection_loop(
     token: Option<String>,
     expected_network: Option<BinanceNetwork>,
     mut first_socket: Option<GatewaySocket>,
+    filter: SymbolFilter,
     tx: mpsc::UnboundedSender<MarketEvent>,
 ) {
     let mut backoff = BackoffState::new();
@@ -290,6 +312,7 @@ async fn run_connection_loop(
                     match read.next().await {
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<MarketEvent>(&text) {
+                                Ok(event) if !filter.allows(&event) => {}
                                 Ok(event) => {
                                     if tx.send(event).is_err() {
                                         tracing::info!(
@@ -338,6 +361,55 @@ async fn run_connection_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instrument(symbol: &str) -> Instrument {
+        use apexes_core::{AssetClass, MarketType};
+        use rust_decimal_macros::dec;
+        Instrument::new(
+            symbol,
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some(symbol.trim_end_matches("USDT").to_string()),
+            Some("USDT".to_string()),
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap()
+    }
+
+    fn trade(symbol: &str) -> MarketEvent {
+        use rust_decimal_macros::dec;
+        MarketEvent::Trade(apexes_core::TradeEvent {
+            symbol: symbol.to_string(),
+            venue: Venue::Binance,
+            price: dec!(1),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    #[test]
+    fn a_session_only_sees_the_symbols_it_asked_for() {
+        let filter = SymbolFilter::for_instruments(&[instrument("ETHUSDT")]);
+        assert!(filter.allows(&trade("ETHUSDT")));
+        assert!(
+            !filter.allows(&trade("BTCUSDT")),
+            "another session's symbol on a shared gateway must be dropped"
+        );
+    }
+
+    #[test]
+    fn several_symbols_are_all_allowed_and_no_instruments_means_no_filter() {
+        let two = SymbolFilter::for_instruments(&[instrument("ETHUSDT"), instrument("BTCUSDT")]);
+        assert!(two.allows(&trade("ETHUSDT")) && two.allows(&trade("BTCUSDT")));
+        assert!(!two.allows(&trade("SOLUSDT")));
+        let none = SymbolFilter::for_instruments(&[]);
+        assert!(none.allows(&trade("ANYTHING")));
+    }
 
     #[test]
     fn backoff_state_doubles_each_call_and_caps_at_max_backoff() {

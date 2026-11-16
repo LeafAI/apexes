@@ -306,3 +306,194 @@ fn the_console_sees_a_real_testnet_session_and_can_control_it() {
     }
     stopped.expect("a clean stop through the control endpoint");
 }
+
+/// Reads `/market` of a real gateway for a few seconds and returns the set of
+/// symbols seen in the events and how many arrived.
+fn symbols_seen(
+    port: u16,
+    token: &str,
+    seconds: u64,
+) -> (std::collections::BTreeSet<String>, usize) {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async move {
+        let mut request = format!("ws://127.0.0.1:{port}/market")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let mut symbols = std::collections::BTreeSet::new();
+        let mut count = 0;
+        let end = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        while let Ok(Some(Ok(message))) = tokio::time::timeout_at(end, socket.next()).await {
+            if let Ok(text) = message.into_text()
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(inner) = value.as_object().and_then(|o| o.values().next())
+                && let Some(symbol) = inner.get("symbol").and_then(|s| s.as_str())
+            {
+                symbols.insert(symbol.to_string());
+                count += 1;
+            }
+        }
+        (symbols, count)
+    })
+}
+
+/// The reported bug, with the real gateway: BTCUSDT is already streaming and
+/// ETHUSDT is asked for. Needs only the network (no keys, no Postgres).
+#[test]
+#[ignore = "needs network and the built gateway binary"]
+fn a_second_symbol_gets_its_own_real_gateway_and_each_streams_only_its_own_data() {
+    let home = temp_home("twogw");
+    let sup = supervisor(&home, "unused", "unused");
+    let btc = sup
+        .ensure_gateway(BinanceNetwork::Testnet, &["BTCUSDT".to_string()])
+        .expect("BTC gateway");
+    let eth = sup
+        .ensure_gateway(BinanceNetwork::Testnet, &["ETHUSDT".to_string()])
+        .expect("an ETH request must start its own gateway, not be refused");
+    let again = sup
+        .ensure_gateway(BinanceNetwork::Testnet, &["BTCUSDT".to_string()])
+        .expect("BTC again");
+
+    let (btc_symbols, btc_events) = symbols_seen(btc.port, btc.token.as_deref().unwrap(), 12);
+    let (eth_symbols, eth_events) = symbols_seen(eth.port, eth.token.as_deref().unwrap(), 12);
+    println!("BTC gateway: {btc_events} events {btc_symbols:?}");
+    println!("ETH gateway: {eth_events} events {eth_symbols:?}");
+
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::thread::sleep(Duration::from_millis(500));
+    let alive = (
+        apexes_supervisor::pidfile::port_open(btc.port),
+        apexes_supervisor::pidfile::port_open(eth.port),
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    assert!(btc.started && eth.started);
+    assert_ne!(btc.port, eth.port);
+    assert!(!again.started && again.port == btc.port, "BTC is reused");
+    assert!(
+        btc_events > 0 && eth_events > 0,
+        "both feeds delivered live data"
+    );
+    assert_eq!(
+        btc_symbols.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["BTCUSDT"]
+    );
+    assert_eq!(
+        eth_symbols.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["ETHUSDT"]
+    );
+    assert_eq!(alive, (false, false), "stop_gateway stopped both");
+}
+
+/// Your exact report, with real processes and your testnet keys: a BTCUSDT
+/// session is running, then an ETHUSDT session is launched. Both must run,
+/// each on its own gateway, and each must see only its own symbol's market.
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn a_btc_session_and_an_eth_session_run_side_by_side_on_the_real_testnet() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("btceth");
+    let sup = supervisor(&home, &key, &secret);
+    let mut eth_request = request("t-eth");
+    eth_request.symbols = vec!["ETHUSDT".to_string()];
+
+    let btc = sup.launch(request("t-btc"));
+    let eth = btc.as_ref().ok().map(|_| sup.launch(eth_request));
+    let logs = ["t-btc", "t-eth"].map(|id| {
+        std::fs::read_to_string(sup.paths().session_log(&SessionId::parse(id).unwrap()))
+            .unwrap_or_default()
+    });
+
+    let result = (|| -> Result<(), String> {
+        let btc = btc.as_ref().map_err(|e| format!("BTC launch: {e}"))?;
+        let eth = eth
+            .as_ref()
+            .ok_or("no ETH launch")?
+            .as_ref()
+            .map_err(|e| format!("ETH launch failed (the reported bug): {e}"))?;
+        if btc.gateway.port == eth.gateway.port {
+            return Err("both sessions share one gateway".to_string());
+        }
+        // Each session's own snapshot: its equity is priced from ITS symbol
+        // only, so a BTC price leaking into the ETH session would show here.
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        for (label, session, expect) in [("BTC", btc, "BTCUSDT"), ("ETH", eth, "ETHUSDT")] {
+            let token = session.info.token.clone().ok_or("token")?;
+            let url = session.info.control_url.clone();
+            let identity: Result<String, String> = runtime.block_on(async {
+                let mut req = url
+                    .as_str()
+                    .into_client_request()
+                    .map_err(|e| e.to_string())?;
+                req.headers_mut().insert(
+                    "Authorization",
+                    apexes_security::bearer_header_value(&token)
+                        .parse()
+                        .map_err(|_| "header")?,
+                );
+                let (mut socket, _) = tokio_tungstenite::connect_async(req)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    while let Some(Ok(Message::Text(text))) = socket.next().await {
+                        if let Ok(SessionMessage::Snapshot(s)) =
+                            serde_json::from_str::<SessionMessage>(&text)
+                            && !s.is_placeholder()
+                            && let Some(id) = s.identity
+                        {
+                            return Some(format!(
+                                "{} {} equity {}",
+                                id.session_id, id.strategy, s.equity
+                            ));
+                        }
+                    }
+                    None
+                })
+                .await
+                .map_err(|_| format!("{label}: no real snapshot within 60s"))?
+                .ok_or_else(|| format!("{label}: snapshot stream ended"))
+            });
+            println!("{label} ({expect}): {}", identity?);
+        }
+        Ok(())
+    })();
+
+    let gateways = sup.paths().gateway_keys(BinanceNetwork::Testnet).len();
+    println!("gateway records: {gateways}");
+    println!("--- ETH engine log tail ---");
+    for line in logs[1]
+        .lines()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!("{line}");
+    }
+    for id in ["t-btc", "t-eth"] {
+        let _ = sup.request_stop(
+            &SessionId::parse(id).unwrap(),
+            Duration::from_secs(30),
+            true,
+        );
+    }
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+    result.expect("both sessions run side by side");
+}
