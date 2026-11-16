@@ -35,3 +35,23 @@ fn engine_only_mode_is_optional_so_no_arguments_means_the_launcher() {
         "there must be no default engine address: {text}"
     );
 }
+
+#[test]
+fn a_strategy_can_be_prefilled_but_not_together_with_engine_only_mode() {
+    let text = help();
+    assert!(text.contains("--strategy"), "{text}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_apexes-operator"))
+        .args([
+            "--engine",
+            "ws://127.0.0.1:1/session/ws",
+            "--strategy",
+            "x.drift",
+        ])
+        .output()
+        .expect("run apexes-operator");
+    assert!(
+        !output.status.success(),
+        "--strategy means nothing in console-only mode and must be refused, not ignored"
+    );
+}

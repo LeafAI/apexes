@@ -2,8 +2,14 @@
 # Starts everything needed for a Binance Spot TESTNET session and opens the
 # Apexes operator app (launcher + console). Safe to run repeatedly.
 #
-#   scripts/run-testnet.sh            # check, build if needed, open the app
-#   scripts/run-testnet.sh --check    # only check prerequisites, start nothing
+#   scripts/run-testnet.sh                          # check, build if needed, open the app
+#   scripts/run-testnet.sh --check                  # only check prerequisites, start nothing
+#   scripts/run-testnet.sh --strategy FILE.drift    # pre-fill the launcher with this strategy
+#
+# --strategy takes a path to any readable file (relative paths are taken from
+# where you run this, not from the repository). It only fills the Launcher's
+# "Strategy file" box; you still press Launch, and can change it there. Without
+# it the launcher starts with deploy/strategy.example.drift.
 #
 # Reads your testnet HMAC key from ~/.apexes/binance.yaml:
 #
@@ -20,10 +26,36 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${APEXES_BINANCE_CONFIG:-$HOME/.apexes/binance.yaml}"
 CHECK_ONLY=0
-[ "${1:-}" = "--check" ] && CHECK_ONLY=1
+STRATEGY=""
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 ok()   { echo "  ok  $*"; }
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '$d'; }
+
+# Arguments are checked before anything is started or any credential is read,
+# so a typo costs nothing.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK_ONLY=1 ;;
+    --strategy)
+      [ $# -ge 2 ] && [ -n "$2" ] || fail "--strategy needs a file path"
+      STRATEGY="$2"; shift ;;
+    --strategy=*)
+      STRATEGY="${1#--strategy=}"
+      [ -n "$STRATEGY" ] || fail "--strategy needs a file path" ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown argument: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+if [ -n "$STRATEGY" ]; then
+  [ -e "$STRATEGY" ] || fail "strategy file not found: $STRATEGY"
+  [ -f "$STRATEGY" ] || fail "strategy path is not a file: $STRATEGY"
+  [ -r "$STRATEGY" ] || fail "strategy file is not readable: $STRATEGY"
+  # Absolute, because the engine is started from another directory.
+  STRATEGY="$(cd "$(dirname "$STRATEGY")" && pwd)/$(basename "$STRATEGY")"
+fi
 
 echo "Apexes testnet launcher"
 
@@ -129,8 +161,16 @@ if [ "$need_build" = 1 ]; then
 else
   ok "release binaries present"
 fi
-[ -f "$ROOT/deploy/strategy.example.drift" ] || fail "deploy/strategy.example.drift is missing"
-ok "demo strategy present"
+if [ -n "$STRATEGY" ]; then
+  ok "strategy: $STRATEGY"
+  case "$STRATEGY" in
+    *.drift) ;;
+    *) echo "  WARN $STRATEGY does not end in .drift; the engine will still try to read it as a Drift script" ;;
+  esac
+else
+  [ -f "$ROOT/deploy/strategy.example.drift" ] || fail "deploy/strategy.example.drift is missing"
+  ok "demo strategy present"
+fi
 
 if [ "$CHECK_ONLY" = 1 ]; then
   echo "All checks done (nothing was started)."
@@ -143,5 +183,8 @@ fi
 cd "$ROOT"
 export APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY="$API_KEY"
 export APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET="$API_SECRET"
+ARGS=()
+[ -n "$STRATEGY" ] && ARGS+=(--strategy "$STRATEGY")
 echo "Starting the app. In the Launcher tab: leave Testnet selected, press 'Launch on TESTNET'."
-exec "$BIN/apexes-operator"
+[ -n "$STRATEGY" ] && echo "The Strategy file box is pre-filled with $STRATEGY"
+exec "$BIN/apexes-operator" ${ARGS[@]+"${ARGS[@]}"}

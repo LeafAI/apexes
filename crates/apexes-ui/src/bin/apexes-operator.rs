@@ -9,6 +9,8 @@
 //!
 //! ```text
 //! apexes-operator                      # launcher + console (starts and finds sessions)
+//! apexes-operator --strategy ~/strategies/mine.drift
+//!                                      # launcher with that strategy pre-filled
 //! APEXES_CONTROL_TOKEN=<token> apexes-operator --engine ws://127.0.0.1:9100/session/ws
 //!                                      # console only, for an engine started elsewhere
 //! ```
@@ -39,6 +41,11 @@ struct Cli {
     /// command-line arguments are visible to other users of the machine.
     #[arg(long, env = "APEXES_CONTROL_TOKEN", hide_env_values = true)]
     token: Option<String>,
+    /// Strategy file to pre-fill in the launcher's "Strategy file" box. It is
+    /// only a starting value: nothing launches until you press Launch, and you
+    /// can still change it there. Ignored with `--engine`.
+    #[arg(long, value_name = "FILE", conflicts_with = "engine")]
+    strategy: Option<String>,
 }
 
 fn main() -> eframe::Result {
@@ -48,11 +55,11 @@ fn main() -> eframe::Result {
 
     match cli.engine {
         Some(engine) => run_console_only(runtime, engine, cli.token),
-        None => run_launcher(runtime),
+        None => run_launcher(runtime, cli.strategy),
     }
 }
 
-fn run_launcher(runtime: tokio::runtime::Runtime) -> eframe::Result {
+fn run_launcher(runtime: tokio::runtime::Runtime, strategy: Option<String>) -> eframe::Result {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         eprintln!("apexes-operator: HOME is not set; cannot locate ~/.apexes");
         std::process::exit(2);
@@ -65,7 +72,11 @@ fn run_launcher(runtime: tokio::runtime::Runtime) -> eframe::Result {
     eframe::run_native(
         "Apexes",
         apexes_ui::chrome::native_options(),
-        Box::new(move |_cc| Ok(Box::new(ShellApp::new(supervisor, handle)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(
+                ShellApp::new(supervisor, handle).with_strategy_path(strategy),
+            ))
+        }),
     )
 }
 

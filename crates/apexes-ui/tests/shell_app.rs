@@ -33,6 +33,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, choice: ThemeChoice) -> Self {
+        Self::new_with(name, choice, None)
+    }
+
+    fn new_with(name: &str, choice: ThemeChoice, strategy: Option<String>) -> Self {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let home = std::env::temp_dir().join(format!(
             "apexes-shell-{name}-{}",
@@ -46,7 +50,9 @@ impl Fixture {
         let supervisor = Supervisor::new(&home);
         let harness = Harness::builder()
             .with_size(egui::vec2(1000.0, 700.0))
-            .build_eframe(move |_cc| ShellApp::with_chrome(supervisor, handle, chrome));
+            .build_eframe(move |_cc| {
+                ShellApp::with_chrome(supervisor, handle, chrome).with_strategy_path(strategy)
+            });
         Self {
             harness,
             _runtime: runtime,
@@ -102,6 +108,33 @@ fn it_starts_on_the_launcher_with_no_console_tabs() {
     assert_eq!(f.active(), View::Launcher);
     assert!(f.ids().is_empty());
     assert!(f.shows("Launcher"));
+}
+
+#[test]
+fn without_the_option_the_launcher_starts_with_the_demo_strategy() {
+    let mut f = Fixture::new("default", ThemeChoice::Dark);
+    assert_eq!(f.app().strategy_path(), "deploy/strategy.example.drift");
+}
+
+#[test]
+fn a_strategy_given_on_the_command_line_prefills_the_launcher_and_nothing_launches() {
+    let chosen = "/home/me/strategy.trend_guard.drift".to_string();
+    let mut f = Fixture::new_with("strategy", ThemeChoice::Dark, Some(chosen.clone()));
+    f.harness.step();
+    assert_eq!(f.app().strategy_path(), chosen);
+    assert!(
+        f.ids().is_empty(),
+        "pre-filling never opens or launches anything"
+    );
+    assert_eq!(f.active(), View::Launcher);
+}
+
+#[test]
+fn a_blank_strategy_option_keeps_the_default() {
+    for blank in [Some("   ".to_string()), Some(String::new())] {
+        let mut f = Fixture::new_with("blank", ThemeChoice::Dark, blank);
+        assert_eq!(f.app().strategy_path(), "deploy/strategy.example.drift");
+    }
 }
 
 #[test]

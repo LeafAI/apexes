@@ -78,6 +78,21 @@ impl ShellApp {
         }
     }
 
+    /// Pre-fills the launcher's strategy box (the `--strategy` option). Only a
+    /// starting value: nothing launches until the operator presses Launch.
+    /// Blank input is ignored, so the default stays.
+    pub fn with_strategy_path(mut self, path: Option<String>) -> Self {
+        if let Some(path) = path.filter(|p| !p.trim().is_empty()) {
+            self.shell.launcher.form.strategy_path = path;
+        }
+        self
+    }
+
+    /// What the launcher would start with, for tests.
+    pub fn strategy_path(&self) -> &str {
+        &self.shell.launcher.form.strategy_path
+    }
+
     pub fn tabs(&self) -> &Tabs {
         &self.tabs
     }

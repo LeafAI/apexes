@@ -22,6 +22,8 @@ scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability
 scripts/run-testnet.sh           # starts Postgres if needed, builds if needed, opens the app
 ```
 
+To start with a different strategy, pass it: `scripts/run-testnet.sh --strategy ~/Downloads/strategy.trend_guard.drift` (any readable file; a relative path is taken from where you run the script). It only pre-fills the Launcher's **Strategy file** box. You still press Launch, and can change the file there. Typos are caught before anything starts.
+
 The window has a **Launcher** tab and one tab per open session. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first); the new session's console then opens by itself.
 
 **Windows and tabs.** Open as many sessions as you like (**Open console** in the Launcher list); each keeps its own connection, and switching tabs loses nothing. A coloured dot on each tab shows its health, and a tab says `(offline)` or `HALTED` without you opening it. Closing a tab (the x, middle-click, or Cmd/Ctrl+W) only disconnects the console: the session keeps running.
