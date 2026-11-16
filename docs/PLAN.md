@@ -50,6 +50,10 @@ _Last updated: 2026-11-15 (testnet MVP built; e2e run against the real testnet)_
 | One window, many sessions: a tab per console (`tabs.rs`, `shell_app.rs`), each with its own connection; a launch opens its console; background tabs keep reading and show `(offline)`/`HALTED`; Cmd/Ctrl+1-9, [ ], W; window size and position remembered, minimum size enforced | 9 `ShellApp` tests through the real app, 9 pure tab-model tests |
 | Found by looking at rendered PNGs, not by tests: eframe clears to near-black and gives `ui()` no background, so the light theme drew white-on-black text on a dark window (and dark-theme text on white) until every app drew a themed page; the `●` glyph is missing from egui's fonts and drew as an empty box (now a painted circle); limit-bar text was unreadable on its own fill | `cargo test -p apexes-ui --test themes -- --include-ignored` writes the PNGs |
 
+### Silent feed death (2026-11-16, reported from a real run)
+
+An overnight session halted with `market data stale: no events for 108.9s`; the feed then never came back. The gateway's two upstream sockets were `ESTABLISHED` but frozen (byte counters flat for 10+ minutes) while a fresh connection from the same machine delivered at once: a half-open connection, which `barter-data` never reconnects because it saw no error and no close. Fix: `supervised.rs` wraps trades, ticker, depth and mark-price in an idle-timeout/backoff loop on a fresh runtime per attempt. Verified: 9 supervisor tests incl. a real socket that stays open and silent (replaced, data resumes), 15 repeated and 5 CPU-loaded runs, and the real testnet gateway serving 150 live events in 25 s. **Not verified:** a real mid-run network cut (can't be induced without root); the engine's halt is deliberately sticky, so after a feed outage you still press Resume.
+
 ### Found by hand-testing a real session (2026-11-16) and fixed
 
 | Symptom (from a screenshot and the session log) | Root cause | Fix |

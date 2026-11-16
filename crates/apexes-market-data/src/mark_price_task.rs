@@ -7,75 +7,79 @@
 //! `docs/superpowers/specs/2026-08-02-apexes-mark-price-pipeline-design.md`
 //! §3.2 for the raw message shape.
 
+use crate::supervised::{self, Flow, Timings};
 use apexes_core::{MarkPriceUpdate, MarketEvent, Venue};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use futures::stream::LocalBoxStream;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Message;
 
 const WS_BASE_URL: &str = "wss://fstream.binance.com/stream";
-/// Delay before attempting to reconnect after the WebSocket connection
-/// drops -- avoids a tight reconnect loop hammering Binance during an
-/// outage. `barter-data`'s tasks get equivalent backoff for free from
-/// the library; this hand-rolled task must implement its own.
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Runs until `symbols` is empty (returns immediately, matching the
 /// other tasks' "empty subscription list -> warn and return" behavior)
-/// or forever otherwise, reconnecting automatically on any WebSocket
-/// error or unexpected close.
-pub async fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
+/// or until the output channel closes. The connection is supervised
+/// (`crate::supervised`): an error, a close, a failed connect, or a socket
+/// that goes silent all lead to a backed-off reconnect. Blocks the calling
+/// thread.
+pub fn run(symbols: Vec<String>, tx: UnboundedSender<MarketEvent>) {
     if symbols.is_empty() {
         tracing::warn!("mark_price_task: no symbols provided, nothing to subscribe to");
         return;
     }
-
     let stream_names: Vec<String> = symbols
         .iter()
         .map(|s| format!("{}@markPrice@1s", s.to_lowercase()))
         .collect();
     let url = format!("{WS_BASE_URL}?streams={}", stream_names.join("/"));
+    run_at(url, Timings::default(), tx);
+}
 
-    loop {
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((socket, _response)) => {
-                tracing::info!(?symbols, "mark_price_task: connected");
-                let (_write, mut read) = socket.split();
-                loop {
-                    match read.next().await {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Some(event) = parse_mark_price_message(&text)
-                                && tx.send(event).is_err()
-                            {
-                                tracing::warn!("mark_price_task: output channel closed, stopping");
-                                return;
-                            }
-                        }
-                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                ?error,
-                                "mark_price_task: WebSocket error, reconnecting"
-                            );
-                            break;
-                        }
-                        None => {
-                            tracing::warn!("mark_price_task: WebSocket stream ended, reconnecting");
-                            break;
-                        }
-                    }
-                }
+/// [`run`] against an explicit URL and timings (tests point it at a local
+/// server and shorten the idle window).
+fn run_at(url: String, timings: Timings, tx: UnboundedSender<MarketEvent>) {
+    supervised::run_isolated(
+        "mark_price_task",
+        timings,
+        move || connect(url.clone()),
+        move |event: MarketEvent| {
+            if tx.send(event).is_err() {
+                tracing::warn!("mark_price_task: output channel closed, stopping");
+                Flow::Stop
+            } else {
+                Flow::Continue
             }
-            Err(error) => {
-                tracing::warn!(?error, "mark_price_task: failed to connect, retrying");
-            }
+        },
+    );
+}
+
+/// Opens the WebSocket and yields parsed mark-price events. Ping/pong and
+/// other control frames are answered by the library and filtered out here,
+/// so only real data counts as activity; a close or error ends the stream.
+async fn connect(url: String) -> Option<LocalBoxStream<'static, MarketEvent>> {
+    match tokio_tungstenite::connect_async(&url).await {
+        Ok((socket, _response)) => {
+            tracing::info!("mark_price_task: connected");
+            let (_write, read) = socket.split();
+            Some(
+                read.take_while(|message| std::future::ready(message.is_ok()))
+                    .filter_map(|message| {
+                        std::future::ready(match message {
+                            Ok(Message::Text(text)) => parse_mark_price_message(&text),
+                            _ => None,
+                        })
+                    })
+                    .boxed_local(),
+            )
         }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        Err(error) => {
+            tracing::warn!(?error, "mark_price_task: failed to connect");
+            None
+        }
     }
 }
 
@@ -148,5 +152,76 @@ mod tests {
     fn returns_none_when_price_field_is_not_a_valid_decimal() {
         let raw = r#"{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1234567890000,"s":"BTCUSDT","p":"not-a-number"}}"#;
         assert!(parse_mark_price_message(raw).is_none());
+    }
+
+    /// The failure from the field, against a real socket: the server delivers
+    /// one update and then goes silent with the connection left open (no
+    /// close, no reset). The task must notice, reconnect, and get data again.
+    #[test]
+    fn a_connection_that_goes_silent_but_stays_open_is_replaced() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = server_runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = accepted.clone();
+        server_runtime.spawn(async move {
+            use futures::SinkExt;
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let message = sample_message().replace("65012.34", &format!("{}", 65000 + n));
+                    let _ = ws.send(Message::Text(message.into())).await;
+                    // Silent from here on, connection held open.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let timings = Timings {
+            idle: Duration::from_millis(400),
+            connect: Duration::from_secs(5),
+            backoff_initial: Duration::from_millis(50),
+            backoff_max: Duration::from_millis(200),
+        };
+        std::thread::spawn(move || {
+            run_at(format!("ws://127.0.0.1:{port}/stream"), timings, tx);
+        });
+
+        let mut prices = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while prices.len() < 3 && std::time::Instant::now() < deadline {
+            if let Ok(MarketEvent::MarkPrice(m)) = rx.try_recv() {
+                prices.push(m.mark_price);
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            prices.len(),
+            3,
+            "data kept arriving across silent connections (got {prices:?})"
+        );
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 3,
+            "each silent connection was dropped and replaced"
+        );
+        drop(rx);
     }
 }

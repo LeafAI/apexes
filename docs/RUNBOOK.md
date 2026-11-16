@@ -143,6 +143,13 @@ checks — reducing exposure must not be blockable.
   `apexes_unflattened_positions` stays above zero: **close them manually**.
 - The automatic stale-data halt does not flatten (a dead feed is a poor moment
   to fire market orders unattended); send a `Halt` with `flatten` if you want it.
+- **After a stale-data halt the engine stays halted until you press Resume**, even
+  once data is flowing again (a person should look first). The gateway now
+  replaces a connection that goes quiet for 30 s (trades: 120 s) by itself, so the
+  feed normally recovers within a minute; if the halt reason shows a long gap, check
+  the gateway log for `the connection looks dead, reconnecting`. A gateway that was
+  started **before** this fix cannot recover from a silent connection: stop it and
+  its sessions and start them again.
 
 ## Operator console
 
