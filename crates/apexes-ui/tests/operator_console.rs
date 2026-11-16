@@ -73,13 +73,20 @@ fn state(role: &str, halted: bool) -> OperatorState {
     s
 }
 
+/// The window a real operator has: the app's default size, not egui_kittest's
+/// 800x600, which is smaller than the minimum the app allows. The console is a
+/// scrolling page and a test must not depend on what happens to fit a toy window.
+const WINDOW: [f32; 2] = [1180.0, 1500.0];
+
 fn harness(state: OperatorState) -> Harness<'static, Fixture> {
-    Harness::new_ui_state(
-        |ui, (state, sent): &mut Fixture| {
-            sent.extend(show(ui, state));
-        },
-        (state, Vec::new()),
-    )
+    Harness::builder()
+        .with_size(egui::vec2(WINDOW[0], WINDOW[1]))
+        .build_ui_state(
+            |ui, (state, sent): &mut Fixture| {
+                sent.extend(show(ui, state));
+            },
+            (state, Vec::new()),
+        )
 }
 
 #[test]
@@ -333,7 +340,7 @@ fn the_evaluation_view_shows_metrics_limits_and_the_timeline() {
     let mut h = harness(state_with(snap));
     h.run();
     for text in [
-        "Evaluation",
+        "Equity",
         "Total PnL",
         "+500",
         "Drawdown (max)",
@@ -653,5 +660,55 @@ fn only_the_newest_orders_are_drawn_until_the_operator_asks_for_more() {
     assert!(
         h.state().0.show_all_orders,
         "the choice is kept in the state"
+    );
+}
+
+// ---- Reachability at the smallest window the app allows -------------------
+
+fn small_window(state: OperatorState) -> Harness<'static, Fixture> {
+    // chrome::MIN_WINDOW_SIZE: the smallest window the app lets an operator make.
+    Harness::builder()
+        .with_size(egui::vec2(760.0, 520.0))
+        .build_ui_state(
+            |ui, (state, sent): &mut Fixture| sent.extend(show(ui, state)),
+            (state, Vec::new()),
+        )
+}
+
+/// At the smallest window the page scrolls, but HALT is in the fixed top part:
+/// it must be on screen without scrolling, always.
+#[test]
+fn halt_is_visible_without_scrolling_at_the_smallest_window() {
+    let mut h = small_window(state("operator", false));
+    h.run();
+    let halt = h.get_by_label("HALT TRADING").rect();
+    assert!(
+        halt.min.y >= 0.0 && halt.max.y <= 520.0,
+        "HALT is on screen: {halt:?}"
+    );
+    assert!(halt.min.x >= 0.0 && halt.max.x <= 760.0, "{halt:?}");
+}
+
+/// Everything below the fixed top scrolls: the parameter Set button is
+/// reachable by scrolling to it, and clicking it works.
+#[test]
+fn a_parameter_can_still_be_set_at_the_smallest_window_by_scrolling() {
+    let mut h = small_window(state("operator", false));
+    h.run();
+    h.state_mut()
+        .0
+        .param_edits
+        .insert("threshold".to_string(), "7.5".to_string());
+    h.run();
+    h.get_by_label("Set").scroll_to_me();
+    h.run();
+    h.get_by_label("Set").click();
+    h.run();
+    assert_eq!(
+        h.state().1,
+        vec![SessionCommand::SetParam {
+            name: "threshold".to_string(),
+            value: dec!(7.5)
+        }]
     );
 }

@@ -26,7 +26,7 @@ To start with a different strategy, pass it: `scripts/run-testnet.sh --strategy 
 
 The window has a **Launcher** tab and one tab per open session. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first); the new session's console then opens by itself.
 
-**Windows and tabs.** Open as many sessions as you like (**Open console** in the Launcher list); each keeps its own connection, and switching tabs loses nothing. A coloured dot on each tab shows its health, and a tab says `(offline)` or `HALTED` without you opening it. Closing a tab (the x, middle-click, or Cmd/Ctrl+W) only disconnects the console: the session keeps running.
+**Windows and tabs.** Open as many sessions as you like (**Open console** in the Launcher list); each keeps its own connection, and switching tabs loses nothing. A coloured dot on each tab shows its health, and a tab says `offline` or `HALTED` without you opening it; the active tab is the filled, underlined one. Closing a tab (the x, middle-click, or Cmd/Ctrl+W) only disconnects the console: the session keeps running.
 
 | Keys (Ctrl instead of Cmd off macOS) | Does |
 |---|---|
@@ -34,6 +34,8 @@ The window has a **Launcher** tab and one tab per open session. In **Launcher**:
 | Cmd+[ / Cmd+] | Previous / next tab, wrapping |
 | Cmd+W | Close the console in front (never the Launcher) |
 | Cmd+Shift+L | Cycle the theme: System, Light, Dark |
+
+**The console's layout.** Top to bottom: the environment banner; one status line (connection, a TRADING / PAUSED / HALTED pill, how old the data is, and the controls, with **HALT TRADING** the one red button); the key figures as tiles (Equity, PnL, Drawdown, Exposure, Trades; with holdings from before the session, *Strategy PnL* leads and *From holdings* gets its own tile); the equity chart; then cards for the details, the risk limits (as bars), positions and open orders, balances, and the strategy parameters in up to three columns. Cards sit side by side when the window is wide and stack when it is narrow; the page scrolls, and the top (banner, status line, HALT) never does.
 
 **Recent orders.** Every order the strategy sends is listed, newest first, with its time, side, quantity, the price it filled at and its outcome: *Filled*, *Partially filled*, *Working*, *Rejected* (a risk limit or the exchange refused it; the reason is printed under the row) or *Closed* (it stopped working without filling). It sits in the empty space to the right of the tables when the window is wide, and under them when it is narrow; drag its left edge to resize. The last 100 are kept; `Show N older` reveals the ones beyond the newest 30.
 

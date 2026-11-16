@@ -179,29 +179,38 @@ impl ShellApp {
         let mut focus = None;
         let mut close = None;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             let on_launcher = self.tabs.active() == &View::Launcher;
-            if ui.selectable_label(on_launcher, "Launcher").clicked() {
+            if tab(ui, &palette, on_launcher, None, "Launcher").clicked() {
                 focus = Some(View::Launcher);
             }
             for console in &self.consoles {
                 let health = TabHealth::of(console.app.state());
                 let (color, suffix) = match health {
                     TabHealth::Ok => (palette.good, ""),
-                    TabHealth::Attention => (palette.warn, "  (offline)"),
+                    TabHealth::Attention => (palette.warn, "  offline"),
                     TabHealth::Halted => (palette.danger, "  HALTED"),
                 };
                 let active = self.tabs.active() == &View::Console(console.id.clone());
-                crate::theme::status_dot(ui, color);
-                let label = ui
-                    .selectable_label(active, format!("{}{suffix}", console.id))
-                    .on_hover_text("Cmd/Ctrl+W closes this tab; the session keeps running");
-                if label.clicked() {
+                let response = tab(
+                    ui,
+                    &palette,
+                    active,
+                    Some(color),
+                    &format!("{}{suffix}", console.id),
+                )
+                .on_hover_text("Cmd/Ctrl+W closes this tab; the session keeps running");
+                if response.clicked() {
                     focus = Some(View::Console(console.id.clone()));
                 }
-                if label.middle_clicked() || ui.small_button("\u{00D7}").clicked() {
+                // A close button that is a button, not a stray glyph.
+                let closer = ui
+                    .add(egui::Button::new(egui::RichText::new("\u{00D7}").size(15.0)).frame(false))
+                    .on_hover_text("Close this tab (the session keeps running)");
+                if response.middle_clicked() || closer.clicked() {
                     close = Some(console.id.clone());
                 }
-                ui.add_space(6.0);
+                ui.add_space(8.0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.chrome.selector(ui);
@@ -234,6 +243,55 @@ impl ShellApp {
             },
         }
     }
+}
+
+/// One tab: a rounded button, with the active one filled and underlined so the
+/// current view is obvious at a glance (the old selectable label was a faint
+/// highlight). A health dot, when given, leads it.
+fn tab(
+    ui: &mut egui::Ui,
+    palette: &crate::theme::Palette,
+    active: bool,
+    dot: Option<egui::Color32>,
+    text: &str,
+) -> egui::Response {
+    let fill = if active {
+        palette.card_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let stroke = if active {
+        egui::Stroke::new(1.0, palette.card_stroke)
+    } else {
+        egui::Stroke::NONE
+    };
+    let inner = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(color) = dot {
+                    crate::theme::status_dot(ui, color);
+                }
+                let label = egui::RichText::new(text);
+                ui.label(if active { label.strong() } else { label });
+            });
+        });
+    let response = inner.response.interact(egui::Sense::click());
+    if active {
+        // The accent underline under the current tab.
+        let rect = inner.response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.min.x + 6.0, rect.max.y),
+                egui::pos2(rect.max.x - 6.0, rect.max.y),
+            ],
+            egui::Stroke::new(2.0, palette.info),
+        );
+    }
+    response
 }
 
 impl eframe::App for ShellApp {

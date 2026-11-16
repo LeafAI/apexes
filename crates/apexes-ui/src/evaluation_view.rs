@@ -168,23 +168,60 @@ pub fn banner(ui: &mut egui::Ui, banner: &EnvironmentBanner) {
     crate::theme::banner(ui, &palette, banner.kind.color(&palette), &banner.text);
 }
 
+/// A thin full-width track with a coloured fill of `fraction` of it. Even a
+/// 0% limit shows its empty track, and a tiny fraction is still visible.
+pub fn limit_bar(ui: &mut egui::Ui, fraction: f32, fill: Color32, track: Color32) {
+    let height = 8.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 4.0, track);
+    let filled = bar_fill_width(rect.width(), fraction, height);
+    if filled > 0.0 {
+        let mut bar = rect;
+        bar.set_width(filled);
+        ui.painter().rect_filled(bar, 4.0, fill);
+    }
+}
+
+/// How wide the filled part is: proportional, never beyond the track, and at
+/// least as wide as the bar is tall once there is anything to show (so 1% is a
+/// visible nub, not nothing). Zero stays zero.
+pub fn bar_fill_width(track: f32, fraction: f32, min_visible: f32) -> f32 {
+    if !fraction.is_finite() || fraction <= 0.0 || track <= 0.0 {
+        return 0.0;
+    }
+    (track * fraction.min(1.0)).max(min_visible.min(track))
+}
+
 fn limit_row(ui: &mut egui::Ui, usage: &LimitUsage) {
     let palette = palette_of(ui.ctx());
     let fraction = usage.fraction();
     let severity = limit_severity(fraction);
-    ui.horizontal(|ui| {
-        ui.label(&usage.name);
-        let bar = egui::ProgressBar::new(fraction.to_f32().unwrap_or(0.0).clamp(0.0, 1.0))
-            .fill(severity.color(&palette))
-            .desired_width(160.0);
-        ui.add(bar);
-        ui.label(format!(
+    let width = ui.available_width();
+    crate::widgets::pair_row(
+        ui,
+        &palette,
+        width,
+        &usage.name,
+        &format!(
             "{} / {}  ({})",
-            usage.used,
-            usage.limit,
+            number_format::amount(usage.used),
+            number_format::amount(usage.limit),
             percent(fraction)
-        ));
-    });
+        ),
+        crate::widgets::LabelStyle::Normal,
+    );
+    // A bar as wide as its card, so every limit lines up with the next. Drawn
+    // by hand: `ProgressBar` rounds a short bar into a dot and ignores the
+    // width of a card it is placed in.
+    limit_bar(
+        ui,
+        fraction.to_f32().unwrap_or(0.0),
+        severity.color(&palette),
+        palette.track,
+    );
 }
 
 /// The PnL rows.
@@ -235,40 +272,193 @@ pub fn drawdown_max(e: &EvaluationSummary) -> Decimal {
     }
 }
 
-fn metrics_grid(ui: &mut egui::Ui, e: &EvaluationSummary) {
-    egui::Grid::new("evaluation_metrics")
-        .num_columns(2)
-        .spacing([24.0, 4.0])
-        .show(ui, |ui| {
-            let mut row = |name: &str, value: String| {
-                ui.label(name);
-                ui.label(value);
-                ui.end_row();
-            };
-            row("Start equity", number_format::money(e.start_equity));
-            for (name, value) in pnl_rows(e) {
-                row(name, value);
-            }
-            row("Drawdown (now)", percent(drawdown_now(e)));
-            row("Drawdown (max)", percent(drawdown_max(e)));
-            row("Gross exposure", percent(e.gross_exposure_fraction));
-            row("Time in market", percent(e.time_in_market_fraction));
-            row("Trades", e.trade_count.to_string());
-            row("Turnover", number_format::money(e.turnover));
-            row("Fees paid", number_format::fees(&e.fees_paid));
-        });
+/// One key figure at the top of the console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tile {
+    pub label: &'static str,
+    pub value: String,
+    /// The sign that colours the value, when it has one.
+    pub sign: Option<crate::widgets::Sign>,
+    /// A small line under the value.
+    pub note: Option<String>,
 }
 
-/// Equity timeline with the running peak, and the metrics and limit
-/// utilisation underneath.
-pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
-    let palette = palette_of(ui.ctx());
-    ui.heading("Evaluation");
-    if snapshot.equity_history.len() < 2 {
-        ui.weak("collecting equity history...");
+/// The figures an operator looks at first, in the order they are read:
+/// what the account is worth, what the strategy has done, how deep it has
+/// been, and how exposed it is. Everything else stays in the details card.
+///
+/// When the account held assets before the session, the account's own PnL is
+/// shown as a figure of its own next to the strategy's, so neither is mistaken
+/// for the other.
+pub fn key_tiles(equity: Decimal, e: Option<&EvaluationSummary>) -> Vec<Tile> {
+    use crate::widgets::sign_of;
+    let mut tiles = vec![Tile {
+        label: "Equity",
+        value: number_format::money(equity),
+        sign: None,
+        note: e.map(|e| format!("started at {}", number_format::money(e.start_equity))),
+    }];
+    let Some(e) = e else { return tiles };
+    let (pnl_label, pnl, pnl_note) = if has_starting_holdings(e) {
+        (
+            "Strategy PnL",
+            e.strategy_pnl,
+            Some(format!("account {}", signed(e.total_pnl))),
+        )
     } else {
+        ("PnL", e.total_pnl, None)
+    };
+    tiles.push(Tile {
+        label: pnl_label,
+        value: signed(pnl),
+        sign: Some(sign_of(pnl)),
+        note: pnl_note,
+    });
+    if has_starting_holdings(e) {
+        tiles.push(Tile {
+            label: "From holdings",
+            value: signed(e.holdings_pnl),
+            sign: Some(sign_of(e.holdings_pnl)),
+            note: Some("market move on held assets".to_string()),
+        });
+    }
+    tiles.push(Tile {
+        label: "Drawdown",
+        value: percent(drawdown_now(e)),
+        sign: None,
+        note: Some(format!("max {}", percent(drawdown_max(e)))),
+    });
+    tiles.push(Tile {
+        label: "Exposure",
+        value: percent(e.gross_exposure_fraction),
+        sign: None,
+        note: Some(format!("in market {}", percent(e.time_in_market_fraction))),
+    });
+    tiles.push(Tile {
+        label: "Trades",
+        value: e.trade_count.to_string(),
+        sign: None,
+        note: Some(format!("turnover {}", number_format::money(e.turnover))),
+    });
+    tiles
+}
+
+/// The rows of the details card, in two groups that are drawn as two blocks:
+/// where the money stands, and how the strategy has behaved. A group is never
+/// split across blocks (a lone "Drawdown (now)" stranded under the PnL rows
+/// was the old layout's flaw).
+pub fn detail_groups(e: &EvaluationSummary) -> [Vec<(&'static str, String)>; 2] {
+    let mut money = vec![("Start equity", number_format::money(e.start_equity))];
+    money.extend(pnl_rows(e));
+    money.push(("Fees paid", number_format::fees(&e.fees_paid)));
+    let behaviour = vec![
+        ("Drawdown (now)", percent(drawdown_now(e))),
+        ("Drawdown (max)", percent(drawdown_max(e))),
+        ("Gross exposure", percent(e.gross_exposure_fraction)),
+        ("Time in market", percent(e.time_in_market_fraction)),
+        ("Trades", e.trade_count.to_string()),
+        ("Turnover", number_format::money(e.turnover)),
+    ];
+    [money, behaviour]
+}
+
+/// All the detail rows in reading order.
+pub fn detail_rows(e: &EvaluationSummary) -> Vec<(&'static str, String)> {
+    detail_groups(e).into_iter().flatten().collect()
+}
+
+/// The details card: every figure, label left and value right-aligned so the
+/// digits line up down the column.
+pub fn details_card(ui: &mut egui::Ui, e: &EvaluationSummary) {
+    use crate::widgets::{LabelStyle, pair_row};
+    let palette = palette_of(ui.ctx());
+    crate::widgets::card(ui, &palette, |ui| {
+        crate::widgets::section_title(ui, "Details");
+        let groups = detail_groups(e);
+        let inner = ui.available_width();
+        // The two groups side by side when the card is wide, stacked when not.
+        let side_by_side = inner >= DETAILS_TWO_COLUMN_FROM;
+        let gap = 28.0;
+        let block_width = if side_by_side {
+            (inner - gap) / 2.0
+        } else {
+            inner
+        };
+        let draw = |ui: &mut egui::Ui, rows: &[(&'static str, String)]| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (name, value) in rows {
+                let (label, style) = match name.strip_prefix(' ') {
+                    Some(sub) => (sub.trim_start(), LabelStyle::Sub),
+                    None => (*name, LabelStyle::Normal),
+                };
+                pair_row(ui, &palette, block_width, label, value, style);
+            }
+        };
+        if side_by_side {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for rows in &groups {
+                    ui.vertical(|ui| draw(ui, rows));
+                }
+            });
+        } else {
+            for (index, rows) in groups.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(10.0);
+                }
+                ui.vertical(|ui| draw(ui, rows));
+            }
+        }
+    });
+}
+
+/// Card width from which the details are laid out in two blocks.
+pub const DETAILS_TWO_COLUMN_FROM: f32 = 520.0;
+
+/// The risk-limits card: each limit as a bar with its numbers.
+pub fn limits_card(ui: &mut egui::Ui, usages: &[LimitUsage]) {
+    let palette = palette_of(ui.ctx());
+    crate::widgets::card(ui, &palette, |ui| {
+        crate::widgets::section_title(ui, "Risk limits");
+        if usages.is_empty() {
+            ui.label(crate::widgets::caption(&palette, "no limits configured"));
+            return;
+        }
+        for usage in usages {
+            limit_row(ui, usage);
+            ui.add_space(4.0);
+        }
+    });
+}
+
+/// Height of the equity chart. Taller than the old 180: a chart is the one
+/// thing on this screen read by shape, and it was the smallest part of it.
+pub const CHART_HEIGHT: f32 = 230.0;
+
+/// The equity timeline as a card: a title, the running peak (dashed) and the
+/// equity line with a soft fill under it.
+pub fn chart_card(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
+    let palette = palette_of(ui.ctx());
+    crate::widgets::card(ui, &palette, |ui| {
+        ui.horizontal(|ui| {
+            crate::widgets::section_title(ui, "Equity");
+            ui.label(crate::widgets::caption(
+                &palette,
+                "dashed line: running peak",
+            ));
+        });
+        if snapshot.equity_history.len() < 2 {
+            ui.add_space(8.0);
+            ui.label(crate::widgets::caption(
+                &palette,
+                "collecting equity history...",
+            ));
+            ui.add_space(8.0);
+            return;
+        }
         let equity = plot_points(&snapshot.equity_history);
         let peak = peak_points(&snapshot.equity_history);
+        let floor = equity.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
         let zone = time_axis::local_zone();
         let title = snapshot
             .equity_history
@@ -276,10 +466,11 @@ pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
             .map(|(at, _)| time_axis::axis_title(&zone, *at))
             .unwrap_or_default();
         Plot::new("equity_timeline")
-            .height(180.0)
+            .height(CHART_HEIGHT)
             .allow_scroll(false)
+            .show_background(false)
+            .grid_color(palette.grid)
             .x_axis_label(title)
-            .y_axis_label("equity (USDT)")
             .y_grid_spacer(|input| value_axis::grid_marks(input.bounds, input.base_step_size))
             .y_axis_formatter(|mark, range| {
                 value_axis::label(mark.value, (*range.start(), *range.end()))
@@ -313,25 +504,18 @@ pub fn show_evaluation(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
                 plot_ui.line(
                     Line::new("peak", PlotPoints::from(peak))
                         .color(palette.plot_peak)
+                        .width(1.2)
                         .style(egui_plot::LineStyle::dashed_dense()),
                 );
-                plot_ui.line(Line::new("equity", PlotPoints::from(equity)).color(palette.info));
+                let mut line = Line::new("equity", PlotPoints::from(equity))
+                    .color(palette.info)
+                    .width(2.0);
+                if floor.is_finite() {
+                    line = line.fill(floor as f32).fill_alpha(0.14);
+                }
+                plot_ui.line(line);
             });
-    }
-
-    let Some(evaluation) = &snapshot.evaluation else {
-        ui.weak("no evaluation data from this engine yet");
-        return;
-    };
-    ui.add_space(6.0);
-    metrics_grid(ui, evaluation);
-    if !evaluation.limit_usage.is_empty() {
-        ui.add_space(6.0);
-        ui.strong("Risk limits");
-        for usage in &evaluation.limit_usage {
-            limit_row(ui, usage);
-        }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -481,6 +665,132 @@ mod tests {
         let flat = summary_with(dec!(0));
         assert_eq!(drawdown_max(&flat), dec!(0.0116));
         assert_eq!(drawdown_now(&flat), dec!(0.0092));
+    }
+
+    #[test]
+    fn a_limit_bar_is_proportional_bounded_and_a_small_value_is_still_visible() {
+        assert_eq!(bar_fill_width(200.0, 0.5, 8.0), 100.0);
+        assert_eq!(bar_fill_width(200.0, 1.0, 8.0), 200.0);
+        assert_eq!(
+            bar_fill_width(200.0, 3.0, 8.0),
+            200.0,
+            "over the limit stops at the track"
+        );
+        assert_eq!(
+            bar_fill_width(200.0, 0.01, 8.0),
+            8.0,
+            "1% is a visible nub, not nothing"
+        );
+        assert_eq!(bar_fill_width(200.0, 0.0, 8.0), 0.0, "zero stays zero");
+        assert_eq!(bar_fill_width(200.0, -0.2, 8.0), 0.0);
+        assert_eq!(bar_fill_width(200.0, f32::NAN, 8.0), 0.0);
+        assert_eq!(bar_fill_width(0.0, 0.5, 8.0), 0.0, "no track, no bar");
+        assert_eq!(
+            bar_fill_width(5.0, 0.5, 8.0),
+            5.0,
+            "never wider than a tiny track"
+        );
+    }
+
+    #[test]
+    fn the_key_figures_for_a_flat_start_are_equity_pnl_drawdown_exposure_trades() {
+        let tiles = key_tiles(dec!(74078.28), Some(&summary_with(dec!(0))));
+        let labels: Vec<_> = tiles.iter().map(|t| t.label).collect();
+        assert_eq!(labels, ["Equity", "PnL", "Drawdown", "Exposure", "Trades"]);
+        assert_eq!(tiles[0].value, "74078.28");
+        assert_eq!(tiles[1].value, "-271.99");
+        assert_eq!(tiles[1].sign, Some(crate::widgets::Sign::Loss));
+    }
+
+    /// The screenshot's case: the headline PnL is the strategy's, and the
+    /// market's move has a tile of its own, so the two cannot be confused.
+    #[test]
+    fn with_holdings_the_headline_pnl_is_the_strategys_and_the_markets_move_is_beside_it() {
+        let tiles = key_tiles(dec!(74078.28), Some(&summary_with(dec!(64000))));
+        let labels: Vec<_> = tiles.iter().map(|t| t.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Equity",
+                "Strategy PnL",
+                "From holdings",
+                "Drawdown",
+                "Exposure",
+                "Trades"
+            ]
+        );
+        let strategy = &tiles[1];
+        assert_eq!(strategy.value, "-0.08");
+        assert_eq!(strategy.note.as_deref(), Some("account -271.99"));
+        let holdings = &tiles[2];
+        assert_eq!(holdings.value, "-271.91");
+        assert_eq!(holdings.sign, Some(crate::widgets::Sign::Loss));
+    }
+
+    #[test]
+    fn the_drawdown_tile_is_the_strategys_when_there_were_holdings() {
+        let with = key_tiles(dec!(1), Some(&summary_with(dec!(64000))));
+        let dd = with.iter().find(|t| t.label == "Drawdown").unwrap();
+        assert_eq!(dd.value, percent(dec!(0.000001)));
+        let flat = key_tiles(dec!(1), Some(&summary_with(dec!(0))));
+        let dd = flat.iter().find(|t| t.label == "Drawdown").unwrap();
+        assert_eq!(dd.value, percent(dec!(0.0092)));
+    }
+
+    #[test]
+    fn before_any_evaluation_only_equity_is_shown_and_nothing_is_invented() {
+        let tiles = key_tiles(dec!(10000), None);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].label, "Equity");
+        assert!(tiles[0].note.is_none());
+    }
+
+    /// A group is never split: the money rows stay together and so do the
+    /// behaviour rows, so a block break cannot strand one row on its own.
+    #[test]
+    fn the_details_are_two_whole_groups_money_and_behaviour() {
+        let [money, behaviour] = detail_groups(&summary_with(dec!(64000)));
+        let names = |rows: &[(&'static str, String)]| -> Vec<String> {
+            rows.iter().map(|(n, _)| n.trim().to_string()).collect()
+        };
+        assert!(names(&money).contains(&"Strategy PnL".to_string()));
+        assert!(names(&money).contains(&"Fees paid".to_string()));
+        assert_eq!(names(&behaviour)[0], "Drawdown (now)");
+        assert!(names(&behaviour).contains(&"Turnover".to_string()));
+        assert!(
+            !names(&money).iter().any(|n| n.starts_with("Drawdown")),
+            "drawdown rows are not stranded with the money rows"
+        );
+        assert!(
+            behaviour.len() >= 5 && money.len() >= 5,
+            "neither block is a stub"
+        );
+    }
+
+    #[test]
+    fn the_details_card_keeps_every_number_the_tiles_summarise() {
+        let rows = detail_rows(&summary_with(dec!(64000)));
+        let names: Vec<_> = rows.iter().map(|(n, _)| n.trim()).collect();
+        for expected in [
+            "Start equity",
+            "Account PnL",
+            "from holdings",
+            "Strategy PnL",
+            "Realized",
+            "Unrealized",
+            "Drawdown (now)",
+            "Drawdown (max)",
+            "Gross exposure",
+            "Time in market",
+            "Trades",
+            "Turnover",
+            "Fees paid",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
     }
 
     #[test]

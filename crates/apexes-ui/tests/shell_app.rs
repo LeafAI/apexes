@@ -222,7 +222,7 @@ fn a_console_that_cannot_reach_its_engine_says_so_in_its_tab() {
     f.open("alpha");
     f.press(Modifiers::COMMAND, Key::Num1);
     assert!(
-        f.shows("(offline)"),
+        f.shows("offline"),
         "a background tab with a lost connection is flagged"
     );
 }

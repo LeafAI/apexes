@@ -86,6 +86,18 @@ pub struct Palette {
     pub on_banner: Color32,
     /// The dashed running-peak line behind the equity plot.
     pub plot_peak: Color32,
+    /// Surface of a card: a step off the window background, so a group of
+    /// related numbers reads as one object without drawing boxes everywhere.
+    pub card_fill: Color32,
+    /// A card's hairline border.
+    pub card_stroke: Color32,
+    /// Label text under a number: quieter than body text, still legible.
+    pub label: Color32,
+    /// Chart grid lines: a whisper behind the data, never competing with it.
+    pub grid: Color32,
+    /// The empty part of a gauge: dark enough to read as a track waiting to
+    /// fill, not as a disabled control.
+    pub track: Color32,
 }
 
 impl Palette {
@@ -95,21 +107,31 @@ impl Palette {
             egui::Theme::Dark => Self {
                 good: Color32::from_rgb(70, 190, 100),
                 warn: Color32::from_rgb(235, 165, 40),
-                danger: Color32::from_rgb(225, 70, 70),
+                danger: Color32::from_rgb(240, 100, 100),
                 info: Color32::from_rgb(90, 150, 230),
                 muted: Color32::from_gray(150),
                 on_banner: Color32::WHITE,
                 plot_peak: Color32::from_gray(150),
+                card_fill: Color32::from_rgb(34, 36, 40),
+                card_stroke: Color32::from_rgb(58, 61, 67),
+                label: Color32::from_gray(165),
+                grid: Color32::from_rgb(78, 82, 90),
+                track: Color32::from_rgb(58, 62, 70),
             },
             // Deeper tones: the dark-theme ones wash out on white.
             egui::Theme::Light => Self {
                 good: Color32::from_rgb(25, 130, 55),
-                warn: Color32::from_rgb(175, 105, 0),
+                warn: Color32::from_rgb(160, 95, 0),
                 danger: Color32::from_rgb(190, 30, 30),
                 info: Color32::from_rgb(35, 85, 175),
                 muted: Color32::from_gray(95),
                 on_banner: Color32::WHITE,
                 plot_peak: Color32::from_gray(120),
+                card_fill: Color32::WHITE,
+                card_stroke: Color32::from_rgb(218, 221, 226),
+                label: Color32::from_gray(98),
+                grid: Color32::from_rgb(192, 198, 208),
+                track: Color32::from_rgb(222, 226, 232),
             },
         }
     }
@@ -165,6 +187,59 @@ pub fn window_background(theme: egui::Theme) -> Color32 {
 /// to call whenever the choice changes.
 pub fn apply(ctx: &egui::Context, choice: ThemeChoice) {
     ctx.set_theme(choice.preference());
+    install_style(ctx);
+}
+
+/// The look shared by every window: roomier spacing, rounder corners, a
+/// clearer type scale, and controls that look like controls. Set for both
+/// themes at once, so switching theme never loses it.
+pub fn install_style(ctx: &egui::Context) {
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let palette = Palette::for_theme(theme);
+        ctx.style_mut_of(theme, |style| {
+            apply_style(style, &palette);
+        });
+    }
+}
+
+/// Pure on a `Style`, so it is tested without a window.
+pub fn apply_style(style: &mut egui::Style, palette: &Palette) {
+    use egui::{FontFamily, FontId, TextStyle};
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    style.spacing.interact_size.y = 24.0;
+    style.spacing.window_margin = egui::Margin::same(12);
+    let radius = egui::CornerRadius::same(6);
+    let widgets = &mut style.visuals.widgets;
+    for w in [
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.noninteractive,
+        &mut widgets.open,
+    ] {
+        w.corner_radius = radius;
+    }
+    // Buttons read as buttons at rest: a hairline edge, not just a faint fill.
+    widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.card_stroke);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(8);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    // Type scale: body stays 14, headings step up so a title reads as one.
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(18.0, FontFamily::Proportional),
+    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(12.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(13.5, FontFamily::Monospace),
+    );
 }
 
 /// The palette for what `ctx` is showing right now.
@@ -309,6 +384,91 @@ mod tests {
                     "{theme:?} {name} banner fill {fill:?}: white text contrast {ratio:.2}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_shared_style_gives_controls_room_and_rounded_corners_in_both_themes() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let mut style = egui::Style::default();
+            apply_style(&mut style, &Palette::for_theme(theme));
+            assert!(
+                style.spacing.interact_size.y >= 24.0,
+                "{theme:?}: tap target"
+            );
+            assert!(style.spacing.button_padding.x >= 8.0);
+            assert_eq!(style.visuals.widgets.inactive.corner_radius.nw, 6);
+            assert!(
+                style.visuals.widgets.inactive.bg_stroke.width >= 1.0,
+                "buttons have an edge"
+            );
+            let body = style.text_styles[&egui::TextStyle::Body].size;
+            let heading = style.text_styles[&egui::TextStyle::Heading].size;
+            assert!(
+                heading >= body + 3.0,
+                "headings step up from body: {heading} vs {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn installing_the_style_is_idempotent_and_survives_a_theme_switch() {
+        let ctx = egui::Context::default();
+        apply(&ctx, ThemeChoice::Light);
+        apply(&ctx, ThemeChoice::Light);
+        let light = ctx.style_of(egui::Theme::Light).spacing.interact_size.y;
+        apply(&ctx, ThemeChoice::Dark);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).spacing.interact_size.y,
+            light
+        );
+        assert!(ctx.style_of(egui::Theme::Dark).spacing.interact_size.y >= 24.0);
+    }
+
+    /// A card must read as a distinct surface, and the text on it must stay
+    /// legible: the label colour is used for small captions, the hardest case.
+    #[test]
+    fn cards_are_distinct_from_the_window_and_their_text_is_legible() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let p = Palette::for_theme(theme);
+            let window = window_background(theme);
+            assert_ne!(
+                p.card_fill, window,
+                "{theme:?}: a card must differ from the window"
+            );
+            assert!(
+                contrast_ratio(p.card_stroke, p.card_fill) >= 1.15,
+                "{theme:?}: the border is visible against the card"
+            );
+            for (name, colour) in [
+                ("label", p.label),
+                ("good", p.good),
+                ("warn", p.warn),
+                ("danger", p.danger),
+                ("info", p.info),
+            ] {
+                let ratio = contrast_ratio(colour, p.card_fill);
+                assert!(ratio >= 4.5, "{theme:?} {name} on a card: {ratio:.2}");
+            }
+        }
+    }
+
+    /// The grid sits behind the data: clearly dimmer than the line drawn over it
+    /// and than any text, but still there.
+    #[test]
+    fn the_chart_grid_is_quieter_than_the_data_and_the_text() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let p = Palette::for_theme(theme);
+            let on_card = |c| contrast_ratio(c, p.card_fill);
+            assert!(on_card(p.grid) < on_card(p.info), "{theme:?}: grid vs line");
+            assert!(
+                on_card(p.grid) < on_card(p.label),
+                "{theme:?}: grid vs label text"
+            );
+            assert!(
+                on_card(p.grid) > 1.3,
+                "{theme:?}: the grid must still be visible"
+            );
         }
     }
 
