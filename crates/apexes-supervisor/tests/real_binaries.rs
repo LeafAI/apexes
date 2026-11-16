@@ -738,3 +738,110 @@ function on_market_event(event, ctx) {
         );
     }
 }
+
+/// One session on two symbols, for real: the engine must price BOTH assets and
+/// its equity must agree with Binance's own balances at Binance's own prices.
+/// (The evaluation only starts once every held asset is priced, so its presence
+/// already proves both feeds reach the engine.)
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn one_session_on_two_symbols_prices_both_and_matches_binances_balances() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("twosym");
+    let sup = supervisor(&home, &key, &secret);
+    let idle = home.join("idle.drift");
+    std::fs::write(
+        &idle,
+        "function on_market_event(event, ctx) {\n  return [];\n}\n",
+    )
+    .unwrap();
+    let mut req = request("t-two");
+    req.symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+    req.strategy = StrategyRef::DriftScript { path: idle };
+    let launched = match sup.launch(req) {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome: Result<apexes_backtest::SessionSnapshot, String> = runtime.block_on(async {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        req.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(&token)
+                .parse()
+                .map_err(|_| "header")?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut last = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(deadline, socket.next()).await
+        {
+            if let Ok(SessionMessage::Snapshot(s)) = serde_json::from_str::<SessionMessage>(&text)
+                && !s.is_placeholder()
+                && s.evaluation.is_some()
+            {
+                last = Some(s);
+            }
+        }
+        last.ok_or_else(|| "no priced snapshot within 45 s".to_string())
+    });
+    let ids = launched.gateway.instruments.clone();
+    let _ = sup.request_stop(
+        &SessionId::parse("t-two").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+
+    let snapshot = outcome.expect("a snapshot");
+    println!("GATEWAY instruments {ids:?}");
+    println!(
+        "BALANCES {:?}  EQUITY {}",
+        snapshot
+            .balances
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>(),
+        snapshot.equity
+    );
+    assert_eq!(ids, ["BTCUSDT", "ETHUSDT"], "one gateway carries both");
+    for asset in ["BTC", "ETH", "USDT"] {
+        assert!(
+            snapshot.balances.contains_key(asset),
+            "{asset} missing: {:?}",
+            snapshot.balances
+        );
+    }
+    assert!(
+        !snapshot.balances.contains_key("BNB"),
+        "an asset of neither symbol stays out of the ledger"
+    );
+    let e = snapshot.evaluation.expect("evaluation");
+    assert!(
+        e.holdings_value_at_start > dec!(0),
+        "both holdings were priced and recorded"
+    );
+    println!("EQUITY_FOR_CHECK {}", snapshot.equity);
+}
