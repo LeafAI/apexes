@@ -74,6 +74,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 23. **A gateway's instruments are fixed when it starts, so a new symbol means a new gateway, never a refusal or a restart.** The supervisor reuses the smallest running gateway that carries every requested symbol, else starts one for exactly those symbols; it must never restart a gateway under running sessions. Because a gateway can carry symbols a session did not ask for, `GatewayMarketDataProvider` drops events for any other symbol (a foreign price would value the session's position wrongly). Keep both halves.
 
+24. **The testnet charges no fees, so it cannot test fee handling.** A ledger change must be checked with mainnet-style fills: a fee in the asset *received* (base on a buy, quote on a sell), a fee in an asset the session does not hold (BNB), and a fee in a held asset. A fill the exchange reports must reach the ledger; skipping one (the live loop logs and continues) silently desynchronises the session from the account.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

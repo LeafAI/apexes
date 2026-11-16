@@ -1062,6 +1062,112 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
+    fn spot_btcusdt() -> Instrument {
+        Instrument {
+            asset_class: AssetClass::Spot,
+            ..btcusdt_perpetual_instrument()
+        }
+    }
+
+    fn live_fill(side: Side, quantity: Decimal, fee: Decimal, fee_currency: &str) -> Fill {
+        Fill {
+            id: apexes_core::FillId(uuid::Uuid::new_v4()),
+            order_id: apexes_core::OrderId(uuid::Uuid::new_v4()),
+            symbol: "BTCUSDT".to_string(),
+            venue: apexes_core::Venue::Binance,
+            side,
+            price: dec!(60000),
+            quantity,
+            fee,
+            fee_currency: Some(fee_currency.to_string()),
+            filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
+        }
+    }
+
+    /// Applies exchange-reported fills the way the live loop does and returns
+    /// the ledger and the overall tracker.
+    fn apply_live_fills(
+        balances: &[(&str, Decimal)],
+        fills: Vec<Fill>,
+    ) -> (PortfolioLedger, Vec<Fill>) {
+        let mut ledger = PortfolioLedger::new(
+            HashMap::from([("BTCUSDT".to_string(), spot_btcusdt())]),
+            balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
+        );
+        let mut tracker = PerformanceTracker::new(Decimal::ZERO);
+        let mut all_fills = Vec::new();
+        apply_supplemental_fills(
+            &mut ledger,
+            &mut tracker,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut None,
+            &mut all_fills,
+            fills,
+            Decimal::ZERO,
+        );
+        (ledger, all_fills)
+    }
+
+    /// The reported risk: a mainnet account that pays fees in BNB. The ledger
+    /// used to refuse the fill ("required 0.0004 BNB, available 0"), and this
+    /// loop logged and skipped it, so the session's position, balances and PnL
+    /// stopped matching the exchange.
+    #[test]
+    fn a_fill_whose_fee_is_paid_in_bnb_still_reaches_the_ledger_and_the_fee_total() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![live_fill(Side::Buy, dec!(0.5), dec!(0.0004), "BNB")],
+        );
+        assert_eq!(fills.len(), 1, "the fill was not skipped");
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+        assert_eq!(ledger.balances()["USDT"], dec!(70000));
+        // The evaluation's fee total reads the same fill list, so the BNB
+        // fee is reported in its own currency.
+        let mut evaluation =
+            crate::evaluation::EvaluationTracker::new(crate::evaluation::LimitSpec {
+                max_position_per_symbol: None,
+                max_daily_fills: None,
+            });
+        evaluation.observe_fills(&fills);
+        let summary = evaluation.summary(dec!(0), dec!(0), dec!(0), dec!(0));
+        assert_eq!(summary.fees_paid["BNB"], dec!(0.0004));
+    }
+
+    /// Binance's default fee is a slice of what was just bought.
+    #[test]
+    fn a_fill_whose_fee_is_taken_from_the_asset_bought_reaches_the_ledger() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![live_fill(Side::Buy, dec!(0.5), dec!(0.0005), "BTC")],
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.4995));
+    }
+
+    /// The safety net stays: a fill the ledger truly cannot afford is still
+    /// skipped (logged), and the ones before and after it are unaffected.
+    #[test]
+    fn a_genuinely_unaffordable_fill_is_still_skipped_without_blocking_the_rest() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![
+                live_fill(Side::Buy, dec!(0.5), dec!(0), "BTC"),
+                live_fill(Side::Sell, dec!(5), dec!(0), "USDT"), // sells 5 BTC, holds 0.5
+                live_fill(Side::Buy, dec!(0.1), dec!(0), "BTC"),
+            ],
+        );
+        // The ledger took the first and last and refused the middle one, which
+        // would have sold 5 BTC out of 0.5 (the fill list keeps all three: it
+        // is the record of what the exchange reported).
+        assert_eq!(fills.len(), 3);
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.6));
+        assert_eq!(ledger.balances()["BTC"], dec!(0.6));
+        assert_eq!(ledger.balances()["USDT"], dec!(100000) - dec!(36000));
+    }
+
     fn btcusdt_perpetual_instrument() -> Instrument {
         Instrument {
             symbol: "BTCUSDT".to_string(),
