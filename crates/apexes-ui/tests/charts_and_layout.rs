@@ -239,34 +239,111 @@ fn a_priced_session_shows_the_equity_number() {
 
 // ---- layout ------------------------------------------------------------
 
-/// Left column: details, then positions and open orders. Right column: risk
-/// limits, then balances.
+/// Wide window: the right column is the orders panel and holds Recent orders,
+/// then Risk limits, then Balances. The left column is Details, then Positions
+/// and Open orders.
 #[test]
-fn details_and_positions_are_on_the_left_and_limits_and_balances_on_the_right() {
+fn risk_limits_and_balances_sit_under_recent_orders_in_the_right_column() {
     let mut h = harness(state(snapshot(&["BTCUSDT"], true)), 1180.0);
     h.run();
-    let details = rect_of(&h, "Details");
-    let positions = rect_of(&h, "Positions");
+    let orders = rect_of(&h, "Recent orders");
     let limits = rect_of(&h, "Risk limits");
     let balances = rect_of(&h, "Balances");
+    let details = rect_of(&h, "Details");
+    let positions = rect_of(&h, "Positions");
 
+    for (name, r) in [("Risk limits", limits), ("Balances", balances)] {
+        assert!(
+            (r.min.x - orders.min.x).abs() < 2.0,
+            "{name} shares Recent orders' column: {r:?} vs {orders:?}"
+        );
+    }
+    assert!(limits.min.y > orders.min.y, "limits under the orders list");
+    assert!(balances.min.y > limits.min.y, "balances under limits");
     assert!(
         (details.min.x - positions.min.x).abs() < 2.0,
         "details and positions share the left column"
     );
     assert!(
-        (limits.min.x - balances.min.x).abs() < 2.0,
-        "limits and balances share the right column"
-    );
-    assert!(
-        limits.min.x > details.max.x - 1.0 || limits.min.x > details.min.x + 300.0,
-        "the right column is to the right of the left: {details:?} {limits:?}"
+        orders.min.x > details.min.x + 300.0,
+        "the right column is to the right of the left: {details:?} {orders:?}"
     );
     assert!(positions.min.y > details.min.y, "positions under details");
-    assert!(balances.min.y > limits.min.y, "balances under limits");
+}
+
+/// With limits and balances moved out, the left column has the whole main
+/// width: Details no longer shares a row with another card.
+#[test]
+fn the_left_column_no_longer_shares_its_row_with_limits() {
+    let mut h = harness(state(snapshot(&["BTCUSDT"], true)), 1180.0);
+    h.run();
+    let details = rect_of(&h, "Details");
+    let limits = rect_of(&h, "Risk limits");
     assert!(
-        (details.min.y - limits.min.y).abs() < 2.0,
-        "the two columns start on the same row"
+        limits.min.x > details.min.x + 300.0 && limits.min.y < details.min.y + 600.0,
+        "limits are in the orders panel, not beside Details in the body"
+    );
+    // Positions' table has room: its card is as wide as Details' card.
+    let positions = rect_of(&h, "Positions");
+    assert!((positions.min.x - details.min.x).abs() < 2.0);
+}
+
+/// No side panel in a narrow window, so the cards keep their own two columns
+/// there (limits and balances on the right of the body, orders below).
+#[test]
+fn without_the_side_panel_limits_and_balances_stay_in_the_bodys_right_column() {
+    let mut h = harness(state(snapshot(&["BTCUSDT"], true)), 900.0);
+    h.run();
+    let limits = rect_of(&h, "Risk limits");
+    let balances = rect_of(&h, "Balances");
+    let positions = rect_of(&h, "Positions");
+    let orders = rect_of(&h, "Recent orders");
+    assert!((limits.min.x - balances.min.x).abs() < 2.0);
+    assert!(limits.min.x > positions.min.x + 200.0);
+    assert!(
+        orders.min.y > positions.min.y,
+        "orders panel is below the cards"
+    );
+}
+
+/// The orders panel is taller now (orders, limits, balances) and is a fixed
+/// full-height column, so it must scroll rather than cut Balances off.
+#[test]
+fn a_full_orders_list_does_not_cut_off_balances() {
+    use apexes_backtest::OrderRecord;
+    let mut snap = snapshot(&["BTCUSDT"], true);
+    snap.recent_orders = (0..30)
+        .map(|i| OrderRecord {
+            id: format!("o{i}"),
+            at: Utc::now() - Duration::seconds(i),
+            symbol: "BTCUSDT".to_string(),
+            side: if i % 2 == 0 { "Buy" } else { "Sell" }.to_string(),
+            order_type: "Market".to_string(),
+            quantity: dec!(0.001),
+            limit_price: None,
+            filled_quantity: dec!(0.001),
+            avg_fill_price: Some(dec!(65000)),
+            status: "Filled".to_string(),
+            detail: None,
+        })
+        .collect();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1180.0, 700.0))
+        .build_ui_state(
+            |ui, (state, sent): &mut Fixture| sent.extend(show(ui, state)),
+            (state(snap), Vec::new()),
+        );
+    h.run();
+    assert!(
+        has_text(&h, "Balances"),
+        "Balances is still part of the panel"
+    );
+    assert!(has_text(&h, "Risk limits"));
+    assert!(
+        h.query_all_by_label_contains("HALT TRADING")
+            .next()
+            .is_some(),
+        "HALT stays reachable"
     );
 }
 
@@ -548,6 +625,7 @@ fn renders_the_real_shell_window() {
     for (name, at) in [
         ("hover-edge", [998.0, 600.0]),
         ("hover-body", [700.0, 600.0]),
+        ("hover-orders", [1250.0, 500.0]),
     ] {
         println!(
             "{}",
