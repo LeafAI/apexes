@@ -110,6 +110,18 @@ A BNBUSDT buy of 0.0846 was refused. Binance requires a quantity that is a multi
 
 Not covered: `MARKET_LOT_SIZE` (the testnet's is unrestricted), `PERCENT_PRICE`, and `ICEBERG` and `MAX_NUM_ORDERS` filters; a rounded-down order is smaller than the strategy intended, which the Recent orders list shows (quantity as sent). A strategy that sizes its own sells from what it holds still needs its own epsilon for float residue.
 
+### Strategy trade-off: trend_guard trades rarely, a mean-reversion one was built (2026-11-17)
+
+Asked why a `trend_guard` ETH session had made no orders: it had made **4** (Binance, the engine's snapshot and a replay of the real script in the real interpreter all agree; the window simply did not show them). It is selective by design, ETH moved in a ~1% band for hours and ended flat, and every faster setting traded more and earned less. So the request became a strategy that suits a ranging market: `deploy/strategy.mean_reversion.drift`.
+
+**Method.** Two weeks of real ETHUSDT testnet prints (11-03 to 11-17, 284,075 trades), split by date: parameters were chosen on the first week only and judged on the second. The shipped script was run in the real Drift interpreter over all of it and produced the **same 720 orders as an independent harness, order for order** (side, print index and price), which is what the numbers below rest on. Eight committed tests cover the script's behaviour and each of the guard, the stop and the entry cap was broken on purpose to confirm a test fails.
+
+**Finding that matters most: the testnet feed prints garbage.** About 0.4% of prints (11 episodes in two weeks) sit hundreds of dollars from the market (e.g. 1,490 while ETH was 1,814). `trend_guard` on the raw feed lost 13.97 USD on $50 in the two weeks, and 11.13 of that came from 5 trips that entered or exited on a garbage print. The new script ignores any print more than 1% from a slow average of accepted prints, and re-anchors after 30 in a row so a real crash is not missed.
+
+**Result, stated plainly: no edge was shown.** With the shipped defaults, zero cost, fills on the next print, it made +23.47 USD on a $50 position over 360 round trips (62% winners; first week +5.5, second +17.9; t-statistic about 1.2, which is not significant), against -9.35 for buying and holding and -13.97 for `trend_guard`. But the sign flips with small changes: fills 10 prints (about 20 s) later give -5.87, **filling at the market's real price instead of the raw print gives -9.07**, and a 0.1% fee per side (mainnet) gives -12.47; 0.05% gives +5.50. Five trades out of 360 account for +36.63. It trades often enough to exercise the platform and it is measurably better than the trend follower on this data, but it should not be read as a profitable strategy and I would not run it on mainnet.
+
+Not tested: other symbols, another period, partial fills, the engine's real latency, and a second random split. Two weeks of one asset in a falling market (ETH 2,246 to 1,826) is one sample.
+
 ### Found by hand-testing a real session (2026-11-16) and fixed
 
 | Symptom (from a screenshot and the session log) | Root cause | Fix |

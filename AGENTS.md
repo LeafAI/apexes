@@ -88,6 +88,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 30. **An order is made valid for its symbol by the engine, never by the strategy.** Binance enforces a per-symbol quantity step, price tick and minimum value (`-1013`), and the same script trades symbols whose rules differ. `exchangeInfo` is read at startup (`symbol_rules`) and `UnifiedLoopConfig::symbol_rules` conforms every intent before the risk check: quantity down to the step (never up), limit price to the passive tick, and an order that cannot be made valid is refused with its reason, not sent. `Instrument::{tick,lot}_size` are placeholders; do not read them for this.
 
+31. **A strategy's result is judged on data it was not tuned on, and the testnet feed is not clean.** Choose parameters on one part of the history and report the other part; run the shipped script in the real interpreter and check it against the research harness order for order (a harness that differs from the script proves nothing). The testnet prints garbage (about 0.4% of trades, hundreds of dollars off the market): a strategy must ignore such prints or it trades phantom moves, and a result must say whether it fills at the raw print or the real price, because that alone flipped a "profitable" strategy to a loss. Report fills with delay and per-side cost, never a single zero-cost number.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

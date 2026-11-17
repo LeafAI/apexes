@@ -1089,3 +1089,93 @@ function on_market_event(event, ctx) {
         buy.status, buy.quantity, buy.avg_fill_price
     );
 }
+
+/// The shipped mean-reversion script, loaded and run by the REAL engine against
+/// the real testnet: the session must start, price itself, stay healthy and
+/// show the script's parameters in the console. (Whether it trades depends on
+/// the market; the strategy's behaviour is pinned by its own tests.)
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn the_shipped_mean_reversion_script_runs_in_the_real_engine() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("meanrev");
+    let sup = supervisor(&home, &key, &secret);
+    let mut req = request("t-mr");
+    req.symbols = vec!["ETHUSDT".to_string()];
+    req.strategy = StrategyRef::DriftScript {
+        path: workspace().join("deploy/strategy.mean_reversion.drift"),
+    };
+    let launched = match sup.launch(req) {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome: Result<apexes_backtest::SessionSnapshot, String> = runtime.block_on(async {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        req.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(&token)
+                .parse()
+                .map_err(|_| "header")?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut last = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(deadline, socket.next()).await
+        {
+            if let Ok(SessionMessage::Snapshot(s)) = serde_json::from_str::<SessionMessage>(&text)
+                && !s.is_placeholder()
+                && !s.params.is_empty()
+            {
+                last = Some(s);
+            }
+        }
+        last.ok_or_else(|| "no snapshot with parameters within 40 s".to_string())
+    });
+    let _ = sup.request_stop(
+        &SessionId::parse("t-mr").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+
+    let snapshot = outcome.expect("a snapshot");
+    println!("PARAMS {:?}", snapshot.params.keys().collect::<Vec<_>>());
+    for name in [
+        "entry_z",
+        "min_edge_pct",
+        "guard_pct",
+        "max_entries",
+        "stop_pct",
+    ] {
+        assert!(
+            snapshot.params.contains_key(name),
+            "{name}: {:?}",
+            snapshot.params
+        );
+    }
+    assert!(snapshot.equity_priced && snapshot.evaluation.is_some());
+    assert!(!snapshot.paused);
+}

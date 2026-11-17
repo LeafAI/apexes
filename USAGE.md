@@ -22,6 +22,8 @@ scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability
 scripts/run-testnet.sh           # starts Postgres if needed, rebuilds the latest code, opens the app
 ```
 
+Two strategies ship, both for the testnet only and neither a profit machine: `deploy/strategy.example.drift` (a trend-following toy, trades rarely) and `deploy/strategy.mean_reversion.drift` (buys dips and sells the bounce, about 25 round trips a day on ETHUSDT, with a guard against the testnet's garbage prints; its header says what the replay did and did not show). Use the second to exercise orders, fills and the Recent orders panel.
+
 To start with a different strategy, pass it: `scripts/run-testnet.sh --strategy ~/Downloads/strategy.trend_guard.drift` (any readable file; a relative path is taken from where you run the script). It only pre-fills the Launcher's **Strategy file** box. You still press Launch, and can change the file there. Typos are caught before anything starts.
 
 The window has a **Launcher** tab and one tab per open session. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first); the new session's console then opens by itself.
