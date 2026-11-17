@@ -60,6 +60,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
     if placement == Placement::Side {
         egui::Panel::right("recent_orders_panel")
             .resizable(true)
+            // The cards carry their own borders, so a full-height rule beside
+            // them only adds a line. egui still draws it while the edge is
+            // hovered or dragged, which is when it tells you it is a handle.
+            .show_separator_line(false)
             .default_size(orders_view::SIDE_PANEL_DEFAULT_WIDTH)
             .size_range(orders_view::SIDE_PANEL_MIN_WIDTH..=orders_view::SIDE_PANEL_MAX_WIDTH)
             .frame(egui::Frame::new().inner_margin(egui::Margin {

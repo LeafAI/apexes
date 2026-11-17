@@ -419,3 +419,31 @@ fn renders_charts_and_layout() {
             .expect("save");
     }
 }
+
+// ---- no separator rule beside the orders panel -------------------------
+
+/// The pixel column just right of the main column's cards, where the side
+/// panel's full-height rule used to be drawn, must be plain page background.
+#[test]
+fn no_full_height_rule_is_drawn_between_the_cards_and_the_orders_panel() {
+    use apexes_ui::chrome::Chrome;
+    use apexes_ui::operator_view::{OperatorApp, StandaloneConsole};
+    use apexes_ui::theme::ThemeChoice;
+    let mut chrome = Chrome::load(None);
+    chrome.set(ThemeChoice::Light);
+    let s = state(snapshot(&["BTCUSDT"], true));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1500.0, 1250.0))
+        .build_eframe(move |_cc| StandaloneConsole::new(OperatorApp::new_for_test(s), chrome));
+    h.step();
+    h.step();
+    let image = h.render().expect("render");
+    // Below every card (the parameters card ends near y = 1000), where only the
+    // page background and the separator could be.
+    let (x_range, y) = (960..1010u32, 1150u32);
+    let page = *image.get_pixel(20, y);
+    let rule = x_range
+        .filter(|x| *image.get_pixel(*x, y) != page)
+        .collect::<Vec<_>>();
+    assert!(rule.is_empty(), "a vertical rule is drawn at x = {rule:?}");
+}
