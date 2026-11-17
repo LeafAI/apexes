@@ -74,6 +74,9 @@ pub struct LiveTradingConfig {
     /// event, so held assets are valued from the start. See
     /// `UnifiedLoopConfig::initial_prices`.
     pub initial_prices: HashMap<String, Decimal>,
+    /// The exchange's rules per symbol, applied to every order before it is
+    /// sent. See `UnifiedLoopConfig::symbol_rules`.
+    pub symbol_rules: HashMap<String, apexes_core::SymbolRules>,
     pub risk_free_return: Decimal,
     /// Fallback polling interval for `OrderManager::reconcile()`,
     /// running alongside (not instead of) the push-based
@@ -309,6 +312,7 @@ pub async fn run_live_trading(
         market_condition_config: config.market_condition_config,
         control: config.control,
         initial_prices: config.initial_prices,
+        symbol_rules: config.symbol_rules,
     };
 
     let report = run_unified_event_loop(

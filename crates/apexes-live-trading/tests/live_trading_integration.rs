@@ -200,6 +200,7 @@ fn base_config() -> LiveTradingConfig {
         market_condition_config: None,
         auto_derisk_live: false,
         initial_prices: HashMap::new(),
+        symbol_rules: HashMap::new(),
         risk_free_return: dec!(0),
         reconcile_interval: Duration::from_secs(3600), // long enough not to fire during this test
         ems_postgres_url: POSTGRES_URL.to_string(),

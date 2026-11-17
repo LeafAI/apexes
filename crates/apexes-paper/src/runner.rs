@@ -147,6 +147,7 @@ pub async fn run_paper_trading(
         market_condition_config: config.market_condition_config,
         control: config.control,
         initial_prices: HashMap::new(),
+        symbol_rules: HashMap::new(),
     };
 
     run_unified_event_loop(

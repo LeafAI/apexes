@@ -14,6 +14,7 @@ pub mod instrument;
 pub mod market_data;
 pub mod order;
 pub mod registry;
+pub mod symbol_rules;
 
 pub use account::{FundMovement, FundMovementStatus, WalletId};
 pub use chain_data::{ChainBlockHeader, ChainDataProvider, DexPool, PendingTransactionHash};
@@ -25,3 +26,4 @@ pub use market_data::{
     Tick, TradeEvent,
 };
 pub use order::{MarginMode, Order, OrderId, OrderStatus, OrderType, Side};
+pub use symbol_rules::{Conformed, RuleViolation, SymbolRules};

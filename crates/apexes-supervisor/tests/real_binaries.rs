@@ -968,3 +968,124 @@ fn a_quiet_symbol_is_priced_from_the_exchange_at_start_not_from_its_first_trade(
         );
     }
 }
+
+/// The reported rejection, for real: `Filter failure: LOT_SIZE (code -1013)` on
+/// BNBUSDT. A strategy sized for ETH (step 0.0001) asked for 0.0846 BNB, whose
+/// step is 0.001. The engine must round it to 0.084 and the order must fill.
+/// Buys then sells back what it holds, so the account ends where it began.
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn an_off_step_bnb_order_is_rounded_to_the_exchanges_step_and_fills() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("lot");
+    let sup = supervisor(&home, &key, &secret);
+    let script = home.join("off_step.drift");
+    std::fs::write(
+        &script,
+        r#"let sent = 0;
+function on_market_event(event, ctx) {
+  if (event.type != "trade") { return []; }
+  if (sent >= 2) { return []; }
+  if (ctx.has_open_order(event.symbol)) { return []; }
+  let held = ctx.get_position(event.symbol).quantity;
+  if (sent == 0) {
+    sent = 1;
+    return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot", side: "buy", order_type: "market", quantity: 0.0846 }];
+  }
+  if (held <= 0) { return []; }
+  sent = 2;
+  return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot", side: "sell", order_type: "market", quantity: held }];
+}
+"#,
+    )
+    .unwrap();
+    let mut req = request("t-lot");
+    req.symbols = vec!["BNBUSDT".to_string()];
+    req.strategy = StrategyRef::DriftScript { path: script };
+    req.risk_limits.max_order_quantity = dec!(1);
+    req.risk_limits.max_position_per_symbol = dec!(1);
+    req.risk_limits.max_order_notional = dec!(300);
+    // BNBUSDT alone can go minutes without a trade; the stale-data watchdog
+    // (tested elsewhere) would halt the session before the order is sent.
+    req.stale_data_timeout_secs = None;
+    let launched = match sup.launch(req) {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome: Result<Vec<apexes_backtest::OrderRecord>, String> = runtime.block_on(async {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        req.headers_mut().insert(
+            "Authorization",
+            apexes_security::bearer_header_value(&token)
+                .parse()
+                .map_err(|_| "header")?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut best: Vec<apexes_backtest::OrderRecord> = Vec::new();
+        // BNBUSDT is quiet on the testnet: allow minutes for its trades.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(420);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(deadline, socket.next()).await
+        {
+            if let Ok(SessionMessage::Snapshot(s)) = serde_json::from_str::<SessionMessage>(&text)
+                && !s.is_placeholder()
+                && s.recent_orders.len() >= best.len()
+            {
+                best = s.recent_orders.clone();
+                if best.len() >= 2 && best.iter().all(|o| o.status == "Filled") {
+                    break;
+                }
+            }
+        }
+        Ok(best)
+    });
+    let _ = sup.request_stop(
+        &SessionId::parse("t-lot").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+
+    let orders = outcome.expect("the console connection");
+    println!("--- {orders:#?}");
+    assert!(
+        orders.iter().all(|o| o.status != "Rejected"),
+        "no -1013 rejection any more: {orders:?}"
+    );
+    let buy = orders
+        .iter()
+        .find(|o| o.side == "Buy")
+        .expect("the buy was sent");
+    assert_eq!(
+        buy.quantity,
+        dec!(0.084),
+        "0.0846 rounded down to BNB's 0.001 step"
+    );
+    assert_eq!(buy.status, "Filled", "{buy:?}");
+    println!(
+        "BUY {} {} @ {:?}",
+        buy.status, buy.quantity, buy.avg_fill_price
+    );
+}

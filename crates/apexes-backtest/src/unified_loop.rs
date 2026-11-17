@@ -117,6 +117,12 @@ pub struct UnifiedLoopConfig {
     /// the ledger's 1.0 placeholder until its first trade arrives, which on a
     /// quiet market can be minutes. Empty for backtest/paper.
     pub initial_prices: HashMap<String, Decimal>,
+    /// The exchange's trading rules per symbol (quantity step, minimums, tick).
+    /// Every order is conformed to its symbol's rules before the risk check,
+    /// and one that cannot be made valid is refused with the reason. A symbol
+    /// without an entry is sent as the strategy asked, and the exchange
+    /// decides. Empty for backtest/paper.
+    pub symbol_rules: HashMap<String, apexes_core::SymbolRules>,
 }
 
 /// Runs the unified event loop: consumes `market_events` in order
@@ -585,6 +591,32 @@ pub async fn run_unified_event_loop(
                 };
 
                 for intent in intents {
+                    // Make the order valid for its symbol (round the quantity
+                    // down to the exchange's step, the price to its tick) before
+                    // anything judges it: the risk checks must see the order
+                    // that will really be sent, and one that cannot be made
+                    // valid is refused here, with the reason, not sent to be
+                    // refused by the exchange.
+                    let intent = match conform_to_rules(
+                        &intent,
+                        &config.symbol_rules,
+                        &instruments_by_symbol,
+                        &last_prices,
+                    ) {
+                        Ok(conformed) => conformed,
+                        Err(reason) => {
+                            tracing::warn!(
+                                symbol = %intent.symbol,
+                                quantity = %intent.quantity,
+                                %reason,
+                                "order refused: it cannot satisfy the exchange's trading rules"
+                            );
+                            if let Some(log) = &mut order_log {
+                                record_refusal(log, &intent, timestamp, &reason);
+                            }
+                            continue;
+                        }
+                    };
                     // Re-fetched per intent (not reusing `open_orders`
                     // above): the former loop's own map was updated as
                     // each intent was submitted, so a later intent's risk
@@ -932,6 +964,31 @@ fn priced_for_risk_check(
         price: reference,
         ..intent.clone()
     }
+}
+
+/// `intent` with its quantity (and limit price) made valid for its symbol's
+/// exchange rules. A symbol with no rules comes back unchanged. `Err` is the
+/// reason the order cannot be made valid, for the order log.
+fn conform_to_rules(
+    intent: &apexes_strategy::OrderIntent,
+    rules: &HashMap<String, apexes_core::SymbolRules>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+    last_prices: &HashMap<String, Decimal>,
+) -> Result<apexes_strategy::OrderIntent, String> {
+    let Some(rule) = rules.get(&intent.symbol) else {
+        return Ok(intent.clone());
+    };
+    let reference = instruments_by_symbol
+        .get(&intent.symbol)
+        .and_then(|instrument| instrument.base_currency.as_ref())
+        .and_then(|base| last_prices.get(base).copied());
+    rule.conform(intent.side, intent.quantity, intent.price, reference)
+        .map(|conformed| apexes_strategy::OrderIntent {
+            quantity: conformed.quantity,
+            price: conformed.price,
+            ..intent.clone()
+        })
+        .map_err(|violation| violation.to_string())
 }
 
 /// The seeded prices keyed the way the loop keeps them (by base asset), for
@@ -1520,6 +1577,7 @@ mod tests {
             market_condition_config: None,
             control: None,
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         }
     }
 
@@ -1789,6 +1847,7 @@ mod tests {
             market_condition_config: None,
             control: None,
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         };
 
         let report = run(
@@ -1842,6 +1901,7 @@ mod tests {
             }),
             control: None,
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         };
 
         let report = run(
@@ -2054,6 +2114,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             risk_checker: Some(checker),
             ..unified_loop_config(dec!(100000), None, HashMap::new())
         };
@@ -2164,6 +2225,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
 
@@ -2210,6 +2272,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
         let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
@@ -2265,6 +2328,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..unified_loop_config(dec!(10000), None, HashMap::new())
         };
         let config = UnifiedLoopConfig {
@@ -2306,6 +2370,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             initial_balances: balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
             ..unified_loop_config(dec!(0), None, HashMap::new())
         };
@@ -2505,6 +2570,205 @@ mod tests {
         assert_eq!(snapshot.price_history["BTCUSDT"], vec![(t0, dec!(100))]);
     }
 
+    /// Asks for one fixed quantity on every tick, as `trend_guard` does for ETH
+    /// (a step of 0.0001) on a symbol whose own step is coarser.
+    struct FixedQuantity(Decimal, Side, OrderType, Option<Decimal>);
+
+    impl Strategy for FixedQuantity {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if !matches!(event, MarketEvent::Trade(_)) {
+                return Vec::new();
+            }
+            vec![OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: apexes_core::Venue::Binance,
+                asset_class: AssetClass::Perpetual,
+                side: self.1,
+                order_type: self.2,
+                quantity: self.0,
+                price: self.3,
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            }]
+        }
+    }
+
+    /// Remembers every intent it is asked to submit, and accepts nothing.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(Decimal, Option<Decimal>)>>);
+
+    #[async_trait::async_trait]
+    impl OrderExecutor for Recorder {
+        async fn submit(
+            &self,
+            intent: &OrderIntent,
+            _positions: &HashMap<String, apexes_strategy::Position>,
+            _balances: &HashMap<String, Decimal>,
+            _now: chrono::DateTime<Utc>,
+        ) -> Result<(apexes_core::Order, Vec<Fill>), apexes_core::ApexesError> {
+            if let Ok(mut sent) = self.0.lock() {
+                sent.push((intent.quantity, intent.price));
+            }
+            Err(apexes_core::ApexesError::OrderRejected {
+                reason: "recorder accepts nothing".to_string(),
+            })
+        }
+        fn on_market_event(&self, _event: &MarketEvent) -> Vec<(apexes_core::OrderId, Vec<Fill>)> {
+            Vec::new()
+        }
+        async fn open_orders(&self) -> HashMap<apexes_core::OrderId, apexes_core::Order> {
+            HashMap::new()
+        }
+    }
+
+    fn bnb_like_rules() -> HashMap<String, apexes_core::SymbolRules> {
+        // The 0.001 step and 5 USDT minimum BNBUSDT really has, applied to the
+        // test symbol so the rejected order from the log can be replayed.
+        [(
+            "BTCUSDT".to_string(),
+            apexes_core::SymbolRules {
+                quantity_step: dec!(0.001),
+                min_quantity: dec!(0.001),
+                max_quantity: dec!(900000),
+                price_tick: dec!(0.01),
+                min_notional: dec!(5),
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// Runs `strategy` for two trades at `price` and returns what reached the
+    /// executor and the order log's last snapshot.
+    async fn through_rules(
+        strategy: FixedQuantity,
+        rules: HashMap<String, apexes_core::SymbolRules>,
+        price: Decimal,
+    ) -> (
+        Vec<(Decimal, Option<Decimal>)>,
+        crate::control::SessionSnapshot,
+    ) {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(price, t0 + Duration::seconds(1)),
+            trade_event(price, t0 + Duration::seconds(2)),
+        ];
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [("USDT".to_string(), dec!(100000))].into_iter().collect(),
+            symbol_rules: rules,
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        let recorder = Arc::new(Recorder::default());
+        let executor: Arc<dyn OrderExecutor> = recorder.clone();
+        let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+            Arc::new(crate::ems_adapter::MatchingEngineChildOrderSink::new(
+                Arc::new(Mutex::new(MatchingEngine::new(
+                    zero_cost_model(None),
+                    dec!(0.5),
+                ))),
+            )),
+            Arc::new(apexes_strategy::PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        ));
+        run_unified_event_loop(
+            config,
+            futures::stream::iter(events),
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+            executor,
+            Arc::new(BacktestLiquidationPolicy),
+            NeverFillSupplementalFillSource,
+            ems,
+            strategy,
+            None,
+            None,
+        )
+        .await
+        .expect("loop");
+        let sent = recorder.0.lock().map(|s| s.clone()).unwrap_or_default();
+        let snapshot = snapshot_rx.borrow().clone();
+        (sent, snapshot)
+    }
+
+    /// The reported order: Buy 0.0846 against a 0.001 step.
+    #[tokio::test]
+    async fn an_off_step_quantity_is_rounded_down_before_it_is_sent() {
+        let strategy = FixedQuantity(dec!(0.0846), Side::Buy, OrderType::Market, None);
+        let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(q, _)| *q == dec!(0.084)), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn without_rules_the_order_is_sent_exactly_as_the_strategy_asked() {
+        let strategy = FixedQuantity(dec!(0.0846), Side::Buy, OrderType::Market, None);
+        let (sent, _) = through_rules(strategy, HashMap::new(), dec!(590)).await;
+        assert!(sent.iter().all(|(q, _)| *q == dec!(0.0846)), "{sent:?}");
+    }
+
+    /// Too small to be valid: never sent, and the operator is told why.
+    #[tokio::test]
+    async fn an_order_that_cannot_be_made_valid_is_refused_with_the_reason_and_never_sent() {
+        let strategy = FixedQuantity(dec!(0.0004), Side::Buy, OrderType::Market, None);
+        let (sent, snapshot) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert!(sent.is_empty(), "nothing reaches the exchange: {sent:?}");
+        let refused = snapshot
+            .recent_orders
+            .iter()
+            .find(|o| o.status == crate::order_log::REJECTED)
+            .expect("the refusal is listed under Recent orders");
+        let detail = refused.detail.clone().unwrap_or_default();
+        assert!(detail.contains("0.001"), "names the step: {detail}");
+    }
+
+    #[tokio::test]
+    async fn an_order_under_the_minimum_value_is_refused_not_sent() {
+        // 0.008 at 590 is 4.72 USDT, under the 5 minimum.
+        let strategy = FixedQuantity(dec!(0.008), Side::Buy, OrderType::Market, None);
+        let (sent, snapshot) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert!(sent.is_empty());
+        let detail = snapshot
+            .recent_orders
+            .iter()
+            .find_map(|o| o.detail.clone())
+            .unwrap_or_default();
+        assert!(detail.contains("minimum"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_limit_price_is_moved_to_the_tick_and_the_quantity_to_the_step() {
+        let strategy = FixedQuantity(
+            dec!(0.0846),
+            Side::Buy,
+            OrderType::Limit,
+            Some(dec!(590.019)),
+        );
+        let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert_eq!(sent[0], (dec!(0.084), Some(dec!(590.01))));
+    }
+
+    /// The order the strategy asked for is what the risk checker sees only
+    /// after conforming: a rounded-down order is smaller, never larger.
+    #[tokio::test]
+    async fn conforming_never_makes_an_order_bigger_than_asked() {
+        for asked in [dec!(0.0846), dec!(0.0999), dec!(1.2345)] {
+            let strategy = FixedQuantity(asked, Side::Buy, OrderType::Market, None);
+            let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+            assert!(sent.iter().all(|(q, _)| *q <= asked), "{asked}: {sent:?}");
+        }
+    }
+
     /// `control: None` must stay free of evaluation work: no handle, no
     /// tracker, and the report is unchanged (the existing guard
     /// `control_none_is_a_true_no_op` covers the config; this covers the
@@ -2620,6 +2884,7 @@ mod tests {
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
             initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
 

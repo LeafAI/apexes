@@ -104,6 +104,12 @@ A real 3-symbol session (BTC, ETH, BNB) showed no chart and a wrong headline equ
 
 Not verified: the new chart and layout in your real window (renders only), hovering the chart, and the selector with a session running for hours.
 
+### Order rejected: `Filter failure: LOT_SIZE (code -1013)` (2026-11-17, fixed)
+
+A BNBUSDT buy of 0.0846 was refused. Binance requires a quantity that is a multiple of the symbol's step, and the step differs per symbol (BTC 0.00001, ETH 0.0001, BNB 0.001); `trend_guard` sizes for ETH (`step` 0.0001), so on BNB it asked for a quantity off BNB's step. The engine had only placeholder lot sizes ("nothing in the live path reads them") and sent whatever the strategy asked. **Fixed in the engine, not the strategy** (a script cannot know every symbol's rules): at startup the engine reads each symbol's real rules from the public `exchangeInfo` (`BinanceExecutionGateway::symbol_rules`: quantity step/min/max, price tick, minimum order value) and the loop conforms every order before the risk check (`apexes_core::SymbolRules::conform`): the quantity is **rounded down** to the step (never up, so it never spends more than asked), a limit price moves to the passive side of the tick, and an order that cannot be made valid (rounds to nothing, under the minimum quantity or the 5 USDT minimum value, over the maximum) is **refused with the reason** in Recent orders and never sent. The risk checks therefore judge the order that is really sent. A symbol whose rules cannot be fetched is sent as asked and the exchange decides, as before. Verified on the real testnet: the same 0.0846 BNB order went out as 0.084 and filled at 589.93 (`an_off_step_bnb_order_is_rounded_to_the_exchanges_step_and_fills`).
+
+Not covered: `MARKET_LOT_SIZE` (the testnet's is unrestricted), `PERCENT_PRICE`, and `ICEBERG` and `MAX_NUM_ORDERS` filters; a rounded-down order is smaller than the strategy intended, which the Recent orders list shows (quantity as sent). A strategy that sizes its own sells from what it holds still needs its own epsilon for float residue.
+
 ### Found by hand-testing a real session (2026-11-16) and fixed
 
 | Symptom (from a screenshot and the session log) | Root cause | Fix |

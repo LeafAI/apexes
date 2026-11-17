@@ -898,6 +898,7 @@ async fn run_live_mode(
         .map(|i| i.symbol.clone())
         .collect();
     let initial_prices = binance_gateway.last_prices(&symbols).await;
+    let symbol_rules = binance_gateway.symbol_rules(&symbols).await;
 
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
@@ -908,6 +909,7 @@ async fn run_live_mode(
         market_condition_config: launch_config.market_condition_config.clone(),
         auto_derisk_live,
         initial_prices,
+        symbol_rules,
         risk_free_return: launch_config.risk_free_return,
         reconcile_interval,
         ems_postgres_url,

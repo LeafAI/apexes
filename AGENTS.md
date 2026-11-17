@@ -86,6 +86,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 29. **A number the loop cannot compute yet is "pricing…", never a placeholder.** `PortfolioLedger::equity` values an asset without a price at 1.0, which on a held BNB or BTC is wrong by hundreds or tens of thousands. Seed every session symbol's last price from the exchange at start (`UnifiedLoopConfig::initial_prices`; live asks `BinanceExecutionGateway::last_prices`), because a quiet symbol can go minutes without a trade; and when a held asset is still unpriced, set `SessionSnapshot::equity_priced = false` so the console says so. Anything charted per symbol comes from `SessionSnapshot::price_history` (bounded by `history.rs`; a new series must use it, an unbounded `Vec` grows for days).
 
+30. **An order is made valid for its symbol by the engine, never by the strategy.** Binance enforces a per-symbol quantity step, price tick and minimum value (`-1013`), and the same script trades symbols whose rules differ. `exchangeInfo` is read at startup (`symbol_rules`) and `UnifiedLoopConfig::symbol_rules` conforms every intent before the risk check: quantity down to the step (never up), limit price to the passive tick, and an order that cannot be made valid is refused with its reason, not sent. `Instrument::{tick,lot}_size` are placeholders; do not read them for this.
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.
