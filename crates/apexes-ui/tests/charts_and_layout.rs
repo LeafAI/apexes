@@ -447,3 +447,140 @@ fn no_full_height_rule_is_drawn_between_the_cards_and_the_orders_panel() {
         .collect::<Vec<_>>();
     assert!(rule.is_empty(), "a vertical rule is drawn at x = {rule:?}");
 }
+
+/// Renders the whole window as `scripts/run-testnet.sh` shows it: tab bar,
+/// page and a console in it. The standalone-console renders above lack the tab
+/// bar, whose rule sits right above the cards. Returns the PNG's path.
+fn render_shell(theme: apexes_ui::theme::ThemeChoice, size: [f32; 2], name: &str) -> String {
+    render_shell_at(theme, size, 1.0, name)
+}
+
+/// A rendered window as plain data: width, height, and one RGBA per pixel.
+struct Shot {
+    width: u32,
+    height: u32,
+    pixels: Vec<[u8; 4]>,
+}
+
+fn render_shell_at(
+    theme: apexes_ui::theme::ThemeChoice,
+    size: [f32; 2],
+    pixels_per_point: f32,
+    name: &str,
+) -> String {
+    render_shell_hover(theme, size, pixels_per_point, None, name).0
+}
+
+fn render_shell_hover(
+    theme: apexes_ui::theme::ThemeChoice,
+    size: [f32; 2],
+    pixels_per_point: f32,
+    hover: Option<[f32; 2]>,
+    name: &str,
+) -> (String, Shot) {
+    use apexes_ui::chrome::Chrome;
+    use apexes_ui::operator_view::OperatorApp;
+    use apexes_ui::shell_app::ShellApp;
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let home = std::env::temp_dir().join(format!(
+        "apexes-shellshot-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&home).expect("home");
+    let mut chrome = Chrome::load(None);
+    chrome.set(theme);
+    let handle = runtime.handle().clone();
+    let supervisor = apexes_supervisor::Supervisor::new(&home);
+    let mut s = state(snapshot(&["BTCUSDT", "ETHUSDT", "BNBUSDT"], true));
+    s.engine_url = "test".to_string();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(size[0], size[1]))
+        .with_pixels_per_point(pixels_per_point)
+        .build_eframe(move |_cc| {
+            let mut app = ShellApp::with_chrome(supervisor, handle, chrome);
+            app.open_console_with_state("testnet-demo", OperatorApp::new_for_test(s));
+            app
+        });
+    h.step();
+    h.step();
+    if let Some(at) = hover {
+        h.hover_at(egui::pos2(at[0], at[1]));
+        h.step();
+        h.step();
+    }
+    let image = h.render().expect("render");
+    let dir = std::env::var("APEXES_SHOTS").unwrap_or_else(|_| "/tmp/shots".to_string());
+    std::fs::create_dir_all(&dir).expect("shots dir");
+    let path = format!("{dir}/charts-shell-{name}.png");
+    image.save(&path).expect("save");
+    std::fs::remove_dir_all(&home).ok();
+    drop(h);
+    drop(runtime);
+    let (width, height) = (image.width(), image.height());
+    let pixels = image.pixels().map(|p| p.0).collect();
+    (
+        path,
+        Shot {
+            width,
+            height,
+            pixels,
+        },
+    )
+}
+
+#[test]
+#[ignore = "writes PNG files for manual inspection"]
+fn renders_the_real_shell_window() {
+    use apexes_ui::theme::ThemeChoice;
+    for (name, theme) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        println!("{}", render_shell(theme, [1180.0, 760.0], name));
+    }
+    println!(
+        "{}",
+        render_shell_at(ThemeChoice::Light, [1500.0, 1000.0], 2.0, "retina")
+    );
+    println!(
+        "{}",
+        render_shell_at(ThemeChoice::Light, [1500.0, 1000.0], 1.0, "large")
+    );
+    // The mouse resting on the gap between the cards and the orders panel,
+    // then over the main column.
+    for (name, at) in [
+        ("hover-edge", [998.0, 600.0]),
+        ("hover-body", [700.0, 600.0]),
+    ] {
+        println!(
+            "{}",
+            render_shell_hover(ThemeChoice::Light, [1500.0, 1000.0], 1.0, Some(at), name).0
+        );
+    }
+}
+
+/// With the mouse over the page (where an operator's mouse nearly always is) no
+/// tall bar may appear. egui draws the scroll bar's handle there when the
+/// content is taller than the window, and it read as a stray vertical line.
+#[test]
+fn the_mouse_over_the_page_draws_no_full_height_bar() {
+    use apexes_ui::theme::ThemeChoice;
+    let (_, rest) = render_shell_hover(ThemeChoice::Light, [1500.0, 1000.0], 1.0, None, "t-rest");
+    let (_, over) = render_shell_hover(
+        ThemeChoice::Light,
+        [1500.0, 1000.0],
+        1.0,
+        Some([700.0, 600.0]),
+        "t-over",
+    );
+    let (w, h) = (rest.width as usize, rest.height as usize);
+    let tall: Vec<usize> = (0..w)
+        .filter(|x| {
+            (0..h)
+                .filter(|y| rest.pixels[y * w + x] != over.pixels[y * w + x])
+                .count()
+                > h / 3
+        })
+        .collect();
+    assert!(
+        tall.is_empty(),
+        "hovering the page draws a tall bar at x = {tall:?}"
+    );
+}

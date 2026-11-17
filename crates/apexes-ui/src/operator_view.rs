@@ -86,6 +86,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
     }
 
     egui::ScrollArea::vertical()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             body(ui, state, placement, &mut out);

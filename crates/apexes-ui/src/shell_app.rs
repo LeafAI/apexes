@@ -107,6 +107,20 @@ impl ShellApp {
         self.tabs.open(&id);
     }
 
+    /// Opens a tab for a console with a fixed state and no engine behind it,
+    /// so a test can render the whole window (tab bar, page and console)
+    /// exactly as an operator sees it.
+    pub fn open_console_with_state(&mut self, id: &str, app: OperatorApp) {
+        if !self.tabs.is_open(id) {
+            self.consoles.push(Console {
+                id: id.to_string(),
+                app,
+                task: self.runtime.spawn(async {}),
+            });
+        }
+        self.tabs.open(id);
+    }
+
     fn spawn_console(&self, id: &str, info: &SessionInfo) -> Console {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
