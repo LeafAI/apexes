@@ -718,8 +718,8 @@ fn renders_the_real_shell_window() {
     // The mouse resting on the gap between the cards and the orders panel,
     // then over the main column.
     for (name, at) in [
-        ("hover-edge", [998.0, 600.0]),
         ("hover-body", [700.0, 600.0]),
+        ("hover-edge", [937.0, 600.0]),
         ("hover-orders", [1250.0, 500.0]),
     ] {
         println!(
@@ -781,4 +781,75 @@ fn the_side_panel_keeps_its_width_with_a_wide_table_and_does_not_grow() {
         (full_last - empty_last).abs() < 2.0,
         "content must not change the column's width: {empty_last} vs {full_last}"
     );
+}
+
+/// Where the two columns' gap is, in the row of the key tiles (both columns
+/// have a card there): the run of plain page background around `near_x`.
+fn gap_between_columns(shot: &Shot, near_x: usize, y: usize) -> (usize, usize) {
+    let w = shot.width as usize;
+    let page = shot.pixels[y * w + 3];
+    let plain = |x: usize| shot.pixels[y * w + x] == page;
+    let mut lo = near_x;
+    while lo > 0 && !plain(lo) {
+        lo -= 1;
+    }
+    let mut start = lo;
+    while start > 0 && plain(start - 1) {
+        start -= 1;
+    }
+    let mut end = lo;
+    while end + 1 < w && plain(end + 1) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The x of the tall dark bar that appears when the mouse is on the resize
+/// handle: columns that differ from the resting render over most of the height.
+fn handle_columns(rest: &Shot, hover: &Shot) -> Vec<usize> {
+    let (w, h) = (rest.width as usize, rest.height as usize);
+    (0..w)
+        .filter(|x| {
+            (0..h)
+                .filter(|y| rest.pixels[y * w + x] != hover.pixels[y * w + x])
+                .count()
+                > h / 2
+        })
+        .collect()
+}
+
+/// The resize bar must sit in the middle of the gap between the left column's
+/// cards and the orders panel. It was drawn on the left cards' right border
+/// because the whole gap was padding inside the panel.
+#[test]
+fn the_resize_handle_is_in_the_middle_of_the_gap_between_the_columns() {
+    use apexes_ui::theme::ThemeChoice;
+    for width in [1300.0, 1500.0, 1800.0] {
+        let size = [width, 1000.0];
+        let (_, rest) = render_shell_hover(ThemeChoice::Light, size, 1.0, None, "g-rest");
+        // The tile row sits at y = 190: tiles on the left, Recent orders on the right.
+        let (start, end) = gap_between_columns(&rest, width as usize - 560 - 8, 190);
+        assert!(
+            end > start + 6,
+            "width {width}: found no gap ({start}..{end})"
+        );
+        let mid = (start + end) as f32 / 2.0;
+        let (_, hover) =
+            render_shell_hover(ThemeChoice::Light, size, 1.0, Some([mid, 600.0]), "g-hover");
+        let cols = handle_columns(&rest, &hover);
+        assert!(
+            !cols.is_empty(),
+            "width {width}: the handle did not show at x = {mid}"
+        );
+        let bar = cols.iter().sum::<usize>() as f32 / cols.len() as f32;
+        assert!(
+            (bar - mid).abs() <= 1.5,
+            "width {width}: handle at x = {bar}, gap is {start}..{end} (middle {mid}), \
+             handle columns {cols:?}"
+        );
+        assert!(
+            cols.iter().all(|x| *x > start && *x < end),
+            "width {width}: the handle must not touch either card: {cols:?} in {start}..{end}"
+        );
+    }
 }

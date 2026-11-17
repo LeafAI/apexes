@@ -33,6 +33,10 @@ fn dash(value: Option<impl ToString>) -> String {
 /// the key figures, the equity chart, then cards that sit side by side when
 /// the window is wide enough and stack when it is not. The recent-orders panel
 /// takes the whitespace on the right (or goes under the cards when narrow).
+/// Half the gap between the main column and the orders panel, in points. Each
+/// side pads this much, so the panel's resize handle sits in the middle.
+const COLUMN_GAP_HALF: i8 = 6;
+
 pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand> {
     let mut out = Vec::new();
     let palette = palette_of(ui.ctx());
@@ -66,8 +70,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
             .show_separator_line(false)
             .default_size(orders_view::SIDE_PANEL_DEFAULT_WIDTH)
             .size_range(orders_view::SIDE_PANEL_MIN_WIDTH..=orders_view::SIDE_PANEL_MAX_WIDTH)
+            // egui draws the resize handle on the panel's outer edge. Padding
+            // the whole gap inside the panel put the handle on the left
+            // cards' right border; half the gap goes here and half on the
+            // body's right side (below), so the handle falls in the middle.
             .frame(egui::Frame::new().inner_margin(egui::Margin {
-                left: 12,
+                left: COLUMN_GAP_HALF,
                 right: 0,
                 top: 0,
                 bottom: 0,
@@ -84,11 +92,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut OperatorState) -> Vec<SessionCommand>
             });
     }
 
+    // The body's half of the gap beside the orders panel (see above).
+    let body_right = if placement == Placement::Side {
+        f32::from(COLUMN_GAP_HALF)
+    } else {
+        0.0
+    };
     egui::ScrollArea::vertical()
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            body(ui, state, placement, &mut out);
+            let mut rect = ui.max_rect();
+            rect.max.x -= body_right;
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                body(ui, state, placement, &mut out);
+            });
         });
     out
 }
