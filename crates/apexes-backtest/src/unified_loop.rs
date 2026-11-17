@@ -112,6 +112,11 @@ pub struct UnifiedLoopConfig {
     /// silent no-op: no command draining, no pause gating, no
     /// snapshot pushes.
     pub control: Option<ControlHandle>,
+    /// A last price per symbol known before the first event (live startup
+    /// asks the exchange). Without it an asset the account holds is valued at
+    /// the ledger's 1.0 placeholder until its first trade arrives, which on a
+    /// quiet market can be minutes. Empty for backtest/paper.
+    pub initial_prices: HashMap<String, Decimal>,
 }
 
 /// Runs the unified event loop: consumes `market_events` in order
@@ -190,7 +195,9 @@ pub async fn run_unified_event_loop(
     let mut overall_tracker = PerformanceTracker::new(config.risk_free_return);
     let mut per_symbol_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
     let mut per_venue_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
-    let mut last_prices: HashMap<String, Decimal> = HashMap::new();
+    let mut last_prices: HashMap<String, Decimal> =
+        seeded_last_prices(&config.initial_prices, &instruments_by_symbol);
+    let mut price_history = crate::history::PriceHistory::new();
     let mut mark_prices: HashMap<String, Decimal> = HashMap::new();
     let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut all_fills: Vec<Fill> = Vec::new();
@@ -262,6 +269,11 @@ pub async fn run_unified_event_loop(
                     let initial_equity = ledger.equity(&last_prices)?;
                     overall_tracker.record_equity_point(event_timestamp(&event), initial_equity);
                     recorded_initial_equity = true;
+                    // The exchange's prices from before the first event are
+                    // real observations: the charts start from them.
+                    for (symbol, price) in &config.initial_prices {
+                        price_history.record(symbol, event_timestamp(&event), *price);
+                    }
                 }
 
                 let timestamp = event_timestamp(&event);
@@ -324,6 +336,7 @@ pub async fn run_unified_event_loop(
                 // was inserted before `MatchingEngine::on_trade_event`).
                 match &event {
                     MarketEvent::Trade(trade) => {
+                        price_history.record(&trade.symbol, trade.timestamp, trade.price);
                         if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
                             && let Some(base) = &instrument.base_currency
                         {
@@ -808,6 +821,13 @@ pub async fn run_unified_event_loop(
                             paused: handle.is_paused(),
                             open_orders,
                             recent_orders,
+                            price_history: price_history
+                                .view(crate::evaluation::SNAPSHOT_HISTORY_POINTS),
+                            equity_priced: holdings_priced(
+                                ledger.balances(),
+                                &last_prices,
+                                &instruments_by_symbol,
+                            ),
                             timestamp,
                         };
                         handle.maybe_push_snapshot(snapshot);
@@ -912,6 +932,22 @@ fn priced_for_risk_check(
         price: reference,
         ..intent.clone()
     }
+}
+
+/// The seeded prices keyed the way the loop keeps them (by base asset), for
+/// the symbols the session actually trades. A non-positive price is ignored.
+fn seeded_last_prices(
+    initial_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> HashMap<String, Decimal> {
+    initial_prices
+        .iter()
+        .filter(|(_, price)| **price > Decimal::ZERO)
+        .filter_map(|(symbol, price)| {
+            let base = instruments_by_symbol.get(symbol)?.base_currency.clone()?;
+            Some((base, *price))
+        })
+        .collect()
 }
 
 /// True when every non-zero balance is either a quote currency of a traded
@@ -1483,6 +1519,7 @@ mod tests {
             margin_tiers,
             market_condition_config: None,
             control: None,
+            initial_prices: HashMap::new(),
         }
     }
 
@@ -1751,6 +1788,7 @@ mod tests {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             control: None,
+            initial_prices: HashMap::new(),
         };
 
         let report = run(
@@ -1803,6 +1841,7 @@ mod tests {
                 include_spot: true, // this test uses a SPOT buy-once strategy
             }),
             control: None,
+            initial_prices: HashMap::new(),
         };
 
         let report = run(
@@ -2014,6 +2053,7 @@ mod tests {
         );
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             risk_checker: Some(checker),
             ..unified_loop_config(dec!(100000), None, HashMap::new())
         };
@@ -2077,6 +2117,8 @@ mod tests {
             evaluation: None,
             equity_history: Vec::new(),
             recent_orders: Vec::new(),
+            price_history: HashMap::new(),
+            equity_priced: true,
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,
@@ -2121,6 +2163,7 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             ..config
         };
 
@@ -2166,6 +2209,7 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             ..config
         };
         let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
@@ -2220,6 +2264,7 @@ mod tests {
         balances.insert("BTC".to_string(), dec!(1));
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             ..unified_loop_config(dec!(10000), None, HashMap::new())
         };
         let config = UnifiedLoopConfig {
@@ -2260,6 +2305,7 @@ mod tests {
             ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             initial_balances: balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
             ..unified_loop_config(dec!(0), None, HashMap::new())
         };
@@ -2322,6 +2368,141 @@ mod tests {
         assert_eq!(e.holdings_pnl, dec!(0));
         assert_eq!(e.holdings_value_at_start, dec!(0));
         assert_eq!(e.strategy_pnl, e.total_pnl);
+    }
+
+    /// A quiet market: the account holds 1 BTC and no trade has printed yet.
+    /// With the exchange's last price seeded, the session is valued at once;
+    /// without it, the headline equity is flagged as not yet real.
+    #[tokio::test]
+    async fn a_seeded_price_values_a_held_asset_before_its_first_trade() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [
+                ("USDT".to_string(), dec!(10000)),
+                ("BTC".to_string(), dec!(1)),
+            ]
+            .into_iter()
+            .collect(),
+            initial_prices: [("BTCUSDT".to_string(), dec!(100))].into_iter().collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+
+        let snapshot = snapshot_rx.borrow().clone();
+        assert!(snapshot.equity_priced);
+        assert_eq!(snapshot.equity, dec!(10100), "1 BTC at 100, not at 1.0");
+        let e = snapshot
+            .evaluation
+            .expect("evaluation starts without waiting for a trade");
+        assert_eq!(e.start_equity, dec!(10100));
+        assert_eq!(e.holdings_value_at_start, dec!(100));
+        assert_eq!(e.total_pnl, dec!(0));
+    }
+
+    #[tokio::test]
+    async fn without_a_price_the_held_asset_is_unpriced_and_equity_says_so() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [
+                ("USDT".to_string(), dec!(10000)),
+                ("BTC".to_string(), dec!(1)),
+            ]
+            .into_iter()
+            .collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+        let snapshot = snapshot_rx.borrow().clone();
+        assert!(
+            !snapshot.equity_priced,
+            "BTC has no price yet: equity is a placeholder"
+        );
+        assert!(
+            snapshot.equity_history.is_empty(),
+            "the placeholder equity must not be charted"
+        );
+    }
+
+    /// A flat account has nothing to price: equity is real from the start.
+    #[tokio::test]
+    async fn a_cash_only_account_is_always_priced() {
+        let snapshot = snapshot_after(&[("USDT", dec!(10000))], &[], NoopStrategy).await;
+        assert!(snapshot.equity_priced);
+    }
+
+    /// An unpriced holding is flagged, and the flag clears with its first trade.
+    #[tokio::test]
+    async fn the_first_trade_prices_an_unseeded_holding() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100)],
+            NoopStrategy,
+        )
+        .await;
+        assert!(snapshot.equity_priced);
+        assert_eq!(snapshot.equity, dec!(10100));
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_carries_each_symbols_trade_prices_in_order() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(101), dec!(99)],
+            NoopStrategy,
+        )
+        .await;
+        let prices: Vec<Decimal> = snapshot.price_history["BTCUSDT"]
+            .iter()
+            .map(|(_, price)| *price)
+            .collect();
+        assert_eq!(prices, vec![dec!(100), dec!(101), dec!(99)]);
+        assert!(
+            snapshot.price_history["BTCUSDT"]
+                .windows(2)
+                .all(|w| w[0].0 <= w[1].0)
+        );
+    }
+
+    /// A seeded price is a real observation: the chart starts with it instead
+    /// of staying empty until a quiet symbol's first trade.
+    #[tokio::test]
+    async fn a_seeded_price_starts_the_symbols_price_history() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [("USDT".to_string(), dec!(10000))].into_iter().collect(),
+            initial_prices: [("BTCUSDT".to_string(), dec!(100))].into_iter().collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+        let snapshot = snapshot_rx.borrow().clone();
+        assert_eq!(snapshot.price_history["BTCUSDT"], vec![(t0, dec!(100))]);
     }
 
     /// `control: None` must stay free of evaluation work: no handle, no
@@ -2438,6 +2619,7 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
             ..config
         };
 

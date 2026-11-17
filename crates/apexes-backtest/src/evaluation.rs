@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use crate::history::BoundedSeries as EquityHistory;
 use apexes_core::Fill;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -21,8 +22,6 @@ use serde::{Deserialize, Serialize};
 /// a hundred-millionth of a USDT: finer than any price or fee moves a number.
 const PNL_DP: u32 = 8;
 
-/// Raw points kept before the history is halved.
-const HISTORY_CAP: usize = 4096;
 /// Most points ever sent in one snapshot.
 pub const SNAPSHOT_HISTORY_POINTS: usize = 400;
 
@@ -99,56 +98,6 @@ pub struct EvaluationSummary {
     /// Fraction of observed time holding any position.
     pub time_in_market_fraction: Decimal,
     pub limit_usage: Vec<LimitUsage>,
-}
-
-/// Equity history that stays bounded by halving: when `HISTORY_CAP` is
-/// reached every other point is dropped and the sampling stride doubles, so
-/// early and recent history stay evenly represented.
-#[derive(Debug, Clone)]
-struct EquityHistory {
-    points: Vec<(DateTime<Utc>, Decimal)>,
-    stride: u64,
-    seen: u64,
-    latest: Option<(DateTime<Utc>, Decimal)>,
-}
-
-impl EquityHistory {
-    fn new() -> Self {
-        Self {
-            points: Vec::new(),
-            stride: 1,
-            seen: 0,
-            latest: None,
-        }
-    }
-
-    fn record(&mut self, at: DateTime<Utc>, equity: Decimal) {
-        self.latest = Some((at, equity));
-        if self.seen.is_multiple_of(self.stride) {
-            self.points.push((at, equity));
-            if self.points.len() >= HISTORY_CAP {
-                self.points = self.points.iter().step_by(2).copied().collect();
-                self.stride *= 2;
-            }
-        }
-        self.seen += 1;
-    }
-
-    /// At most `max` points, evenly thinned, always ending on the latest.
-    fn view(&self, max: usize) -> Vec<(DateTime<Utc>, Decimal)> {
-        let mut out: Vec<_> = if self.points.len() <= max || max < 2 {
-            self.points.clone()
-        } else {
-            let step = self.points.len().div_ceil(max);
-            self.points.iter().step_by(step).copied().collect()
-        };
-        if let Some(latest) = self.latest
-            && out.last() != Some(&latest)
-        {
-            out.push(latest);
-        }
-        out
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +388,7 @@ impl EvaluationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::HISTORY_CAP;
     use apexes_core::{FillId, OrderId, Side, Venue};
     use chrono::TimeZone;
     use rust_decimal_macros::dec;

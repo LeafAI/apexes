@@ -28,6 +28,8 @@ fn snapshot() -> SessionSnapshot {
         evaluation: None,
         equity_history: Vec::new(),
         recent_orders: Vec::new(),
+        price_history: Default::default(),
+        equity_priced: true,
         positions: HashMap::new(),
         balances: HashMap::from([("USDT".to_string(), dec!(500))]),
         equity: dec!(500),

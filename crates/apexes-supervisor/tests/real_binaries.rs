@@ -845,3 +845,126 @@ fn one_session_on_two_symbols_prices_both_and_matches_binances_balances() {
     );
     println!("EQUITY_FOR_CHECK {}", snapshot.equity);
 }
+
+/// The reported defect, for real: a session holding BNB, a symbol that can go
+/// minutes without a trade on the testnet. The exchange's own last price must
+/// value it from the first second, so the session is priced, measured and
+/// charted at once instead of waiting for BNB's first trade.
+#[test]
+#[ignore = "needs your testnet keys in APEXES_TESTNET_API_KEY / APEXES_TESTNET_API_SECRET and Postgres"]
+fn a_quiet_symbol_is_priced_from_the_exchange_at_start_not_from_its_first_trade() {
+    use apexes_engine::SessionMessage;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("APEXES_TESTNET_API_KEY"),
+        std::env::var("APEXES_TESTNET_API_SECRET"),
+    ) else {
+        panic!("set APEXES_TESTNET_API_KEY and APEXES_TESTNET_API_SECRET");
+    };
+    let home = temp_home("quiet");
+    let sup = supervisor(&home, &key, &secret);
+    let idle = home.join("idle.drift");
+    std::fs::write(
+        &idle,
+        "function on_market_event(event, ctx) {\n  return [];\n}\n",
+    )
+    .unwrap();
+    let mut req = request("t-quiet");
+    req.symbols = vec![
+        "BTCUSDT".to_string(),
+        "ETHUSDT".to_string(),
+        "BNBUSDT".to_string(),
+    ];
+    req.strategy = StrategyRef::DriftScript { path: idle };
+    let launched = match sup.launch(req) {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup(&sup, &home);
+            panic!("launch failed: {e}");
+        }
+    };
+    let token = launched.info.token.clone().expect("token");
+    let url = launched.info.control_url.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // (seconds until the first priced snapshot, that snapshot)
+    let outcome: Result<(f64, apexes_backtest::SessionSnapshot), String> =
+        runtime.block_on(async {
+            let mut req = url
+                .as_str()
+                .into_client_request()
+                .map_err(|e| e.to_string())?;
+            req.headers_mut().insert(
+                "Authorization",
+                apexes_security::bearer_header_value(&token)
+                    .parse()
+                    .map_err(|_| "header")?,
+            );
+            let (mut socket, _) = tokio_tungstenite::connect_async(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            let began = tokio::time::Instant::now();
+            let deadline = began + Duration::from_secs(40);
+            while let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout_at(deadline, socket.next()).await
+            {
+                if let Ok(SessionMessage::Snapshot(s)) =
+                    serde_json::from_str::<SessionMessage>(&text)
+                    && !s.is_placeholder()
+                    && s.equity_priced
+                    && s.evaluation.is_some()
+                {
+                    return Ok((began.elapsed().as_secs_f64(), s));
+                }
+            }
+            Err("no priced snapshot within 40 s".to_string())
+        });
+    let _ = sup.request_stop(
+        &SessionId::parse("t-quiet").unwrap(),
+        Duration::from_secs(30),
+        true,
+    );
+    let _ = sup.stop_gateway(BinanceNetwork::Testnet);
+    std::fs::remove_dir_all(&home).ok();
+
+    let (seconds, snapshot) = outcome.expect("a priced snapshot");
+    let e = snapshot.evaluation.as_ref().expect("evaluation");
+    println!("PRICED_AFTER {seconds:.1}s  EQUITY {}", snapshot.equity);
+    println!(
+        "START_EQUITY {}  HOLDINGS_AT_START {}  PRICE_SERIES {:?}",
+        e.start_equity,
+        e.holdings_value_at_start,
+        snapshot
+            .price_history
+            .iter()
+            .map(|(k, v)| format!("{k}:{}", v.len()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        snapshot.balances.contains_key("BNB"),
+        "the account holds BNB: {:?}",
+        snapshot.balances
+    );
+    assert!(
+        e.holdings_value_at_start > dec!(60000),
+        "BTC + ETH + BNB are all valued at the start: {}",
+        e.holdings_value_at_start
+    );
+    assert!(
+        snapshot.equity > dec!(70000),
+        "equity is a real number, not BNB counted at 1.0: {}",
+        snapshot.equity
+    );
+    for symbol in ["BTCUSDT", "ETHUSDT", "BNBUSDT"] {
+        assert!(
+            snapshot
+                .price_history
+                .get(symbol)
+                .is_some_and(|series| !series.is_empty()),
+            "{symbol} has a price series from the start: {:?}",
+            snapshot.price_history.keys().collect::<Vec<_>>()
+        );
+    }
+}

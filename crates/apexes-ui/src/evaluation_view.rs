@@ -8,11 +8,9 @@
 use crate::number_format;
 use crate::theme::{Palette, palette_of};
 use crate::time_axis;
-use crate::value_axis;
-use apexes_backtest::{EvaluationSummary, LimitUsage, SessionIdentity, SessionSnapshot};
+use apexes_backtest::{EvaluationSummary, LimitUsage, SessionIdentity};
 use chrono::{DateTime, Utc};
 use egui::Color32;
-use egui_plot::{Line, Plot, PlotPoints};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -290,14 +288,31 @@ pub struct Tile {
 /// When the account held assets before the session, the account's own PnL is
 /// shown as a figure of its own next to the strategy's, so neither is mistaken
 /// for the other.
-pub fn key_tiles(equity: Decimal, e: Option<&EvaluationSummary>) -> Vec<Tile> {
-    use crate::widgets::sign_of;
-    let mut tiles = vec![Tile {
+/// The equity tile. While a held asset has no price the ledger counts it at
+/// 1.0, so the number would be wrong by thousands: say so instead of showing it.
+fn equity_tile(equity: Decimal, priced: bool, e: Option<&EvaluationSummary>) -> Tile {
+    if !priced {
+        return Tile {
+            label: "Equity",
+            value: PRICING.to_string(),
+            sign: None,
+            note: Some("waiting for a price of a held asset".to_string()),
+        };
+    }
+    Tile {
         label: "Equity",
         value: number_format::money(equity),
         sign: None,
         note: e.map(|e| format!("started at {}", number_format::money(e.start_equity))),
-    }];
+    }
+}
+
+/// Shown in place of a number that cannot be computed yet.
+pub const PRICING: &str = "pricing…";
+
+pub fn key_tiles(equity: Decimal, priced: bool, e: Option<&EvaluationSummary>) -> Vec<Tile> {
+    use crate::widgets::sign_of;
+    let mut tiles = vec![equity_tile(equity, priced, e)];
     let Some(e) = e else { return tiles };
     let (pnl_label, pnl, pnl_note) = if has_starting_holdings(e) {
         (
@@ -433,91 +448,6 @@ pub fn limits_card(ui: &mut egui::Ui, usages: &[LimitUsage]) {
 
 /// Height of the equity chart. Taller than the old 180: a chart is the one
 /// thing on this screen read by shape, and it was the smallest part of it.
-pub const CHART_HEIGHT: f32 = 230.0;
-
-/// The equity timeline as a card: a title, the running peak (dashed) and the
-/// equity line with a soft fill under it.
-pub fn chart_card(ui: &mut egui::Ui, snapshot: &SessionSnapshot) {
-    let palette = palette_of(ui.ctx());
-    crate::widgets::card(ui, &palette, |ui| {
-        ui.horizontal(|ui| {
-            crate::widgets::section_title(ui, "Equity");
-            ui.label(crate::widgets::caption(
-                &palette,
-                "dashed line: running peak",
-            ));
-        });
-        if snapshot.equity_history.len() < 2 {
-            ui.add_space(8.0);
-            ui.label(crate::widgets::caption(
-                &palette,
-                "collecting equity history...",
-            ));
-            ui.add_space(8.0);
-            return;
-        }
-        let equity = plot_points(&snapshot.equity_history);
-        let peak = peak_points(&snapshot.equity_history);
-        let floor = equity.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
-        let zone = time_axis::local_zone();
-        let title = snapshot
-            .equity_history
-            .last()
-            .map(|(at, _)| time_axis::axis_title(&zone, *at))
-            .unwrap_or_default();
-        Plot::new("equity_timeline")
-            .height(CHART_HEIGHT)
-            .allow_scroll(false)
-            .show_background(false)
-            .grid_color(palette.grid)
-            .x_axis_label(title)
-            .y_grid_spacer(|input| value_axis::grid_marks(input.bounds, input.base_step_size))
-            .y_axis_formatter(|mark, range| {
-                value_axis::label(mark.value, (*range.start(), *range.end()))
-            })
-            .x_grid_spacer(move |input| {
-                time_axis::grid_marks(&zone, input.bounds, input.base_step_size)
-            })
-            .x_axis_formatter(move |mark, range| {
-                let bounds = (*range.start(), *range.end());
-                time_axis::label_for_mark(&zone, mark.value, bounds)
-            })
-            .label_formatter(move |hover| {
-                use egui_plot::HoverPosition;
-                match hover {
-                    HoverPosition::NearDataPoint {
-                        plot_name,
-                        position,
-                        ..
-                    } if !plot_name.is_empty() => Some(format!(
-                        "{plot_name}\n{}\n{:.2}",
-                        time_axis::hover_label(&zone, position.x),
-                        position.y
-                    )),
-                    HoverPosition::Elsewhere { position } => {
-                        Some(time_axis::hover_label(&zone, position.x))
-                    }
-                    HoverPosition::NearDataPoint { .. } => None,
-                }
-            })
-            .show(ui, |plot_ui| {
-                plot_ui.line(
-                    Line::new("peak", PlotPoints::from(peak))
-                        .color(palette.plot_peak)
-                        .width(1.2)
-                        .style(egui_plot::LineStyle::dashed_dense()),
-                );
-                let mut line = Line::new("equity", PlotPoints::from(equity))
-                    .color(palette.info)
-                    .width(2.0);
-                if floor.is_finite() {
-                    line = line.fill(floor as f32).fill_alpha(0.14);
-                }
-                plot_ui.line(line);
-            });
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,7 +624,7 @@ mod tests {
 
     #[test]
     fn the_key_figures_for_a_flat_start_are_equity_pnl_drawdown_exposure_trades() {
-        let tiles = key_tiles(dec!(74078.28), Some(&summary_with(dec!(0))));
+        let tiles = key_tiles(dec!(74078.28), true, Some(&summary_with(dec!(0))));
         let labels: Vec<_> = tiles.iter().map(|t| t.label).collect();
         assert_eq!(labels, ["Equity", "PnL", "Drawdown", "Exposure", "Trades"]);
         assert_eq!(tiles[0].value, "74078.28");
@@ -706,7 +636,7 @@ mod tests {
     /// market's move has a tile of its own, so the two cannot be confused.
     #[test]
     fn with_holdings_the_headline_pnl_is_the_strategys_and_the_markets_move_is_beside_it() {
-        let tiles = key_tiles(dec!(74078.28), Some(&summary_with(dec!(64000))));
+        let tiles = key_tiles(dec!(74078.28), true, Some(&summary_with(dec!(64000))));
         let labels: Vec<_> = tiles.iter().map(|t| t.label).collect();
         assert_eq!(
             labels,
@@ -729,17 +659,17 @@ mod tests {
 
     #[test]
     fn the_drawdown_tile_is_the_strategys_when_there_were_holdings() {
-        let with = key_tiles(dec!(1), Some(&summary_with(dec!(64000))));
+        let with = key_tiles(dec!(1), true, Some(&summary_with(dec!(64000))));
         let dd = with.iter().find(|t| t.label == "Drawdown").unwrap();
         assert_eq!(dd.value, percent(dec!(0.000001)));
-        let flat = key_tiles(dec!(1), Some(&summary_with(dec!(0))));
+        let flat = key_tiles(dec!(1), true, Some(&summary_with(dec!(0))));
         let dd = flat.iter().find(|t| t.label == "Drawdown").unwrap();
         assert_eq!(dd.value, percent(dec!(0.0092)));
     }
 
     #[test]
     fn before_any_evaluation_only_equity_is_shown_and_nothing_is_invented() {
-        let tiles = key_tiles(dec!(10000), None);
+        let tiles = key_tiles(dec!(10000), true, None);
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].label, "Equity");
         assert!(tiles[0].note.is_none());

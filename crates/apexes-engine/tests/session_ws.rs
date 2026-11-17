@@ -45,6 +45,8 @@ fn empty_snapshot() -> SessionSnapshot {
         evaluation: None,
         equity_history: Vec::new(),
         recent_orders: Vec::new(),
+        price_history: Default::default(),
+        equity_priced: true,
         positions: HashMap::new(),
         balances: HashMap::new(),
         equity: Decimal::ZERO,

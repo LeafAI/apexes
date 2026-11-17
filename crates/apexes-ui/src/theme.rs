@@ -98,6 +98,9 @@ pub struct Palette {
     /// The empty part of a gauge: dark enough to read as a track waiting to
     /// fill, not as a disabled control.
     pub track: Color32,
+    /// Lines of a multi-series chart, one per symbol. Distinct from each other
+    /// and at least 3:1 against `card_fill` (checked in `chart_view`'s tests).
+    pub series: [Color32; 6],
 }
 
 impl Palette {
@@ -117,6 +120,14 @@ impl Palette {
                 label: Color32::from_gray(165),
                 grid: Color32::from_rgb(78, 82, 90),
                 track: Color32::from_rgb(58, 62, 70),
+                series: [
+                    Color32::from_rgb(90, 150, 230),
+                    Color32::from_rgb(235, 165, 40),
+                    Color32::from_rgb(70, 190, 100),
+                    Color32::from_rgb(200, 120, 230),
+                    Color32::from_rgb(70, 200, 210),
+                    Color32::from_rgb(240, 120, 120),
+                ],
             },
             // Deeper tones: the dark-theme ones wash out on white.
             egui::Theme::Light => Self {
@@ -132,6 +143,14 @@ impl Palette {
                 label: Color32::from_gray(98),
                 grid: Color32::from_rgb(192, 198, 208),
                 track: Color32::from_rgb(222, 226, 232),
+                series: [
+                    Color32::from_rgb(35, 85, 175),
+                    Color32::from_rgb(170, 100, 0),
+                    Color32::from_rgb(25, 130, 55),
+                    Color32::from_rgb(140, 50, 170),
+                    Color32::from_rgb(0, 125, 140),
+                    Color32::from_rgb(190, 40, 40),
+                ],
             },
         }
     }

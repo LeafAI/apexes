@@ -84,6 +84,8 @@ These are load-bearing. A change that violates one needs a design discussion fir
 
 28. **Layout is built from exact rectangles, and checked by looking.** A `Ui` that is only *offered* a width takes whatever its contents ask for, which pushed cards under their neighbours; place rows and cells in an allocated rect (`widgets::pair_row`, `orders_view::line`, `two_up`). Use real labels, not `painter.text` (no accessibility node, so screen readers and `egui_kittest` cannot see it). Decide widths in a pure function (`console_layout`) and test it; then render a PNG at the default, minimum and a large size, in both themes, and look. HALT must stay on screen without scrolling at the smallest window (`halt_is_visible_without_scrolling_at_the_smallest_window`).
 
+29. **A number the loop cannot compute yet is "pricing…", never a placeholder.** `PortfolioLedger::equity` values an asset without a price at 1.0, which on a held BNB or BTC is wrong by hundreds or tens of thousands. Seed every session symbol's last price from the exchange at start (`UnifiedLoopConfig::initial_prices`; live asks `BinanceExecutionGateway::last_prices`), because a quiet symbol can go minutes without a trade; and when a held asset is still unpriced, set `SessionSnapshot::equity_priced = false` so the console says so. Anything charted per symbol comes from `SessionSnapshot::price_history` (bounded by `history.rs`; a new series must use it, an unbounded `Vec` grows for days).
+
 ## 5. Working on a sub-project
 
 1. **Design before code.** New sub-projects go brainstorm → spec (`docs/superpowers/specs/`) → plan (`docs/superpowers/plans/`) → implementation. Ask the user when a decision is genuinely ambiguous rather than guessing.

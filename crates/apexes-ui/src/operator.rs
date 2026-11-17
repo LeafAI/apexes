@@ -108,6 +108,8 @@ pub struct OperatorState {
     /// The operator asked for every recorded order, not just the newest.
     /// Kept here, not in the drawing code, so it survives tab switches.
     pub show_all_orders: bool,
+    /// Which chart the card shows. Kept here so it survives tab switches.
+    pub chart: crate::chart_view::ChartView,
     /// The engine this console talks to, for the connection's hover text.
     pub engine_url: String,
 }
@@ -241,6 +243,8 @@ mod tests {
             evaluation: None,
             equity_history: Vec::new(),
             recent_orders: Vec::new(),
+            price_history: Default::default(),
+            equity_priced: true,
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: dec!(100),

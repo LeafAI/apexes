@@ -271,6 +271,49 @@ impl BinanceExecutionGateway {
 }
 
 impl BinanceExecutionGateway {
+    /// The latest traded price of each symbol, from the public ticker.
+    ///
+    /// Used once at session start to value every held asset before its first
+    /// live trade arrives (a quiet market can take minutes). A symbol the
+    /// exchange refuses, answers garbled, or prices at zero or below is left
+    /// out and logged; the caller values it from its first trade instead.
+    pub async fn last_prices(&self, symbols: &[String]) -> HashMap<String, Decimal> {
+        let lookups = symbols
+            .iter()
+            .map(|symbol| async move { (symbol.clone(), self.last_price(symbol).await) });
+        let mut prices = HashMap::new();
+        for (symbol, outcome) in futures::future::join_all(lookups).await {
+            match outcome {
+                Ok(price) => {
+                    prices.insert(symbol, price);
+                }
+                Err(error) => {
+                    tracing::warn!(%symbol, %error, "no start price; valued from its first trade");
+                }
+            }
+        }
+        prices
+    }
+
+    async fn last_price(&self, symbol: &str) -> Result<Decimal, String> {
+        #[derive(Deserialize)]
+        struct Ticker {
+            price: Decimal,
+        }
+        let body = self
+            .rest
+            .public_get("/api/v3/ticker/price", &format!("symbol={symbol}"))
+            .await?;
+        let ticker: Ticker =
+            serde_json::from_str(&body).map_err(|error| format!("unreadable price: {error}"))?;
+        if ticker.price <= Decimal::ZERO {
+            return Err(format!("non-positive price {}", ticker.price));
+        }
+        Ok(ticker.price)
+    }
+}
+
+impl BinanceExecutionGateway {
     /// Queries real Spot (`GET /api/v3/account`) and USDS-M Futures
     /// (`GET /fapi/v2/balance`) balances, merging both wallets into a
     /// single asset-symbol -> total-quantity map (matching

@@ -146,6 +146,7 @@ pub async fn run_backtest(
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
         control: config.control,
+        initial_prices: HashMap::new(),
     };
 
     run_unified_event_loop(

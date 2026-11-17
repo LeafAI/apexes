@@ -127,6 +127,8 @@ fn build_control_handle(
         evaluation: None,
         equity_history: Vec::new(),
         recent_orders: Vec::new(),
+        price_history: Default::default(),
+        equity_priced: true,
         positions: HashMap::new(),
         balances: HashMap::new(),
         equity: rust_decimal::Decimal::ZERO,
@@ -890,6 +892,13 @@ async fn run_live_mode(
         );
     }
 
+    let symbols: Vec<String> = launch_config
+        .instruments
+        .iter()
+        .map(|i| i.symbol.clone())
+        .collect();
+    let initial_prices = binance_gateway.last_prices(&symbols).await;
+
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
         initial_balances: session_balances,
@@ -898,6 +907,7 @@ async fn run_live_mode(
         margin_tiers: launch_config.margin_tiers.clone(),
         market_condition_config: launch_config.market_condition_config.clone(),
         auto_derisk_live,
+        initial_prices,
         risk_free_return: launch_config.risk_free_return,
         reconcile_interval,
         ems_postgres_url,

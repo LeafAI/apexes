@@ -1,5 +1,6 @@
 pub mod app_state;
 pub mod chart_state;
+pub mod chart_view;
 pub mod chrome;
 pub mod client;
 pub mod console_layout;

@@ -105,38 +105,31 @@ fn body(
         return;
     };
     let width = ui.available_width();
-    let tiles = crate::evaluation_view::key_tiles(snapshot.equity, snapshot.evaluation.as_ref());
+    let tiles = crate::evaluation_view::key_tiles(
+        snapshot.equity,
+        snapshot.equity_priced,
+        snapshot.evaluation.as_ref(),
+    );
     let layout = crate::console_layout::layout(width, tiles.len());
 
     key_figures(ui, &palette, &tiles, layout.tiles_per_row);
     ui.add_space(crate::widgets::GAP);
-    crate::evaluation_view::chart_card(ui, &snapshot);
+    crate::chart_view::chart_card(ui, &mut state.chart, &snapshot);
     ui.add_space(crate::widgets::GAP);
 
-    match &snapshot.evaluation {
-        Some(evaluation) => {
-            two_up(
-                ui,
-                layout.split_mid,
-                crate::console_layout::MID_LEFT_SHARE,
-                |ui| crate::evaluation_view::details_card(ui, evaluation),
-                |ui| crate::evaluation_view::limits_card(ui, &evaluation.limit_usage),
-            );
-        }
-        None => {
-            ui.label(crate::widgets::caption(
-                &palette,
-                "no evaluation data from this engine yet",
-            ));
-        }
-    }
-    ui.add_space(crate::widgets::GAP);
-
+    // Two columns: what the session has done on the left (details, then what
+    // it holds and has working), what constrains it on the right (limits, then
+    // balances). Stacked in that same order when the window is narrow.
     two_up(
         ui,
-        layout.split_bottom,
-        crate::console_layout::BOTTOM_LEFT_SHARE,
+        layout.split_cards,
+        crate::console_layout::CARDS_LEFT_SHARE,
         |ui| {
+            match &snapshot.evaluation {
+                Some(evaluation) => crate::evaluation_view::details_card(ui, evaluation),
+                None => no_evaluation(ui, &palette, snapshot.equity_priced),
+            }
+            ui.add_space(crate::widgets::GAP);
             crate::widgets::card(ui, &palette, |ui| {
                 positions(ui, &snapshot);
                 ui.add_space(10.0);
@@ -144,6 +137,10 @@ fn body(
             });
         },
         |ui| {
+            if let Some(evaluation) = &snapshot.evaluation {
+                crate::evaluation_view::limits_card(ui, &evaluation.limit_usage);
+                ui.add_space(crate::widgets::GAP);
+            }
             crate::widgets::card(ui, &palette, |ui| balances(ui, &snapshot));
         },
     );
@@ -161,7 +158,23 @@ fn body(
     ui.add_space(crate::widgets::GAP);
 }
 
-/// Two cards side by side (`split`) or stacked, so the narrow layout loses
+/// Why the details card is empty: a session still waiting for a price of an
+/// asset it holds is not an engine that lacks the feature.
+pub fn no_evaluation_text(priced: bool) -> &'static str {
+    if priced {
+        "no evaluation data from this engine yet"
+    } else {
+        "waiting for a price of a held asset before measuring PnL"
+    }
+}
+
+fn no_evaluation(ui: &mut egui::Ui, palette: &crate::theme::Palette, priced: bool) {
+    crate::widgets::card(ui, palette, |ui| {
+        ui.label(crate::widgets::caption(palette, no_evaluation_text(priced)));
+    });
+}
+
+/// Two columns side by side (`split`) or stacked, so the narrow layout loses
 /// nothing. The left one takes `left_share` of the row.
 ///
 /// Each card is given an exact width and clipped to it: a `Ui` that is only

@@ -17,6 +17,7 @@ pub mod error;
 
 pub mod control;
 pub mod evaluation;
+pub mod history;
 pub mod order_log;
 
 pub mod ems_adapter;

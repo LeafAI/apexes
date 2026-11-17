@@ -13,26 +13,26 @@ use crate::widgets::GAP;
 pub const MIN_TILE_WIDTH: f32 = 170.0;
 /// Most key-figure tiles shown in one row.
 pub const MAX_TILES_PER_ROW: usize = 6;
-/// Width from which the details card and the risk-limits card share a row.
-pub const SPLIT_MID_FROM: f32 = 640.0;
-/// Width from which positions/orders and balances share a row.
-pub const SPLIT_BOTTOM_FROM: f32 = 700.0;
+/// Width from which the two card columns sit side by side. Left: details,
+/// positions and open orders. Right: risk limits and balances.
+///
+/// 640 and not more: at the default 1180-point window the recent-orders side
+/// panel takes about 500 of it, leaving the body about 660 wide, and the
+/// columns must still split there (a test in `charts_and_layout` guards it).
+pub const SPLIT_CARDS_FROM: f32 = 640.0;
 /// Narrowest a strategy-parameter column may be.
 pub const MIN_PARAM_COLUMN: f32 = 330.0;
 pub const MAX_PARAM_COLUMNS: usize = 3;
 
-/// Width of the left part of the mid row when it is split (the details card),
-/// as a share of the row. The risk card gets the rest.
-pub const MID_LEFT_SHARE: f32 = 0.58;
-/// The same for the bottom row: positions and open orders (the wider one).
-pub const BOTTOM_LEFT_SHARE: f32 = 0.64;
+/// Share of the row the left column takes (details and the positions table,
+/// the wider content). The right column (limits, balances) gets the rest.
+pub const CARDS_LEFT_SHARE: f32 = 0.60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsoleLayout {
     /// Key-figure tiles per row, balanced so rows are as even as possible.
     pub tiles_per_row: usize,
-    pub split_mid: bool,
-    pub split_bottom: bool,
+    pub split_cards: bool,
     pub param_columns: usize,
 }
 
@@ -58,8 +58,7 @@ pub fn param_columns(width: f32) -> usize {
 pub fn layout(width: f32, tile_count: usize) -> ConsoleLayout {
     ConsoleLayout {
         tiles_per_row: balanced_tiles_per_row(width, tile_count),
-        split_mid: width >= SPLIT_MID_FROM,
-        split_bottom: width >= SPLIT_BOTTOM_FROM,
+        split_cards: width >= SPLIT_CARDS_FROM,
         param_columns: param_columns(width),
     }
 }
@@ -125,13 +124,11 @@ mod tests {
     }
 
     #[test]
-    fn cards_share_a_row_only_when_each_has_room() {
-        let narrow = layout(500.0, 6);
-        assert!(!narrow.split_mid && !narrow.split_bottom, "narrow: stacked");
-        let medium = layout(660.0, 6);
-        assert!(medium.split_mid && !medium.split_bottom);
-        let wide = layout(1260.0, 6);
-        assert!(wide.split_mid && wide.split_bottom);
+    fn the_two_card_columns_share_a_row_only_when_each_has_room() {
+        assert!(!layout(500.0, 6).split_cards, "narrow: stacked");
+        assert!(!layout(630.0, 6).split_cards);
+        assert!(layout(660.0, 6).split_cards, "the default window's body");
+        assert!(layout(1260.0, 6).split_cards);
     }
 
     #[test]
@@ -139,7 +136,7 @@ mod tests {
         // 760 wide minus margins, orders panel below: about 720 usable.
         let l = layout(720.0, 6);
         assert!(l.tiles_per_row >= 3);
-        assert!(l.split_mid && l.split_bottom);
+        assert!(l.split_cards);
         assert_eq!(l.param_columns, 2);
     }
 
