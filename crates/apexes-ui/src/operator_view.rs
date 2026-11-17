@@ -121,30 +121,27 @@ fn body(
     crate::chart_view::chart_card(ui, &mut state.chart, &snapshot);
     ui.add_space(crate::widgets::GAP);
 
-    // What the session has done: details, then what it holds and has working.
-    // With the orders panel beside the page, the constraints (limits, balances)
-    // live in that panel under the orders; without it (a narrow window) they
-    // take a second column here, stacked in the same order when very narrow.
-    let left = |ui: &mut egui::Ui| {
-        match &snapshot.evaluation {
-            Some(evaluation) => crate::evaluation_view::details_card(ui, evaluation),
-            None => no_evaluation(ui, &palette, snapshot.equity_priced),
-        }
-        ui.add_space(crate::widgets::GAP);
-        crate::widgets::card(ui, &palette, |ui| {
-            positions(ui, &snapshot);
-            ui.add_space(10.0);
-            open_orders(ui, &snapshot);
-        });
+    // Wide window: the main column is Details, and everything else about what
+    // the session holds and is bound by lives in the right-hand panel under the
+    // orders (positions, limits, balances). Narrow window: there is no side
+    // panel, so the body keeps two columns of its own, details and positions on
+    // the left, limits and balances on the right (one column when very narrow).
+    let details = |ui: &mut egui::Ui| match &snapshot.evaluation {
+        Some(evaluation) => crate::evaluation_view::details_card(ui, evaluation),
+        None => no_evaluation(ui, &palette, snapshot.equity_priced),
     };
     if placement == Placement::Side {
-        left(ui);
+        details(ui);
     } else {
         two_up(
             ui,
             layout.split_cards,
             crate::console_layout::CARDS_LEFT_SHARE,
-            left,
+            |ui| {
+                details(ui);
+                ui.add_space(crate::widgets::GAP);
+                positions_card(ui, &palette, &snapshot);
+            },
             |ui| limits_and_balances(ui, &palette, &snapshot),
         );
     }
@@ -162,6 +159,19 @@ fn body(
     ui.add_space(crate::widgets::GAP);
 }
 
+/// What the session holds and has working: its positions, then its open orders.
+fn positions_card(
+    ui: &mut egui::Ui,
+    palette: &crate::theme::Palette,
+    snapshot: &apexes_backtest::SessionSnapshot,
+) {
+    crate::widgets::card(ui, palette, |ui| {
+        positions(ui, snapshot);
+        ui.add_space(10.0);
+        open_orders(ui, snapshot);
+    });
+}
+
 /// Risk limits, then balances: what constrains the session and what it holds.
 fn limits_and_balances(
     ui: &mut egui::Ui,
@@ -175,8 +185,8 @@ fn limits_and_balances(
     crate::widgets::card(ui, palette, |ui| balances(ui, snapshot));
 }
 
-/// The right-hand column of a wide window: Recent orders, then Risk limits and
-/// Balances under it.
+/// The right-hand column of a wide window, top to bottom: Recent orders,
+/// Positions (with Open orders), Risk limits, Balances.
 fn side_column(ui: &mut egui::Ui, state: &mut OperatorState, palette: &crate::theme::Palette) {
     let Some(snapshot) = state.snapshot.clone() else {
         crate::widgets::card(ui, palette, |ui| {
@@ -190,6 +200,8 @@ fn side_column(ui: &mut egui::Ui, state: &mut OperatorState, palette: &crate::th
     crate::widgets::card(ui, palette, |ui| {
         orders_view::show(ui, &snapshot, &mut state.show_all_orders);
     });
+    ui.add_space(crate::widgets::GAP);
+    positions_card(ui, palette, &snapshot);
     ui.add_space(crate::widgets::GAP);
     limits_and_balances(ui, palette, &snapshot);
 }

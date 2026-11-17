@@ -95,6 +95,35 @@ fn snapshot(symbols: &[&str], priced: bool) -> SessionSnapshot {
     }
 }
 
+/// A session that holds a position and has an order working, so a render shows
+/// the positions card with content in it (a flat account shows only "flat").
+fn holding_snapshot() -> SessionSnapshot {
+    let mut snap = snapshot(&["BTCUSDT", "ETHUSDT", "BNBUSDT"], true);
+    snap.positions.insert(
+        "BTCUSDT".to_string(),
+        apexes_strategy::Position {
+            symbol: "BTCUSDT".to_string(),
+            quantity: dec!(0.12345),
+            average_entry_price: dec!(65432.1),
+            leverage: None,
+            margin_mode: None,
+            allocated_margin: dec!(0),
+        },
+    );
+    snap.open_orders = vec![apexes_backtest::OpenOrderView {
+        id: "o1".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        side: "Buy".to_string(),
+        order_type: "Limit".to_string(),
+        quantity: dec!(0.5),
+        filled_quantity: dec!(0.1),
+        price: Some(dec!(1795.5)),
+        status: "PartiallyFilled".to_string(),
+        created_at: Utc::now(),
+    }];
+    snap
+}
+
 fn state(snapshot: SessionSnapshot) -> OperatorState {
     let mut s = OperatorState::default();
     s.set_connection(ConnectionStatus::Connected);
@@ -239,53 +268,108 @@ fn a_priced_session_shows_the_equity_number() {
 
 // ---- layout ------------------------------------------------------------
 
-/// Wide window: the right column is the orders panel and holds Recent orders,
-/// then Risk limits, then Balances. The left column is Details, then Positions
-/// and Open orders.
+/// Wide window: the right column is the orders panel and holds, top to bottom,
+/// Recent orders, Positions (with Open orders), Risk limits, Balances. The main
+/// column keeps Details and the parameters.
 #[test]
-fn risk_limits_and_balances_sit_under_recent_orders_in_the_right_column() {
+fn the_right_column_runs_orders_then_positions_then_limits_then_balances() {
     let mut h = harness(state(snapshot(&["BTCUSDT"], true)), 1180.0);
     h.run();
     let orders = rect_of(&h, "Recent orders");
+    let positions = rect_of(&h, "Positions");
+    let open = rect_of(&h, "Open orders (0)");
     let limits = rect_of(&h, "Risk limits");
     let balances = rect_of(&h, "Balances");
     let details = rect_of(&h, "Details");
-    let positions = rect_of(&h, "Positions");
 
-    for (name, r) in [("Risk limits", limits), ("Balances", balances)] {
+    for (name, r) in [
+        ("Positions", positions),
+        ("Open orders", open),
+        ("Risk limits", limits),
+        ("Balances", balances),
+    ] {
         assert!(
             (r.min.x - orders.min.x).abs() < 2.0,
             "{name} shares Recent orders' column: {r:?} vs {orders:?}"
         );
     }
-    assert!(limits.min.y > orders.min.y, "limits under the orders list");
+    assert!(
+        positions.min.y > orders.min.y,
+        "positions under the orders list"
+    );
+    assert!(
+        open.min.y > positions.min.y,
+        "open orders are in the positions card"
+    );
+    assert!(
+        limits.min.y > open.min.y,
+        "limits under positions (and its open orders)"
+    );
     assert!(balances.min.y > limits.min.y, "balances under limits");
     assert!(
-        (details.min.x - positions.min.x).abs() < 2.0,
-        "details and positions share the left column"
-    );
-    assert!(
         orders.min.x > details.min.x + 300.0,
-        "the right column is to the right of the left: {details:?} {orders:?}"
+        "the right column is to the right of the main one: {details:?} {orders:?}"
     );
-    assert!(positions.min.y > details.min.y, "positions under details");
 }
 
-/// With limits and balances moved out, the left column has the whole main
-/// width: Details no longer shares a row with another card.
+/// Positions left the main column, so Details is the only card above the
+/// parameters there and nothing of the right column is beside it.
 #[test]
-fn the_left_column_no_longer_shares_its_row_with_limits() {
+fn positions_are_no_longer_in_the_main_column() {
     let mut h = harness(state(snapshot(&["BTCUSDT"], true)), 1180.0);
     h.run();
     let details = rect_of(&h, "Details");
-    let limits = rect_of(&h, "Risk limits");
-    assert!(
-        limits.min.x > details.min.x + 300.0 && limits.min.y < details.min.y + 600.0,
-        "limits are in the orders panel, not beside Details in the body"
-    );
-    // Positions' table has room: its card is as wide as Details' card.
     let positions = rect_of(&h, "Positions");
-    assert!((positions.min.x - details.min.x).abs() < 2.0);
+    assert!(
+        positions.min.x > details.min.x + 300.0,
+        "positions are in the right column: {details:?} {positions:?}"
+    );
+    let params = rect_of(&h, "Strategy parameters");
+    assert!(
+        (params.min.x - details.min.x).abs() < 2.0 && params.min.y > details.min.y,
+        "the main column is Details, then the parameters"
+    );
+}
+
+/// The positions table has six columns; the side panel is narrower than the
+/// body was, so the card must still hold them without running past its edge.
+#[test]
+fn a_position_row_fits_inside_the_side_panel() {
+    let mut snap = snapshot(&["BTCUSDT"], true);
+    snap.positions.insert(
+        "BTCUSDT".to_string(),
+        apexes_strategy::Position {
+            symbol: "BTCUSDT".to_string(),
+            quantity: dec!(0.12345),
+            average_entry_price: dec!(65432.1),
+            leverage: Some(dec!(3)),
+            margin_mode: None,
+            allocated_margin: dec!(0),
+        },
+    );
+    for width in [1100.0, 1180.0, 1500.0] {
+        let mut h = harness(state(snap.clone()), width);
+        h.run();
+        let orders = rect_of(&h, "Recent orders");
+        for label in [
+            "Symbol",
+            "Qty",
+            "Entry",
+            "Leverage",
+            "Margin ratio",
+            "Liq. price",
+        ] {
+            let r = rect_of(&h, label);
+            assert!(
+                r.max.x <= width + 1.0,
+                "width {width}: header {label} runs off the window: {r:?}"
+            );
+            assert!(
+                r.min.x >= orders.min.x - 1.0,
+                "{label} starts inside the column"
+            );
+        }
+    }
 }
 
 /// No side panel in a narrow window, so the cards keep their own two columns
@@ -367,13 +451,19 @@ fn the_two_columns_never_overlap() {
     for width in [720.0, 900.0, 1180.0, 1800.0] {
         let mut h = harness(state(snapshot(&["BTCUSDT"], true)), width);
         h.run();
-        let positions = rect_of(&h, "Positions");
+        let details = rect_of(&h, "Details");
         let limits = rect_of(&h, "Risk limits");
+        // Wide: limits are in the orders panel, right of the whole main
+        // column. Narrow: they are the body's right column, right of Positions.
+        let left_edge_of_right = if width >= 1100.0 {
+            details.min.x + 300.0
+        } else {
+            rect_of(&h, "Positions").min.x + 200.0
+        };
         assert!(
-            limits.min.x >= positions.min.x + 200.0,
-            "width {width}: right column starts at {} left at {}",
+            limits.min.x >= left_edge_of_right,
+            "width {width}: right column starts at {} (needs {left_edge_of_right})",
             limits.min.x,
-            positions.min.x
         );
         assert!(limits.max.x <= width + 1.0, "width {width}: {limits:?}");
     }
@@ -568,7 +658,7 @@ fn render_shell_hover(
     chrome.set(theme);
     let handle = runtime.handle().clone();
     let supervisor = apexes_supervisor::Supervisor::new(&home);
-    let mut s = state(snapshot(&["BTCUSDT", "ETHUSDT", "BNBUSDT"], true));
+    let mut s = state(holding_snapshot());
     s.engine_url = "test".to_string();
     let mut h = Harness::builder()
         .with_size(egui::vec2(size[0], size[1]))
@@ -620,6 +710,11 @@ fn renders_the_real_shell_window() {
         "{}",
         render_shell_at(ThemeChoice::Light, [1500.0, 1000.0], 1.0, "large")
     );
+    // The narrowest window that still gets the side panel.
+    println!(
+        "{}",
+        render_shell_at(ThemeChoice::Light, [1130.0, 900.0], 1.0, "narrowest-side")
+    );
     // The mouse resting on the gap between the cards and the orders panel,
     // then over the main column.
     for (name, at) in [
@@ -660,5 +755,30 @@ fn the_mouse_over_the_page_draws_no_full_height_bar() {
     assert!(
         tall.is_empty(),
         "hovering the page draws a tall bar at x = {tall:?}"
+    );
+}
+
+/// The side panel is a fixed-default, resizable column. Content (a wide open
+/// orders table) must not widen it past its default, and it must not creep
+/// wider frame after frame.
+#[test]
+fn the_side_panel_keeps_its_width_with_a_wide_table_and_does_not_grow() {
+    let width_of = |snap: SessionSnapshot, frames: usize| {
+        let mut h = harness(state(snap), 1500.0);
+        h.step();
+        h.step();
+        let first = rect_of(&h, "Recent orders").min.x;
+        for _ in 0..frames {
+            h.step();
+        }
+        (first, rect_of(&h, "Recent orders").min.x)
+    };
+    let (empty_first, empty_last) = width_of(snapshot(&["BTCUSDT"], true), 20);
+    let (full_first, full_last) = width_of(holding_snapshot(), 20);
+    assert_eq!(empty_first, empty_last, "an empty panel settles");
+    assert_eq!(full_first, full_last, "a panel with tables settles");
+    assert!(
+        (full_last - empty_last).abs() < 2.0,
+        "content must not change the column's width: {empty_last} vs {full_last}"
     );
 }

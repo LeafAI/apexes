@@ -23,7 +23,7 @@ use crate::number_format;
 pub const SIDE_BY_SIDE_MIN_WIDTH: f32 = 1100.0;
 /// Narrowest the side panel is allowed to be dragged to.
 pub const SIDE_PANEL_MIN_WIDTH: f32 = 380.0;
-pub const SIDE_PANEL_DEFAULT_WIDTH: f32 = 500.0;
+pub const SIDE_PANEL_DEFAULT_WIDTH: f32 = 560.0;
 /// Widest the side panel may be dragged to, so it can never push the main
 /// column (where HALT and the evaluation live) below a usable width.
 pub const SIDE_PANEL_MAX_WIDTH: f32 = 640.0;
