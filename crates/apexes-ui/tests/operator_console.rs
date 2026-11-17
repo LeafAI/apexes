@@ -646,23 +646,117 @@ fn the_panel_settles_and_does_not_grow_frame_after_frame() {
     );
 }
 
+/// `n` orders, newest first, each a second apart. The oldest is on `ZZZUSDT`
+/// so it can be told apart from the rest.
+fn many_orders(n: i64) -> Vec<apexes_backtest::OrderRecord> {
+    (0..n)
+        .map(|i| {
+            let mut o = order(
+                10 + i,
+                if i % 2 == 0 { "Buy" } else { "Sell" },
+                "Filled",
+                None,
+            );
+            if i == n - 1 {
+                o.symbol = "ZZZUSDT".to_string();
+            }
+            o
+        })
+        .collect()
+}
+
+/// The y of the card under the orders panel's list: it moves down if the list
+/// grows, so it measures the list's height without naming any widget.
+fn y_of_card_under_orders(h: &Harness<'static, Fixture>) -> f32 {
+    h.get_by_label("Positions").rect().min.y
+}
+
+/// The list is about ten orders tall however many there are: 45 orders take
+/// no more room than 10, and fewer orders take less.
 #[test]
-fn only_the_newest_orders_are_drawn_until_the_operator_asks_for_more() {
-    let orders: Vec<_> = (0..45)
-        .map(|i| order(10 + i, "Buy", "Filled", None))
-        .collect();
-    let mut h = wide_harness(state_with_orders(orders), 1180.0);
-    h.run();
-    assert!(has_text(&h, "45 orders"));
-    assert!(has_text(&h, "Show 15 older"));
-    h.get_by_label_contains("Show 15 older").click();
-    h.run();
-    assert!(!has_text(&h, "Show 15 older"));
-    assert!(has_text(&h, "Show fewer"));
+fn the_orders_list_is_ten_rows_tall_however_many_orders_there_are() {
+    let y = |n: i64| {
+        let mut h = wide_harness(state_with_orders(many_orders(n)), 1180.0);
+        h.run();
+        y_of_card_under_orders(&h)
+    };
+    let (three, ten, forty_five, hundred) = (y(3), y(10), y(45), y(100));
+    assert!(three < ten, "fewer orders take less room: {three} vs {ten}");
     assert!(
-        h.state().0.show_all_orders,
-        "the choice is kept in the state"
+        (ten - forty_five).abs() < 2.0 && (ten - hundred).abs() < 2.0,
+        "the list is capped at ten rows: 10 -> {ten}, 45 -> {forty_five}, 100 -> {hundred}"
     );
+}
+
+/// "Ten rows" is the visible height: the eleventh order starts past the end of
+/// the box and the oldest is far past it, so the box has to scroll to reach them.
+#[test]
+fn only_ten_orders_are_visible_and_the_rest_are_reached_by_scrolling() {
+    let mut h = wide_harness(state_with_orders(many_orders(45)), 1180.0);
+    h.run();
+    let oldest = h.get_by_label("ZZZUSDT");
+    let before = oldest.rect().min.y;
+    let box_bottom = y_of_card_under_orders(&h);
+    assert!(
+        before > box_bottom,
+        "the oldest order is below the list's visible end: {before} vs {box_bottom}"
+    );
+    oldest.scroll_to_me();
+    h.run();
+    let after = h.get_by_label("ZZZUSDT").rect().min.y;
+    assert!(
+        after < box_bottom && after < before,
+        "scrolling brings the oldest order into the box: {before} -> {after} (box ends {box_bottom})"
+    );
+}
+
+/// The column names stay put while the list scrolls (they are above it, not in it).
+#[test]
+fn the_column_headings_stay_in_place_while_the_orders_scroll() {
+    let mut h = wide_harness(state_with_orders(many_orders(45)), 1180.0);
+    h.run();
+    let head = h.get_by_label("Status").rect().min.y;
+    h.get_by_label("ZZZUSDT").scroll_to_me();
+    h.run();
+    assert_eq!(h.get_by_label("Status").rect().min.y, head);
+}
+
+/// A refused order carries a reason line under it, so ten of those are taller
+/// than ten plain rows. The box is sized from real heights, so it still shows
+/// ten orders and never cuts the tenth one in half.
+#[test]
+fn ten_refused_orders_get_a_taller_box_than_ten_plain_ones_and_none_is_cut() {
+    let refused: Vec<_> = (0..45)
+        .map(|i| {
+            order(
+                10 + i,
+                "Buy",
+                "Rejected",
+                Some(
+                    "quantity 0.0004 is below the 0.001 step: it rounds to nothing (minimum 0.001)",
+                ),
+            )
+        })
+        .collect();
+    let mut h = wide_harness(state_with_orders(refused), 1180.0);
+    h.run();
+    let tall = y_of_card_under_orders(&h);
+    let mut h = wide_harness(state_with_orders(many_orders(45)), 1180.0);
+    h.run();
+    let plain = y_of_card_under_orders(&h);
+    assert!(tall > plain + 40.0, "reasons add height: {tall} vs {plain}");
+}
+
+/// Every recorded order can be reached, not only the newest thirty the old
+/// "show older" button stopped at.
+#[test]
+fn all_one_hundred_recorded_orders_are_reachable() {
+    let mut h = wide_harness(state_with_orders(many_orders(100)), 1180.0);
+    h.run();
+    assert!(has_text(&h, "100 orders"));
+    h.get_by_label("ZZZUSDT").scroll_to_me();
+    h.run();
+    assert!(has_text(&h, "ZZZUSDT"));
 }
 
 // ---- Reachability at the smallest window the app allows -------------------

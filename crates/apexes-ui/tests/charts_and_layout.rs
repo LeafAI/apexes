@@ -99,6 +99,27 @@ fn snapshot(symbols: &[&str], priced: bool) -> SessionSnapshot {
 /// the positions card with content in it (a flat account shows only "flat").
 fn holding_snapshot() -> SessionSnapshot {
     let mut snap = snapshot(&["BTCUSDT", "ETHUSDT", "BNBUSDT"], true);
+    snap.recent_orders = (0..45)
+        .map(|i| {
+            let refused = i % 7 == 3;
+            apexes_backtest::OrderRecord {
+                id: format!("r{i}"),
+                at: Utc::now() - Duration::seconds(30 * i),
+                symbol: ["ETHUSDT", "BTCUSDT", "BNBUSDT"][(i % 3) as usize].to_string(),
+                side: if i % 2 == 0 { "Buy" } else { "Sell" }.to_string(),
+                order_type: "Market".to_string(),
+                quantity: dec!(0.0272),
+                limit_price: None,
+                filled_quantity: if refused { dec!(0) } else { dec!(0.0272) },
+                avg_fill_price: (!refused).then_some(dec!(1834.9)),
+                status: if refused { "Rejected" } else { "Filled" }.to_string(),
+                detail: refused.then(|| {
+                    "quantity 0.0004 is below the 0.001 step: it rounds to nothing (minimum 0.001)"
+                        .to_string()
+                }),
+            }
+        })
+        .collect();
     snap.positions.insert(
         "BTCUSDT".to_string(),
         apexes_strategy::Position {

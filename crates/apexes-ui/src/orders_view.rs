@@ -28,8 +28,9 @@ pub const SIDE_PANEL_DEFAULT_WIDTH: f32 = 560.0;
 /// column (where HALT and the evaluation live) below a usable width.
 pub const SIDE_PANEL_MAX_WIDTH: f32 = 640.0;
 
-/// Orders shown unless the operator asks for all of them.
-pub const DEFAULT_SHOWN: usize = 30;
+/// Orders visible at once. The list scrolls beyond that, so a busy strategy
+/// cannot push the cards under it (positions, limits, balances) off the screen.
+pub const VISIBLE_ORDERS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
@@ -172,9 +173,10 @@ pub fn today_local() -> chrono::NaiveDate {
     Local::now().date_naive()
 }
 
-/// Draws the panel's contents. `show_all` is the operator's "show all"
-/// choice, kept by the caller so it survives redraws and tab switches.
-pub fn show(ui: &mut egui::Ui, snapshot: &apexes_backtest::SessionSnapshot, show_all: &mut bool) {
+/// Draws the panel's contents: a title, a summary, the column headings, and the
+/// orders in a box that is [`VISIBLE_ORDERS`] tall and scrolls for the rest
+/// (every recorded order is reachable, newest first).
+pub fn show(ui: &mut egui::Ui, snapshot: &apexes_backtest::SessionSnapshot) {
     let palette = crate::theme::palette_of(ui.ctx());
     ui.heading("Recent orders");
     ui.weak(summary(&snapshot.recent_orders));
@@ -184,37 +186,48 @@ pub fn show(ui: &mut egui::Ui, snapshot: &apexes_backtest::SessionSnapshot, show
         return;
     }
     let zone = crate::time_axis::local_zone();
-    let today = today_local();
-    let limit = if *show_all { usize::MAX } else { DEFAULT_SHOWN };
-    let (rows, hidden) = rows(&zone, &snapshot.recent_orders, limit, today);
+    let (rows, _) = rows(&zone, &snapshot.recent_orders, usize::MAX, today_local());
+    // The panel is resizable: rows are laid out in exactly the width it has
+    // now, never asking for more (asking made it grow every frame).
+    let width = ui.available_width();
+    // The headings sit above the box, so they stay put while the orders scroll.
+    ui.spacing_mut().item_spacing.y = 1.0;
+    header_row(ui, width);
     egui::ScrollArea::vertical()
         .id_salt("recent_orders_scroll")
+        .max_height(visible_height(&rows))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            // One small grid per order, not one grid for all: a refusal's
-            // reason needs the panel's full width, and inside a shared grid it
-            // is squeezed into the narrow first column.
-            // The panel is resizable: columns are laid out in the width it
-            // currently has, never asking for more (asking made it grow every
-            // frame).
-            // Rows are laid out in exactly the width the panel has now.
             ui.spacing_mut().item_spacing.y = 1.0;
             let width = ui.available_width();
-            header_row(ui, width);
             for (i, r) in rows.iter().enumerate() {
                 order_row(ui, i, r, &palette, width);
             }
-            if hidden > 0 && ui.small_button(format!("Show {hidden} older")).clicked() {
-                *show_all = true;
-            }
-            if *show_all
-                && snapshot.recent_orders.len() > DEFAULT_SHOWN
-                && ui.small_button("Show fewer").clicked()
-            {
-                *show_all = false;
-            }
         });
 }
+
+/// Height of the first [`VISIBLE_ORDERS`] rows, so the box shows exactly that
+/// many: a refused order has a reason line under it and is taller than a plain
+/// one, so this is summed per row and not multiplied.
+pub fn visible_height(rows: &[Row]) -> f32 {
+    rows.iter().take(VISIBLE_ORDERS).map(row_height).sum()
+}
+
+/// One row's height: its line, plus its reason line when it has one, plus the
+/// spacing between rows.
+pub fn row_height(row: &Row) -> f32 {
+    let spacing = 1.0;
+    let reason = if row.detail.is_some() {
+        REASON_LINE + spacing
+    } else {
+        0.0
+    };
+    LINE + spacing + reason
+}
+
+/// A refusal's reason, small and weak, under its row. Wraps to the panel's
+/// width, so a long reason can take more than one of these.
+const REASON_LINE: f32 = 14.0;
 
 /// Column widths as fractions of the panel, so the columns line up between the
 /// header and every row. They sum to 1: a row is exactly the panel wide.
@@ -424,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_are_drawn_and_the_rest_are_counted() {
+    fn every_recorded_order_becomes_a_row_newest_first() {
         let records: Vec<OrderRecord> = (0..45)
             .map(|i| {
                 let mut r = record(order_log::FILLED, dec!(0.0007));
@@ -432,12 +445,34 @@ mod tests {
                 r
             })
             .collect();
-        let (shown, hidden) = rows(&kst(), &records, DEFAULT_SHOWN, today());
-        assert_eq!((shown.len(), hidden), (30, 15));
         let (all, hidden) = rows(&kst(), &records, usize::MAX, today());
         assert_eq!((all.len(), hidden), (45, 0));
-        let (none, hidden) = rows(&kst(), &[], DEFAULT_SHOWN, today());
+        let (none, hidden) = rows(&kst(), &[], usize::MAX, today());
         assert_eq!((none.len(), hidden), (0, 0));
+    }
+
+    #[test]
+    fn the_visible_height_is_ten_rows_and_a_reason_makes_a_row_taller() {
+        let plain = row(&kst(), &record(order_log::FILLED, dec!(0.0007)), today());
+        let mut refused_record = record(order_log::REJECTED, dec!(0.0007));
+        refused_record.detail = Some("below the minimum".to_string());
+        let refused = row(&kst(), &refused_record, today());
+        assert!(row_height(&refused) > row_height(&plain));
+        let twelve: Vec<Row> = (0..12).map(|_| plain.clone()).collect();
+        assert_eq!(
+            visible_height(&twelve),
+            10.0 * row_height(&plain),
+            "ten rows, not twelve"
+        );
+        let three: Vec<Row> = (0..3).map(|_| plain.clone()).collect();
+        assert_eq!(
+            visible_height(&three),
+            3.0 * row_height(&plain),
+            "fewer take less"
+        );
+        assert_eq!(visible_height(&[]), 0.0);
+        let ten_refused: Vec<Row> = (0..12).map(|_| refused.clone()).collect();
+        assert_eq!(visible_height(&ten_refused), 10.0 * row_height(&refused));
     }
 
     #[test]

@@ -167,7 +167,7 @@ fn body(
     if placement == Placement::Below {
         ui.add_space(crate::widgets::GAP);
         crate::widgets::card(ui, &palette, |ui| {
-            orders_view::show(ui, &snapshot, &mut state.show_all_orders);
+            orders_view::show(ui, &snapshot);
         });
     }
     ui.add_space(crate::widgets::GAP);
@@ -216,7 +216,7 @@ fn side_column(ui: &mut egui::Ui, state: &mut OperatorState, palette: &crate::th
         return;
     };
     crate::widgets::card(ui, palette, |ui| {
-        orders_view::show(ui, &snapshot, &mut state.show_all_orders);
+        orders_view::show(ui, &snapshot);
     });
     ui.add_space(crate::widgets::GAP);
     positions_card(ui, palette, &snapshot);

@@ -105,9 +105,6 @@ pub struct OperatorState {
     pub pending: Option<OperatorAction>,
     /// Text being typed into each parameter's edit box.
     pub param_edits: BTreeMap<String, String>,
-    /// The operator asked for every recorded order, not just the newest.
-    /// Kept here, not in the drawing code, so it survives tab switches.
-    pub show_all_orders: bool,
     /// Which chart the card shows. Kept here so it survives tab switches.
     pub chart: crate::chart_view::ChartView,
     /// The engine this console talks to, for the connection's hover text.
