@@ -36,16 +36,9 @@ use crate::matching_engine::MatchingEngine;
 /// through one single order book, not two independent simulations.
 pub struct MatchingEngineOrderExecutor {
     engine: Arc<Mutex<MatchingEngine>>,
-    /// Every order this executor has ever submitted, keyed by
-    /// `OrderId`. `MatchingEngine` itself keeps no such lookup table
-    /// (see `ems_adapter`'s `submitted` field for the same precedent),
-    /// so this adapter keeps its own -- taking over the role a
-    /// caller's own local `open_orders: HashMap<OrderId, Order>` map
-    /// used to play before this crate's event loop was unified. NEVER
-    /// pruned on terminal status (preserving that exact, however
-    /// unbounded, existing behavior is required by this plan's
-    /// behavior-preservation constraint, not a defect this task is
-    /// meant to fix).
+    /// Working orders only, matching the live OMS contract. Terminal
+    /// orders are reported through submissions/fills and the OrderLog,
+    /// not retained in the strategy's open-order view.
     open_orders: Mutex<HashMap<OrderId, Order>>,
 }
 
@@ -96,7 +89,12 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         };
 
         let (order, fills) = submit_result?;
-        self.lock_open_orders().insert(order.id, order.clone());
+        if matches!(
+            order.status,
+            OrderStatus::New | OrderStatus::PartiallyFilled
+        ) {
+            self.lock_open_orders().insert(order.id, order.clone());
+        }
         Ok((order, fills))
     }
 
@@ -122,6 +120,12 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
                         }
                     }
                 }
+                open_orders.retain(|_, order| {
+                    matches!(
+                        order.status,
+                        OrderStatus::New | OrderStatus::PartiallyFilled
+                    )
+                });
                 fill_results
             }
             MarketEvent::Depth(update) => {
@@ -233,6 +237,7 @@ mod tests {
             "crossing market order must fill immediately"
         );
         assert_eq!(order.status, OrderStatus::Filled);
+        assert!(!executor.open_orders().await.contains_key(&order.id));
     }
 
     #[tokio::test]
@@ -319,9 +324,11 @@ mod tests {
         assert!(!fills.is_empty());
 
         let open_orders = executor.open_orders().await;
-        let tracked = open_orders.get(&order.id).unwrap();
-        assert_eq!(tracked.status, OrderStatus::Filled);
-        assert_eq!(tracked.filled_quantity, dec!(1));
+        assert!(!open_orders.contains_key(&order.id));
+        assert_eq!(
+            fills.iter().map(|fill| fill.quantity).sum::<Decimal>(),
+            dec!(1)
+        );
     }
 
     #[test]
