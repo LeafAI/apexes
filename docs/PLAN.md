@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (quantitative enhancement baseline qualification)_
+_Last updated: 2026-11-26 (trading diagnostics qualification)_
 
 ---
 
@@ -26,7 +26,9 @@ Feature F00.01: preserve the original Trend Guard script and add deterministic
 offline replay through the real Drift runtime and matching engine. See the
 [feature plan](superpowers/plans/2026-11-25-apexes-quantitative-enhancement.md)
 and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design.md).
-Next: F00.02 decision diagnostics, then safety/reliability and configurable
+PR #11 passed all three CI jobs and merged into the integration branch; PR #12 promotes it to master.
+F00.02 now adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)).
+Next: safety/reliability and configurable
 costs (F01, F02, F03.01). Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
@@ -41,9 +43,19 @@ isolated PostgreSQL 17 instance, stopped afterwards. No live databases or
 exchange orders were used. The prior failing flatten test was caused by
 the unavailable database, and all 22 live-trading unit tests passed with
 the isolated database. Docker/ClickHouse and ignored external integration
-tests were not available/qualified. The local base 910cb22 contains 20
-pre-existing commits not on origin/master (1fad37d); do not publish them
-implicitly. Remote CI/merge remains blocked until a safe baseline is agreed.
+tests were not available/qualified. The 20 existing local baseline commits were approved, passed CI, and merged in PR #10. PR #11 passed remote CI and merged into the integration branch; promotion to master is PR #12.
+
+F00.02 local qualification (Rust 1.99.0, locked): full workspace build,
+formatting, Clippy with warnings denied, all 1,299 default tests across
+serial split runs (0 failures, 75 ignored), and all 30 doc-test suites passed.
+A new temporary loopback PostgreSQL 17 database was used for the default
+database-dependent tests and stopped afterwards. New tests cover real
+Drift order/fill correlation, pretrade refusal, synthetic-secret omission,
+and supplemental fill ledger success/failure. No live exchange or database
+was used. External ignored tests and remote CI for F00.02 remain pending.
+The log target, correlation contract and known redaction boundary are
+documented in the design and RUNBOOK. The log does not repair ledger
+discrepancies; F02.02 addresses reconciliation.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 
@@ -235,7 +247,7 @@ Ordered by the roadmap's "vertical slice first" principle. None of these has a s
 ## Carry-forward technical debt
 
 - Simulated immediate market orders with insufficient visible depth currently remain New/PartiallyFilled despite no resting market-order mechanism; resolve under F03.02 with explicit terminal remainder semantics and tests.
-- F00.01 local workspace qualification passed; remote baseline integration, CI and ignored external integration tests remain unverified. Synthetic data is not a profitability result.
+- F00.01 local and remote CI qualification passed (including database integration tests); PR #12 promotion and live-exchange qualification remain pending. Synthetic data is not a profitability result.
 
 Found during reviews and deliberately deferred. Close them in the 13c final review (Task 14) or schedule them as their own tasks.
 

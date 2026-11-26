@@ -102,7 +102,8 @@ impl InMemoryEms {
         params: &SliceParams,
         quantity: Decimal,
     ) -> Result<(apexes_core::OrderId, Vec<Fill>), EmsError> {
-        self.sink
+        let result = self
+            .sink
             .submit_child_order(ChildOrderIntent {
                 symbol: params.symbol.clone(),
                 venue: params.venue,
@@ -116,7 +117,16 @@ impl InMemoryEms {
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id,
                 reason: error.to_string(),
-            })
+            });
+        match &result {
+            Ok((order_id, _)) => {
+                tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %order_id.0)
+            }
+            Err(_) => {
+                tracing::info!(target: "apexes::decision", stage = "ems_child_failed", parent_id = %parent_id.0, reason = "child_submission_failed")
+            }
+        }
+        result
     }
 
     /// Submits one TWAP slice for `parent_id` (whichever venue
