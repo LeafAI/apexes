@@ -1,0 +1,179 @@
+// TESTNET ONLY. A low-frequency, long-only trend follower for Binance Spot.
+// Not a guaranteed profit: it is built to lose small, trade rarely, and be
+// easy to measure. Fees (about 0.1% per side) are the main enemy, so it only
+// trades when the trend is clear and the market is actually moving.
+//
+// Idea
+//   * Trend: a fast EMA over a slow EMA of trade prices, with a gap
+//     (hysteresis) between the entry and exit thresholds so it does not flip
+//     on noise like the demo did.
+//   * Activity gate: skip entries when recent price dispersion is too low to
+//     beat fees.
+//   * Exits (first one wins): stop loss, take profit, trend broken, or
+//     enabled = 0. All are computed from ctx.get_position(), so they work
+//     even if the script's own state is lost.
+//   * Brakes: cooldown after every exit (3x longer after a stop), a minimum
+//     gap between any two orders (so a rejected order is retried slowly
+//     instead of on every trade), and a cap on entries per session so the
+//     launch config's daily order limit (50 by default) can never lock the
+//     strategy out of selling.
+//
+// Periods are counted in TRADES, not minutes. On a thin testnet that can be
+// many trades per minute or very few. Check the first 10-15 minutes and
+// adjust the two EMA periods below if the strategy warms up too slowly.
+//
+// Tunable from the console while running (read INSIDE on_market_event):
+//   notional         USDT to hold when long (keep >= 5 and within the launch
+//                    config's order value / position limits)
+//   step             smallest quantity increment (0.0001 for ETHUSDT)
+//   enabled          1 = trade, 0 = sell what is held and stay flat
+//   entry_pct        fast EMA must be this % above the slow EMA to enter
+//   exit_pct         fast EMA this % below the slow EMA ends the trade
+//   min_vol_pct      minimum price std-dev as a % of price to allow entries
+//   stop_pct         stop loss, % below average entry price
+//   target_pct       take profit, % above average entry price
+//   cooldown_trades  trades to wait after an exit before re-entering
+//   order_gap_trades minimum trades between any two orders
+//   max_entries      most entries per session (0 = no new entries)
+//   min_notional     positions worth less than this (USDT) count as dust
+//
+// Assumes a single symbol per session: the indicators are shared.
+
+let fast_ema = indicators.ema(30);
+let slow_ema = indicators.ema(120);
+let dispersion = indicators.stddev(120);
+
+// Script state. Persists between events in the script's top-level scope.
+let trades_seen = 0;
+let last_order_at = -1000000;
+let cooldown_until = 0;
+let entries_sent = 0;
+
+function on_market_event(event, ctx) {
+  if (event.type != "trade") {
+    return [];
+  }
+
+  let notional = param("notional", 50);
+  let step = param("step", 0.0001);
+  let enabled = param("enabled", 1);
+  let entry_pct = param("entry_pct", 0.08);
+  let exit_pct = param("exit_pct", 0.03);
+  let min_vol_pct = param("min_vol_pct", 0.03);
+  let stop_pct = param("stop_pct", 0.6);
+  let target_pct = param("target_pct", 1.5);
+  let cooldown = param("cooldown_trades", 150);
+  let order_gap = param("order_gap_trades", 20);
+  let max_entries = param("max_entries", 15);
+  let min_notional = param("min_notional", 6);
+
+  let price = event.price;
+  trades_seen = trades_seen + 1;
+
+  // Update every indicator on every trade BEFORE any early return, so they
+  // keep warming up even while we are blocked from trading.
+  let fast = fast_ema.update(price);
+  let slow = slow_ema.update(price);
+  let dev = dispersion.update(price);
+  if (fast == null) {
+    return [];
+  }
+  if (slow == null) {
+    return [];
+  }
+  if (dev == null) {
+    return [];
+  }
+
+  // One working order at a time, and a minimum gap between orders.
+  if (ctx.has_open_order(event.symbol)) {
+    return [];
+  }
+  if (trades_seen - last_order_at < order_gap) {
+    return [];
+  }
+
+  let position = ctx.get_position(event.symbol);
+  let held = position.quantity;
+  let in_position = held * price >= min_notional;
+
+  // ---- Exit ----
+  if (in_position) {
+    let entry = position.average_entry_price;
+    let hit_stop = entry > 0 && price <= entry * (1 - stop_pct / 100);
+    let hit_target = entry > 0 && price >= entry * (1 + target_pct / 100);
+    let trend_broke = fast < slow * (1 - exit_pct / 100);
+    let switched_off = enabled <= 0;
+
+    let should_exit = false;
+    if (hit_stop) {
+      should_exit = true;
+    }
+    if (hit_target) {
+      should_exit = true;
+    }
+    if (trend_broke) {
+      should_exit = true;
+    }
+    if (switched_off) {
+      should_exit = true;
+    }
+
+    if (should_exit) {
+      // Round DOWN to whole steps. The tiny epsilon only absorbs
+      // floating-point residue; it never rounds a real remainder up, so we
+      // never try to sell more than we hold.
+      let sell_qty = math.floor(held / step + 0.000001) * step;
+      if (sell_qty <= 0) {
+        return [];
+      }
+      last_order_at = trades_seen;
+      cooldown_until = trades_seen + (hit_stop ? cooldown * 3 : cooldown);
+      return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "sell",
+        order_type: "market",
+        quantity: sell_qty,
+      }];
+    }
+    return [];
+  }
+
+  // ---- Entry ----
+  if (enabled <= 0) {
+    return [];
+  }
+  if (entries_sent >= max_entries) {
+    return [];
+  }
+  if (trades_seen < cooldown_until) {
+    return [];
+  }
+
+  let trend_up = fast > slow * (1 + entry_pct / 100);
+  if (!trend_up) {
+    return [];
+  }
+  let active = dev / price * 100 >= min_vol_pct;
+  if (!active) {
+    return [];
+  }
+
+  let buy_qty = math.floor(notional / price / step + 0.000001) * step;
+  if (buy_qty <= 0) {
+    return [];
+  }
+
+  entries_sent = entries_sent + 1;
+  last_order_at = trades_seen;
+  return [{
+    symbol: event.symbol,
+    venue: event.venue,
+    asset_class: "spot",
+    side: "buy",
+    order_type: "market",
+    quantity: buy_qty,
+  }];
+}

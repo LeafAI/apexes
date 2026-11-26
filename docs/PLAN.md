@@ -16,11 +16,36 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-15 (testnet MVP built; e2e run against the real testnet)_
+_Last updated: 2026-11-26 (quantitative enhancement baseline qualification)_
 
 ---
 
-## Now — Binance Spot testnet MVP: built; remaining verification and polish
+## Now — Quantitative trading enhancement
+
+Feature F00.01: preserve the original Trend Guard script and add deterministic
+offline replay through the real Drift runtime and matching engine. See the
+[feature plan](superpowers/plans/2026-11-25-apexes-quantitative-enhancement.md)
+and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design.md).
+Next: F00.02 decision diagnostics, then safety/reliability and configurable
+costs (F01, F02, F03.01). Feature statuses remain in FEATURES.md.
+
+Baseline discovered a simulator defect: completed orders remained in
+open_orders and blocked all later strategy orders. The regression now checks
+the real script's round trip and removes terminal orders from that view.
+
+Local qualification (Rust 1.99.0, locked dependencies): workspace build,
+formatting, Clippy with warnings denied, and all 78 non-doc test binaries
+passed in split runs (1,295 passed, 0 failed, 75 ignored); 30 doc-test
+suites passed. PostgreSQL-dependent default tests ran against a temporary
+isolated PostgreSQL 17 instance, stopped afterwards. No live databases or
+exchange orders were used. The prior failing flatten test was caused by
+the unavailable database, and all 22 live-trading unit tests passed with
+the isolated database. Docker/ClickHouse and ignored external integration
+tests were not available/qualified. The local base 910cb22 contains 20
+pre-existing commits not on origin/master (1fad37d); do not publish them
+implicitly. Remote CI/merge remains blocked until a safe baseline is agreed.
+
+## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 
 **Goal.** One operator can start a Binance **Spot testnet** live session from a UI, watch it, tune it, halt it, and judge the strategy and its risk from a live timeline. Mainnet is an explicit opt-in (typed `MAINNET`) and is not part of this MVP's acceptance. Design: [`specs/2026-11-15-apexes-binance-spot-testnet-mvp-design.md`](superpowers/specs/2026-11-15-apexes-binance-spot-testnet-mvp-design.md). Operating it: [`RUNBOOK.md`](RUNBOOK.md).
 
@@ -208,6 +233,9 @@ Ordered by the roadmap's "vertical slice first" principle. None of these has a s
 ---
 
 ## Carry-forward technical debt
+
+- Simulated immediate market orders with insufficient visible depth currently remain New/PartiallyFilled despite no resting market-order mechanism; resolve under F03.02 with explicit terminal remainder semantics and tests.
+- F00.01 local workspace qualification passed; remote baseline integration, CI and ignored external integration tests remain unverified. Synthetic data is not a profitability result.
 
 Found during reviews and deliberately deferred. Close them in the 13c final review (Task 14) or schedule them as their own tasks.
 
