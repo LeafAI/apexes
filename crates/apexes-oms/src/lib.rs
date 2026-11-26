@@ -23,7 +23,7 @@ pub mod store;
 
 pub use error::OmsError;
 pub use exchange_update::ExchangeUpdate;
-pub use gateway::{ExchangeFill, ExecutionGateway, GatewayOutcome};
+pub use gateway::{ExchangeFill, ExecutionGateway, GatewayOutcome, OrderExecutionSnapshot};
 pub use kill_switch::{KillSwitch, SessionPhase};
 pub use manager::{CancelAllReport, OrderManager};
 pub use mock_gateway::MockExecutionGateway;

@@ -367,3 +367,19 @@ orders/fills or blindly set the owner marker. Credential changes and
 instrument-set changes also require review. Automatic legacy adoption,
 continuous reservations and account-wide coordination are not implemented
 in this iteration. Existing data is preserved.
+
+### Authoritative fill reconciliation (F02.02)
+
+Managed Spot sessions verify cumulative execution quantity and persist
+fills and order status atomically. Repeated partial fills and executions
+that race with cancellation are included in the durable journal.
+Ordinary order submission waits for ledger acknowledgement. Contradictory
+or incomplete exchange evidence, late executions preceding applied
+history, or rejected ledger applications latch session health.
+Do not treat an acknowledgement failure as a rejected exchange trade;
+inspect persisted fills, exchange order/trade history and wallet balances.
+Reconcile the discrepancy and restart explicitly. Startup reconstructs
+from the complete durable journal; the acknowledgement watermark is
+process-local. Do not delete records or advance the cursor manually.
+Automatic historical pagination and online cost-basis correction remain
+outside this iteration.

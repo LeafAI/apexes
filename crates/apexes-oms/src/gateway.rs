@@ -48,6 +48,14 @@ pub struct ExchangeFill {
     pub filled_at: DateTime<Utc>,
 }
 
+/// Authoritative order state and cumulative executed base quantity from
+/// one exchange response (not inferred from the returned trade page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderExecutionSnapshot {
+    pub status: OrderStatus,
+    pub executed_quantity: Decimal,
+}
+
 #[async_trait]
 pub trait ExecutionGateway: Send + Sync {
     /// Submits `order` (already persisted locally with status `New` by
@@ -81,6 +89,15 @@ pub trait ExecutionGateway: Send + Sync {
     /// exchange has no record of this order ID at all (distinct from
     /// "query failed" -- that's `Err`).
     async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String>;
+
+    /// Required for managed fill reconciliation. Legacy integrations
+    /// may keep the status-only interface.
+    async fn query_order_execution(
+        &self,
+        _order: &Order,
+    ) -> Result<OrderExecutionSnapshot, String> {
+        Err("authoritative executed quantity is not supported".into())
+    }
 
     /// Looks an order up by OUR client order id (`order.id`) -- the only
     /// handle available for an order whose submission outcome was

@@ -121,6 +121,15 @@ impl OrderExecutor for OrderManagerExecutor {
         Ok((order, Vec::new()))
     }
 
+    async fn acknowledge_supplemental_fills(&self, fills: &[Fill], applied: bool) {
+        let ids: Vec<_> = fills.iter().map(|fill| fill.id).collect();
+        self.order_manager
+            .lock()
+            .await
+            .acknowledge_fill_batch(&ids, applied)
+            .await;
+    }
+
     fn on_market_event(&self, _event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
         // Live trading holds no local resting-order simulation to react
         // to market data with -- all fills come from the exchange via
@@ -292,47 +301,21 @@ where
             state,
             |(order_manager, exchange_updates, reconcile_interval, resync)| async move {
                 loop {
-                    tokio::select! {
+                    let legacy_fills = tokio::select! {
                         update = exchange_updates.next() => {
-                            let Some(update) = update else {
-                                // The caller's guard (chaining with
-                                // `futures::stream::pending()`) should
-                                // make this unreachable in steady-state
-                                // operation; ending the merged stream
-                                // here is a safe fallback rather than
-                                // risking a busy loop.
-                                return None;
-                            };
-                            let fills = run_detached({
+                            let update = update?;
+                            run_detached({
                                 let order_manager = Arc::clone(&order_manager);
                                 async move {
-                                    order_manager
-                                        .lock()
-                                        .await
-                                        .apply_exchange_update(
-                                            update.client_order_id,
-                                            update.exchange_order_id,
-                                            update.status,
-                                        )
-                                        .await
+                                    order_manager.lock().await.apply_exchange_update(
+                                        update.client_order_id, update.exchange_order_id, update.status,
+                                    ).await
                                 }
-                            })
-                            .await
-                            .and_then(|result| {
-                                result
-                                    .map_err(|error| {
-                                        tracing::warn!(
-                                            ?error,
-                                            "LiveSupplementalFillSource: apply_exchange_update failed"
-                                        );
-                                    })
-                                    .ok()
-                            })
-                            .unwrap_or_default();
-                            if fills.is_empty() {
-                                continue;
-                            }
-                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
+                            }).await.and_then(|result| {
+                                result.map_err(|_| {
+                                    tracing::warn!("live exchange update reconciliation failed");
+                                }).ok()
+                            }).unwrap_or_default()
                         }
                         _ = async {
                             match &resync {
@@ -340,21 +323,32 @@ where
                                 None => futures::future::pending::<()>().await,
                             }
                         } => {
-                            tracing::info!("LiveSupplementalFillSource: push stream (re)connected; reconciling now");
-                            let fills = reconcile_detached(&order_manager, "resync").await;
-                            if fills.is_empty() {
-                                continue;
-                            }
-                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
+                            reconcile_detached(&order_manager, "resync").await
                         }
                         _ = reconcile_interval.tick() => {
-                            let fills = reconcile_detached(&order_manager, "periodic").await;
-                            if fills.is_empty() {
-                                continue;
-                            }
-                            return Some((fills, (order_manager, exchange_updates, reconcile_interval, resync)));
+                            reconcile_detached(&order_manager, "periodic").await
                         }
+                    };
+                    // Managed sessions recover committed executions even
+                    // if the writer was a cancel sweep or a reconciliation
+                    // task which subsequently failed.
+                    let durable = run_detached({
+                        let order_manager = Arc::clone(&order_manager);
+                        async move { order_manager.lock().await.durable_fill_batch().await }
+                    })
+                    .await;
+                    let fills = match durable {
+                        Some(Some(fills)) => fills,
+                        Some(None) => legacy_fills,
+                        None => Vec::new(),
+                    };
+                    if fills.is_empty() {
+                        continue;
                     }
+                    return Some((
+                        fills,
+                        (order_manager, exchange_updates, reconcile_interval, resync),
+                    ));
                 }
             },
         ))

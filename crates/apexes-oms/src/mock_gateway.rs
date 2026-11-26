@@ -168,6 +168,29 @@ impl ExecutionGateway for MockExecutionGateway {
             .map(|(_, status, _)| *status))
     }
 
+    async fn query_order_execution(
+        &self,
+        order: &Order,
+    ) -> Result<crate::OrderExecutionSnapshot, String> {
+        let status = self
+            .query_order_status(order)
+            .await?
+            .ok_or("unknown mock order")?;
+        let fills = self.fills.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let executed_quantity = fills
+            .get(&order.id)
+            .into_iter()
+            .flatten()
+            .filter(|fill| seen.insert(&fill.exchange_trade_id))
+            .map(|fill| fill.quantity)
+            .sum();
+        Ok(crate::OrderExecutionSnapshot {
+            status,
+            executed_quantity,
+        })
+    }
+
     async fn query_order_by_client_id(
         &self,
         order: &Order,
