@@ -28,6 +28,8 @@ pub struct BacktestReport {
     pub simulated_fees: Option<crate::SimulatedFeeReport>,
     #[serde(default)]
     pub simulated_execution: Option<crate::SimulatedExecution>,
+    #[serde(default)]
+    pub simulated_depth: Option<crate::SimulatedDepthPolicy>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

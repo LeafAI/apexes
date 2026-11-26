@@ -125,23 +125,41 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
                 fill_results
             }
             MarketEvent::Depth(update) => {
-                self.lock_engine().on_depth_update(update);
+                let mut engine = self.lock_engine();
+                engine.on_depth_update(update);
+                self.lock_open_orders()
+                    .retain(|id, _| engine.is_working(*id));
                 Vec::new()
             }
             MarketEvent::Tick(tick) => {
-                self.lock_engine().advance_time(tick.timestamp);
+                let mut engine = self.lock_engine();
+                engine.advance_time(tick.timestamp);
+                self.lock_open_orders()
+                    .retain(|id, _| engine.is_working(*id));
                 Vec::new()
             }
             MarketEvent::MarkPrice(mark) => {
-                self.lock_engine().advance_time(mark.timestamp);
+                let mut engine = self.lock_engine();
+                engine.advance_time(mark.timestamp);
+                self.lock_open_orders()
+                    .retain(|id, _| engine.is_working(*id));
                 Vec::new()
             }
-            MarketEvent::Bar(_) => Vec::new(),
+            MarketEvent::Bar(bar) => {
+                let mut engine = self.lock_engine();
+                engine.advance_depth_time(bar.close_time);
+                self.lock_open_orders()
+                    .retain(|id, _| engine.is_working(*id));
+                Vec::new()
+            }
         }
     }
 
     async fn open_orders(&self) -> HashMap<OrderId, Order> {
-        self.lock_open_orders().clone()
+        let engine = self.lock_engine();
+        let mut open = self.lock_open_orders();
+        open.retain(|id, _| engine.is_working(*id));
+        open.clone()
     }
 }
 
@@ -221,6 +239,108 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[tokio::test]
+    async fn strict_depth_expiry_and_gap_cancel_working_orders_until_snapshot() {
+        let policy = crate::SimulatedDepthPolicy {
+            max_age_ms: 1000,
+            sequence: crate::DepthSequence::Contiguous,
+        };
+        let engine = MatchingEngine::new(
+            CostModel {
+                fee_schedule: Box::new(FlatFeeSchedule {
+                    maker_bps: dec!(0),
+                    taker_bps: dec!(0),
+                }),
+                funding_rate_bps: None,
+            },
+            dec!(0),
+        )
+        .with_depth_policy(Some(policy));
+        let executor = MatchingEngineOrderExecutor::new(Arc::new(Mutex::new(engine)));
+        let at = Utc::now();
+        let mut depth = DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(10),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(101),
+                quantity: dec!(10),
+            }],
+            sequence: Some(1),
+            is_snapshot: true,
+            timestamp: at,
+        };
+        let market = market_intent(OrderType::Market, None);
+        let limit = market_intent(OrderType::Limit, Some(dec!(99)));
+        assert!(
+            executor
+                .submit(&market, &HashMap::new(), &HashMap::new(), at)
+                .await
+                .is_err()
+        );
+        executor.on_market_event(&MarketEvent::Depth(depth.clone()));
+        let (order, _) = executor
+            .submit(&limit, &HashMap::new(), &HashMap::new(), at)
+            .await
+            .unwrap();
+        assert!(executor.open_orders().await.contains_key(&order.id));
+        depth.is_snapshot = false;
+        depth.sequence = Some(3);
+        depth.timestamp = at + chrono::Duration::milliseconds(1);
+        executor.on_market_event(&MarketEvent::Depth(depth.clone()));
+        assert!(executor.open_orders().await.is_empty());
+        assert!(
+            executor
+                .submit(&market, &HashMap::new(), &HashMap::new(), depth.timestamp)
+                .await
+                .is_err()
+        );
+        depth.is_snapshot = true;
+        depth.sequence = Some(10);
+        executor.on_market_event(&MarketEvent::Depth(depth.clone()));
+        let (order, _) = executor
+            .submit(&limit, &HashMap::new(), &HashMap::new(), depth.timestamp)
+            .await
+            .unwrap();
+        assert!(executor.open_orders().await.contains_key(&order.id));
+        let later = at + chrono::Duration::milliseconds(1002);
+        let trade = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(99),
+            quantity: dec!(2),
+            side: Some(Side::Sell),
+            trade_id: None,
+            timestamp: later,
+        });
+        assert!(executor.on_market_event(&trade).is_empty());
+        assert!(executor.open_orders().await.is_empty());
+        depth.is_snapshot = false;
+        depth.sequence = Some(11);
+        depth.timestamp = later;
+        executor.on_market_event(&MarketEvent::Depth(depth.clone()));
+        assert!(
+            executor
+                .submit(&market, &HashMap::new(), &HashMap::new(), later)
+                .await
+                .is_err()
+        );
+        depth.is_snapshot = true;
+        executor.on_market_event(&MarketEvent::Depth(depth));
+        assert_eq!(
+            executor
+                .submit(&market, &HashMap::new(), &HashMap::new(), later)
+                .await
+                .unwrap()
+                .0
+                .status,
+            OrderStatus::Filled
+        );
     }
 
     #[tokio::test]

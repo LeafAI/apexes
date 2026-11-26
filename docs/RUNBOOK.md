@@ -558,3 +558,26 @@ in reports. Missing launch policy or explicit `{"kind":"unrestricted_market"}`
 selects the legacy benchmark. Live launch rejects simulation policies.
 This models the live price bound, not all dynamic exchange filters,
 fees, inventory controls or order-arrival latency.
+
+### Strict simulated depth integrity
+
+Backtest and paper launch JSON can independently select strict depth:
+
+```json
+{"simulated_depth":{"max_age_ms":1000,"sequence":"contiguous"}}
+```
+
+Use `contiguous` only for a source whose incremental sequence advances
+exactly one per update. For full snapshots use `snapshot_only`, which
+invalidates the book on unexpected deltas. Binance update IDs may span
+ranges; a final sequence alone is insufficient to establish continuity.
+Do not apply contiguous assumptions to arbitrary exchange update IDs.
+A positive age limit is measured in simulated event time. No fills or
+new working orders are allowed without fresh valid depth. Invalid,
+crossed, gapped or expired books require a new nonolder snapshot;
+duplicates cannot replenish an active chain. Existing simulated resting
+and trigger orders are discarded on integrity loss rather than assuming
+queue continuity. This is a conservative simulation cancellation
+assumption, not an exchange cancellation instruction. Reports record
+the policy. Omission preserves legacy depth behavior; live sessions
+reject this setting. Causal arrival and queue calibration remain open.

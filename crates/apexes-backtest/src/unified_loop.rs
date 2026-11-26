@@ -999,6 +999,7 @@ pub async fn run_unified_event_loop(
         spot_pnl: ledger.spot_pnl(),
         simulated_fees: None,
         simulated_execution: None,
+        simulated_depth: None,
     })
 }
 

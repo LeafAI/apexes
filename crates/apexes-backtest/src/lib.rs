@@ -34,7 +34,9 @@ pub mod order_book;
 // Populated in Task 5.
 pub mod cost_model;
 
+pub mod depth_policy;
 pub mod execution_policy;
+pub use depth_policy::{DepthSequence, SimulatedDepthPolicy};
 pub mod latency;
 pub use execution_policy::SimulatedExecution;
 pub mod mark_price_source;

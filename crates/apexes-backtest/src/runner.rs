@@ -102,6 +102,7 @@ pub async fn run_backtest(
         })?;
 
     let execution = crate::SimulatedExecution::from_registry(registry, &config.instruments)?;
+    let depth = crate::SimulatedDepthPolicy::from_registry(registry)?;
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let events = market_data.events().await?;
     let event_stream = futures::stream::iter(events);
@@ -123,7 +124,8 @@ pub async fn run_backtest(
     // independent simulations.
     let matching_engine = Arc::new(Mutex::new(
         MatchingEngine::new(config.cost_model, config.queue_position_factor)
-            .with_execution(execution.clone()),
+            .with_execution(execution.clone())
+            .with_depth_policy(depth),
     ));
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
@@ -167,6 +169,7 @@ pub async fn run_backtest(
     .await?;
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
+    report.simulated_depth = depth;
     Ok(report)
 }
 
