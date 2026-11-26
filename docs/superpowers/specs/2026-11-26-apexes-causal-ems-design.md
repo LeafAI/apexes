@@ -25,3 +25,14 @@ not actual quantity filled. No parent capital reservation or independent
 child risk check in simulated EMS; existing simulated ledger and matching
 policy remain authoritative. Independent per-child transit delay and
 full data provenance are future work. No real exchange calls.
+
+## Fill-preservation follow-up
+
+For causal fixed-route simulated parents, collect each parent's result
+independently. Mark a failed parent terminal Failed with its error
+reason and continue collecting fills from other parents, including
+across algorithm classes. Do not discard previously executed fills
+when a later child is refused. This relies on the single fixed-route
+allocation and synchronous simulated child contract; it does not
+resolve ambiguous execution or legacy multi-allocation error handling.
+Legacy and PostgreSQL EMS error propagation are unchanged.

@@ -81,6 +81,31 @@ impl InMemoryEms {
         self
     }
 
+    /// In causal simulation each fixed-route parent has one allocation.
+    /// A failed parent must not erase earlier parents' executed fills.
+    fn collect_parent_result(
+        &self,
+        id: ParentOrderId,
+        result: Result<Vec<Fill>, EmsError>,
+        fills: &mut Vec<Fill>,
+    ) -> Result<(), EmsError> {
+        match result {
+            Ok(child_fills) => fills.extend(child_fills),
+            Err(error) if self.causal => {
+                let reason = error.to_string();
+                let mut parents = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(parent) = parents.get_mut(&id) {
+                    parent.status = ParentOrderStatus::Failed {
+                        reason: reason.clone(),
+                    };
+                }
+                tracing::warn!(parent_id = %id.0, %reason, "causal simulated parent failed");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
     fn sort_parents<T>(&self, items: &mut [T], id: impl Fn(&T) -> ParentOrderId) {
         let parents = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
         items.sort_by_key(|item| parents.get(&id(item)).map_or(usize::MAX, |p| p.ordinal));
@@ -314,7 +339,8 @@ impl InMemoryEms {
         }
         let mut fills = Vec::new();
         for parent_id in candidates {
-            fills.extend(self.process_one_iceberg_parent(parent_id).await?);
+            let result = self.process_one_iceberg_parent(parent_id).await;
+            self.collect_parent_result(parent_id, result, &mut fills)?;
         }
         Ok(fills)
     }
@@ -479,10 +505,8 @@ impl InMemoryEms {
         let mut fills = Vec::new();
         for (parent_id, participation_rate) in candidates {
             let target_quantity = trade.quantity * participation_rate;
-            fills.extend(
-                self.submit_pov_increment(parent_id, target_quantity)
-                    .await?,
-            );
+            let result = self.submit_pov_increment(parent_id, target_quantity).await;
+            self.collect_parent_result(parent_id, result, &mut fills)?;
         }
         Ok(fills)
     }
@@ -597,10 +621,8 @@ impl InMemoryEms {
         }
         let mut fills = Vec::new();
         for (parent_id, target_fraction) in candidates {
-            fills.extend(
-                self.submit_vwap_increment(parent_id, target_fraction)
-                    .await?,
-            );
+            let result = self.submit_vwap_increment(parent_id, target_fraction).await;
+            self.collect_parent_result(parent_id, result, &mut fills)?;
         }
         Ok(fills)
     }
@@ -894,7 +916,8 @@ impl Ems for InMemoryEms {
         }
         let mut all_fills = Vec::new();
         for parent_id in due {
-            all_fills.extend(self.submit_due_twap_slice(parent_id, now).await?);
+            let result = self.submit_due_twap_slice(parent_id, now).await;
+            self.collect_parent_result(parent_id, result, &mut all_fills)?;
         }
 
         all_fills.extend(self.process_iceberg_parents().await?);
@@ -969,6 +992,7 @@ mod tests {
         /// `new_with_fills` for tests exercising the fill pass-through
         /// path from sink -> `on_market_event`'s return value.
         fills_to_return: Vec<Fill>,
+        reject_quantity: Option<Decimal>,
     }
 
     impl RecordingSink {
@@ -976,6 +1000,7 @@ mod tests {
             Self {
                 submitted: StdMutex::new(Vec::new()),
                 fills_to_return: Vec::new(),
+                reject_quantity: None,
             }
         }
 
@@ -983,6 +1008,7 @@ mod tests {
             Self {
                 submitted: StdMutex::new(Vec::new()),
                 fills_to_return,
+                reject_quantity: None,
             }
         }
     }
@@ -993,7 +1019,13 @@ mod tests {
             &self,
             intent: ChildOrderIntent,
         ) -> Result<(OrderId, Vec<Fill>), EmsError> {
+            let reject = self.reject_quantity == Some(intent.quantity);
             self.submitted.lock().unwrap().push(intent);
+            if reject {
+                return Err(EmsError::ParentAdmissionRejected {
+                    reason: "injected child refusal".into(),
+                });
+            }
             Ok((OrderId(Uuid::new_v4()), self.fills_to_return.clone()))
         }
 
@@ -1035,6 +1067,72 @@ mod tests {
             is_snapshot: true,
             timestamp: now,
         })
+    }
+
+    #[tokio::test]
+    async fn causal_parent_refusal_preserves_other_fills_and_stops_only_failed_parent() {
+        let at = Utc::now();
+        let synthetic_fill = Fill {
+            id: apexes_core::FillId(Uuid::new_v4()),
+            order_id: OrderId(Uuid::new_v4()),
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: Decimal::ZERO,
+            fee_currency: Some("USDT".into()),
+            filled_at: at,
+            leverage: None,
+            margin_mode: None,
+        };
+        let sink = Arc::new(RecordingSink {
+            reject_quantity: Some(dec!(2)),
+            ..RecordingSink::new_with_fills(vec![synthetic_fill])
+        });
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        )
+        .with_event_time(true);
+        ems.on_market_event(&depth_event(at)).await.unwrap();
+        let first = ems.submit_algo_order(sample_request()).await.unwrap();
+        let mut failed = sample_request();
+        failed.quantity = dec!(8);
+        let failed = ems.submit_algo_order(failed).await.unwrap();
+        let mut third = sample_request();
+        third.quantity = dec!(12);
+        let third = ems.submit_algo_order(third).await.unwrap();
+        let fills = ems
+            .on_market_event(&depth_event(at + chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        assert!(
+            matches!(ems.parent_order_status(failed).await.unwrap(),Some(ParentOrderStatus::Failed{reason}) if reason.contains("injected child refusal"))
+        );
+        for id in [first, third] {
+            assert_eq!(
+                ems.parent_order_status(id).await.unwrap(),
+                Some(ParentOrderStatus::Scheduling)
+            );
+        }
+        let fills = ems
+            .on_market_event(&depth_event(at + chrono::Duration::seconds(11)))
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(
+            sink.submitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|i| i.quantity)
+                .collect::<Vec<_>>(),
+            vec![dec!(1), dec!(2), dec!(3), dec!(1), dec!(3)]
+        );
     }
 
     #[tokio::test]
