@@ -951,6 +951,40 @@ fn millis_to_datetime(millis: i64) -> Result<DateTime<Utc>, String> {
 
 #[async_trait]
 impl ExecutionGateway for BinanceExecutionGateway {
+    async fn spot_sell_inventory(&self, symbol: &str) -> Result<(String, Decimal), String> {
+        if symbol.is_empty()
+            || !symbol
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return Err("invalid spot symbol".into());
+        }
+        let body = self
+            .rest
+            .public_get("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
+            .await?;
+        let info: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| "invalid spot metadata")?;
+        let row = info["symbols"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter().find(|r| {
+                    r["symbol"].as_str() == Some(symbol)
+                        && r["isSpotTradingAllowed"].as_bool() == Some(true)
+                })
+            })
+            .ok_or("spot instrument unavailable")?;
+        let base = row["baseAsset"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("missing base asset")?
+            .to_owned();
+        let wallet = self.spot_balances().await?;
+        Ok((
+            base.clone(),
+            wallet.get(&base).map_or(Decimal::ZERO, |b| b.free),
+        ))
+    }
     async fn submit_order(&self, order: &Order) -> GatewayOutcome {
         if let (Some(leverage), Some(margin_mode)) = (order.leverage, order.margin_mode)
             && let Err(reason) = self

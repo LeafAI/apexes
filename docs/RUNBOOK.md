@@ -416,3 +416,23 @@ of all external account funding. The refresh scans the journal and
 limits each cycle to 16 historical lookups and 32 direct mark pairs;
 large-history performance and multi-hop conversion are not qualified.
 The worker does not retroactively rewrite session-only attribution.
+
+### Protective exits (F02.04)
+
+A verified, immediate fixed-route Binance Spot market sell within
+strategy-owned long inventory is exempt from daily count/volume and
+position-ceiling entry budgets. It still counts as an accepted order.
+Per-order limits, equity floor, other configured risk checks, market
+rules, unresolved orders, ledger acknowledgement and health gates
+remain active. Managed sells require durable owned inventory and
+exchange free base balance; an inventory shortfall latches health.
+Do not treat an unrelated wallet balance as strategy inventory.
+Managed Spot flatten cannot bypass health. Native derivative reduce-only
+protection and continuous fee-aware reservations are not provided here.
+
+Trend Guard evaluates stop-loss, take-profit and disabled-state exits
+before entry warm-up and spacing. Trend exits require ready fast/slow
+indicators; the independent exit_retry_trades parameter (default five)
+paces repeated exit attempts. A working order still prevents another
+order. Reconcile and explicitly restart a halted managed session rather
+than attempting to override its safety gates.

@@ -30,6 +30,7 @@ pub struct MockExecutionGateway {
     fills: Mutex<HashMap<OrderId, Vec<crate::gateway::ExchangeFill>>>,
     /// Number of upcoming `query_fills_for_order` calls that must fail.
     failing_fill_queries: Mutex<u32>,
+    spot_inventory: Mutex<Option<(String, rust_decimal::Decimal)>>,
 }
 
 impl Default for MockExecutionGateway {
@@ -46,7 +47,12 @@ impl MockExecutionGateway {
             exchange_state: Mutex::new(HashMap::new()),
             fills: Mutex::new(HashMap::new()),
             failing_fill_queries: Mutex::new(0),
+            spot_inventory: Mutex::new(None),
         }
+    }
+
+    pub fn set_spot_sell_inventory(&self, asset: &str, free: rust_decimal::Decimal) {
+        *self.spot_inventory.lock().unwrap() = Some((asset.into(), free));
     }
 
     pub fn program_next_submit_outcome(&self, outcome: GatewayOutcome) {
@@ -107,6 +113,16 @@ impl MockExecutionGateway {
 
 #[async_trait]
 impl ExecutionGateway for MockExecutionGateway {
+    async fn spot_sell_inventory(
+        &self,
+        _symbol: &str,
+    ) -> Result<(String, rust_decimal::Decimal), String> {
+        self.spot_inventory
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "mock spot inventory unavailable".into())
+    }
     async fn submit_order(&self, order: &Order) -> GatewayOutcome {
         if let Some(outcome) = self.next_submit_outcome.lock().unwrap().take() {
             // Even for a programmed Accepted outcome, record the

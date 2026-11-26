@@ -90,6 +90,13 @@ pub trait ExecutionGateway: Send + Sync {
     /// "query failed" -- that's `Err`).
     async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String>;
 
+    /// Authoritative base identity and spendable Spot inventory. The
+    /// managed OMS uses this only for sell safety; unsupported gateways
+    /// must refuse rather than guess availability.
+    async fn spot_sell_inventory(&self, _symbol: &str) -> Result<(String, Decimal), String> {
+        Err("spot sell inventory is not supported".into())
+    }
+
     /// Required for managed fill reconciliation. Legacy integrations
     /// may keep the status-only interface.
     async fn query_order_execution(

@@ -24,7 +24,7 @@ pub use circuit_breaker::{
 pub use composite::CompositeRiskChecker;
 pub use error::{CircuitBreakerScope, RiskViolation};
 pub use in_trade::InTradeMonitor;
-pub use limits::{LimitChecker, RiskLimits};
+pub use limits::{LimitChecker, RiskLimits, is_protective_spot_exit};
 pub use lists::{ListMode, SymbolVenueList};
 pub use margin_monitor::{
     MarginMonitor, MarginMonitorPositionAdapter, MarginMonitorPreTradeAdapter,
