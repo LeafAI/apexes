@@ -179,3 +179,333 @@ async fn recovering_a_scheduling_parent_order_resumes_from_where_it_left_off() {
         .sum();
     assert_eq!(total, dec!(2)); // only the REMAINING 2 units, not the already-recorded 2
 }
+
+fn pov_request() -> AlgoOrderRequest {
+    AlgoOrderRequest {
+        execution_algo: ExecutionAlgoSpec::Pov {
+            participation_rate: dec!(0.5),
+        },
+        ..twap_request()
+    }
+}
+
+fn trade(venue: Venue, symbol: &str) -> apexes_core::MarketEvent {
+    apexes_core::MarketEvent::Trade(apexes_core::TradeEvent {
+        symbol: symbol.into(),
+        venue,
+        quantity: dec!(2),
+        price: dec!(100),
+        side: None,
+        trade_id: None,
+        timestamp: chrono::Utc::now(),
+    })
+}
+
+async fn wait_completed(ems: &PostgresEms, id: apexes_strategy::ParentOrderId) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if ems.parent_order_status(id).await.unwrap() == Some(ParentOrderStatus::Completed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn pov_index_matches_venue_and_symbol_and_recovers_from_persisted_quantity() {
+    clean_db().await;
+    let sink = Arc::new(RecordingSink::new());
+    let ems = PostgresEms::new(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    for event in [
+        trade(Venue::Okx, "BTCUSDT"),
+        trade(Venue::Binance, "ETHUSDT"),
+    ] {
+        ems.on_market_event(&event).await.unwrap();
+    }
+    assert!(sink.submitted.lock().await.is_empty());
+    ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let quantity: rust_decimal::Decimal = sqlx::query_scalar(
+                "SELECT filled_quantity FROM parent_orders WHERE id = $1 AND NOT dispatch_pending",
+            )
+            .bind(id.0)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+            if quantity == dec!(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(ems);
+    let ems = PostgresEms::new(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+            .await
+            .unwrap();
+    }
+    wait_completed(&ems, id).await;
+    assert_eq!(sink.submitted.lock().await.len(), 4);
+    let quantity: rust_decimal::Decimal =
+        sqlx::query_scalar("SELECT filled_quantity FROM parent_orders WHERE id=$1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(quantity, dec!(4));
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM parent_order_children WHERE parent_order_id=$1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 4);
+}
+
+#[tokio::test]
+#[ignore]
+async fn cancelled_pov_is_removed_from_index_and_never_dispatched() {
+    clean_db().await;
+    let sink = Arc::new(RecordingSink::new());
+    let ems = PostgresEms::new(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    ems.cancel_parent_order(id).await.unwrap();
+    for _ in 0..100 {
+        ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        ems.parent_order_status(id).await.unwrap(),
+        Some(ParentOrderStatus::Cancelled)
+    );
+    assert!(sink.submitted.lock().await.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn unresolved_child_marker_refuses_restart_without_submitting_replacement() {
+    clean_db().await;
+    let sink = Arc::new(RecordingSink::new());
+    let ems = PostgresEms::new(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    drop(ems);
+    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    sqlx::query("UPDATE parent_orders SET dispatch_pending=TRUE WHERE id=$1")
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ks = Arc::new(apexes_oms::KillSwitch::new());
+    let result = PostgresEms::new_with_kill_switch(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+        Some(ks.clone()),
+    )
+    .await;
+    assert!(matches!(result, Err(EmsError::SchedulingSuspended)));
+    assert!(ks.is_engaged());
+    assert!(sink.submitted.lock().await.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
+    clean_db().await;
+    let sink = Arc::new(RecordingSink::new());
+    let ks = Arc::new(apexes_oms::KillSwitch::new());
+    let ems = PostgresEms::new_with_kill_switch(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+        Some(ks.clone()),
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    // Make the child-link INSERT fail after the sink has accepted the order.
+    sqlx::query(
+        "ALTER TABLE parent_order_children ADD CONSTRAINT inject_link_failure CHECK (FALSE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !ks.is_engaged() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sink.submitted.lock().await.len(), 1);
+    let (pending, quantity): (bool, rust_decimal::Decimal) =
+        sqlx::query_as("SELECT dispatch_pending, filled_quantity FROM parent_orders WHERE id=$1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(pending);
+    assert_eq!(quantity, dec!(0));
+    for _ in 0..10 {
+        ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+            .await
+            .unwrap();
+    }
+    drop(ems);
+    let result = PostgresEms::new(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+    )
+    .await;
+    assert!(matches!(result, Err(EmsError::SchedulingSuspended)));
+    assert_eq!(sink.submitted.lock().await.len(), 1);
+}
+
+struct SlowSink {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    submitted: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ChildOrderSink for SlowSink {
+    async fn submit_child_order(
+        &self,
+        _: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        self.submitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok((OrderId(uuid::Uuid::new_v4()), Vec::new()))
+    }
+
+    async fn cancel_child_order(&self, _: OrderId) -> Result<(), EmsError> {
+        Ok(())
+    }
+
+    async fn order_status(&self, _: OrderId) -> Result<Option<apexes_core::Order>, EmsError> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn slow_child_does_not_block_market_events_and_queue_overflow_halts() {
+    clean_db().await;
+    let sink = Arc::new(SlowSink {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        submitted: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let ks = Arc::new(apexes_oms::KillSwitch::new());
+    let ems = PostgresEms::new_with_kill_switch(
+        POSTGRES_URL,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+        Some(ks.clone()),
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), sink.entered.notified())
+        .await
+        .unwrap();
+    // The exchange acknowledgement is deliberately outstanding. Even
+    // matching trades must return without awaiting the slow child sink.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        for _ in 0..300 {
+            ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+                .await
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ks.is_engaged());
+    assert!(ks.reason().unwrap().contains("queue overflow"));
+    sink.release.notify_one();
+    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (pending, quantity): (bool, rust_decimal::Decimal) = sqlx::query_as(
+                "SELECT dispatch_pending, filled_quantity FROM parent_orders WHERE id=$1",
+            )
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if !pending && quantity == dec!(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sink.submitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(ks.is_engaged());
+}
