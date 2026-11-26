@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 #[path = "crossing_limit.rs"]
 mod crossing_limit;
+#[path = "resting_queue.rs"]
+mod resting_queue;
 
 /// Result of walking a sequence of price levels to fill `quantity`.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +79,7 @@ pub fn walk_book(levels: &[PriceLevel], quantity: Decimal) -> Option<BookWalkRes
 ///
 /// Limit-order fills are driven by real `TradeEvent`s arriving via
 /// `on_trade_event` (not by depth-diffing); `DepthUpdate`/order-book
-/// state is used only to seed the INITIAL `volume_ahead_required`
+/// state is used only to seed the INITIAL `external_ahead_remaining`
 /// threshold at submission time via `submit_limit_order`.
 pub struct MatchingEngine {
     books: HashMap<(Venue, String), ReplayOrderBook>,
@@ -125,28 +127,9 @@ struct RestingOrder {
     order_id: OrderId,
     order: Order,
     remaining_quantity: Decimal,
-    /// Volume that must trade through (via subsequent `TradeEvent`s at
-    /// this order's limit price or better) before this order is
-    /// considered "our turn" to start filling. Computed once at
-    /// submission time as `visible_volume_at_price_at_submission *
-    /// queue_position_factor` (design spec §7.3); 0 if
-    /// `queue_position_factor` is 0.0 (always eligible immediately).
-    ///
-    /// KNOWN LIMITATION: each resting order's `volume_ahead_required` is
-    /// computed independently at submission time and does not account
-    /// for OTHER resting orders on the same symbol/side. When multiple
-    /// resting orders share a trade, this can allocate more total fill
-    /// volume across them than the trade actually had available past the
-    /// shared queue -- see task-10-review.md for a worked example.
-    /// Acceptable for single-resting-order-per-symbol backtests; revisit
-    /// with a shared-queue-cursor model if multi-order queue-position
-    /// accuracy becomes a requirement.
-    volume_ahead_required: Decimal,
-    /// Cumulative volume from `TradeEvent`s at this order's limit price
-    /// or better, observed since submission. Once this reaches
-    /// `volume_ahead_required`, any FURTHER traded volume at/through our
-    /// price is treated as filling our own order (see `on_trade_event`).
-    volume_observed: Decimal,
+    /// Estimated external queue ahead at admission, depleted by causal
+    /// trade volume shared across eligible same-side simulated orders.
+    external_ahead_remaining: Decimal,
 }
 
 impl MatchingEngine {
@@ -506,8 +489,7 @@ impl MatchingEngine {
             order_id: order.id,
             order: order.clone(),
             remaining_quantity: order.quantity - order.filled_quantity,
-            volume_ahead_required: visible_volume_at_price * self.queue_position_factor,
-            volume_observed: Decimal::ZERO,
+            external_ahead_remaining: visible_volume_at_price * self.queue_position_factor,
         };
         self.resting_orders
             .entry((order.venue, order.symbol.clone()))
@@ -595,10 +577,8 @@ impl MatchingEngine {
     /// Buy limit order is triggered by trades at or below its limit
     /// price; a resting Sell limit order is triggered by trades at or
     /// above its limit price.
-    /// Once `volume_ahead_required` (see `RestingOrder`) has been observed
-    /// via cumulative trade volume, further trade volume at/through the
-    /// order's price fills the order itself, up to `trade.quantity` or the
-    /// order's `remaining_quantity`, whichever is smaller. Returns
+    /// A single trade budget covers both estimated external queue depletion
+    /// and fills in price-time priority, on the eligible maker side. Returns
     /// `(OrderId, Vec<Fill>)` for every order that received a fill from
     /// this trade -- including triggered Stop orders (whose Market-order
     /// fills are keyed by the ORIGINAL Stop order's ID) -- and fully
@@ -672,97 +652,6 @@ impl MatchingEngine {
             }
         }
 
-        results
-    }
-
-    /// The resting-limit-order fill pass of `on_trade_event`, extracted so
-    /// the early-return cases above don't skip the StopLimit conversion
-    /// submissions. Operates directly on the symbol's resting-order list.
-    fn fill_resting_orders(
-        orders: &mut Vec<RestingOrder>,
-        trade: &apexes_core::TradeEvent,
-        now: DateTime<Utc>,
-        cost_model: &CostModel,
-    ) -> Vec<(OrderId, Vec<Fill>)> {
-        let mut results = Vec::new();
-        let mut still_resting = Vec::new();
-        let mut remaining_trade_quantity = trade.quantity;
-
-        for mut resting in orders.drain(..) {
-            // A resting order always carries a limit price; skip it if
-            // somehow absent rather than panicking.
-            let Some(price) = resting.order.price else {
-                still_resting.push(resting);
-                continue;
-            };
-            let triggered = match resting.order.side {
-                Side::Buy => trade.price <= price,
-                Side::Sell => trade.price >= price,
-            };
-
-            if !triggered
-                || remaining_trade_quantity <= Decimal::ZERO
-                || now < resting.order.created_at
-            {
-                still_resting.push(resting);
-                continue;
-            }
-
-            resting.volume_observed += remaining_trade_quantity.min(trade.quantity);
-
-            if resting.volume_observed < resting.volume_ahead_required {
-                // Still queued behind other volume; no fill yet, but we
-                // keep tracking cumulative observed volume for next time.
-                still_resting.push(resting);
-                continue;
-            }
-
-            // Eligible: fill from the portion of this trade's volume that
-            // exceeds our required queue-ahead threshold, capped by our
-            // remaining order quantity and the trade's remaining quantity.
-            let volume_past_threshold = resting.volume_observed - resting.volume_ahead_required;
-            let fill_quantity = volume_past_threshold
-                .min(resting.remaining_quantity)
-                .min(remaining_trade_quantity);
-
-            if fill_quantity.is_zero() {
-                still_resting.push(resting);
-                continue;
-            }
-
-            let notional = price * fill_quantity;
-            let fee = cost_model.fee_for_fill(resting.order.venue, FillLiquidity::Maker, notional);
-            let fill = Fill {
-                id: FillId(Uuid::new_v4()),
-                order_id: resting.order_id,
-                symbol: resting.order.symbol.clone(),
-                venue: resting.order.venue,
-                side: resting.order.side,
-                price,
-                quantity: fill_quantity,
-                fee,
-                fee_currency: None,
-                filled_at: now,
-                leverage: resting.order.leverage,
-                margin_mode: resting.order.margin_mode,
-            };
-
-            resting.remaining_quantity -= fill_quantity;
-            resting.order.filled_quantity += fill_quantity;
-            resting.order.updated_at = now;
-            remaining_trade_quantity -= fill_quantity;
-
-            if resting.remaining_quantity.is_zero() {
-                resting.order.status = OrderStatus::Filled;
-                results.push((resting.order_id, vec![fill]));
-            } else {
-                resting.order.status = OrderStatus::PartiallyFilled;
-                results.push((resting.order_id, vec![fill]));
-                still_resting.push(resting);
-            }
-        }
-
-        *orders = still_resting;
         results
     }
 
