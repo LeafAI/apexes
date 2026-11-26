@@ -61,6 +61,15 @@ struct FillDelivery {
     failed: bool,
 }
 
+#[derive(Debug)]
+struct SpotReservation {
+    spend_asset: String,
+    receipt_asset: String,
+    amount: Decimal,
+    owned_quantity: Decimal,
+    reference_price: Decimal,
+}
+
 pub struct OrderManager {
     store: OrderStore,
     gateway: Arc<dyn ExecutionGateway>,
@@ -70,6 +79,10 @@ pub struct OrderManager {
     // Process-local acknowledgement watermark; startup rebuilds from all
     // durable history before establishing a new watermark.
     fill_delivery: Option<FillDelivery>,
+    spot_scope: Option<HashMap<String, (String, String)>>,
+    // Retain the full spend reservation until authoritative terminal state.
+    // Recovery remains quiescent; unknown recovered reservations refuse orders.
+    spot_reservations: HashMap<OrderId, SpotReservation>,
     /// Age threshold for an unresolved-submission warning, not an expiry.
     unsent_order_grace: std::time::Duration,
 }
@@ -103,8 +116,29 @@ impl OrderManager {
             open_orders,
             kill_switch: None,
             fill_delivery: None,
+            spot_scope: None,
+            spot_reservations: HashMap::new(),
             unsent_order_grace: DEFAULT_UNSENT_ORDER_GRACE,
         })
+    }
+
+    /// Restrict managed order identity to the configured live instruments.
+    pub fn with_spot_scope(mut self, instruments: &[apexes_core::Instrument]) -> Self {
+        self.spot_scope = Some(
+            instruments
+                .iter()
+                .filter_map(|i| {
+                    if i.asset_class != AssetClass::Spot || i.venue != apexes_core::Venue::Binance {
+                        return None;
+                    }
+                    Some((
+                        i.symbol.clone(),
+                        (i.base_currency.clone()?, i.quote_currency.clone()?),
+                    ))
+                })
+                .collect(),
+        );
+        self
     }
 
     /// The bound store's persisted spot fills after startup reconciliation.
@@ -227,6 +261,24 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
+        self.submit_order_inner(intent, positions, balances, false)
+            .await
+    }
+
+    /// EMS already persisted its dispatch quantity. Refuse rather than
+    /// silently changing the quantity recorded by the parent scheduler.
+    pub async fn submit_child_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
+        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true)
+            .await
+    }
+
+    async fn submit_order_inner(
+        &mut self,
+        mut intent: OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        exact_quantity: bool,
+    ) -> Result<OrderId, OmsError> {
         if let Some(kill_switch) = &self.kill_switch
             && kill_switch.blocks_submissions()
         {
@@ -250,9 +302,52 @@ impl OrderManager {
                 reason: "durable executions await ledger acknowledgement".into(),
             });
         }
+        let requested_quantity = intent.quantity;
+        let reservation = match self.validate_managed_spot_order(&mut intent).await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if matches!(error, OmsError::QueryFailed { .. }) {
+                    self.report_health_fault("managed spot inventory persistence unavailable");
+                }
+                return Err(error);
+            }
+        };
+        if exact_quantity && requested_quantity != intent.quantity {
+            return Err(OmsError::OrderRejected {
+                reason: "EMS child quantity must already conform to current exchange rules".into(),
+            });
+        }
+        let mut risk_intent = intent.clone();
+        let mut risk_positions = positions.clone();
+        if let Some(evidence) = &reservation {
+            if risk_intent.price.is_none() {
+                risk_intent.price = Some(evidence.reference_price);
+            }
+            // The position cap must not depend on a caller supplying a
+            // snapshot (EMS children supply none). This quantity-only
+            // risk input is never published as a recovered cost basis.
+            if intent.side == Side::Buy {
+                let position = risk_positions
+                    .entry(intent.symbol.clone())
+                    .or_insert(Position {
+                        symbol: intent.symbol.clone(),
+                        quantity: Decimal::ZERO,
+                        average_entry_price: Decimal::ZERO,
+                        leverage: None,
+                        margin_mode: None,
+                        allocated_margin: Decimal::ZERO,
+                    });
+                position.quantity = evidence.owned_quantity;
+            }
+        }
         if let Some(checker) = &self.risk_checker
-            && let Err(violations) =
-                checker.check(&intent, positions, balances, &self.open_orders, Utc::now())
+            && let Err(violations) = checker.check(
+                &risk_intent,
+                &risk_positions,
+                balances,
+                &self.open_orders,
+                Utc::now(),
+            )
         {
             apexes_telemetry::metrics()
                 .orders_submitted
@@ -261,7 +356,7 @@ impl OrderManager {
             return Err(OmsError::RiskCheckFailed { violations });
         }
 
-        let result = self.place_order(intent, false).await;
+        let result = self.place_order(intent, false, reservation).await;
         if matches!(
             &result,
             Err(OmsError::QueryFailed { .. } | OmsError::SubmissionUnresolved { .. })
@@ -284,54 +379,160 @@ impl OrderManager {
     /// limit). Callers must only pass orders that reduce exposure.
     pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
-        self.place_order(intent, true).await
+        self.place_order(intent, true, None).await
     }
 
-    /// Managed Spot sales must never consume unrelated account holdings.
-    /// Do not credit pending buys or permit another sell while any order
-    /// for this symbol is unresolved or still working.
-    async fn validate_managed_spot_sale(&self, intent: &OrderIntent) -> Result<(), OmsError> {
-        if !self.store.inventory_bound()
-            || intent.asset_class != AssetClass::Spot
-            || intent.side != Side::Sell
-        {
-            return Ok(());
+    /// Validate fresh rule/availability evidence and reserve the spend
+    /// asset exclusively while a working order could still consume it.
+    /// Do not credit pending receipts, or infer safety from exchange
+    /// free balance alone when an earlier request may still be in flight.
+    async fn validate_managed_spot_order(
+        &mut self,
+        intent: &mut OrderIntent,
+    ) -> Result<Option<SpotReservation>, OmsError> {
+        if !self.store.inventory_bound() {
+            return Ok(None);
         }
         let reject = |reason: &str| OmsError::OrderRejected {
             reason: reason.into(),
         };
-        if intent.quantity <= Decimal::ZERO
+        if intent.asset_class != AssetClass::Spot
+            || intent.venue != apexes_core::Venue::Binance
+            || intent.quantity <= Decimal::ZERO
             || intent.leverage.is_some()
             || intent.margin_mode.is_some()
         {
-            return Err(reject("invalid managed spot sale"));
+            return Err(reject("invalid managed spot order"));
         }
-        if self.open_orders.values().any(|o| o.symbol == intent.symbol) {
-            return Err(reject("working orders prevent verified spot reduction"));
+        if self
+            .spot_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.contains_key(&intent.symbol))
+        {
+            return Err(reject("symbol is outside managed inventory scope"));
         }
-        let (base, free) = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.gateway.spot_sell_inventory(&intent.symbol),
+        self.spot_reservations
+            .retain(|id, _| self.open_orders.contains_key(id));
+        if self
+            .open_orders
+            .keys()
+            .any(|id| !self.spot_reservations.contains_key(id))
+        {
+            return Err(reject(
+                "working order lacks a verified reservation; reconcile before trading",
+            ));
+        }
+        if self
+            .open_orders
+            .values()
+            .any(|o| o.exchange_order_id.is_none())
+        {
+            return Err(reject("unresolved submission prevents managed trading"));
+        }
+        let evidence = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.gateway.spot_preflight(intent),
         )
         .await
-        .map_err(|_| reject("spot inventory lookup timed out"))?
-        .map_err(|_| reject("spot inventory unavailable"))?;
+        .map_err(|_| reject("spot preflight timed out"))?
+        .map_err(|reason| OmsError::OrderRejected { reason })?;
+        if evidence.reference_price <= Decimal::ZERO
+            || evidence.free_base < Decimal::ZERO
+            || evidence.free_quote < Decimal::ZERO
+            || evidence.base.is_empty()
+            || evidence.quote.is_empty()
+            || evidence.base == evidence.quote
+            || self.spot_scope.as_ref().is_some_and(|scope| {
+                scope.get(&intent.symbol) != Some(&(evidence.base.clone(), evidence.quote.clone()))
+            })
+        {
+            return Err(reject(
+                "invalid spot preflight evidence or instrument identity",
+            ));
+        }
+        if evidence.quantity <= Decimal::ZERO
+            || evidence.quantity > intent.quantity
+            || !match (intent.price, evidence.price) {
+                (None, None) => true,
+                (Some(old), Some(new)) => {
+                    new > Decimal::ZERO
+                        && match intent.side {
+                            Side::Buy => new <= old,
+                            Side::Sell => new >= old,
+                        }
+                }
+                _ => false,
+            }
+        {
+            return Err(reject(
+                "exchange preflight attempted non-passive conformance",
+            ));
+        }
+        intent.quantity = evidence.quantity;
+        intent.price = evidence.price;
         let owned = self
             .store
-            .owned_spot_quantity(&intent.symbol, intent.venue, &base)
+            .owned_spot_quantity(&intent.symbol, intent.venue, &evidence.base)
             .await?;
-        if owned > free {
-            self.report_health_fault("strategy spot inventory exceeds free exchange inventory");
+        if owned < Decimal::ZERO {
+            self.report_health_fault("negative durable strategy spot inventory");
             return Err(reject(
-                "spot inventory discrepancy; reconcile before trading",
+                "negative durable spot inventory; reconcile before trading",
             ));
         }
-        if intent.quantity > owned || intent.quantity > free {
+        let (asset, receipt_asset, required, free) = match intent.side {
+            Side::Sell => {
+                if self.open_orders.values().any(|o| o.symbol == intent.symbol) {
+                    return Err(reject("working orders prevent verified spot reduction"));
+                }
+                if owned > evidence.free_base {
+                    self.report_health_fault(
+                        "strategy spot inventory exceeds free exchange inventory",
+                    );
+                    return Err(reject(
+                        "spot inventory discrepancy; reconcile before trading",
+                    ));
+                }
+                if intent.quantity > owned {
+                    return Err(reject("sale exceeds strategy-owned inventory"));
+                }
+                (
+                    evidence.base,
+                    evidence.quote,
+                    intent.quantity,
+                    evidence.free_base,
+                )
+            }
+            Side::Buy => {
+                let cost = intent
+                    .quantity
+                    .checked_mul(evidence.reference_price)
+                    .and_then(|v| v.checked_mul(Decimal::new(101, 2)))
+                    .ok_or_else(|| reject("spot reservation amount overflow"))?;
+                (evidence.quote, evidence.base, cost, evidence.free_quote)
+            }
+        };
+        if self
+            .spot_reservations
+            .values()
+            .any(|reserved| reserved.spend_asset == asset || reserved.receipt_asset == asset)
+        {
             return Err(reject(
-                "sale exceeds strategy-owned available spot inventory",
+                "spend asset reserved or awaiting receipt from a working order",
             ));
         }
-        Ok(())
+        if required > free {
+            return Err(reject(
+                "insufficient exchange free balance for spot reservation",
+            ));
+        }
+        Ok(Some(SpotReservation {
+            spend_asset: asset,
+            receipt_asset,
+            amount: required,
+            owned_quantity: owned,
+            reference_price: evidence.reference_price,
+        }))
     }
 
     /// Persists, then sends, one order. Shared tail of `submit_order` and
@@ -340,6 +541,7 @@ impl OrderManager {
         &mut self,
         intent: OrderIntent,
         flatten: bool,
+        reservation: Option<SpotReservation>,
     ) -> Result<OrderId, OmsError> {
         // Do not rely on strategies checking has_open_order: the OMS is
         // the final guard, including when a caller attempts a flatten.
@@ -357,12 +559,11 @@ impl OrderManager {
             self.report_health_fault("live inventory lease lost");
             return Err(error);
         }
-        if flatten && self.store.inventory_bound() && intent.asset_class == AssetClass::Spot {
+        if flatten && self.store.inventory_bound() {
             return Err(OmsError::OrderRejected {
                 reason: "managed Spot cannot bypass health through flatten".into(),
             });
         }
-        self.validate_managed_spot_sale(&intent).await?;
         let now = Utc::now();
         let mut order = Order {
             id: OrderId(Uuid::new_v4()),
@@ -387,6 +588,10 @@ impl OrderManager {
         // Retain the guard before awaiting network I/O. Cancellation or a
         // failed acknowledgement write must not erase an in-flight order.
         self.open_orders.insert(order_id, order.clone());
+        if let Some(reservation) = reservation {
+            tracing::debug!(asset = %reservation.spend_asset, amount = %reservation.amount, "managed spot spend reserved");
+            self.spot_reservations.insert(order_id, reservation);
+        }
         if !flatten
             && let Some(ks) = &self.kill_switch
             && ks.blocks_submissions()

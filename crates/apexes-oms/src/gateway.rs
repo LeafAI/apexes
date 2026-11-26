@@ -56,6 +56,19 @@ pub struct OrderExecutionSnapshot {
     pub executed_quantity: Decimal,
 }
 
+/// Fresh exchange evidence for an exact managed Spot intent. All prices
+/// are in the instrument quote asset; free balances exclude exchange locks.
+#[derive(Debug, Clone)]
+pub struct SpotPreflight {
+    pub base: String,
+    pub quote: String,
+    pub free_base: Decimal,
+    pub free_quote: Decimal,
+    pub reference_price: Decimal,
+    pub quantity: Decimal,
+    pub price: Option<Decimal>,
+}
+
 #[async_trait]
 pub trait ExecutionGateway: Send + Sync {
     /// Submits `order` (already persisted locally with status `New` by
@@ -95,6 +108,15 @@ pub trait ExecutionGateway: Send + Sync {
     /// must refuse rather than guess availability.
     async fn spot_sell_inventory(&self, _symbol: &str) -> Result<(String, Decimal), String> {
         Err("spot sell inventory is not supported".into())
+    }
+
+    /// Validate current exchange rules for the exact intent and retrieve
+    /// spendable inventory. Unsupported gateways must refuse managed orders.
+    async fn spot_preflight(
+        &self,
+        _intent: &apexes_strategy::OrderIntent,
+    ) -> Result<SpotPreflight, String> {
+        Err("managed spot preflight unsupported".into())
     }
 
     /// Required for managed fill reconciliation. Legacy integrations
