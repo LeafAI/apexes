@@ -1,4 +1,4 @@
-//! F03.02 direct marketable limits: take causal opposite-side liquidity,
+//! F03.02 direct and triggered marketable limits: take causal opposite-side liquidity,
 //! then enqueue only the unfilled GTC remainder.
 use super::*;
 
@@ -8,12 +8,20 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
-        let mut order = self.prepare_limit_order(intent, now)?;
-        let limit = intent.price.ok_or_else(|| ApexesError::OrderRejected {
+        let order = self.prepare_limit_order(intent, now)?;
+        self.execute_prepared_limit(order, now)
+    }
+
+    pub(super) fn execute_prepared_limit(
+        &mut self,
+        mut order: Order,
+        now: DateTime<Utc>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        let limit = order.price.ok_or_else(|| ApexesError::OrderRejected {
             reason: "Limit order requires a price".into(),
         })?;
         let mut fills = Vec::new();
-        if let Some(book) = self.books.get_mut(&(intent.venue, intent.symbol.clone()))
+        if let Some(book) = self.books.get_mut(&(order.venue, order.symbol.clone()))
             && book.is_causal_at(now)
         {
             let levels = match order.side {
