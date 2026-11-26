@@ -530,3 +530,232 @@ async fn competing_ems_children_share_arrival_capital_without_recharging_parent_
         (2, 2, 1)
     );
 }
+
+struct SharedQuoteBuys(bool);
+
+impl Strategy for SharedQuoteBuys {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if self.0 || !matches!(event, MarketEvent::Depth(depth) if depth.symbol == "ETHUSDT") {
+            return vec![];
+        }
+        self.0 = true;
+        let mut first = BuyOnceStrategy { has_bought: false }
+            .on_market_event(event, ctx)
+            .remove(0);
+        first.quantity = dec!(1);
+        let mut second = first.clone();
+        second.symbol = "ETHUSDT".into();
+        vec![first, second]
+    }
+}
+
+fn shared_quote_fixture(
+    balance: rust_decimal::Decimal,
+    btc_arrival_price: rust_decimal::Decimal,
+) -> (BacktestConfig, Vec<MarketEvent>) {
+    let mut config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    config.initial_balances.insert("USDT".into(), balance);
+    config.instruments.push(
+        Instrument::new(
+            "ETHUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("ETH".into()),
+            Some("USDT".into()),
+            dec!(0.01),
+            dec!(0.0001),
+            dec!(1),
+        )
+        .unwrap(),
+    );
+    let MarketEvent::Depth(mut btc) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    btc.asks[0].price = dec!(6);
+    let mut eth = btc.clone();
+    eth.symbol = "ETHUSDT".into();
+    let mut later = btc.clone();
+    later.timestamp += chrono::Duration::milliseconds(500);
+    later.sequence = Some(2);
+    later.asks[0].price = btc_arrival_price;
+    (
+        config,
+        vec![
+            MarketEvent::Depth(btc),
+            MarketEvent::Depth(eth),
+            MarketEvent::Depth(later),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn in_transit_orders_share_quote_capital_across_symbols() {
+    let (config, events) = shared_quote_fixture(dec!(10), dec!(6));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        SharedQuoteBuys(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "BTCUSDT");
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.scheduled,
+            latency.arrived,
+            latency.refused,
+            latency.capital_refused
+        ),
+        (1, 1, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn price_increase_cannot_consume_another_due_order_hold() {
+    let (config, events) = shared_quote_fixture(dec!(12), dec!(7));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        SharedQuoteBuys(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "ETHUSDT");
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.scheduled,
+            latency.arrived,
+            latency.refused,
+            latency.capital_refused
+        ),
+        (2, 2, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn unarrived_market_intents_release_holds_at_end() {
+    let (config, mut events) = shared_quote_fixture(dec!(12), dec!(6));
+    events.pop();
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        SharedQuoteBuys(false),
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.scheduled,
+            latency.expired_at_end,
+            latency.capital_released_at_end
+        ),
+        (2, 2, 2)
+    );
+}
+
+struct ParentThenDirect {
+    parent: bool,
+    direct: bool,
+}
+
+impl Strategy for ParentThenDirect {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if !self.parent {
+            self.parent = true;
+            return ShortTwapOnce {
+                inner: BuyOnceStrategy { has_bought: false },
+                slices: 1,
+            }
+            .on_market_event(event, ctx);
+        }
+        if !self.direct && matches!(event, MarketEvent::Depth(depth) if depth.symbol == "ETHUSDT") {
+            self.direct = true;
+            let mut order = BuyOnceStrategy { has_bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            order.symbol = "ETHUSDT".into();
+            return vec![order];
+        }
+        vec![]
+    }
+}
+
+#[tokio::test]
+async fn arriving_child_cannot_spend_pending_direct_order_capital() {
+    let (config, _) = shared_quote_fixture(dec!(15), dec!(6));
+    let MarketEvent::Depth(first) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    let mut events = vec![MarketEvent::Depth(first.clone())];
+    for (offset, symbol, price, seq) in [
+        (500, "BTCUSDT", dec!(1), 2),
+        (600, "BTCUSDT", dec!(1), 3),
+        (700, "ETHUSDT", dec!(6), 1),
+        (1100, "BTCUSDT", dec!(10), 4),
+        (1200, "ETHUSDT", dec!(6), 2),
+    ] {
+        let mut d = first.clone();
+        d.symbol = symbol.into();
+        d.timestamp += chrono::Duration::milliseconds(offset);
+        d.sequence = Some(seq);
+        d.asks[0].price = price;
+        events.push(MarketEvent::Depth(d));
+    }
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        ParentThenDirect {
+            parent: false,
+            direct: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "ETHUSDT");
+    let children = report.event_latency.unwrap().child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.rejected_at_arrival
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn transit_buy_reservation_includes_taker_fee() {
+    let (mut config, events) = shared_quote_fixture(dec!(6), dec!(6));
+    config.cost_model.fee_schedule = Box::new(FlatFeeSchedule {
+        maker_bps: dec!(0),
+        taker_bps: dec!(10),
+    });
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        SharedQuoteBuys(false),
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let latency = report.event_latency.unwrap();
+    assert_eq!((latency.scheduled, latency.capital_refused), (0, 2));
+}

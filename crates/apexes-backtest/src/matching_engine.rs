@@ -240,6 +240,71 @@ impl MatchingEngine {
                 .any(|orders| orders.iter().any(|o| o.order_id == id))
     }
 
+    /// Full requested quantity valued at the worst executable observed ask
+    /// (or IOC cap), plus quote-denominated taker fees. Read-only, never
+    /// consumes liquidity. A later arrival must obtain a fresh budget.
+    pub(crate) fn simulated_buy_budget(
+        &self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        let reject = |reason: &str| ApexesError::OrderRejected {
+            reason: reason.into(),
+        };
+        if intent.side != Side::Buy
+            || intent.order_type != OrderType::Market
+            || intent.quantity <= Decimal::ZERO
+        {
+            return Err(reject("invalid market buy reservation intent"));
+        }
+        self.require_depth(intent, now)?;
+        let (_, cap) = self.execution.market_buy(
+            intent,
+            now,
+            self.trade_references
+                .get(&(intent.venue, intent.symbol.clone()))
+                .copied(),
+            false,
+        )?;
+        let price = if let Some(cap) = cap {
+            cap
+        } else {
+            let book = self
+                .books
+                .get(&(intent.venue, intent.symbol.clone()))
+                .filter(|book| book.is_causal_at(now))
+                .ok_or_else(|| reject("missing causal reservation depth"))?;
+            let mut remaining = intent.quantity;
+            let mut worst = None;
+            for level in book.asks() {
+                if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+                    return Err(reject("invalid reservation depth"));
+                }
+                worst = Some(level.price);
+                remaining -= remaining.min(level.quantity);
+                if remaining.is_zero() {
+                    break;
+                }
+            }
+            worst.ok_or_else(|| reject("missing executable reservation ask"))?
+        };
+        let rate = self.cost_model.fee_schedule.taker_fee_bps(intent.venue);
+        if rate < Decimal::ZERO || rate >= Decimal::from(10000) {
+            return Err(reject("invalid reservation fee rate"));
+        }
+        intent
+            .quantity
+            .checked_mul(price)
+            .and_then(|notional| {
+                notional
+                    .checked_mul(rate)
+                    .and_then(|fee| fee.checked_div(Decimal::from(10000)))
+                    .and_then(|fee| notional.checked_add(fee))
+            })
+            .filter(|amount| *amount > Decimal::ZERO)
+            .ok_or_else(|| reject("invalid or overflowing reservation amount"))
+    }
+
     /// Submits a Market `OrderIntent`, filling it immediately by walking
     /// the current local order book from best price outward. If total
     /// visible depth is insufficient to fill the full requested quantity,

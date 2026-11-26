@@ -46,6 +46,18 @@ pub trait OrderExecutor: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError>;
 
+    /// Read-only simulated Spot market-buy budget, including modeled taker fees.
+    /// Live executors do not participate in event-time capital reservation.
+    fn simulated_buy_budget(
+        &self,
+        _intent: &OrderIntent,
+        _now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        Err(ApexesError::OrderRejected {
+            reason: "simulated buy budget unavailable".into(),
+        })
+    }
+
     /// Gives this executor's local resting-order book a chance to react
     /// to a new `MarketEvent` on the SAME primary market-data stream the
     /// unified loop is already iterating (not an independent stream —
