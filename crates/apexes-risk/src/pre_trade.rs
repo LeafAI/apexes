@@ -30,6 +30,20 @@ pub trait PreTradeCheck: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(), Vec<RiskViolation>>;
 
+    /// Re-check a child of an already admitted parent. Custom checks
+    /// retain their normal behavior; parent-level quota checks may
+    /// override this without granting protective-exit exemptions.
+    fn check_child(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        open_orders: &HashMap<OrderId, Order>,
+        now: DateTime<Utc>,
+    ) -> Result<(), Vec<RiskViolation>> {
+        self.check(intent, positions, balances, open_orders, now)
+    }
+
     /// Called once when an order that passed every check was actually
     /// accepted for execution. Stateful limits (orders and volume per day)
     /// advance here and ONLY here.

@@ -127,18 +127,19 @@ pub fn is_protective_spot_exit(
             .any(|order| order.symbol == intent.symbol)
 }
 
-impl PreTradeCheck for LimitChecker {
-    fn check(
+impl LimitChecker {
+    fn check_with_scope(
         &self,
         intent: &OrderIntent,
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
         open_orders: &HashMap<OrderId, Order>,
         now: DateTime<Utc>,
+        child: bool,
     ) -> Result<(), Vec<RiskViolation>> {
         let mut violations = Vec::new();
         let today = now.date_naive();
-        let protective = is_protective_spot_exit(intent, positions, open_orders);
+        let protective = !child && is_protective_spot_exit(intent, positions, open_orders);
 
         if let Some(max_qty) = self.limits.max_order_quantity
             && intent.quantity > max_qty
@@ -216,7 +217,7 @@ impl PreTradeCheck for LimitChecker {
             }
         }
 
-        if !protective {
+        if !protective && !child {
             let state = self.daily_state.lock().unwrap_or_else(|p| p.into_inner());
             let (count, volume) = if state.day == Some(today) {
                 (state.trade_count, state.traded_volume)
@@ -248,6 +249,30 @@ impl PreTradeCheck for LimitChecker {
         } else {
             Err(violations)
         }
+    }
+}
+
+impl PreTradeCheck for LimitChecker {
+    fn check(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        open_orders: &HashMap<OrderId, Order>,
+        now: DateTime<Utc>,
+    ) -> Result<(), Vec<RiskViolation>> {
+        self.check_with_scope(intent, positions, balances, open_orders, now, false)
+    }
+
+    fn check_child(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        open_orders: &HashMap<OrderId, Order>,
+        now: DateTime<Utc>,
+    ) -> Result<(), Vec<RiskViolation>> {
+        self.check_with_scope(intent, positions, balances, open_orders, now, true)
     }
 
     fn on_order_accepted(&self, intent: &OrderIntent, now: DateTime<Utc>) {

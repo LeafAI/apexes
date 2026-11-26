@@ -406,3 +406,127 @@ async fn non_blacklisted_symbol_still_trades_normally_through_a_configured_risk_
 
     assert_eq!(report.trades.len(), 1);
 }
+
+struct ShortTwapOnce {
+    inner: BuyOnceStrategy,
+    slices: u32,
+}
+
+impl Strategy for ShortTwapOnce {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        self.inner
+            .on_market_event(event, ctx)
+            .into_iter()
+            .map(|mut intent| {
+                intent.quantity = rust_decimal::Decimal::from(self.slices);
+                intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                    duration: std::time::Duration::from_millis(100 * u64::from(self.slices)),
+                    slices: self.slices,
+                });
+                intent
+            })
+            .collect()
+    }
+}
+
+fn child_risk_events(price: rust_decimal::Decimal) -> Vec<MarketEvent> {
+    let MarketEvent::Depth(first) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    let mut events = vec![MarketEvent::Depth(first.clone())];
+    for (offset, price, seq) in [
+        (500, dec!(1), 2),
+        (600, dec!(1), 3),
+        (700, dec!(1), 4),
+        (1200, price, 5),
+    ] {
+        let mut next = first.clone();
+        next.timestamp += chrono::Duration::milliseconds(offset);
+        next.sequence = Some(seq);
+        next.asks[0].price = price;
+        events.push(MarketEvent::Depth(next));
+    }
+    events
+}
+
+fn child_risk_registry(limits: apexes_risk::RiskLimits) -> apexes_core::registry::Registry {
+    let registry = apexes_core::registry::Registry::new();
+    registry
+        .register::<apexes_backtest::EventLatencyPolicy, ()>(
+            (),
+            apexes_backtest::EventLatencyPolicy { delay_ms: 500 },
+        )
+        .unwrap();
+    registry
+        .register::<std::sync::Arc<CompositeRiskChecker>, ()>(
+            (),
+            std::sync::Arc::new(
+                CompositeRiskChecker::new()
+                    .with_pre_trade_check(Box::new(apexes_risk::LimitChecker::new(limits))),
+            ),
+        )
+        .unwrap();
+    registry
+}
+
+#[tokio::test]
+async fn ems_child_rechecks_notional_against_arrival_depth() {
+    let registry = child_risk_registry(apexes_risk::RiskLimits {
+        max_order_notional: Some(dec!(50)),
+        ..Default::default()
+    });
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(child_risk_events(dec!(100))),
+        ShortTwapOnce {
+            inner: BuyOnceStrategy { has_bought: false },
+            slices: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let children = report.event_latency.unwrap().child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.rejected_at_arrival
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn competing_ems_children_share_arrival_capital_without_recharging_parent_quota() {
+    let registry = child_risk_registry(apexes_risk::RiskLimits {
+        max_daily_trade_count: Some(1),
+        max_daily_volume: Some(dec!(2)),
+        ..Default::default()
+    });
+    let mut config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+    config.initial_balances.insert("USDT".into(), dec!(15));
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(child_risk_events(dec!(10))),
+        ShortTwapOnce {
+            inner: BuyOnceStrategy { has_bought: false },
+            slices: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].price, dec!(10));
+    let children = report.event_latency.unwrap().child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.rejected_at_arrival
+        ),
+        (2, 2, 1)
+    );
+}

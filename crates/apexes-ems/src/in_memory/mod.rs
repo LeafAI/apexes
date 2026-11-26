@@ -923,6 +923,24 @@ impl Ems for InMemoryEms {
     }
 
     async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError> {
+        self.process_market_event(event, None).await
+    }
+
+    async fn on_market_event_checked(
+        &self,
+        event: &MarketEvent,
+        check: &mut crate::SimulatedChildCheck<'_>,
+    ) -> Result<Vec<Fill>, EmsError> {
+        self.process_market_event(event, Some(check)).await
+    }
+}
+
+impl InMemoryEms {
+    async fn process_market_event(
+        &self,
+        event: &MarketEvent,
+        check: Option<&mut crate::SimulatedChildCheck<'_>>,
+    ) -> Result<Vec<Fill>, EmsError> {
         let now = if self.causal {
             match event {
                 MarketEvent::Bar(bar) => bar.close_time,
@@ -964,7 +982,10 @@ impl Ems for InMemoryEms {
             self.sort_parents(&mut due, |id| *id);
         }
         let mut all_fills = if self.causal {
-            self.sink.advance_simulated_time(now).await
+            match check {
+                Some(check) => self.sink.advance_simulated_time_checked(now, check).await,
+                None => self.sink.advance_simulated_time(now).await,
+            }
         } else {
             Vec::new()
         };

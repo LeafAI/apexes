@@ -373,7 +373,49 @@ pub async fn run_unified_event_loop(
                     }
                 }
 
-                let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
+                let mut checked_child_fills = HashSet::new();
+                let ems_result = if arrivals.is_some() {
+                    let open_orders = executor.open_orders().await;
+                    let mut projected = ledger.execution_snapshot();
+                    let mut check = |intent: &apexes_strategy::OrderIntent, fills: &[Fill]| {
+                        let priced = apexes_strategy::OrderIntent {
+                            // Conservative notional valuation across the proposed
+                            // execution, not a stale last-trade reference.
+                            price: fills.iter().map(|fill| fill.price).max(),
+                            ..intent.clone()
+                        };
+                        if let Some(checker) = &risk_checker {
+                            checker.check_child(&priced, projected.positions(), projected.balances(), &open_orders, timestamp)
+                                .map_err(|violations| join_violations(&violations))?;
+                        }
+                        if let Some((pre_trade, _, _)) = &market_condition_monitor {
+                            pre_trade.check_child(&priced, projected.positions(), projected.balances(), &open_orders, timestamp)
+                                .map_err(|violations| join_violations(&violations))?;
+                        }
+                        // Validate the entire child's proposed execution before
+                        // committing any depth, including all fees and margin.
+                        let mut candidate = projected.execution_snapshot();
+                        for fill in fills {
+                            candidate.apply_fill(fill).map_err(|error| error.to_string())?;
+                        }
+                        // Each accepted child advances the projection before
+                        // the next competing child checks the same account.
+                        if let Some(checker) = &risk_checker {
+                            for fill in fills {
+                                if let Err(violations) = checker.on_fill(fill, candidate.positions(), candidate.balances()) {
+                                    tracing::warn!(?violations, symbol = %fill.symbol, "in-trade risk monitor flagged a child violation");
+                                }
+                                checked_child_fills.insert(fill.id);
+                            }
+                        }
+                        projected = candidate;
+                        Ok(())
+                    };
+                    ems.on_market_event_checked(&event, &mut check).await
+                } else {
+                    ems.on_market_event(&event).await
+                };
+                let ems_fills = ems_result.map_err(|error| {
                     ApexesError::InvalidBacktestConfig {
                         reason: format!("ems.on_market_event failed: {error}"),
                     }
@@ -394,6 +436,9 @@ pub async fn run_unified_event_loop(
                     )?;
                     if let Some(checker) = &mut risk_checker {
                         for fill in &ems_fills {
+                            if checked_child_fills.contains(&fill.id) {
+                                continue;
+                            }
                             if let Err(violations) =
                                 checker.on_fill(fill, ledger.positions(), ledger.balances())
                             {
