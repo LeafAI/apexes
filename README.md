@@ -83,7 +83,7 @@ Strategies are written either as Rust types implementing the `Strategy` trait or
 
 ## Status
 
-[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (70 rows; currently 42 done, 16 in progress, 11 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
+[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (103 rows; currently 42 done, 17 in progress, 32 planned, 11 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
 
 **Implemented**
 - Binance Spot market data, ClickHouse historical storage, tick-level backtesting with matching simulation and cost models.
@@ -94,6 +94,7 @@ Strategies are written either as Rust types implementing the `Strategy` trait or
 - Live-trading safety and operations groundwork: a kill switch with cancel-all and flatten, a stale-market-data watchdog, startup recovery from exchange state, crash-safe order persistence, authenticated and audited control endpoints, Prometheus metrics with alert rules and a Grafana dashboard, container images, CI, and an operations runbook ([`docs/RUNBOOK.md`](docs/RUNBOOK.md)). Several of these map to `FEATURES.md` rows 10.x and 11.x that are still marked Not Started, so the table lags the code here.
 
 **In progress**
+- Quantitative trading enhancement: reproducible strategy baseline, followed by execution reliability, accounting, realistic backtesting and Drift runtime improvements. See [feature plan](docs/superpowers/plans/2026-11-25-apexes-quantitative-enhancement.md).
 - Binance Spot **testnet** trading from the GUI (rows 9.3, 9.4): built, and verified end to end against the real Spot Test Network (launch, authenticated console, halt, stop), but not yet exercised by a human clicking through the window, with a real strategy-driven trade, or through a testnet reset. See [`docs/PLAN.md`](docs/PLAN.md) for exactly what is and is not verified. **Mainnet has never been run.**
 - A-share, H-share, US-equity and DEX market data and gateways — scaffolded, with explicit scope limits recorded in `FEATURES.md`.
 
