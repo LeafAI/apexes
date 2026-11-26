@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (durable fee conversion qualification)_
+_Last updated: 2026-11-26 (protective exit qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up is locally qualified; remote CI remains pending. Next: F02.04 protective exits. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up passed CI and merged in PR #23. F02.04 protective exits is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-protective-exits-design.md)); remote CI remains pending. Next: F02.05 dynamic trading rules and reservation accounting. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -186,6 +186,22 @@ offline conversion datasets, historical external wallet funding and
 large-journal performance remain limits; current session-only attribution
 can still be unpriced. No real orders or live database used. Remote CI,
 independent review and real-service pricing qualification remain pending.
+
+F02.04 local qualification (Rust 1.99.0, locked): workspace build,
+formatting, Clippy with warnings denied, 80 test binaries and 30
+doc-test suites passed. 1,393 executed tests (128 OMS/EMS/live-trading
+including isolated PostgreSQL cases, 940 other core, 63 supervisor,
+262 UI); zero failures and 44 remaining ignored external/manual tests.
+Four new regressions cover the narrow entry-budget exemption, durable
+and free inventory checks, a real Drift exit with its daily budget
+exhausted, and a recovered position's first-trade stop before warm-up.
+The existing deterministic economic baseline remains green. Managed
+health, unresolved submissions, ledger acknowledgement and hard risk
+limits remain enforced. The scope is direct Spot reductions, not
+derivative reduce-only orders or continuous fee-aware reservations.
+Trend Guard's safety-corrected script is distinct from its historical
+V1 Git revision for later research comparisons. No real exchange orders
+or live database used. Remote CI and real-service qualification pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

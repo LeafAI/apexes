@@ -206,6 +206,61 @@ fn trend_guard_can_stop_out_after_a_filled_entry() {
     assert!(report.equity_curve.last().unwrap().1 < dec!(1000));
 }
 
+#[test]
+fn trend_guard_exits_even_when_daily_entry_budget_is_exhausted() {
+    let registry = Registry::new();
+    let checker = apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+        apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+            max_daily_trade_count: Some(1),
+            ..Default::default()
+        }),
+    ));
+    registry
+        .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), Arc::new(checker))
+        .unwrap();
+    let report = replay_with_registry(&trending_prices(), dec!(10), &registry);
+    assert_eq!(report.trades.len(), 2);
+    assert_eq!(report.trades[0].side, Side::Buy);
+    assert_eq!(report.trades[1].side, Side::Sell);
+}
+
+#[test]
+fn trend_guard_protects_recovered_position_on_first_trade_before_warmup() {
+    use apexes_strategy::{Position, Strategy, StrategyContext};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/strategy.trend_guard.drift");
+    let mut strategy = DriftScriptStrategy::from_file(&script).unwrap();
+    let positions = HashMap::from([(
+        SYMBOL.into(),
+        Position {
+            symbol: SYMBOL.into(),
+            quantity: dec!(0.5),
+            average_entry_price: dec!(100),
+            leverage: None,
+            margin_mode: None,
+            allocated_margin: Decimal::ZERO,
+        },
+    )]);
+    let balances = HashMap::from([("ETH".into(), dec!(0.5))]);
+    let event = fixture(&[dec!(98)]).pop().unwrap();
+    let ctx = StrategyContext {
+        positions: &positions,
+        balances: &balances,
+        open_orders: &HashMap::new(),
+        open_parent_orders: &HashMap::new(),
+        margin_status: &HashMap::new(),
+        now: Utc::now(),
+    };
+    let orders = strategy.on_market_event(&event, &ctx);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].side, Side::Sell);
+    assert_eq!(orders[0].quantity, dec!(0.5));
+    // A failed attempt is paced independently of the entry gap.
+    assert!(strategy.on_market_event(&event, &ctx).is_empty());
+}
+
 // F00.02: capture the same JSON tracing records the engine can persist.
 struct TraceWriter(Arc<Mutex<Vec<u8>>>);
 

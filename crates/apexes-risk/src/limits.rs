@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use apexes_core::{Order, OrderId, Side};
-use apexes_strategy::{OrderIntent, Position};
+use apexes_core::{AssetClass, Order, OrderId, OrderType, Side};
+use apexes_strategy::{OrderIntent, OrderRouting, Position};
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 
@@ -99,29 +99,46 @@ impl LimitChecker {
     }
 }
 
+/// Narrow exemption from entry budgets, not an authorization to trade.
+/// The executor must still enforce ownership, available inventory and
+/// health. Delayed/routed/leveraged orders are not protective exits.
+pub fn is_protective_spot_exit(
+    intent: &OrderIntent,
+    positions: &HashMap<String, Position>,
+    open_orders: &HashMap<OrderId, Order>,
+) -> bool {
+    intent.venue == apexes_core::Venue::Binance
+        && intent.asset_class == AssetClass::Spot
+        && intent.side == Side::Sell
+        && intent.order_type == OrderType::Market
+        && intent.execution_algo.is_none()
+        && intent.routing == OrderRouting::Fixed
+        && intent.leverage.is_none()
+        && intent.margin_mode.is_none()
+        && intent.quantity > Decimal::ZERO
+        && positions.get(&intent.symbol).is_some_and(|position| {
+            position.symbol == intent.symbol
+                && position.leverage.is_none()
+                && position.margin_mode.is_none()
+                && position.quantity >= intent.quantity
+        })
+        && !open_orders
+            .values()
+            .any(|order| order.symbol == intent.symbol)
+}
+
 impl PreTradeCheck for LimitChecker {
     fn check(
         &self,
         intent: &OrderIntent,
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
-        _open_orders: &HashMap<OrderId, Order>,
+        open_orders: &HashMap<OrderId, Order>,
         now: DateTime<Utc>,
     ) -> Result<(), Vec<RiskViolation>> {
         let mut violations = Vec::new();
         let today = now.date_naive();
-
-        {
-            let mut state = self
-                .daily_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.day != Some(today) {
-                state.day = Some(today);
-                state.trade_count = 0;
-                state.traded_volume = Decimal::ZERO;
-            }
-        }
+        let protective = is_protective_spot_exit(intent, positions, open_orders);
 
         if let Some(max_qty) = self.limits.max_order_quantity
             && intent.quantity > max_qty
@@ -148,7 +165,7 @@ impl PreTradeCheck for LimitChecker {
         // market orders are covered in practice; a caller that does not (or
         // before any trade has printed) leaves this limit unenforced.
 
-        if let Some(max_position) = self.limits.max_position_per_symbol {
+        if !protective && let Some(max_position) = self.limits.max_position_per_symbol {
             let current = positions
                 .get(&intent.symbol)
                 .map(|p| p.quantity)
@@ -177,25 +194,27 @@ impl PreTradeCheck for LimitChecker {
             }
         }
 
-        {
-            let state = self
-                .daily_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !protective {
+            let state = self.daily_state.lock().unwrap_or_else(|p| p.into_inner());
+            let (count, volume) = if state.day == Some(today) {
+                (state.trade_count, state.traded_volume)
+            } else {
+                (0, Decimal::ZERO)
+            };
             if let Some(max_count) = self.limits.max_daily_trade_count
-                && state.trade_count + 1 > max_count
+                && count.saturating_add(1) > max_count
             {
                 violations.push(RiskViolation::DailyTradeCountExceeded {
-                    actual: state.trade_count + 1,
+                    actual: count.saturating_add(1),
                     limit: max_count,
                     day: now,
                 });
             }
             if let Some(max_volume) = self.limits.max_daily_volume
-                && state.traded_volume + intent.quantity > max_volume
+                && volume + intent.quantity > max_volume
             {
                 violations.push(RiskViolation::DailyVolumeExceeded {
-                    actual: state.traded_volume + intent.quantity,
+                    actual: volume + intent.quantity,
                     limit: max_volume,
                     day: now,
                 });
@@ -220,7 +239,7 @@ impl PreTradeCheck for LimitChecker {
             state.trade_count = 0;
             state.traded_volume = Decimal::ZERO;
         }
-        state.trade_count += 1;
+        state.trade_count = state.trade_count.saturating_add(1);
         state.traded_volume += intent.quantity;
     }
 }
@@ -274,6 +293,57 @@ mod tests {
     }
 
     use chrono::TimeZone;
+
+    #[test]
+    fn verified_spot_exit_bypasses_entry_budgets_but_not_hard_order_limits() {
+        let checker = LimitChecker::new(RiskLimits {
+            max_position_per_symbol: Some(dec!(1)),
+            max_daily_trade_count: Some(0),
+            max_daily_volume: Some(dec!(0)),
+            max_order_quantity: Some(dec!(3)),
+            ..Default::default()
+        });
+        let positions = HashMap::from([(
+            "BTCUSDT".into(),
+            Position {
+                symbol: "BTCUSDT".into(),
+                quantity: dec!(5),
+                average_entry_price: dec!(100),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
+            },
+        )]);
+        let mut exit = sample_intent("BTCUSDT", Side::Sell, dec!(2), None);
+        let ask = |intent: &OrderIntent| {
+            checker.check(
+                intent,
+                &positions,
+                &empty_balances(),
+                &empty_open_orders(),
+                now(),
+            )
+        };
+        assert!(ask(&exit).is_ok()); // residual 3 is still above entry position limit
+        exit.quantity = dec!(4);
+        assert!(matches!(
+            ask(&exit).unwrap_err().as_slice(),
+            [RiskViolation::OrderQuantityExceeded { .. }]
+        ));
+        exit.quantity = dec!(6);
+        assert!(
+            ask(&exit)
+                .unwrap_err()
+                .iter()
+                .any(|v| matches!(v, RiskViolation::DailyTradeCountExceeded { .. }))
+        );
+        exit.quantity = dec!(2);
+        exit.routing = OrderRouting::RouteToBest;
+        assert!(ask(&exit).is_err());
+        exit.routing = OrderRouting::Fixed;
+        exit.side = Side::Buy;
+        assert!(ask(&exit).is_err());
+    }
 
     #[test]
     fn order_quantity_within_limit_passes() {

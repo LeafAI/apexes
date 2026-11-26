@@ -121,6 +121,85 @@ async fn acknowledge(manager: &mut OrderManager, expected: usize) {
 
 #[tokio::test]
 #[ignore]
+async fn managed_spot_sale_requires_durable_owned_free_inventory_and_no_working_order() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    fixture.gateway.set_spot_sell_inventory("BTC", dec!(10));
+    let mut exit = intent();
+    exit.side = Side::Sell;
+    exit.quantity = dec!(1);
+    // Caller-supplied position and a large account wallet do not prove ownership.
+    let positions = HashMap::from([(
+        "BTCUSDT".into(),
+        apexes_strategy::Position {
+            symbol: "BTCUSDT".into(),
+            quantity: dec!(10),
+            average_entry_price: dec!(100),
+            leverage: None,
+            margin_mode: None,
+            allocated_margin: Decimal::ZERO,
+        },
+    )]);
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    );
+    let id = submit(&mut manager).await;
+    fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
+    fixture
+        .gateway
+        .set_fills_for_order(id, vec![fill("1", dec!(3), 0)]);
+    manager.reconcile().await.unwrap();
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    );
+    acknowledge(&mut manager, 1).await;
+    exit.quantity = dec!(3);
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    ); // base fee
+    exit.quantity = dec!(2);
+    let accepted = manager
+        .submit_order(exit.clone(), &positions, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    ); // pending sell
+    manager.cancel_order(accepted).await.unwrap();
+    fixture.gateway.set_spot_sell_inventory("BTC", dec!(1));
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    );
+    assert!(fixture.health.is_engaged());
+    fixture.gateway.set_spot_sell_inventory("BTC", dec!(10));
+    assert!(
+        manager
+            .submit_order(exit.clone(), &positions, &HashMap::new())
+            .await
+            .is_err()
+    );
+    assert!(manager.submit_flatten_order(exit).await.is_err());
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn repeated_partial_and_cancel_deliver_each_execution_once() {
     let fixture = Fixture::new().await;
     let mut manager = fixture.manager().await;

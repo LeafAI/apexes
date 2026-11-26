@@ -645,6 +645,25 @@ pub async fn run_unified_event_loop(
                     // Querying the executor per intent reproduces that
                     // exactly.
                     let open_orders_for_check = executor.open_orders().await;
+                    // A protective classification cannot substitute for
+                    // instrument identity, available inventory, or outstanding
+                    // parent-order reconciliation. Do not grant entry-budget
+                    // exemptions against unrelated wallet holdings.
+                    if apexes_risk::is_protective_spot_exit(&intent, ledger.positions(), &open_orders_for_check) {
+                        let available = instruments_by_symbol.get(&intent.symbol)
+                            .filter(|i| i.venue == intent.venue && i.asset_class == intent.asset_class)
+                            .and_then(|i| i.base_currency.as_ref())
+                            .and_then(|base| ledger.balances().get(base))
+                            .copied().unwrap_or(Decimal::ZERO);
+                        if available < intent.quantity || open_parent_orders.values().any(|status|
+                            matches!(status, apexes_strategy::ParentOrderStatus::Scheduling)) {
+                            trace.outcome("rules_rejected", "protective_inventory_unverified");
+                            if let Some(log) = &mut order_log {
+                                record_refusal(log, &intent, timestamp, "protective inventory or parent orders not reconciled");
+                            }
+                            continue;
+                        }
+                    }
                     // A market order has no price, so a notional limit could never
                     // apply to it. For the check only, value it at the last trade
                     // price (the order itself is sent unchanged).

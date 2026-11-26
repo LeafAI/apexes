@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use apexes_core::registry::Registry;
-use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus};
+use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus, Side};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{OrderIntent, Position};
 use chrono::Utc;
@@ -250,17 +250,15 @@ impl OrderManager {
                 reason: "durable executions await ledger acknowledgement".into(),
             });
         }
-        if let Some(checker) = &self.risk_checker {
-            let empty_open_orders = HashMap::new();
-            if let Err(violations) =
-                checker.check(&intent, positions, balances, &empty_open_orders, Utc::now())
-            {
-                apexes_telemetry::metrics()
-                    .orders_submitted
-                    .with_label_values(&[apexes_telemetry::order_result::RISK_REJECTED])
-                    .inc();
-                return Err(OmsError::RiskCheckFailed { violations });
-            }
+        if let Some(checker) = &self.risk_checker
+            && let Err(violations) =
+                checker.check(&intent, positions, balances, &self.open_orders, Utc::now())
+        {
+            apexes_telemetry::metrics()
+                .orders_submitted
+                .with_label_values(&[apexes_telemetry::order_result::RISK_REJECTED])
+                .inc();
+            return Err(OmsError::RiskCheckFailed { violations });
         }
 
         let result = self.place_order(intent, false).await;
@@ -289,6 +287,53 @@ impl OrderManager {
         self.place_order(intent, true).await
     }
 
+    /// Managed Spot sales must never consume unrelated account holdings.
+    /// Do not credit pending buys or permit another sell while any order
+    /// for this symbol is unresolved or still working.
+    async fn validate_managed_spot_sale(&self, intent: &OrderIntent) -> Result<(), OmsError> {
+        if !self.store.inventory_bound()
+            || intent.asset_class != AssetClass::Spot
+            || intent.side != Side::Sell
+        {
+            return Ok(());
+        }
+        let reject = |reason: &str| OmsError::OrderRejected {
+            reason: reason.into(),
+        };
+        if intent.quantity <= Decimal::ZERO
+            || intent.leverage.is_some()
+            || intent.margin_mode.is_some()
+        {
+            return Err(reject("invalid managed spot sale"));
+        }
+        if self.open_orders.values().any(|o| o.symbol == intent.symbol) {
+            return Err(reject("working orders prevent verified spot reduction"));
+        }
+        let (base, free) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.gateway.spot_sell_inventory(&intent.symbol),
+        )
+        .await
+        .map_err(|_| reject("spot inventory lookup timed out"))?
+        .map_err(|_| reject("spot inventory unavailable"))?;
+        let owned = self
+            .store
+            .owned_spot_quantity(&intent.symbol, intent.venue, &base)
+            .await?;
+        if owned > free {
+            self.report_health_fault("strategy spot inventory exceeds free exchange inventory");
+            return Err(reject(
+                "spot inventory discrepancy; reconcile before trading",
+            ));
+        }
+        if intent.quantity > owned || intent.quantity > free {
+            return Err(reject(
+                "sale exceeds strategy-owned available spot inventory",
+            ));
+        }
+        Ok(())
+    }
+
     /// Persists, then sends, one order. Shared tail of `submit_order` and
     /// `submit_flatten_order`; both paths enforce unresolved-submission safety.
     async fn place_order(
@@ -312,6 +357,12 @@ impl OrderManager {
             self.report_health_fault("live inventory lease lost");
             return Err(error);
         }
+        if flatten && self.store.inventory_bound() && intent.asset_class == AssetClass::Spot {
+            return Err(OmsError::OrderRejected {
+                reason: "managed Spot cannot bypass health through flatten".into(),
+            });
+        }
+        self.validate_managed_spot_sale(&intent).await?;
         let now = Utc::now();
         let mut order = Order {
             id: OrderId(Uuid::new_v4()),

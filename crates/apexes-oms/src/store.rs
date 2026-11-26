@@ -182,6 +182,27 @@ impl OrderStore {
         Ok(())
     }
 
+    /// Strategy-owned Spot inventory, including native base fees.
+    /// Called under the single-writer manager lock, after delivery ack.
+    pub(crate) async fn owned_spot_quantity(
+        &self,
+        symbol: &str,
+        venue: apexes_core::Venue,
+        base: &str,
+    ) -> Result<rust_decimal::Decimal, OmsError> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(
+            CASE WHEN side='Buy' THEN quantity ELSE -quantity END
+            - CASE WHEN fee_currency=$3 THEN fee ELSE 0 END),0)
+            FROM fills WHERE symbol=$1 AND venue=$2",
+        )
+        .bind(symbol)
+        .bind(format!("{venue:?}"))
+        .bind(base)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Replay source: the durable order/fill history, not account balances.
     /// Validate the persisted fill quantities before returning a stable
     /// ordering of the exchange fills. F02.02 adds ongoing reconciliation.

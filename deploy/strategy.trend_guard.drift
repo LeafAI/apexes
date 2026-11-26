@@ -13,10 +13,9 @@
 //     enabled = 0. All are computed from ctx.get_position(), so they work
 //     even if the script's own state is lost.
 //   * Brakes: cooldown after every exit (3x longer after a stop), a minimum
-//     gap between any two orders (so a rejected order is retried slowly
-//     instead of on every trade), and a cap on entries per session so the
-//     launch config's daily order limit (50 by default) can never lock the
-//     strategy out of selling.
+//     gap between entries, and a cap on entries per session. Stop-loss,
+//     take-profit and disable exits do not depend on indicator warm-up
+//     or the entry gap. Working orders and engine safety still apply.
 //
 // Periods are counted in TRADES, not minutes. On a thin testnet that can be
 // many trades per minute or very few. Check the first 10-15 minutes and
@@ -33,7 +32,8 @@
 //   stop_pct         stop loss, % below average entry price
 //   target_pct       take profit, % above average entry price
 //   cooldown_trades  trades to wait after an exit before re-entering
-//   order_gap_trades minimum trades between any two orders
+//   order_gap_trades minimum trades before a new entry
+//   exit_retry_trades minimum trades between exit attempts (not entry cooldown)
 //   max_entries      most entries per session (0 = no new entries)
 //   min_notional     positions worth less than this (USDT) count as dust
 //
@@ -46,6 +46,7 @@ let dispersion = indicators.stddev(120);
 // Script state. Persists between events in the script's top-level scope.
 let trades_seen = 0;
 let last_order_at = -1000000;
+let last_exit_at = -1000000;
 let cooldown_until = 0;
 let entries_sent = 0;
 
@@ -64,6 +65,7 @@ function on_market_event(event, ctx) {
   let target_pct = param("target_pct", 1.5);
   let cooldown = param("cooldown_trades", 150);
   let order_gap = param("order_gap_trades", 20);
+  let exit_retry = param("exit_retry_trades", 5);
   let max_entries = param("max_entries", 15);
   let min_notional = param("min_notional", 6);
 
@@ -75,21 +77,8 @@ function on_market_event(event, ctx) {
   let fast = fast_ema.update(price);
   let slow = slow_ema.update(price);
   let dev = dispersion.update(price);
-  if (fast == null) {
-    return [];
-  }
-  if (slow == null) {
-    return [];
-  }
-  if (dev == null) {
-    return [];
-  }
-
-  // One working order at a time, and a minimum gap between orders.
+  // Working orders may change exposure; never assume they have filled.
   if (ctx.has_open_order(event.symbol)) {
-    return [];
-  }
-  if (trades_seen - last_order_at < order_gap) {
     return [];
   }
 
@@ -102,7 +91,10 @@ function on_market_event(event, ctx) {
     let entry = position.average_entry_price;
     let hit_stop = entry > 0 && price <= entry * (1 - stop_pct / 100);
     let hit_target = entry > 0 && price >= entry * (1 + target_pct / 100);
-    let trend_broke = fast < slow * (1 - exit_pct / 100);
+    let trend_broke = false;
+    if (fast != null && slow != null) {
+      trend_broke = fast < slow * (1 - exit_pct / 100);
+    }
     let switched_off = enabled <= 0;
 
     let should_exit = false;
@@ -120,6 +112,10 @@ function on_market_event(event, ctx) {
     }
 
     if (should_exit) {
+      // Retry pacing is independent of entry cooldown and warm-up.
+      if (trades_seen - last_exit_at < exit_retry) {
+        return [];
+      }
       // Round DOWN to whole steps. The tiny epsilon only absorbs
       // floating-point residue; it never rounds a real remainder up, so we
       // never try to sell more than we hold.
@@ -128,6 +124,7 @@ function on_market_event(event, ctx) {
         return [];
       }
       last_order_at = trades_seen;
+      last_exit_at = trades_seen;
       cooldown_until = trades_seen + (hit_stop ? cooldown * 3 : cooldown);
       return [{
         symbol: event.symbol,
@@ -142,6 +139,12 @@ function on_market_event(event, ctx) {
   }
 
   // ---- Entry ----
+  if (fast == null || slow == null || dev == null) {
+    return [];
+  }
+  if (trades_seen - last_order_at < order_gap) {
+    return [];
+  }
   if (enabled <= 0) {
     return [];
   }
