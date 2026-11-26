@@ -1,6 +1,9 @@
-use apexes_core::{DepthUpdate, PriceLevel};
+use apexes_core::{DepthUpdate, PriceLevel, Side};
 use barter_data::books::{Level, OrderBook};
 use barter_data::subscription::book::OrderBookEvent;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 /// A locally-reconstructed order book for backtest replay, built by
 /// feeding it a chronological sequence of `apexes_core::DepthUpdate`s.
@@ -14,6 +17,10 @@ use barter_data::subscription::book::OrderBookEvent;
 #[derive(Debug, Default)]
 pub struct ReplayOrderBook {
     inner: OrderBook,
+    observed_at: Option<DateTime<Utc>>,
+    sequence: Option<u64>,
+    consumed_bids: HashMap<Decimal, Decimal>,
+    consumed_asks: HashMap<Decimal, Decimal>,
 }
 
 impl ReplayOrderBook {
@@ -24,6 +31,32 @@ impl ReplayOrderBook {
     /// Applies a `DepthUpdate` to the local book: a full replace if
     /// `update.is_snapshot`, or an upsert-merge of delta levels otherwise.
     pub fn apply(&mut self, update: &DepthUpdate) {
+        if self.observed_at.is_some_and(|at| {
+            update.timestamp < at
+                || (update.timestamp == at
+                    && self.sequence.is_some()
+                    && self.sequence == update.sequence)
+        }) || (!update.is_snapshot
+            && self
+                .sequence
+                .zip(update.sequence)
+                .is_some_and(|(old, new)| new <= old))
+        {
+            return;
+        }
+        if update.is_snapshot {
+            self.consumed_bids.clear();
+            self.consumed_asks.clear();
+        } else {
+            for level in &update.bids {
+                self.consumed_bids.remove(&level.price);
+            }
+            for level in &update.asks {
+                self.consumed_asks.remove(&level.price);
+            }
+        }
+        self.observed_at = Some(update.timestamp);
+        self.sequence = update.sequence;
         let sequence = update.sequence.unwrap_or(0);
         let event = if update.is_snapshot {
             OrderBookEvent::Snapshot(OrderBook::new(
@@ -49,7 +82,7 @@ impl ReplayOrderBook {
             .bids()
             .levels()
             .iter()
-            .map(barter_level_to_price_level)
+            .filter_map(|l| available(l, &self.consumed_bids))
             .collect()
     }
 
@@ -59,8 +92,21 @@ impl ReplayOrderBook {
             .asks()
             .levels()
             .iter()
-            .map(barter_level_to_price_level)
+            .filter_map(|l| available(l, &self.consumed_asks))
             .collect()
+    }
+
+    pub fn is_causal_at(&self, now: DateTime<Utc>) -> bool {
+        self.observed_at.is_some_and(|at| at <= now)
+    }
+
+    /// Consume from the opposite side without altering historical depth.
+    pub fn consume(&mut self, side: Side, price: Decimal, quantity: Decimal) {
+        let consumed = match side {
+            Side::Buy => &mut self.consumed_asks,
+            Side::Sell => &mut self.consumed_bids,
+        };
+        *consumed.entry(price).or_default() += quantity;
     }
 }
 
@@ -68,11 +114,12 @@ fn price_level_to_barter_level(level: &PriceLevel) -> Level {
     Level::new(level.price, level.quantity)
 }
 
-fn barter_level_to_price_level(level: &Level) -> PriceLevel {
-    PriceLevel {
+fn available(level: &Level, consumed: &HashMap<Decimal, Decimal>) -> Option<PriceLevel> {
+    let quantity = level.amount - consumed.get(&level.price).copied().unwrap_or_default();
+    (quantity > Decimal::ZERO && level.price > Decimal::ZERO).then_some(PriceLevel {
         price: level.price,
-        quantity: level.amount,
-    }
+        quantity,
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use crate::cost_model::{CostModel, FillLiquidity};
 use crate::order_book::ReplayOrderBook;
 use apexes_core::{
     ApexesError, DepthUpdate, Fill, FillId, Order, OrderId, OrderStatus, OrderType, PriceLevel,
-    Side,
+    Side, Venue,
 };
 use apexes_strategy::OrderIntent;
 use chrono::{DateTime, Utc};
@@ -77,21 +77,23 @@ pub fn walk_book(levels: &[PriceLevel], quantity: Decimal) -> Option<BookWalkRes
 /// state is used only to seed the INITIAL `volume_ahead_required`
 /// threshold at submission time via `submit_limit_order`.
 pub struct MatchingEngine {
-    books: HashMap<String, ReplayOrderBook>,
+    books: HashMap<(Venue, String), ReplayOrderBook>,
+    event_time: Option<DateTime<Utc>>,
     cost_model: CostModel,
     /// 0.0 (optimistic) .. 1.0 (pessimistic), see design spec §7.3.
     queue_position_factor: Decimal,
     /// Resting limit orders, keyed by symbol -> list of `RestingOrder`.
-    resting_orders: HashMap<String, Vec<RestingOrder>>,
+    resting_orders: HashMap<(Venue, String), Vec<RestingOrder>>,
     /// Pending Stop/StopLimit orders awaiting their trigger price, keyed
     /// by symbol -> list of `PendingTrigger`.
-    pending_triggers: HashMap<String, Vec<PendingTrigger>>,
+    pending_triggers: HashMap<(Venue, String), Vec<PendingTrigger>>,
 }
 
 struct PendingTrigger {
     order_id: OrderId,
     intent: OrderIntent,
     stop_price: Decimal,
+    created_at: DateTime<Utc>,
 }
 
 /// The outcome of `MatchingEngine::check_pending_triggers`: fills from
@@ -149,6 +151,7 @@ impl MatchingEngine {
         );
         Self {
             books: HashMap::new(),
+            event_time: None,
             cost_model,
             queue_position_factor,
             resting_orders: HashMap::new(),
@@ -161,18 +164,34 @@ impl MatchingEngine {
     /// chronological order before any fills against that symbol are
     /// computed.
     pub fn on_depth_update(&mut self, update: &DepthUpdate) {
+        self.advance_time(update.timestamp);
         self.books
-            .entry(update.symbol.clone())
+            .entry((update.venue, update.symbol.clone()))
             .or_default()
             .apply(update);
+    }
+
+    pub fn advance_time(&mut self, now: DateTime<Utc>) {
+        self.event_time = Some(self.event_time.map_or(now, |at| at.max(now)));
+    }
+    pub fn event_time(&self) -> Option<DateTime<Utc>> {
+        self.event_time
+    }
+    pub fn is_working(&self, id: OrderId) -> bool {
+        self.resting_orders
+            .values()
+            .any(|orders| orders.iter().any(|o| o.order_id == id))
+            || self
+                .pending_triggers
+                .values()
+                .any(|orders| orders.iter().any(|o| o.order_id == id))
     }
 
     /// Submits a Market `OrderIntent`, filling it immediately by walking
     /// the current local order book from best price outward. If total
     /// visible depth is insufficient to fill the full requested quantity,
-    /// fills whatever is available and returns a `PartiallyFilled` (or
-    /// `New` if nothing could be filled) `Order` -- this is NOT an error,
-    /// per design spec §7.2 (logged via `tracing::warn`).
+    /// fills whatever is available and expires the remainder as `Cancelled`.
+    /// No market order rests, even when nothing fills.
     pub fn submit_market_order(
         &mut self,
         intent: &OrderIntent,
@@ -195,12 +214,19 @@ impl MatchingEngine {
             });
         }
 
-        let book = self.books.entry(intent.symbol.clone()).or_default();
-        let levels = match intent.side {
-            // Buying consumes the ask side (lowest price first).
-            Side::Buy => book.asks(),
-            // Selling consumes the bid side (highest price first).
-            Side::Sell => book.bids(),
+        let book = self
+            .books
+            .entry((intent.venue, intent.symbol.clone()))
+            .or_default();
+        let levels = if !book.is_causal_at(now) {
+            Vec::new()
+        } else {
+            match intent.side {
+                // Buying consumes the ask side (lowest price first).
+                Side::Buy => book.asks(),
+                // Selling consumes the bid side (highest price first).
+                Side::Sell => book.bids(),
+            }
         };
 
         let order_id = OrderId(Uuid::new_v4());
@@ -232,6 +258,7 @@ impl MatchingEngine {
                 margin_mode: intent.margin_mode,
             });
 
+            book.consume(intent.side, level.price, fill_quantity);
             remaining -= fill_quantity;
         }
 
@@ -250,12 +277,10 @@ impl MatchingEngine {
         }
 
         let filled_quantity = intent.quantity - remaining;
-        let status = if filled_quantity.is_zero() {
-            OrderStatus::New
-        } else if remaining.is_zero() {
+        let status = if remaining.is_zero() {
             OrderStatus::Filled
         } else {
-            OrderStatus::PartiallyFilled
+            OrderStatus::Cancelled
         };
 
         let order = Order {
@@ -333,7 +358,10 @@ impl MatchingEngine {
         // us at (or better than) our limit price, on the SAME side of the
         // book we're joining (other resting orders we'd have to queue
         // behind), to seed queue_position_factor's threshold.
-        let book = self.books.entry(intent.symbol.clone()).or_default();
+        let book = self
+            .books
+            .entry((intent.venue, intent.symbol.clone()))
+            .or_default();
         let levels = match intent.side {
             Side::Buy => book.bids(),  // joining the bid side
             Side::Sell => book.asks(), // joining the ask side
@@ -355,7 +383,7 @@ impl MatchingEngine {
             volume_observed: Decimal::ZERO,
         };
         self.resting_orders
-            .entry(intent.symbol.clone())
+            .entry((intent.venue, intent.symbol.clone()))
             .or_default()
             .push(resting);
 
@@ -421,12 +449,13 @@ impl MatchingEngine {
         };
 
         self.pending_triggers
-            .entry(intent.symbol.clone())
+            .entry((intent.venue, intent.symbol.clone()))
             .or_default()
             .push(PendingTrigger {
                 order_id,
                 intent: intent.clone(),
                 stop_price,
+                created_at: now,
             });
 
         Ok(order)
@@ -459,10 +488,13 @@ impl MatchingEngine {
         // trade that triggered a StopLimit can never also fill it in the
         // same call (the order was not yet resting when that trade
         // occurred).
+        self.advance_time(now);
         let trigger_result = self.check_pending_triggers(trade, now);
 
         let mut results = trigger_result.stop_fills;
-        if let Some(orders) = self.resting_orders.get_mut(&trade.symbol)
+        if let Some(orders) = self
+            .resting_orders
+            .get_mut(&(trade.venue, trade.symbol.clone()))
             && !orders.is_empty()
         {
             results.extend(Self::fill_resting_orders(
@@ -475,11 +507,18 @@ impl MatchingEngine {
 
         for (original_order_id, limit_intent) in trigger_result.stop_limit_conversions {
             match self.submit_limit_order(&limit_intent, now) {
-                Ok(_) => tracing::info!(
-                    symbol = %trade.symbol,
-                    order_id = ?original_order_id,
-                    "StopLimit order triggered and converted to resting Limit order"
-                ),
+                Ok(order) => {
+                    if let Some(resting) = self
+                        .resting_orders
+                        .get_mut(&(order.venue, order.symbol.clone()))
+                        .and_then(|orders| orders.iter_mut().find(|r| r.order_id == order.id))
+                    {
+                        resting.order_id = original_order_id;
+                        resting.order.id = original_order_id;
+                    }
+                    tracing::info!(symbol=%trade.symbol,order_id=?original_order_id,
+                        "StopLimit order triggered and converted to resting Limit order");
+                }
                 Err(error) => tracing::warn!(
                     symbol = %trade.symbol,
                     order_id = ?original_order_id,
@@ -517,7 +556,10 @@ impl MatchingEngine {
                 Side::Sell => trade.price >= price,
             };
 
-            if !triggered || remaining_trade_quantity.is_zero() {
+            if !triggered
+                || remaining_trade_quantity <= Decimal::ZERO
+                || now < resting.order.created_at
+            {
                 still_resting.push(resting);
                 continue;
             }
@@ -608,7 +650,10 @@ impl MatchingEngine {
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
     ) -> TriggerCheckResult {
-        let Some(pending) = self.pending_triggers.get_mut(&trade.symbol) else {
+        let Some(pending) = self
+            .pending_triggers
+            .get_mut(&(trade.venue, trade.symbol.clone()))
+        else {
             return TriggerCheckResult::empty();
         };
         if pending.is_empty() {
@@ -623,7 +668,7 @@ impl MatchingEngine {
                 Side::Buy => trade.price >= trigger.stop_price,
                 Side::Sell => trade.price <= trigger.stop_price,
             };
-            if is_triggered {
+            if is_triggered && now >= trigger.created_at {
                 triggered.push(trigger);
             } else {
                 still_pending.push(trigger);
@@ -639,7 +684,7 @@ impl MatchingEngine {
                     let mut market_intent = trigger.intent.clone();
                     market_intent.order_type = OrderType::Market;
                     match self.submit_market_order(&market_intent, now) {
-                        Ok((_order, fills)) if !fills.is_empty() => {
+                        Ok((_order, mut fills)) if !fills.is_empty() => {
                             tracing::info!(
                                 symbol = %trade.symbol,
                                 order_id = ?trigger.order_id,
@@ -650,6 +695,9 @@ impl MatchingEngine {
                             // ID), so the runner's `open_orders` bookkeeping
                             // and `BacktestReport.trades` attribute them to
                             // the order the strategy actually placed.
+                            for fill in &mut fills {
+                                fill.order_id = trigger.order_id;
+                            }
                             stop_fills.push((trigger.order_id, fills));
                         }
                         Ok(_) => {
@@ -795,6 +843,91 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_markets_share_depth_and_only_updated_levels_replenish() {
+        let mut engine = no_fee_engine();
+        let mut depth = snapshot(
+            "BTCUSDT",
+            vec![level(dec!(99), dec!(5))],
+            vec![level(dec!(101), dec!(2)), level(dec!(102), dec!(1))],
+        );
+        let at = depth.timestamp;
+        engine.on_depth_update(&depth);
+        let intent = buy_intent("BTCUSDT", dec!(2));
+        let (_, first) = engine.submit_market_order(&intent, at).unwrap();
+        assert_eq!(first[0].price, dec!(101));
+        let (partial, second) = engine.submit_market_order(&intent, at).unwrap();
+        assert_eq!(second[0].price, dec!(102));
+        assert_eq!(partial.filled_quantity, dec!(1));
+        assert_eq!(partial.status, OrderStatus::Cancelled);
+        engine.on_depth_update(&depth); // identical snapshot is not replenishment
+        assert!(
+            engine
+                .submit_market_order(&intent, at)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        depth.is_snapshot = false;
+        depth.sequence = Some(2);
+        depth.timestamp += chrono::Duration::milliseconds(1);
+        depth.asks = vec![level(dec!(102), dec!(3))];
+        depth.bids.clear();
+        engine.on_depth_update(&depth);
+        let (_, third) = engine
+            .submit_market_order(&intent, depth.timestamp)
+            .unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].price, dec!(102));
+        assert_eq!(third[0].quantity, dec!(2));
+        // Duplicate delta cannot restore consumed volume.
+        engine.on_depth_update(&depth);
+        assert_eq!(
+            engine
+                .submit_market_order(&intent, depth.timestamp)
+                .unwrap()
+                .0
+                .filled_quantity,
+            dec!(1)
+        );
+    }
+
+    #[test]
+    fn future_and_other_venue_depth_cannot_fill_order() {
+        let mut engine = no_fee_engine();
+        let mut depth = snapshot("BTCUSDT", vec![], vec![level(dec!(101), dec!(2))]);
+        let at = depth.timestamp;
+        engine.on_depth_update(&depth);
+        let mut intent = buy_intent("BTCUSDT", dec!(1));
+        assert!(
+            engine
+                .submit_market_order(&intent, at - chrono::Duration::milliseconds(1))
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        intent.venue = Venue::Okx;
+        assert!(
+            engine
+                .submit_market_order(&intent, at)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        depth.venue = Venue::Okx;
+        depth.asks = vec![level(dec!(103), dec!(1))];
+        engine.on_depth_update(&depth);
+        assert_eq!(
+            engine.submit_market_order(&intent, at).unwrap().1[0].price,
+            dec!(103)
+        );
+        intent.venue = Venue::Binance;
+        assert_eq!(
+            engine.submit_market_order(&intent, at).unwrap().1[0].price,
+            dec!(101)
+        );
+    }
+
+    #[test]
     fn market_buy_fills_entirely_at_single_level() {
         let mut engine = no_fee_engine();
         engine.on_depth_update(&snapshot(
@@ -865,12 +998,12 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].quantity, dec!(1));
-        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.status, OrderStatus::Cancelled);
         assert_eq!(order.filled_quantity, dec!(1));
     }
 
     #[test]
-    fn market_buy_with_no_liquidity_returns_unfilled_new_order() {
+    fn market_buy_with_no_liquidity_expires() {
         let mut engine = no_fee_engine();
         // No depth update at all -- empty book.
         let (order, fills) = engine
@@ -878,7 +1011,7 @@ mod tests {
             .unwrap();
 
         assert!(fills.is_empty());
-        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(order.status, OrderStatus::Cancelled);
         assert_eq!(order.filled_quantity, dec!(0));
     }
 

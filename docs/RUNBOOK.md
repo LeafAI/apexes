@@ -519,3 +519,22 @@ rates for configured venues; old reports lacking this field have
 unknown assumptions. Live sessions reject any simulated fee policy;
 actual exchange fill commissions remain authoritative. The cost model
 does not add an artificial spread or causal latency in this increment.
+
+### Simulated liquidity and expiry (F03.02)
+
+Backtest and paper market orders consume remaining displayed depth
+for their venue and symbol. Direct orders and simulated EMS children
+share that book. Accepted snapshots replace available depth, and accepted
+deltas replenish only their updated levels; older timestamps and
+non-advancing sequenced deltas are ignored. A market order cannot use
+a book observed after its submission time. Any unfilled remainder
+expires as Cancelled; the actual executed quantity is retained.
+Triggered stop-market orders also cease working after execution or
+expiry. StopLimit conversions retain their original identity.
+Simulated child fills use the latest observed matching event time when
+available, and the current event is processed before EMS dispatch.
+Historical snapshots/absolute updates are not a counterfactual market
+impact model. This increment does not enforce strict stale-book limits,
+model causal order-arrival latency, or implement managed Spot buy IOC
+parity. Do not treat the existing unrestricted-market benchmark as a
+realistic live execution forecast.
