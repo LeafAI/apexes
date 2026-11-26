@@ -50,6 +50,7 @@ fn evaluation() -> EvaluationSummary {
         strategy_max_drawdown: dec!(0),
         gross_exposure_fraction: dec!(0.1),
         fees_paid: HashMap::new(),
+        spot_pnl: HashMap::new(),
         trade_count: 3,
         turnover: dec!(100),
         time_in_market_fraction: dec!(0.2),

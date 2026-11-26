@@ -270,6 +270,7 @@ fn evaluation() -> apexes_backtest::EvaluationSummary {
         strategy_max_drawdown: dec!(0.05),
         gross_exposure_fraction: dec!(0.3),
         fees_paid: HashMap::from([("USDT".to_string(), dec!(1.25))]),
+        spot_pnl: HashMap::new(),
         trade_count: 7,
         turnover: dec!(4200),
         time_in_market_fraction: dec!(0.6),

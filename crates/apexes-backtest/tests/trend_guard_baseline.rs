@@ -176,6 +176,16 @@ fn trend_guard_round_trip_is_reproducible_and_cost_sensitive() {
     let expected = dec!(1000) + (sell.price - buy.price) * buy.quantity - fees;
     assert_eq!(paid.equity_curve.last().unwrap().1, expected);
     assert_eq!(free.equity_curve.last().unwrap().1 - expected, fees);
+    let accounting = &paid.spot_pnl[&buy.symbol];
+    assert_eq!(
+        accounting.gross_pnl,
+        Some((sell.price - buy.price) * buy.quantity)
+    );
+    assert_eq!(accounting.fee_at_execution, Some(fees));
+    assert_eq!(accounting.fee_at_mark, Some(fees));
+    assert_eq!(accounting.net_pnl, Some(expected - dec!(1000)));
+    assert_eq!(accounting.net_realized, accounting.net_pnl);
+    assert_eq!(accounting.net_unrealized, Some(Decimal::ZERO));
 }
 
 #[test]

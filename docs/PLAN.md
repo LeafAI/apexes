@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (authoritative fill reconciliation qualification)_
+_Last updated: 2026-11-26 (spot fee attribution qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)). Next: F02.03 accurate fee and P&L accounting. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)); automatic historical conversion retrieval and durable provenance remain in progress before F02.04 protective exits. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -155,6 +155,22 @@ process-local acknowledgement cursor over durable fill history and
 rebuilds on restart. Late or inconsistent executions require reconciliation
 and restart; incomplete trade pages halt rather than silently advance.
 No live database or exchange orders used. Remote CI pending.
+
+F02.03 spot attribution increment local qualification (Rust 1.99.0,
+locked): workspace build, fmt, Clippy with warnings denied, all 80 test
+binaries, and 30 doc-test suites passed. Executed 1,385 tests (126
+OMS/EMS/live-trading including isolated PostgreSQL cases, 934 other core,
+63 supervisor, 262 UI); zero failures and 44 remaining ignored
+external/manual tests. Six new regressions verify causal conversion,
+base/quote/third-asset fee economics, held-asset equity reconciliation,
+unknown external fee pricing and quote-specific operator display.
+The unchanged Drift round-trip also asserts explicit gross/net/fee
+attribution. This is an incremental implementation: automatic historical
+conversion retrieval for fee assets outside configured direct pairs,
+durable conversion provenance and lifetime attribution across restarts
+remain open. Existing balance/position and leveraged accounting semantics
+are preserved. No live database or real exchange orders used. Remote CI
+and independent review pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 
