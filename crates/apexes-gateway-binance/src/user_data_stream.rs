@@ -139,11 +139,10 @@ pub(crate) fn parse_binance_status(status: &str) -> Option<OrderStatus> {
         "NEW" => Some(OrderStatus::New),
         "PARTIALLY_FILLED" => Some(OrderStatus::PartiallyFilled),
         "FILLED" => Some(OrderStatus::Filled),
-        "CANCELED" | "EXPIRED" => Some(OrderStatus::Cancelled),
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => Some(OrderStatus::Cancelled),
         "REJECTED" => Some(OrderStatus::Rejected),
         // Statuses outside this gateway's current OrderStatus mapping
-        // (e.g. spot's EXPIRED_IN_MATCH, futures' NEW_INSURANCE /
-        // NEW_ADL) intentionally drop the whole event rather than
+        // (e.g. futures' NEW_INSURANCE / NEW_ADL) intentionally drop the whole event rather than
         // guessing a mapping -- logged so a silent gap is diagnosable
         // in production rather than invisible.
         other => {

@@ -456,5 +456,13 @@ Cumulative execution spend including spend-asset fees is checked against
 the original reservation. An overrun preserves actual fills and durably
 latches a fault. Review orders, executions, fees and wallet balances
 before any audited recovery; no automatic breach-clear path is provided.
-This is post-execution detection, not a hard exchange-side spend cap.
-No stop-order/derivative extension or parent-level allocation is supplied.
+Managed Spot market-buy intents now use bounded LIMIT IOC rather than
+unrestricted MARKET. The cap is the last observed price rounded down to
+the valid tick; base quantity never increases. Persist the cap before
+dispatch, keep the original client ID, and reconcile partial execution or
+expiry before releasing capital. There is no slippage allowance: a buy
+can expire without filling. Principal is bounded by quantity times cap;
+the 1% quote-fee headroom remains an estimate. Any above-cap fill or
+cumulative reservation breach is recorded and durably halts trading.
+No fallback to MARKET, stop-order/derivative extension or parent-level
+allocation is supplied.

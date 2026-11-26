@@ -65,6 +65,8 @@ pub struct SpotPreflight {
     pub free_base: Decimal,
     pub free_quote: Decimal,
     pub reference_price: Decimal,
+    /// Exchange-enforceable limit price for a managed market-buy intent.
+    pub market_buy_cap: Option<Decimal>,
     pub quantity: Decimal,
     pub price: Option<Decimal>,
 }
@@ -81,6 +83,14 @@ pub trait ExecutionGateway: Send + Sync {
     /// local orders even when `exchange_order_id` was never learned
     /// (an `Uncertain` outcome from this call).
     async fn submit_order(&self, order: &Order) -> GatewayOutcome;
+
+    /// Submit a market-buy intent with an exchange-side price and quantity
+    /// bound. An unsupported gateway must never fall back to MARKET.
+    async fn submit_bounded_spot_buy(&self, _order: &Order, _cap: Decimal) -> GatewayOutcome {
+        GatewayOutcome::Rejected {
+            reason: "bounded Spot buy unsupported".into(),
+        }
+    }
 
     /// Cancels an already-submitted order (the caller -- `OrderManager`
     /// -- guarantees `order.exchange_order_id` is `Some` before

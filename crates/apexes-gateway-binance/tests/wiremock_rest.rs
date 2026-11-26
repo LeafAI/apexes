@@ -77,6 +77,45 @@ async fn authoritative_execution_snapshot_requires_identity_and_cumulative_quant
 }
 
 #[tokio::test]
+async fn bounded_market_buy_uses_limit_ioc_and_original_client_id() {
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    let order = sample_order(Uuid::new_v4());
+    Mock::given(method("POST"))
+        .and(path("/api/v3/order"))
+        .and(query_param("newClientOrderId", order.id.0.to_string()))
+        .and(query_param("type", "LIMIT"))
+        .and(query_param("timeInForce", "IOC"))
+        .and(query_param("quantity", "1"))
+        .and(query_param("price", "100"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"orderId":12345})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gateway = gateway_against(&server).await;
+    assert_eq!(
+        gateway.submit_bounded_spot_buy(&order, dec!(100)).await,
+        GatewayOutcome::Accepted {
+            exchange_order_id: "12345".into()
+        }
+    );
+    assert!(matches!(
+        gateway.submit_bounded_spot_buy(&order, dec!(0)).await,
+        GatewayOutcome::Rejected { .. }
+    ));
+    let mut sell = order.clone();
+    sell.side = Side::Sell;
+    assert!(matches!(
+        gateway.submit_bounded_spot_buy(&sell, dec!(100)).await,
+        GatewayOutcome::Rejected { .. }
+    ));
+    assert_eq!(order.order_type, OrderType::Market);
+    assert!(order.price.is_none());
+}
+
+#[tokio::test]
 async fn submit_order_sends_signed_request_with_client_order_id() {
     let mock_server = MockServer::start().await;
     mount_clock(&mock_server).await;
