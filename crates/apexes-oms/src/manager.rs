@@ -61,13 +61,13 @@ struct FillDelivery {
     failed: bool,
 }
 
-#[derive(Debug)]
-struct SpotReservation {
-    spend_asset: String,
-    receipt_asset: String,
-    amount: Decimal,
-    owned_quantity: Decimal,
-    reference_price: Decimal,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpotReservation {
+    pub(crate) spend_asset: String,
+    pub(crate) receipt_asset: String,
+    pub(crate) amount: Decimal,
+    pub(crate) owned_quantity: Decimal,
+    pub(crate) reference_price: Decimal,
 }
 
 pub struct OrderManager {
@@ -83,6 +83,7 @@ pub struct OrderManager {
     // Retain the full spend reservation until authoritative terminal state.
     // Recovery remains quiescent; unknown recovered reservations refuse orders.
     spot_reservations: HashMap<OrderId, SpotReservation>,
+    reservation_breached: bool,
     /// Age threshold for an unresolved-submission warning, not an expiry.
     unsent_order_grace: std::time::Duration,
 }
@@ -105,6 +106,13 @@ impl OrderManager {
         let risk_checker = registry.try_one::<Arc<CompositeRiskChecker>>()?;
 
         let open_orders_vec = store.get_open_orders().await?;
+        let reservation_breached =
+            store.inventory_bound() && store.has_reservation_breach().await?;
+        let spot_reservations = if store.inventory_bound() {
+            store.load_spot_reservations().await?
+        } else {
+            HashMap::new()
+        };
         let open_orders = open_orders_vec
             .into_iter()
             .map(|order| (order.id, order))
@@ -117,7 +125,8 @@ impl OrderManager {
             kill_switch: None,
             fill_delivery: None,
             spot_scope: None,
-            spot_reservations: HashMap::new(),
+            spot_reservations,
+            reservation_breached,
             unsent_order_grace: DEFAULT_UNSENT_ORDER_GRACE,
         })
     }
@@ -300,6 +309,14 @@ impl OrderManager {
         {
             return Err(OmsError::TradingHalted {
                 reason: "durable executions await ledger acknowledgement".into(),
+            });
+        }
+        if self.reservation_breached {
+            self.report_health_fault(
+                "managed spot reservation exceeded; audited reconciliation required",
+            );
+            return Err(OmsError::TradingHalted {
+                reason: "persisted reservation breach requires reconciliation".into(),
             });
         }
         let requested_quantity = intent.quantity;
@@ -583,7 +600,9 @@ impl OrderManager {
             created_at: now,
             updated_at: now,
         };
-        self.store.begin_submission(&order).await?;
+        self.store
+            .begin_submission(&order, reservation.as_ref())
+            .await?;
         let order_id = order.id;
         // Retain the guard before awaiting network I/O. Cancellation or a
         // failed acknowledgement write must not erase an in-flight order.
@@ -821,10 +840,17 @@ impl OrderManager {
             Vec::new()
         };
         candidate.updated_at = Utc::now();
-        let fills = self
+        let (fills, breached) = self
             .store
             .commit_exchange_update(&mut candidate, executions, expected)
             .await?;
+        if managed && breached {
+            self.reservation_breached = true;
+            tracing::error!(order_id = %client_order_id.0, "actual execution spend exceeded durable reservation");
+            self.report_health_fault(
+                "managed spot reservation exceeded; audited reconciliation required",
+            );
+        }
         if matches!(
             candidate.status,
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected

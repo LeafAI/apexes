@@ -448,6 +448,13 @@ use estimated notional plus one percent headroom, not a hard price or
 fee cap. The durable inventory and fill acknowledgement guards remain.
 EMS children must already match current lot size; a rounded child is
 refused rather than contradicting its parent's dispatch record.
-Reservations require terminal reconciliation before release, and unknown
-recovered working orders block submission. No stop-order/derivative
-extension or parent-level allocation is supplied by this increment.
+Reservations are persisted with the pre-dispatch order record and restored
+by the OMS after restart. Terminal reconciliation releases the active
+reservation but retains its audit evidence. Unknown recovered reservations
+block submission; the managed engine still requires quiescent startup.
+Cumulative execution spend including spend-asset fees is checked against
+the original reservation. An overrun preserves actual fills and durably
+latches a fault. Review orders, executions, fees and wallet balances
+before any audited recovery; no automatic breach-clear path is provided.
+This is post-execution detection, not a hard exchange-side spend cap.
+No stop-order/derivative extension or parent-level allocation is supplied.
