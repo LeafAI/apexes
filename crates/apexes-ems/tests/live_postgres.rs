@@ -14,12 +14,37 @@ use tokio::sync::Mutex as TokioMutex;
 
 const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
 
-async fn clean_db() {
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
-    sqlx::query("DROP TABLE IF EXISTS parent_order_children, parent_orders")
-        .execute(&pool)
+/// Give each test its own schema, including the deliberately unresolved
+/// dispatch fixtures. Even a panicking test cannot poison the public
+/// schema used by the subsequent live-trading integration suite.
+struct TestSchema {
+    admin: sqlx::PgPool,
+    name: String,
+    url: String,
+}
+
+impl TestSchema {
+    async fn new() -> Self {
+        let admin = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+        // SQL identifier is generated exclusively from a fixed prefix and UUID hex.
+        let name = format!("ems_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let url = format!("{POSTGRES_URL}?options[search_path]={name}");
+        Self { admin, name, url }
+    }
+
+    async fn cleanup(self) {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            self.name
+        )))
+        .execute(&self.admin)
         .await
         .unwrap();
+    }
 }
 
 struct RecordingSink {
@@ -75,10 +100,10 @@ fn twap_request() -> AlgoOrderRequest {
 #[tokio::test]
 #[ignore]
 async fn twap_parent_order_persists_and_completes() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -110,14 +135,15 @@ async fn twap_parent_order_persists_and_completes() {
         .map(|intent| intent.quantity)
         .sum();
     assert_eq!(total, dec!(4));
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn recovering_a_scheduling_parent_order_resumes_from_where_it_left_off() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
 
     // Simulate a crash: insert a parent order directly with 2 of 4
     // slices already "submitted" (filled_quantity = 2), no
@@ -145,7 +171,7 @@ async fn recovering_a_scheduling_parent_order_resumes_from_where_it_left_off() {
     // resume scheduling (submitting only the REMAINING quantity, not
     // the already-recorded 2 units).
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -178,6 +204,7 @@ async fn recovering_a_scheduling_parent_order_resumes_from_where_it_left_off() {
         .map(|intent| intent.quantity)
         .sum();
     assert_eq!(total, dec!(2)); // only the REMAINING 2 units, not the already-recorded 2
+    fixture.cleanup().await;
 }
 
 fn pov_request() -> AlgoOrderRequest {
@@ -217,10 +244,10 @@ async fn wait_completed(ems: &PostgresEms, id: apexes_strategy::ParentOrderId) {
 #[tokio::test]
 #[ignore]
 async fn pov_index_matches_venue_and_symbol_and_recovers_from_persisted_quantity() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -239,7 +266,7 @@ async fn pov_index_matches_venue_and_symbol_and_recovers_from_persisted_quantity
     ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
         .await
         .unwrap();
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let quantity: rust_decimal::Decimal = sqlx::query_scalar(
@@ -260,7 +287,7 @@ async fn pov_index_matches_venue_and_symbol_and_recovers_from_persisted_quantity
     .unwrap();
     drop(ems);
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -289,15 +316,16 @@ async fn pov_index_matches_venue_and_symbol_and_recovers_from_persisted_quantity
             .await
             .unwrap();
     assert_eq!(count, 4);
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn cancelled_pov_is_removed_from_index_and_never_dispatched() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -318,15 +346,16 @@ async fn cancelled_pov_is_removed_from_index_and_never_dispatched() {
         Some(ParentOrderStatus::Cancelled)
     );
     assert!(sink.submitted.lock().await.is_empty());
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn unresolved_child_marker_refuses_restart_without_submitting_replacement() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
     let ems = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -336,7 +365,7 @@ async fn unresolved_child_marker_refuses_restart_without_submitting_replacement(
     .unwrap();
     let id = ems.submit_algo_order(pov_request()).await.unwrap();
     drop(ems);
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     sqlx::query("UPDATE parent_orders SET dispatch_pending=TRUE WHERE id=$1")
         .bind(id.0)
         .execute(&pool)
@@ -344,7 +373,7 @@ async fn unresolved_child_marker_refuses_restart_without_submitting_replacement(
         .unwrap();
     let ks = Arc::new(apexes_oms::KillSwitch::new());
     let result = PostgresEms::new_with_kill_switch(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -355,16 +384,17 @@ async fn unresolved_child_marker_refuses_restart_without_submitting_replacement(
     assert!(matches!(result, Err(EmsError::SchedulingSuspended)));
     assert!(ks.is_engaged());
     assert!(sink.submitted.lock().await.is_empty());
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());
     let ks = Arc::new(apexes_oms::KillSwitch::new());
     let ems = PostgresEms::new_with_kill_switch(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -374,7 +404,7 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     .await
     .unwrap();
     let id = ems.submit_algo_order(pov_request()).await.unwrap();
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     // Make the child-link INSERT fail after the sink has accepted the order.
     sqlx::query(
         "ALTER TABLE parent_order_children ADD CONSTRAINT inject_link_failure CHECK (FALSE)",
@@ -408,7 +438,7 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     }
     drop(ems);
     let result = PostgresEms::new(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -417,6 +447,7 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     .await;
     assert!(matches!(result, Err(EmsError::SchedulingSuspended)));
     assert_eq!(sink.submitted.lock().await.len(), 1);
+    fixture.cleanup().await;
 }
 
 struct SlowSink {
@@ -450,7 +481,7 @@ impl ChildOrderSink for SlowSink {
 #[tokio::test]
 #[ignore]
 async fn slow_child_does_not_block_market_events_and_queue_overflow_halts() {
-    clean_db().await;
+    let fixture = TestSchema::new().await;
     let sink = Arc::new(SlowSink {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -458,7 +489,7 @@ async fn slow_child_does_not_block_market_events_and_queue_overflow_halts() {
     });
     let ks = Arc::new(apexes_oms::KillSwitch::new());
     let ems = PostgresEms::new_with_kill_switch(
-        POSTGRES_URL,
+        &fixture.url,
         sink.clone(),
         Arc::new(PriceAndFeeScorer),
         HashMap::new(),
@@ -488,7 +519,7 @@ async fn slow_child_does_not_block_market_events_and_queue_overflow_halts() {
     assert!(ks.is_engaged());
     assert!(ks.reason().unwrap().contains("queue overflow"));
     sink.release.notify_one();
-    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let (pending, quantity): (bool, rust_decimal::Decimal) = sqlx::query_as(
@@ -508,4 +539,5 @@ async fn slow_child_does_not_block_market_events_and_queue_overflow_halts() {
     .unwrap();
     assert_eq!(sink.submitted.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(ks.is_engaged());
+    fixture.cleanup().await;
 }

@@ -865,15 +865,18 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn idle_and_unmatched_events_need_no_database_and_outage_latches_halt() {
-        let url = "postgres://apexes:apexes@localhost:5432/apexes";
-        let pool = PgPool::connect(url).await.unwrap();
-        sqlx::query("DROP TABLE IF EXISTS parent_order_children,parent_orders")
+        let base_url = "postgres://apexes:apexes@localhost:5432/apexes";
+        let pool = PgPool::connect(base_url).await.unwrap();
+        // SQL identifier is generated exclusively from a fixed prefix and UUID hex.
+        let schema = format!("ems_test_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&pool)
             .await
             .unwrap();
+        let url = format!("{base_url}?options[search_path]={schema}");
         let ks = Arc::new(apexes_oms::KillSwitch::new());
         let ems = PostgresEms::new_with_kill_switch(
-            url,
+            &url,
             Arc::new(NoDispatch),
             Arc::new(PriceAndFeeScorer),
             HashMap::new(),
@@ -932,5 +935,10 @@ mod tests {
             ks.is_engaged(),
             "operator release cannot clear EMS fault latch"
         );
+        drop(ems);
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

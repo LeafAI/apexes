@@ -106,6 +106,17 @@ and remaining external tests are pending. No live database or exchange
 orders were used. The EMS fault latch requires reconciliation/restart;
 operator health and recovery controls are the next feature.
 
+PR #18 CI follow-up: the initial PostgreSQL job failed six live-trading
+integration tests because an EMS failure-injection fixture left an
+unresolved dispatch marker in the shared public schema. The startup guard
+correctly refused recovery. All eight EMS database tests now use isolated
+UUID-named schemas and remove them on success. The original safety
+assertions and production scheduling code are unchanged. The exact CI
+PostgreSQL sequence passed locally on one fresh temporary PostgreSQL 17
+database: OMS 53, EMS 26, live-trading 30 (109 total, zero failures).
+Confirmed no EMS test schemas or public parent_orders table remained
+after the EMS suite. Workspace Clippy and fmt passed; remote CI pending.
+
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 
 **Goal.** One operator can start a Binance **Spot testnet** live session from a UI, watch it, tune it, halt it, and judge the strategy and its risk from a live timeline. Mainnet is an explicit opt-in (typed `MAINNET`) and is not part of this MVP's acceptance. Design: [`specs/2026-11-15-apexes-binance-spot-testnet-mvp-design.md`](superpowers/specs/2026-11-15-apexes-binance-spot-testnet-mvp-design.md). Operating it: [`RUNBOOK.md`](RUNBOOK.md).
