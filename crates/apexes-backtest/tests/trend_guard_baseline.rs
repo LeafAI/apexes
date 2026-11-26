@@ -6,6 +6,7 @@ use apexes_backtest::{
     BacktestConfig, BacktestReport, CostModel, FlatFeeSchedule, InMemoryMarketDataSource,
     ReplaySpeed, run_backtest,
 };
+use apexes_core::registry::Registry;
 use apexes_core::{
     AssetClass, DepthUpdate, Instrument, MarketEvent, MarketType, PriceLevel, Side, TradeEvent,
     Venue,
@@ -14,7 +15,12 @@ use apexes_strategy::drift_dsl::DriftScriptStrategy;
 use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 const SYMBOL: &str = "ETHUSDT";
 
@@ -52,6 +58,14 @@ fn fixture(prices: &[Decimal]) -> Vec<MarketEvent> {
 }
 
 fn replay(prices: &[Decimal], taker_bps: Decimal) -> BacktestReport {
+    replay_with_registry(prices, taker_bps, &Registry::new())
+}
+
+fn replay_with_registry(
+    prices: &[Decimal],
+    taker_bps: Decimal,
+    registry: &Registry,
+) -> BacktestReport {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let script =
@@ -93,7 +107,7 @@ fn replay(prices: &[Decimal], taker_bps: Decimal) -> BacktestReport {
     // the loop outside Tokio's task context, just as apexes-engine does.
     futures::executor::block_on(run_backtest(
         config,
-        &apexes_core::registry::Registry::new(),
+        registry,
         InMemoryMarketDataSource::new(fixture(prices)),
         strategy,
     ))
@@ -180,4 +194,118 @@ fn trend_guard_can_stop_out_after_a_filled_entry() {
     assert_eq!(sell.price, dec!(97.99));
     assert!(sell.price < buy.price * dec!(0.994));
     assert!(report.equity_curve.last().unwrap().1 < dec!(1000));
+}
+
+// F00.02: capture the same JSON tracing records the engine can persist.
+struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TraceWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn trace_replay(
+    prices: &[Decimal],
+    registry: &Registry,
+) -> (BacktestReport, Vec<serde_json::Value>) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || TraceWriter(Arc::clone(&writer)))
+        .finish();
+    let report = tracing::subscriber::with_default(subscriber, || {
+        replay_with_registry(prices, dec!(10), registry)
+    });
+    let buffer = output.lock().unwrap();
+    let records = std::str::from_utf8(&buffer)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["target"] == "apexes::decision")
+        .map(|record| record["fields"].clone())
+        .collect();
+    (report, records)
+}
+
+#[test]
+fn decision_trace_links_real_drift_intents_to_orders_fills_and_ledger() {
+    let prices = trending_prices();
+    let (report, records) = trace_replay(&prices, &Registry::new());
+    assert_eq!(
+        economic_report(&report),
+        economic_report(&replay(&prices, dec!(10)))
+    );
+    let intents: Vec<_> = records.iter().filter(|r| r["stage"] == "intent").collect();
+    assert_eq!(intents.len(), 2);
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "decision" && r["intent_count"] == 0)
+    );
+    assert_eq!(records.iter().filter(|r| r["stage"] == "fill").count(), 2);
+    for (intent, fill) in intents.iter().zip(&report.trades) {
+        let same_decision = |record: &&serde_json::Value| {
+            record["run_id"] == intent["run_id"] && record["event_seq"] == intent["event_seq"]
+        };
+        assert!(
+            records
+                .iter()
+                .filter(same_decision)
+                .any(|r| r["stage"] == "decision" && r["intent_count"] == 1)
+        );
+        let order = records
+            .iter()
+            .filter(same_decision)
+            .find(|r| {
+                r["stage"] == "order_result" && r["intent_ordinal"] == intent["intent_ordinal"]
+            })
+            .unwrap();
+        assert_eq!(order["order_id"], fill.order_id.0.to_string());
+        assert!(records.iter().filter(same_decision).any(|r| {
+            r["stage"] == "fill"
+                && r["order_id"] == order["order_id"]
+                && r["fill_id"] == fill.id.0.to_string()
+                && r["ledger_result"] == "applied"
+        }));
+    }
+}
+
+#[test]
+fn decision_trace_correlates_risk_refusal_without_a_submission() {
+    let registry = Registry::new();
+    let checker = apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+        apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+            max_order_quantity: Some(dec!(0.1)),
+            ..Default::default()
+        }),
+    ));
+    registry
+        .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), Arc::new(checker))
+        .unwrap();
+    let (report, records) = trace_replay(&trending_prices(), &registry);
+    assert!(report.trades.is_empty());
+    let refused: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "risk_rejected")
+        .collect();
+    assert!(!refused.is_empty());
+    for rejection in refused {
+        assert_eq!(rejection["reason"], "order_quantity_exceeded");
+        assert!(records.iter().any(|r| r["stage"] == "intent"
+            && r["run_id"] == rejection["run_id"]
+            && r["event_seq"] == rejection["event_seq"]
+            && r["intent_ordinal"] == rejection["intent_ordinal"]));
+    }
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["stage"] == "order_result" || r["stage"] == "fill")
+    );
 }

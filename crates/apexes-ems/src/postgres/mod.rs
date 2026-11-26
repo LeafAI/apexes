@@ -435,7 +435,10 @@ impl SchedulingDeps {
                 leverage: None,
                 margin_mode: None,
             })
-            .await?;
+            .await
+            .inspect_err(|_| tracing::info!(target: "apexes::decision", stage = "ems_child_failed", parent_id = %parent_id.0, reason = "child_submission_failed"))?;
+        // Record the accepted child even if the subsequent persistence fails.
+        tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %child_order_id.0);
 
         let child_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM parent_order_children WHERE parent_order_id = $1",

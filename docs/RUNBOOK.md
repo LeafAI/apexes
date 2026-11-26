@@ -242,3 +242,21 @@ It lives on the `apexes-engine-data` volume; back it up.
 
 High availability / failover, TLS/mTLS, KMS-held keys, and
 post-trade compliance reporting are tracked in the production-readiness epic.
+
+### Trading decision diagnostics (F00.02)
+
+Engine and supervisor-launched sessions can emit structured decision traces
+to the existing session log. Set `APEXES_LOG_FORMAT=json` and
+`RUST_LOG=info,apexes::decision=debug` before launching the engine or
+supervisor. Use INFO for order-producing decisions only; DEBUG records
+zero-intent and paused decisions as well, which can be high-volume.
+
+Filter JSON log records by target `apexes::decision`. The fields
+`run_id`, `event_seq` and `intent_ordinal` identify a decision/intent;
+`order_id` joins later fills and `parent_id` joins EMS child orders.
+`ledger_result` distinguishes applied fills from ledger failures.
+Supplemental exchange fills do not have a causal event sequence.
+Reason codes are allowlisted rather than raw exchange error messages.
+Logs contain trading data: restrict access and manage retention. A ledger
+failure requires reconciliation; the diagnostic record alone does not repair
+account state.

@@ -33,6 +33,7 @@
 use crate::clock::BacktestClock;
 use crate::control::{ControlHandle, SessionSnapshot};
 use crate::cost_model::{CostModel, FlatFeeSchedule};
+use crate::diagnostics::{Diagnostics, error_code, rule_code};
 use crate::latency::LatencyModel;
 use crate::ledger::PortfolioLedger;
 use crate::performance::PerformanceTracker;
@@ -208,6 +209,7 @@ pub async fn run_unified_event_loop(
     let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut recorded_initial_equity = false;
+    let mut diagnostics = Diagnostics::new();
     let mut risk_checker = config.risk_checker;
     let mut control = config.control;
     // Only built for sessions with a control handle: `control: None` stays
@@ -283,6 +285,7 @@ pub async fn run_unified_event_loop(
                 }
 
                 let timestamp = event_timestamp(&event);
+                diagnostics.next_event();
                 clock.wait_for_next_event(timestamp).await;
 
                 // Feed every event to the local `MarketConditionMonitor` (a
@@ -307,6 +310,7 @@ pub async fn run_unified_event_loop(
                         log.filled(&ems_fills);
                     }
                     apply_fills(
+                        diagnostics, "ems",
                         &mut ledger,
                         &mut overall_tracker,
                         &mut per_symbol_trackers,
@@ -368,6 +372,7 @@ pub async fn run_unified_event_loop(
                 // inline here.
                 for (_order_id, fills) in executor.on_market_event(&event) {
                     apply_fills(
+                        diagnostics, "resting",
                         &mut ledger,
                         &mut overall_tracker,
                         &mut per_symbol_trackers,
@@ -462,13 +467,16 @@ pub async fn run_unified_event_loop(
                         leverage: position.leverage,
                         margin_mode: position.margin_mode,
                     };
+                    let trace = diagnostics.intent(&liquidation_intent, "liquidation", timestamp);
                     match executor
                         .submit(&liquidation_intent, ledger.positions(), ledger.balances(), timestamp)
                         .await
                     {
-                        Ok((_order, fills)) => {
+                        Ok((order, fills)) => {
+                            trace.accepted(&order);
                             tracing::error!(symbol = %symbol, "position force-liquidated (margin ratio breached)");
                             apply_fills(
+                                diagnostics, "liquidation",
                                 &mut ledger,
                                 &mut overall_tracker,
                                 &mut per_symbol_trackers,
@@ -479,7 +487,8 @@ pub async fn run_unified_event_loop(
                             )?;
                         }
                         Err(error) => {
-                            tracing::error!(?error, symbol = %symbol, "liquidation order submission failed");
+                            trace.outcome("submission_failed", error_code(&error));
+                            tracing::error!(reason = error_code(&error), symbol = %symbol, "liquidation order submission failed");
                         }
                     }
                 }
@@ -545,13 +554,16 @@ pub async fn run_unified_event_loop(
                             leverage: position.leverage,
                             margin_mode: position.margin_mode,
                         };
+                        let trace = diagnostics.intent(&de_risk_intent, "derisk", timestamp);
                         match executor
                             .submit(&de_risk_intent, ledger.positions(), ledger.balances(), timestamp)
                             .await
                         {
-                            Ok((_order, fills)) => {
+                            Ok((order, fills)) => {
+                                trace.accepted(&order);
                                 tracing::warn!(symbol = %symbol, %quantity, "position partially closed (extreme market conditions)");
                                 apply_fills(
+                                    diagnostics, "derisk",
                                     &mut ledger,
                                     &mut overall_tracker,
                                     &mut per_symbol_trackers,
@@ -562,7 +574,8 @@ pub async fn run_unified_event_loop(
                                 )?;
                             }
                             Err(error) => {
-                                tracing::error!(?error, symbol = %symbol, "de-risking order submission failed");
+                                trace.outcome("submission_failed", error_code(&error));
+                                tracing::error!(reason = error_code(&error), symbol = %symbol, "de-risking order submission failed");
                             }
                         }
                     }
@@ -579,7 +592,8 @@ pub async fn run_unified_event_loop(
                     margin_status: &margin_status,
                     now: timestamp,
                 };
-                let intents = if control.as_ref().is_some_and(ControlHandle::is_paused) {
+                let paused = control.as_ref().is_some_and(ControlHandle::is_paused);
+                let intents = if paused {
                     // Paused: no new decisions this tick. Everything
                     // BEFORE this point (funding settlement, margin
                     // status, auto-liquidation, de-risking) already ran
@@ -590,7 +604,9 @@ pub async fn run_unified_event_loop(
                     strategy.on_market_event(&event, &ctx)
                 };
 
+                diagnostics.decision(&event, timestamp, paused, intents.len());
                 for intent in intents {
+                    let trace = diagnostics.intent(&intent, "strategy", timestamp);
                     // Make the order valid for its symbol (round the quantity
                     // down to the exchange's step, the price to its tick) before
                     // anything judges it: the risk checks must see the order
@@ -604,7 +620,9 @@ pub async fn run_unified_event_loop(
                         &last_prices,
                     ) {
                         Ok(conformed) => conformed,
-                        Err(reason) => {
+                        Err(violation) => {
+                            trace.outcome("rules_rejected", rule_code(&violation));
+                            let reason = violation.to_string();
                             tracing::warn!(
                                 symbol = %intent.symbol,
                                 quantity = %intent.quantity,
@@ -617,6 +635,7 @@ pub async fn run_unified_event_loop(
                             continue;
                         }
                     };
+                    trace.conformed(&intent);
                     // Re-fetched per intent (not reusing `open_orders`
                     // above): the former loop's own map was updated as
                     // each intent was submitted, so a later intent's risk
@@ -638,6 +657,7 @@ pub async fn run_unified_event_loop(
                             timestamp,
                         )
                     {
+                        trace.risk_rejected("risk_rejected", &violations);
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -653,6 +673,7 @@ pub async fn run_unified_event_loop(
                             timestamp,
                         )
                     {
+                        trace.risk_rejected("market_condition_rejected", &violations);
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -660,6 +681,7 @@ pub async fn run_unified_event_loop(
                         continue;
                     }
 
+                    trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
                     if let Some(latency_model) = &latency_model {
                         latency_model.apply().await;
                     }
@@ -677,6 +699,7 @@ pub async fn run_unified_event_loop(
                         };
                         match ems.submit_algo_order(request).await {
                             Ok(parent_id) => {
+                                trace.parent_accepted(parent_id);
                                 open_parent_orders
                                     .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
                                 // The parent order is what the strategy asked for and
@@ -686,8 +709,9 @@ pub async fn run_unified_event_loop(
                                     checker.on_order_accepted(&intent, timestamp);
                                 }
                             }
-                            Err(error) => {
-                                tracing::warn!(?error, symbol = %intent.symbol, "algo order submission failed");
+                            Err(_) => {
+                                trace.outcome("parent_submission_failed", "ems_error");
+                                tracing::warn!(reason = "ems_error", symbol = %intent.symbol, "algo order submission failed");
                             }
                         }
                         continue;
@@ -704,6 +728,7 @@ pub async fn run_unified_event_loop(
                         .await
                     {
                         Ok((order, fills)) => {
+                            trace.accepted(&order);
                             if let Some(log) = &mut order_log {
                                 log.submitted(&order);
                                 log.filled(&fills);
@@ -719,6 +744,7 @@ pub async fn run_unified_event_loop(
                             }
                             if !fills.is_empty() {
                                 apply_fills(
+                                    diagnostics, "strategy",
                                     &mut ledger,
                                     &mut overall_tracker,
                                     &mut per_symbol_trackers,
@@ -743,15 +769,16 @@ pub async fn run_unified_event_loop(
                             }
                         }
                         Err(error) => {
+                            trace.outcome("submission_failed", error_code(&error));
                             tracing::warn!(
-                                ?error,
+                                reason = error_code(&error),
                                 symbol = %intent.symbol,
                                 side = ?intent.side,
                                 quantity = %intent.quantity,
                                 "order submission rejected"
                             );
                             if let Some(log) = &mut order_log {
-                                record_refusal(log, &intent, timestamp, &error.to_string());
+                                record_refusal(log, &intent, timestamp, error_code(&error));
                             }
                         }
                     }
@@ -896,6 +923,7 @@ pub async fn run_unified_event_loop(
                     log.filled(&fills);
                 }
                 apply_supplemental_fills(
+                    diagnostics,
                     &mut ledger,
                     &mut overall_tracker,
                     &mut per_symbol_trackers,
@@ -974,7 +1002,7 @@ fn conform_to_rules(
     rules: &HashMap<String, apexes_core::SymbolRules>,
     instruments_by_symbol: &HashMap<String, Instrument>,
     last_prices: &HashMap<String, Decimal>,
-) -> Result<apexes_strategy::OrderIntent, String> {
+) -> Result<apexes_strategy::OrderIntent, apexes_core::RuleViolation> {
     let Some(rule) = rules.get(&intent.symbol) else {
         return Ok(intent.clone());
     };
@@ -988,7 +1016,6 @@ fn conform_to_rules(
             price: conformed.price,
             ..intent.clone()
         })
-        .map_err(|violation| violation.to_string())
 }
 
 /// The seeded prices keyed the way the loop keeps them (by base asset), for
@@ -1128,7 +1155,10 @@ fn exposure_inputs(
 /// overall/per-symbol/per-venue `PerformanceTracker`s, and accumulates
 /// every fill into `all_fills` (the `BacktestReport.trades` source) in
 /// occurrence order.
+#[allow(clippy::too_many_arguments)]
 fn apply_fills(
+    diagnostics: Diagnostics,
+    source: &'static str,
     ledger: &mut PortfolioLedger,
     overall_tracker: &mut PerformanceTracker,
     per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
@@ -1138,7 +1168,9 @@ fn apply_fills(
     risk_free_return: Decimal,
 ) -> Result<(), ApexesError> {
     for fill in fills {
-        ledger.apply_fill(fill)?;
+        let result = ledger.apply_fill(fill);
+        diagnostics.fill(fill, source, result.as_ref().err());
+        result?;
         overall_tracker.record_fill(fill);
         record_fill_in_split_trackers(
             per_symbol_trackers,
@@ -1164,6 +1196,7 @@ fn apply_fills(
 /// cannot undo them, only flag them.
 #[allow(clippy::too_many_arguments)]
 fn apply_supplemental_fills(
+    diagnostics: Diagnostics,
     ledger: &mut PortfolioLedger,
     overall_tracker: &mut PerformanceTracker,
     per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
@@ -1174,8 +1207,10 @@ fn apply_supplemental_fills(
     risk_free_return: Decimal,
 ) {
     for fill in &new_fills {
-        if let Err(error) = ledger.apply_fill(fill) {
-            tracing::warn!(?error, order_id = ?fill.order_id, "failed to apply fill to ledger");
+        let result = ledger.apply_fill(fill);
+        diagnostics.fill(fill, "supplemental", result.as_ref().err());
+        if let Err(error) = result {
+            tracing::warn!(reason = error_code(&error), order_id = ?fill.order_id, "failed to apply fill to ledger");
             continue;
         }
         overall_tracker.record_fill(fill);
@@ -1257,8 +1292,8 @@ async fn refresh_open_parent_orders(
             Ok(None) => {
                 open_parent_orders.remove(&id);
             }
-            Err(error) => {
-                tracing::warn!(?error, parent_id = ?id, "failed to refresh parent order status");
+            Err(_) => {
+                tracing::warn!(reason = "ems_error", parent_id = ?id, "failed to refresh parent order status");
             }
         }
     }
@@ -1326,6 +1361,7 @@ mod tests {
         let mut tracker = PerformanceTracker::new(Decimal::ZERO);
         let mut all_fills = Vec::new();
         apply_supplemental_fills(
+            Diagnostics::new(),
             &mut ledger,
             &mut tracker,
             &mut HashMap::new(),
@@ -1336,6 +1372,30 @@ mod tests {
             Decimal::ZERO,
         );
         (ledger, all_fills)
+    }
+
+    #[test]
+    fn supplemental_fill_diagnostics_distinguish_applied_and_failed_ledger_updates() {
+        let applied = live_fill(Side::Buy, dec!(0.5), Decimal::ZERO, "USDT");
+        let refused = live_fill(Side::Buy, dec!(10), Decimal::ZERO, "USDT");
+        let applied_id = applied.id.0.to_string();
+        let refused_id = refused.id.0.to_string();
+        let records = crate::diagnostics::tests::capture(|| {
+            let (ledger, _) = apply_live_fills(&[("USDT", dec!(100000))], vec![applied, refused]);
+            assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+        });
+        let fills: Vec<_> = records
+            .iter()
+            .filter(|r| r["target"] == "apexes::decision" && r["fields"]["stage"] == "fill")
+            .map(|r| &r["fields"])
+            .collect();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0]["fill_id"], applied_id);
+        assert_eq!(fills[0]["ledger_result"], "applied");
+        assert_eq!(fills[1]["fill_id"], refused_id);
+        assert_eq!(fills[1]["ledger_result"], "failed");
+        assert_eq!(fills[1]["reason"], "insufficient_balance");
+        assert!(fills.iter().all(|f| f["source"] == "supplemental"));
     }
 
     /// The reported risk: a mainnet account that pays fees in BNB. The ledger
