@@ -443,6 +443,9 @@ async fn run_inner(
     if let Some(policy) = launch_config.simulated_execution.clone() {
         registry.register::<apexes_backtest::SimulatedExecution, ()>((), policy)?;
     }
+    if let Some(policy) = launch_config.simulated_depth {
+        registry.register::<apexes_backtest::SimulatedDepthPolicy, ()>((), policy)?;
+    }
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
     let control_handle = control_handle
@@ -1133,6 +1136,7 @@ mod tests {
             risk_free_return: dec!(0),
             simulated_fees: None,
             simulated_execution: None,
+            simulated_depth: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }

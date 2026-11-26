@@ -134,6 +134,28 @@ fn economic_report(report: &BacktestReport) -> serde_json::Value {
 }
 
 #[test]
+fn stale_depth_policy_changes_replay_and_is_reported() {
+    let registry = Registry::new();
+    let policy = apexes_backtest::SimulatedDepthPolicy {
+        max_age_ms: 500,
+        sequence: apexes_backtest::DepthSequence::Contiguous,
+    };
+    registry
+        .register::<apexes_backtest::SimulatedDepthPolicy, ()>((), policy)
+        .unwrap();
+    let prices = trending_prices();
+    let strict = replay_with_registry(&prices, dec!(10), &registry);
+    assert!(
+        strict.trades.is_empty(),
+        "fixture trades arrive one second after depth"
+    );
+    assert_eq!(strict.simulated_depth, Some(policy));
+    let legacy = replay(&prices, dec!(10));
+    assert_eq!(legacy.trades.len(), 2);
+    assert!(legacy.simulated_depth.is_none());
+}
+
+#[test]
 fn bounded_ioc_replay_does_not_buy_above_reference_and_reports_policy() {
     let registry = Registry::new();
     let policy = apexes_backtest::SimulatedExecution::BoundedSpotIoc {

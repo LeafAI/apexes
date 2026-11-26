@@ -77,6 +77,7 @@ pub async fn run_paper_trading(
 ) -> Result<BacktestReport, ApexesError> {
     let execution =
         apexes_backtest::SimulatedExecution::from_registry(registry, &config.instruments)?;
+    let depth = apexes_backtest::SimulatedDepthPolicy::from_registry(registry)?;
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let risk_checker = registry
         .try_one::<Arc<CompositeRiskChecker>>()
@@ -124,7 +125,8 @@ pub async fn run_paper_trading(
     // the same wiring `run_backtest` performs.
     let matching_engine = Arc::new(Mutex::new(
         MatchingEngine::new(config.cost_model, config.queue_position_factor)
-            .with_execution(execution.clone()),
+            .with_execution(execution.clone())
+            .with_depth_policy(depth),
     ));
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
@@ -168,6 +170,7 @@ pub async fn run_paper_trading(
     .await?;
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
+    report.simulated_depth = depth;
     Ok(report)
 }
 

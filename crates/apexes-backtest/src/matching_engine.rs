@@ -80,6 +80,7 @@ pub struct MatchingEngine {
     books: HashMap<(Venue, String), ReplayOrderBook>,
     event_time: Option<DateTime<Utc>>,
     execution: crate::SimulatedExecution,
+    depth_policy: Option<crate::SimulatedDepthPolicy>,
     trade_references: HashMap<(Venue, String), (DateTime<Utc>, Decimal)>,
     cost_model: CostModel,
     /// 0.0 (optimistic) .. 1.0 (pessimistic), see design spec §7.3.
@@ -155,6 +156,7 @@ impl MatchingEngine {
             books: HashMap::new(),
             event_time: None,
             execution: crate::SimulatedExecution::default(),
+            depth_policy: None,
             trade_references: HashMap::new(),
             cost_model,
             queue_position_factor,
@@ -167,6 +169,10 @@ impl MatchingEngine {
         self.execution = execution;
         self
     }
+    pub fn with_depth_policy(mut self, policy: Option<crate::SimulatedDepthPolicy>) -> Self {
+        self.depth_policy = policy;
+        self
+    }
     pub(crate) fn execution_policy(&self) -> &crate::SimulatedExecution {
         &self.execution
     }
@@ -177,14 +183,63 @@ impl MatchingEngine {
     /// computed.
     pub fn on_depth_update(&mut self, update: &DepthUpdate) {
         self.advance_time(update.timestamp);
-        self.books
-            .entry((update.venue, update.symbol.clone()))
-            .or_default()
-            .apply(update);
+        if let Some(policy) = self.depth_policy
+            && self
+                .event_time
+                .is_some_and(|now| now - update.timestamp > policy.max_age())
+        {
+            return;
+        }
+        let key = (update.venue, update.symbol.clone());
+        let book = self.books.entry(key.clone()).or_default();
+        if let Some(policy) = self.depth_policy {
+            if book.apply_strict(update, policy) {
+                self.resting_orders.remove(&key);
+                self.pending_triggers.remove(&key);
+            }
+        } else {
+            book.apply(update);
+        }
     }
 
     pub fn advance_time(&mut self, now: DateTime<Utc>) {
-        self.event_time = Some(self.event_time.map_or(now, |at| at.max(now)));
+        let now = self.event_time.map_or(now, |at| at.max(now));
+        self.event_time = Some(now);
+        if let Some(policy) = self.depth_policy {
+            for book in self.books.values_mut() {
+                book.expire_at(now, policy);
+            }
+            let fresh = |key: &(Venue, String)| {
+                self.books
+                    .get(key)
+                    .is_some_and(|book| book.fresh_at(now, policy))
+            };
+            self.resting_orders.retain(|key, _| fresh(key));
+            self.pending_triggers.retain(|key, _| fresh(key));
+        }
+    }
+    fn depth_available(&self, venue: Venue, symbol: &str, now: DateTime<Utc>) -> bool {
+        self.depth_policy.is_none_or(|policy| {
+            self.event_time.is_none_or(|at| at <= now)
+                && self
+                    .books
+                    .get(&(venue, symbol.to_owned()))
+                    .is_some_and(|book| book.fresh_at(now, policy))
+        })
+    }
+    fn require_depth(&self, intent: &OrderIntent, now: DateTime<Utc>) -> Result<(), ApexesError> {
+        if self.depth_available(intent.venue, &intent.symbol, now) {
+            Ok(())
+        } else {
+            Err(ApexesError::OrderRejected {
+                reason: "simulated depth missing, stale or invalid".into(),
+            })
+        }
+    }
+    pub(crate) fn advance_depth_time(&mut self, now: DateTime<Utc>) {
+        if self.depth_policy.is_some() {
+            self.advance_time(now);
+        }
     }
     pub fn event_time(&self) -> Option<DateTime<Utc>> {
         self.event_time
@@ -243,6 +298,8 @@ impl MatchingEngine {
             });
         }
 
+        self.advance_depth_time(now);
+        self.require_depth(intent, now)?;
         let (quantity, cap) = self.execution.market_buy(
             intent,
             now,
@@ -354,6 +411,8 @@ impl MatchingEngine {
         now: DateTime<Utc>,
     ) -> Result<Order, ApexesError> {
         self.execution.validate_intent(intent)?;
+        self.advance_depth_time(now);
+        self.require_depth(intent, now)?;
         if intent.order_type != OrderType::Limit {
             return Err(ApexesError::OrderRejected {
                 reason: format!(
@@ -442,6 +501,8 @@ impl MatchingEngine {
         now: DateTime<Utc>,
     ) -> Result<Order, ApexesError> {
         self.execution.validate_intent(intent)?;
+        self.advance_depth_time(now);
+        self.require_depth(intent, now)?;
         if intent.order_type != OrderType::Stop && intent.order_type != OrderType::StopLimit {
             return Err(ApexesError::OrderRejected {
                 reason: format!(
@@ -540,6 +601,11 @@ impl MatchingEngine {
                 self.trade_references
                     .insert(key, (trade.timestamp, trade.price));
             }
+        }
+        if !self.depth_available(trade.venue, &trade.symbol, now)
+            || (self.depth_policy.is_some() && trade.timestamp > now)
+        {
+            return Vec::new();
         }
         let trigger_result = self.check_pending_triggers(trade, now);
 
