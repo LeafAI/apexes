@@ -197,7 +197,13 @@ async fn event_latency_admits_twap_parent_then_dispatches_on_observed_events() {
     let MarketEvent::Depth(first) = events[0].clone() else {
         panic!("depth fixture")
     };
-    for (offset, price, seq) in [(500, dec!(2), 2), (600, dec!(3), 3), (1600, dec!(4), 4)] {
+    for (offset, price, seq) in [
+        (500, dec!(2), 2),
+        (600, dec!(3), 3),
+        (1100, dec!(4), 4),
+        (1600, dec!(5), 5),
+        (2100, dec!(6), 6),
+    ] {
         let mut d = first.clone();
         d.timestamp += chrono::Duration::milliseconds(offset);
         d.sequence = Some(seq);
@@ -219,7 +225,7 @@ async fn event_latency_admits_twap_parent_then_dispatches_on_observed_events() {
     let report = run_backtest(
         base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
         &registry,
-        InMemoryMarketDataSource::new(events),
+        InMemoryMarketDataSource::new(events.clone()),
         TwapOnce(BuyOnceStrategy { has_bought: false }),
     )
     .await
@@ -227,20 +233,51 @@ async fn event_latency_admits_twap_parent_then_dispatches_on_observed_events() {
     assert_eq!(report.trades.len(), 2);
     assert_eq!(
         report.trades.iter().map(|f| f.price).collect::<Vec<_>>(),
-        vec![dec!(3), dec!(4)]
+        vec![dec!(4), dec!(6)]
     );
     assert_eq!(
         report.trades[0].filled_at,
-        first.timestamp + chrono::Duration::milliseconds(600)
+        first.timestamp + chrono::Duration::milliseconds(1100)
     );
     assert_eq!(
         report.trades[1].filled_at,
-        first.timestamp + chrono::Duration::milliseconds(1600)
+        first.timestamp + chrono::Duration::milliseconds(2100)
     );
     let latency = report.event_latency.unwrap();
     assert_eq!(
         (latency.scheduled, latency.arrived, latency.expired_at_end),
         (1, 1, 0)
+    );
+
+    let children = latency.child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.expired_at_end
+        ),
+        (2, 2, 0)
+    );
+
+    // End at the second child's submission, without inventing another event.
+    events.pop();
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        TwapOnce(BuyOnceStrategy { has_bought: false }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    let children = report.event_latency.unwrap().child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.expired_at_end
+        ),
+        (2, 1, 1)
     );
 }
 

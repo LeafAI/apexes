@@ -134,12 +134,17 @@ pub async fn run_paper_trading(
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
     )));
-    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
-        MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+    let child_order_sink = Arc::new(
+        MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)).with_event_latency(
+            match latency {
+                apexes_backtest::LatencyModel::EventTime(p) => Some(p),
+                _ => None,
+            },
+        ),
     );
     let ems: Arc<dyn Ems> = Arc::new(
         apexes_ems::InMemoryEms::new(
-            child_order_sink,
+            child_order_sink.clone(),
             venue_scorer,
             HashMap::new(),
             volume_curve_provider,
@@ -180,6 +185,9 @@ pub async fn run_paper_trading(
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
     report.simulated_depth = depth;
+    if let Some(report) = &mut report.event_latency {
+        report.child_orders = child_order_sink.finish_child_latency();
+    }
     Ok(report)
 }
 
@@ -353,6 +361,78 @@ mod tests {
                 evidence.arrived,
                 evidence.expired_at_end
             ),
+            (1, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn event_latency_defers_ems_children_in_paper() {
+        struct TwapOnce(BuyOnceStrategy);
+        impl Strategy for TwapOnce {
+            fn on_market_event(
+                &mut self,
+                event: &MarketEvent,
+                ctx: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                self.0
+                    .on_market_event(event, ctx)
+                    .into_iter()
+                    .map(|mut intent| {
+                        intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                            duration: Duration::from_secs(1),
+                            slices: 1,
+                        });
+                        intent
+                    })
+                    .collect()
+            }
+        }
+        let mut events = sample_events();
+        let MarketEvent::Depth(first) = events[0].clone() else {
+            panic!("depth fixture");
+        };
+        for (offset, price, seq) in [
+            (1500, dec!(102), 2),
+            (1600, dec!(103), 3),
+            (2100, dec!(104), 4),
+        ] {
+            let mut next = first.clone();
+            next.timestamp += chrono::Duration::milliseconds(offset);
+            next.sequence = Some(seq);
+            next.asks[0].price = price;
+            events.push(MarketEvent::Depth(next));
+        }
+        let bus = MarketEventBus::new(Box::new(MockMarketDataProvider { events }));
+        let registry = Registry::new();
+        registry
+            .register::<apexes_backtest::EventLatencyPolicy, ()>(
+                (),
+                apexes_backtest::EventLatencyPolicy { delay_ms: 500 },
+            )
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
+        let report = run_paper_trading(
+            base_config(),
+            &registry,
+            &bus,
+            TwapOnce(BuyOnceStrategy { bought: false }),
+            rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].price, dec!(104));
+        assert_eq!(
+            report.trades[0].filled_at,
+            first.timestamp + chrono::Duration::milliseconds(2100)
+        );
+        let child = report.event_latency.unwrap().child_orders.unwrap();
+        assert_eq!(
+            (child.scheduled, child.arrived, child.expired_at_end),
             (1, 1, 0)
         );
     }

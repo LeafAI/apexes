@@ -10,9 +10,8 @@
 //! independent simulations.
 //!
 //! **All child orders submit as Market orders** -- `ChildOrderIntent`
-//! has no price/order-type field, so this adapter always calls
-//! `MatchingEngine::submit_market_order`. See this task's own plan
-//! entry for the full rationale.
+//! has no price/order-type field. Legacy children execute immediately;
+//! opt-in event-time children arrive later through the same matcher.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,18 +24,16 @@ use chrono::Utc;
 
 use crate::matching_engine::MatchingEngine;
 
+#[path = "ems_child_latency.rs"]
+mod child_latency;
+use child_latency::ChildArrivalQueue;
+
 pub struct MatchingEngineChildOrderSink {
     engine: Arc<Mutex<MatchingEngine>>,
-    /// Every order this sink has ever submitted, keyed by `OrderId`,
-    /// recording the terminal (or partially-filled) `Order` snapshot
-    /// `submit_market_order` returned at submission time. `MatchingEngine`
-    /// itself does not retain a lookup table for orders after they fill
-    /// (see `order_status`'s doc comment for why a lookup table is
-    /// needed HERE instead), so this adapter keeps its own -- required
-    /// for `Ems`'s Iceberg scheduling, whose `refill_iceberg_allocation`
-    /// polls `order_status` to detect when a resting child has reached a
-    /// terminal state before submitting the next visible slice.
+    /// Accepted child snapshots, including in-transit and terminal orders.
+    /// Iceberg polls these snapshots before releasing another visible slice.
     submitted: Mutex<HashMap<OrderId, Order>>,
+    arrivals: Option<Mutex<ChildArrivalQueue>>,
 }
 
 impl MatchingEngineChildOrderSink {
@@ -44,6 +41,7 @@ impl MatchingEngineChildOrderSink {
         Self {
             engine,
             submitted: Mutex::new(HashMap::new()),
+            arrivals: None,
         }
     }
 }
@@ -108,6 +106,9 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             leverage: intent.leverage,
             margin_mode: intent.margin_mode,
         };
+        if let Some(arrivals) = &self.arrivals {
+            return self.schedule_child(arrivals, order_intent, now);
+        }
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         let (order, fills) = engine
             .submit_market_child(&order_intent, now)
@@ -126,26 +127,20 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         Ok((order.id, fills))
     }
 
-    async fn cancel_child_order(&self, _order_id: OrderId) -> Result<(), EmsError> {
-        // MatchingEngine's Market orders fill immediately at submission
-        // (no resting state exists to cancel by the time this could be
-        // called) -- a no-op success, matching `ChildOrderSink`'s own
-        // documented "cancelling an already-terminal order is a no-op
-        // success" convention.
+    fn defers_children(&self) -> bool {
+        self.arrivals.is_some()
+    }
+
+    async fn advance_simulated_time(&self, at: chrono::DateTime<Utc>) -> Vec<apexes_core::Fill> {
+        self.deliver_arrivals(at)
+    }
+
+    async fn cancel_child_order(&self, order_id: OrderId) -> Result<(), EmsError> {
+        self.cancel_pending_child(order_id);
         Ok(())
     }
 
     async fn order_status(&self, order_id: OrderId) -> Result<Option<Order>, EmsError> {
-        // Every order submitted through this adapter is a Market order
-        // that fills (fully or partially) synchronously within
-        // submit_child_order itself -- there is no resting-order concept
-        // here, so by the time this method could ever be called, the
-        // order this adapter recorded is already permanently terminal.
-        // Returns that recorded snapshot (with `status` normalized to
-        // `Filled`/`Rejected` at submission time, see
-        // `submit_child_order`'s doc comment) so Iceberg's
-        // `refill_iceberg_allocation` correctly detects completion on
-        // its very next poll instead of waiting forever.
         Ok(self
             .submitted
             .lock()

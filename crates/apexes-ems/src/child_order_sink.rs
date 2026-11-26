@@ -93,6 +93,18 @@ pub trait ChildOrderSink: Send + Sync {
         self.submit_child_order(intent).await
     }
 
+    /// Simulated sinks can defer child execution until a later market event.
+    /// Live and legacy sinks remain synchronous at this interface.
+    fn defers_children(&self) -> bool {
+        false
+    }
+
+    /// Deliver arrivals before scheduling new slices on the observed event.
+    /// Called only by the causal in-memory scheduler.
+    async fn advance_simulated_time(&self, _at: chrono::DateTime<chrono::Utc>) -> Vec<Fill> {
+        Vec::new()
+    }
+
     /// Cancels a previously-submitted child order, if still active.
     /// Implementations should treat cancelling an already-terminal
     /// order as a no-op success, not an error (mirrors
