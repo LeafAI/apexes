@@ -36,6 +36,64 @@ async fn mount_clock(server: &MockServer) {
 }
 
 #[tokio::test]
+async fn fee_conversion_uses_unsigned_verified_pair_and_closed_causal_candle() {
+    use wiremock::matchers::{header_exists, query_param};
+    let server = MockServer::start().await;
+    let at = chrono::DateTime::from_timestamp_millis(1_800_000_030_000).unwrap();
+    let minute = at.timestamp_millis().div_euclid(60_000) * 60_000;
+    Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
+        .and(query_param("symbol","BNBUSDT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbols":[{"symbol":"BNBUSDT","baseAsset":"BNB","quoteAsset":"USDT","isSpotTradingAllowed":true}]
+        }))).expect(1).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/klines"))
+        .and(query_param("symbol", "BNBUSDT"))
+        .and(query_param("interval", "1m"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            [minute - 120000, "1", "1", "1", "299", "1", minute - 60001],
+            [minute - 60000, "1", "1", "1", "300", "1", minute - 1],
+            [minute, "1", "1", "1", "999", "1", minute + 59999]
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(header_exists("X-MBX-APIKEY"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let gateway = gateway_against(&server).await;
+    let price = gateway.fee_conversion("BNB", "USDT", at).await.unwrap();
+    assert_eq!(price.rate, dec!(300));
+    assert_eq!(price.observed_at.timestamp_millis(), minute - 1);
+    assert!(gateway.fee_conversion("BNB&bad", "USDT", at).await.is_err());
+}
+
+#[tokio::test]
+async fn fee_conversion_rejects_mismatched_pair_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbols":[{"symbol":"BNBUSDT","baseAsset":"OTHER","quoteAsset":"USDT","isSpotTradingAllowed":true}]
+        }))).expect(1).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/klines"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert!(
+        gateway_against(&server)
+            .await
+            .fee_conversion("BNB", "USDT", chrono::Utc::now())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn account_balances_merges_spot_and_futures_wallets() {
     let mock_server = MockServer::start().await;
     mount_clock(&mock_server).await;

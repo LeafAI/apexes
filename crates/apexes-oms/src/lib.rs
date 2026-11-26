@@ -14,7 +14,9 @@
 
 pub mod error;
 pub mod exchange_update;
+pub mod fee_journal;
 pub mod gateway;
+pub use fee_journal::{FeeConversion, FeeJournal};
 pub mod kill_switch;
 pub mod manager;
 pub mod mock_gateway;

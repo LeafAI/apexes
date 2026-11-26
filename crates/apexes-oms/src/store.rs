@@ -88,9 +88,18 @@ impl OrderStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_fills_exchange_identity ON fills(venue, symbol, exchange_trade_id)")
             .execute(&pool).await?;
 
+        crate::FeeJournal::migrate(&pool).await?;
         Ok(Self {
             pool,
             inventory_lease: None,
+        })
+    }
+
+    /// Pricing is a separate, read-mostly task using the same schema.
+    pub fn fee_journal(&self) -> Option<crate::FeeJournal> {
+        self.inventory_lease.as_ref()?;
+        Some(crate::FeeJournal {
+            pool: self.pool.clone(),
         })
     }
 

@@ -97,6 +97,58 @@ fn execution(side: Side, qty: Decimal, price: Decimal, fee: Decimal, offset: i64
     (order, fill)
 }
 
+#[tokio::test]
+#[ignore]
+async fn durable_fee_conversion_is_causal_immutable_and_recovered_after_restart() {
+    let fixture = Fixture::new().await;
+    let store = bound_store(&fixture.url, "fee-pricing-owner").await;
+    let (order, mut fill) = execution(Side::Buy, dec!(1), dec!(100), dec!(0.01), 0);
+    fill.fee_currency = Some("BNB".into());
+    store.upsert_order(&order).await.unwrap();
+    assert!(store.insert_fill(&fill, "1").await.unwrap());
+    let journal = store.fee_journal().unwrap();
+    assert!(journal.history().await.unwrap()[0].1.is_none());
+    let observed_at =
+        chrono::DateTime::from_timestamp_millis(fill.filled_at.timestamp_millis() - 1000).unwrap();
+    let valid = apexes_oms::FeeConversion {
+        asset: "BNB".into(),
+        quote: "USDT".into(),
+        observed_at,
+        rate: dec!(300),
+    };
+    let future = apexes_oms::FeeConversion {
+        observed_at: fill.filled_at + chrono::TimeDelta::seconds(1),
+        ..valid.clone()
+    };
+    assert!(journal.persist(fill.id, &future).await.is_err());
+    let stale = apexes_oms::FeeConversion {
+        observed_at: fill.filled_at - chrono::TimeDelta::minutes(6),
+        ..valid.clone()
+    };
+    assert!(journal.persist(fill.id, &stale).await.is_err());
+    let wrong_asset = apexes_oms::FeeConversion {
+        asset: "ETH".into(),
+        ..valid.clone()
+    };
+    assert!(journal.persist(fill.id, &wrong_asset).await.is_err());
+    journal.persist(fill.id, &valid).await.unwrap();
+    journal.persist(fill.id, &valid).await.unwrap();
+    let conflicting = apexes_oms::FeeConversion {
+        rate: dec!(301),
+        ..valid.clone()
+    };
+    assert!(journal.persist(fill.id, &conflicting).await.is_err());
+    drop(journal);
+    drop(store);
+    let restarted = bound_store(&fixture.url, "fee-pricing-owner").await;
+    let recovered = restarted.fee_journal().unwrap().history().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].0.id, fill.id);
+    assert_eq!(recovered[0].1, Some(valid));
+    drop(restarted);
+    fixture.cleanup().await;
+}
+
 async fn bound_store(url: &str, owner: &str) -> OrderStore {
     let mut store = OrderStore::new(url).await.unwrap();
     store.bind_spot_inventory(owner).await.unwrap();

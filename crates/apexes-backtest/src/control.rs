@@ -179,6 +179,7 @@ pub struct ControlHandle {
     min_interval: Duration,
     last_pushed: Option<Instant>,
     paused: bool,
+    lifetime_spot_pnl: Option<watch::Receiver<Option<crate::spot_accounting::LifetimeSpotPnl>>>,
 }
 
 /// The outcome of one [`ControlHandle::drain_commands`] call.
@@ -211,6 +212,7 @@ impl ControlHandle {
             min_interval,
             last_pushed: None,
             paused: false,
+            lifetime_spot_pnl: None,
         };
         (handle, command_tx, snapshot_rx)
     }
@@ -224,6 +226,15 @@ impl ControlHandle {
     /// Limits the evaluation view reports utilisation against.
     pub fn with_limits(mut self, limits: crate::evaluation::LimitSpec) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Receive independent durable accounting snapshots without I/O on the loop.
+    pub fn with_lifetime_spot_pnl(
+        mut self,
+        pricing: watch::Receiver<Option<crate::spot_accounting::LifetimeSpotPnl>>,
+    ) -> Self {
+        self.lifetime_spot_pnl = Some(pricing);
         self
     }
 
@@ -295,7 +306,7 @@ impl ControlHandle {
     /// queuing, `watch`'s own "only the latest value matters" semantics
     /// do the throttling naturally once this elapsed-time gate is
     /// applied at the call site).
-    pub(crate) fn maybe_push_snapshot(&mut self, snapshot: SessionSnapshot) {
+    pub(crate) fn maybe_push_snapshot(&mut self, mut snapshot: SessionSnapshot) {
         let now = Instant::now();
         let should_push = match self.last_pushed {
             None => true,
@@ -307,6 +318,11 @@ impl ControlHandle {
         // `watch::Sender::send` only fails when every `Receiver` has
         // been dropped -- not a loop error, just means nobody is
         // listening for snapshots anymore.
+        if let (Some(evaluation), Some(pricing)) =
+            (&mut snapshot.evaluation, &self.lifetime_spot_pnl)
+        {
+            evaluation.lifetime_spot_pnl = pricing.borrow().clone();
+        }
         let _ = self.snapshot_tx.send(snapshot);
         self.last_pushed = Some(now);
     }

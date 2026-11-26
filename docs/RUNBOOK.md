@@ -400,6 +400,19 @@ or before execution, at most five minutes old, retained in bounded
 history. If that observation is unavailable, historical fee valuation
 remains unknown; current marked P&L may be priced separately. Current
 marks are latest observations rather than a synchronized account
-snapshot. Automatic retrieval for unconfigured fee assets, durable
-conversion provenance and lifetime attribution across restarts remain
-pending. Do not interpret session attribution as lifetime tax basis.
+snapshot.
+
+The live engine now also publishes lifetime_spot_pnl from the bound
+durable fill journal. A separate worker resolves missing direct Binance
+Spot conversions using public exchangeInfo and closed one-minute klines,
+persisting the fee asset, quote asset, observation timestamp and rate on
+each fill. It reuses immutable evidence on restart and obtains separate
+fee-only marks without exposing new assets to strategy execution.
+The console labels lifetime net contribution, fee cost, journal fill count
+and mark timestamp separately from session P&L. An unavailable pair
+or price remains unpriced; no stablecoin parity or future candle is
+assumed. This is journal contribution, not lifetime tax basis or proof
+of all external account funding. The refresh scans the journal and
+limits each cycle to 16 historical lookups and 32 direct mark pairs;
+large-history performance and multi-hop conversion are not qualified.
+The worker does not retroactively rewrite session-only attribution.

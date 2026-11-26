@@ -36,6 +36,16 @@ pub struct SpotPnlSummary {
     pub missing_execution_valuations: u64,
 }
 
+/// Lifetime attribution from the bound durable Spot journal. This is
+/// separate from session wallet equity; historical external funding and
+/// wallet classification are not reconstructed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifetimeSpotPnl {
+    pub as_of: DateTime<Utc>,
+    pub fill_count: usize,
+    pub per_symbol: HashMap<String, SpotPnlSummary>,
+}
+
 #[derive(Default)]
 struct SymbolAccount {
     quote: String,
@@ -51,13 +61,13 @@ struct SymbolAccount {
 }
 
 #[derive(Default)]
-pub(crate) struct SpotAccounting {
+pub struct SpotAccounting {
     accounts: HashMap<String, SymbolAccount>,
     prices: HashMap<(Venue, String, String), BTreeMap<DateTime<Utc>, Decimal>>,
 }
 
 impl SpotAccounting {
-    pub(crate) fn observe(
+    pub fn observe(
         &mut self,
         venue: Venue,
         base: &str,
@@ -113,6 +123,20 @@ impl SpotAccounting {
             self.historical_rate(fill.venue, asset, quote, fill.filled_at)
                 .map(|rate| rate * fill.fee)
         };
+        self.record_valued(fill, base, quote, external_fee, fee_value);
+    }
+
+    /// Replay a fill using previously validated durable conversion evidence.
+    /// No wallet balances or positions are changed by this attribution.
+    pub fn record_valued(
+        &mut self,
+        fill: &Fill,
+        base: &str,
+        quote: &str,
+        external_fee: bool,
+        fee_value: Option<Decimal>,
+    ) {
+        let asset = fill.fee_currency.as_deref().unwrap_or(quote);
         let account = self.accounts.entry(fill.symbol.clone()).or_default();
         account.base = base.into();
         account.quote = quote.into();
@@ -130,7 +154,7 @@ impl SpotAccounting {
         }
     }
 
-    pub(crate) fn summaries(&self) -> HashMap<String, SpotPnlSummary> {
+    pub fn summaries(&self) -> HashMap<String, SpotPnlSummary> {
         self.accounts
             .iter()
             .filter_map(|(symbol, account)| {
