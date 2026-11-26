@@ -132,12 +132,16 @@ pub async fn run_backtest(
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
     )));
-    let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
-        crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
+    let child_order_sink = Arc::new(
+        crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine))
+            .with_event_latency(match latency {
+                Some(crate::LatencyModel::EventTime(p)) => Some(p),
+                _ => None,
+            }),
     );
     let ems: Arc<dyn Ems> = Arc::new(
         apexes_ems::InMemoryEms::new(
-            child_order_sink,
+            child_order_sink.clone(),
             venue_scorer,
             HashMap::new(),
             volume_curve_provider,
@@ -175,6 +179,9 @@ pub async fn run_backtest(
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
     report.simulated_depth = depth;
+    if let Some(report) = &mut report.event_latency {
+        report.child_orders = child_order_sink.finish_child_latency();
+    }
     Ok(report)
 }
 

@@ -39,7 +39,7 @@ pub mod execution_policy;
 pub use depth_policy::{DepthSequence, SimulatedDepthPolicy};
 pub mod event_latency;
 pub mod latency;
-pub use event_latency::{EventLatencyPolicy, EventLatencyReport};
+pub use event_latency::{ChildLatencyReport, EventLatencyPolicy, EventLatencyReport};
 pub use execution_policy::SimulatedExecution;
 pub mod mark_price_source;
 

@@ -40,6 +40,19 @@ pub struct EventLatencyReport {
     pub expired_at_end: u64,
     pub refused: u64,
     pub regressing_events: u64,
+    /// Separate EMS child transit accounting; None for legacy reports.
+    #[serde(default)]
+    pub child_orders: Option<ChildLatencyReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildLatencyReport {
+    pub scheduled: u64,
+    pub arrived: u64,
+    pub refused: u64,
+    pub rejected_at_arrival: u64,
+    pub cancelled_before_arrival: u64,
+    pub expired_at_end: u64,
 }
 
 pub(crate) struct ArrivalQueue {
@@ -59,6 +72,7 @@ impl ArrivalQueue {
                 expired_at_end: 0,
                 refused: 0,
                 regressing_events: 0,
+                child_orders: None,
             },
             watermark: None,
         }

@@ -83,7 +83,7 @@ impl InMemoryEms {
 
     /// In causal simulation each fixed-route parent has one allocation.
     /// A failed parent must not erase earlier parents' executed fills.
-    fn collect_parent_result(
+    async fn collect_parent_result(
         &self,
         id: ParentOrderId,
         result: Result<Vec<Fill>, EmsError>,
@@ -93,11 +93,23 @@ impl InMemoryEms {
             Ok(child_fills) => fills.extend(child_fills),
             Err(error) if self.causal => {
                 let reason = error.to_string();
-                let mut parents = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(parent) = parents.get_mut(&id) {
-                    parent.status = ParentOrderStatus::Failed {
-                        reason: reason.clone(),
-                    };
+                let children = {
+                    let mut parents = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(parent) = parents.get_mut(&id) {
+                        parent.status = ParentOrderStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        parent.child_order_ids.clone()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if self.sink.defers_children() {
+                    for child in children {
+                        if let Err(error) = self.sink.cancel_child_order(child).await {
+                            tracing::warn!(parent_id = %id.0, child_id = %child.0, %error, "failed to cancel deferred child");
+                        }
+                    }
                 }
                 tracing::warn!(parent_id = %id.0, %reason, "causal simulated parent failed");
             }
@@ -164,6 +176,14 @@ impl InMemoryEms {
         });
         match &result {
             Ok((order_id, _)) => {
+                if let Some(state) = self
+                    .parent_orders
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&parent_id)
+                {
+                    state.child_order_ids.push(*order_id);
+                }
                 tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %order_id.0)
             }
             Err(_) => {
@@ -242,22 +262,20 @@ impl InMemoryEms {
                     leverage,
                     margin_mode,
                 };
-                let (child_id, slice_fills) = self
+                let (_child_id, slice_fills) = self
                     .submit_slice(parent_id, &params, this_venue_slice)
                     .await?;
                 fills.extend(slice_fills);
 
                 let mut parent_orders =
                     self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(state) = parent_orders.get_mut(&parent_id) {
-                    state.child_order_ids.push(child_id);
-                    if let Some(allocation) = state
+                if let Some(state) = parent_orders.get_mut(&parent_id)
+                    && let Some(allocation) = state
                         .allocations
                         .iter_mut()
                         .find(|a| a.asset_class == asset_class)
-                    {
-                        allocation.submitted_quantity += this_venue_slice;
-                    }
+                {
+                    allocation.submitted_quantity += this_venue_slice;
                 }
             }
         }
@@ -340,7 +358,8 @@ impl InMemoryEms {
         let mut fills = Vec::new();
         for parent_id in candidates {
             let result = self.process_one_iceberg_parent(parent_id).await;
-            self.collect_parent_result(parent_id, result, &mut fills)?;
+            self.collect_parent_result(parent_id, result, &mut fills)
+                .await?;
         }
         Ok(fills)
     }
@@ -506,7 +525,8 @@ impl InMemoryEms {
         for (parent_id, participation_rate) in candidates {
             let target_quantity = trade.quantity * participation_rate;
             let result = self.submit_pov_increment(parent_id, target_quantity).await;
-            self.collect_parent_result(parent_id, result, &mut fills)?;
+            self.collect_parent_result(parent_id, result, &mut fills)
+                .await?;
         }
         Ok(fills)
     }
@@ -622,7 +642,8 @@ impl InMemoryEms {
         let mut fills = Vec::new();
         for (parent_id, target_fraction) in candidates {
             let result = self.submit_vwap_increment(parent_id, target_fraction).await;
-            self.collect_parent_result(parent_id, result, &mut fills)?;
+            self.collect_parent_result(parent_id, result, &mut fills)
+                .await?;
         }
         Ok(fills)
     }
@@ -854,8 +875,36 @@ impl Ems for InMemoryEms {
         &self,
         id: ParentOrderId,
     ) -> Result<Option<ParentOrderStatus>, EmsError> {
-        let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(parent_orders.get(&id).map(|state| state.status.clone()))
+        let (status, children) = {
+            let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(state) = parent_orders.get(&id) else {
+                return Ok(None);
+            };
+            let children =
+                if state.status == ParentOrderStatus::Completed && self.sink.defers_children() {
+                    state.child_order_ids.clone()
+                } else {
+                    Vec::new()
+                };
+            (state.status.clone(), children)
+        };
+        // Internally Completed means the scheduling plan is exhausted.
+        // Externally it must also wait for all deferred children to be terminal.
+        if status == ParentOrderStatus::Completed && self.sink.defers_children() {
+            for child in children {
+                if !matches!(
+                    self.sink.order_status(child).await?.map(|o| o.status),
+                    Some(
+                        apexes_core::OrderStatus::Filled
+                            | apexes_core::OrderStatus::Cancelled
+                            | apexes_core::OrderStatus::Rejected
+                    )
+                ) {
+                    return Ok(Some(ParentOrderStatus::Scheduling));
+                }
+            }
+        }
+        Ok(Some(status))
     }
 
     async fn cancel_parent_order(&self, id: ParentOrderId) -> Result<(), EmsError> {
@@ -914,10 +963,15 @@ impl Ems for InMemoryEms {
         if self.causal {
             self.sort_parents(&mut due, |id| *id);
         }
-        let mut all_fills = Vec::new();
+        let mut all_fills = if self.causal {
+            self.sink.advance_simulated_time(now).await
+        } else {
+            Vec::new()
+        };
         for parent_id in due {
             let result = self.submit_due_twap_slice(parent_id, now).await;
-            self.collect_parent_result(parent_id, result, &mut all_fills)?;
+            self.collect_parent_result(parent_id, result, &mut all_fills)
+                .await?;
         }
 
         all_fills.extend(self.process_iceberg_parents().await?);
