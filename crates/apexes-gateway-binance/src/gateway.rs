@@ -910,7 +910,7 @@ fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {
         "NEW" => Ok(OrderStatus::New),
         "PARTIALLY_FILLED" => Ok(OrderStatus::PartiallyFilled),
         "FILLED" => Ok(OrderStatus::Filled),
-        "CANCELED" | "EXPIRED" => Ok(OrderStatus::Cancelled),
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => Ok(OrderStatus::Cancelled),
         "REJECTED" => Ok(OrderStatus::Rejected),
         other => Err(format!("unknown Binance order status: {other}")),
     }
@@ -952,49 +952,8 @@ fn millis_to_datetime(millis: i64) -> Result<DateTime<Utc>, String> {
         .ok_or_else(|| format!("could not convert {millis} to a valid timestamp"))
 }
 
-#[async_trait]
-impl ExecutionGateway for BinanceExecutionGateway {
-    async fn spot_preflight(
-        &self,
-        intent: &OrderIntent,
-    ) -> Result<apexes_oms::SpotPreflight, String> {
-        self.check_spot_intent(intent).await
-    }
-    async fn spot_sell_inventory(&self, symbol: &str) -> Result<(String, Decimal), String> {
-        if symbol.is_empty()
-            || !symbol
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        {
-            return Err("invalid spot symbol".into());
-        }
-        let body = self
-            .rest
-            .public_get("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
-            .await?;
-        let info: serde_json::Value =
-            serde_json::from_str(&body).map_err(|_| "invalid spot metadata")?;
-        let row = info["symbols"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter().find(|r| {
-                    r["symbol"].as_str() == Some(symbol)
-                        && r["isSpotTradingAllowed"].as_bool() == Some(true)
-                })
-            })
-            .ok_or("spot instrument unavailable")?;
-        let base = row["baseAsset"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("missing base asset")?
-            .to_owned();
-        let wallet = self.spot_balances().await?;
-        Ok((
-            base.clone(),
-            wallet.get(&base).map_or(Decimal::ZERO, |b| b.free),
-        ))
-    }
-    async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+impl BinanceExecutionGateway {
+    async fn submit_order_wire(&self, order: &Order, immediate_or_cancel: bool) -> GatewayOutcome {
         if let (Some(leverage), Some(margin_mode)) = (order.leverage, order.margin_mode)
             && let Err(reason) = self
                 .ensure_leverage_and_margin_mode(&order.symbol, leverage, margin_mode)
@@ -1057,7 +1016,11 @@ impl ExecutionGateway for BinanceExecutionGateway {
                     | (ApiFamily::Spot, apexes_core::OrderType::StopLimit)
             );
             if needs_time_in_force {
-                params.push_str("&timeInForce=GTC");
+                params.push_str(if immediate_or_cancel {
+                    "&timeInForce=IOC"
+                } else {
+                    "&timeInForce=GTC"
+                });
             }
         }
         if let Some(stop_price) = order.stop_price {
@@ -1078,6 +1041,83 @@ impl ExecutionGateway for BinanceExecutionGateway {
             },
             Err(reason) => GatewayOutcome::Uncertain { reason },
         }
+    }
+}
+
+#[async_trait]
+impl ExecutionGateway for BinanceExecutionGateway {
+    async fn spot_preflight(
+        &self,
+        intent: &OrderIntent,
+    ) -> Result<apexes_oms::SpotPreflight, String> {
+        self.check_spot_intent(intent).await
+    }
+    async fn spot_sell_inventory(&self, symbol: &str) -> Result<(String, Decimal), String> {
+        if symbol.is_empty()
+            || !symbol
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return Err("invalid spot symbol".into());
+        }
+        let body = self
+            .rest
+            .public_get("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
+            .await?;
+        let info: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| "invalid spot metadata")?;
+        let row = info["symbols"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter().find(|r| {
+                    r["symbol"].as_str() == Some(symbol)
+                        && r["isSpotTradingAllowed"].as_bool() == Some(true)
+                })
+            })
+            .ok_or("spot instrument unavailable")?;
+        let base = row["baseAsset"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("missing base asset")?
+            .to_owned();
+        let wallet = self.spot_balances().await?;
+        Ok((
+            base.clone(),
+            wallet.get(&base).map_or(Decimal::ZERO, |b| b.free),
+        ))
+    }
+    async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+        self.submit_order_wire(order, false).await
+    }
+
+    async fn submit_bounded_spot_buy(&self, order: &Order, cap: Decimal) -> GatewayOutcome {
+        if order.asset_class != apexes_core::AssetClass::Spot
+            || order.venue != apexes_core::Venue::Binance
+            || order.side != apexes_core::Side::Buy
+            || order.order_type != apexes_core::OrderType::Market
+            || order.price.is_some()
+            || order.stop_price.is_some()
+            || order.leverage.is_some()
+            || order.margin_mode.is_some()
+            || cap <= Decimal::ZERO
+            || order.quantity <= Decimal::ZERO
+            || wire_decimal(cap)
+                .ok()
+                .and_then(|s| s.parse::<Decimal>().ok())
+                != Some(cap)
+            || wire_decimal(order.quantity)
+                .ok()
+                .and_then(|s| s.parse::<Decimal>().ok())
+                != Some(order.quantity)
+        {
+            return GatewayOutcome::Rejected {
+                reason: "invalid bounded Spot buy".into(),
+            };
+        }
+        let mut wire_order = order.clone();
+        wire_order.order_type = apexes_core::OrderType::Limit;
+        wire_order.price = Some(cap);
+        self.submit_order_wire(&wire_order, true).await
     }
 
     async fn cancel_order(&self, order: &Order) -> GatewayOutcome {

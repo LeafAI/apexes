@@ -68,6 +68,7 @@ pub(crate) struct SpotReservation {
     pub(crate) amount: Decimal,
     pub(crate) owned_quantity: Decimal,
     pub(crate) reference_price: Decimal,
+    pub(crate) market_buy_cap: Option<Decimal>,
 }
 
 pub struct OrderManager {
@@ -485,6 +486,17 @@ impl OrderManager {
                 "exchange preflight attempted non-passive conformance",
             ));
         }
+        let requires_cap =
+            intent.side == Side::Buy && intent.order_type == apexes_core::OrderType::Market;
+        if requires_cap != evidence.market_buy_cap.is_some()
+            || evidence
+                .market_buy_cap
+                .is_some_and(|cap| cap <= Decimal::ZERO || cap != evidence.reference_price)
+        {
+            return Err(reject(
+                "missing or invalid exchange-enforceable market-buy cap",
+            ));
+        }
         intent.quantity = evidence.quantity;
         intent.price = evidence.price;
         let owned = self
@@ -549,6 +561,7 @@ impl OrderManager {
             amount: required,
             owned_quantity: owned,
             reference_price: evidence.reference_price,
+            market_buy_cap: evidence.market_buy_cap,
         }))
     }
 
@@ -607,6 +620,7 @@ impl OrderManager {
         // Retain the guard before awaiting network I/O. Cancellation or a
         // failed acknowledgement write must not erase an in-flight order.
         self.open_orders.insert(order_id, order.clone());
+        let market_buy_cap = reservation.as_ref().and_then(|r| r.market_buy_cap);
         if let Some(reservation) = reservation {
             tracing::debug!(asset = %reservation.spend_asset, amount = %reservation.amount, "managed spot spend reserved");
             self.spot_reservations.insert(order_id, reservation);
@@ -629,7 +643,10 @@ impl OrderManager {
         }
 
         let submit_started = std::time::Instant::now();
-        let outcome = self.gateway.submit_order(&order).await;
+        let outcome = match market_buy_cap {
+            Some(cap) => self.gateway.submit_bounded_spot_buy(&order, cap).await,
+            None => self.gateway.submit_order(&order).await,
+        };
         let telemetry = apexes_telemetry::metrics();
         telemetry.observe_submit_latency(submit_started.elapsed());
         telemetry

@@ -56,9 +56,24 @@ can still conservatively refuse children.
 
 ## Limits and qualification
 
+### Bounded market-buy follow-up
+
+Managed market-buy intents dispatch LIMIT IOC with the original client
+ID, conformed base quantity and a tick-aligned cap no greater than the
+observed last price. Validate both market and limit filters. Persist the
+cap atomically with the reservation; keep the original intent locally.
+Unsupported gateways reject without fallback to MARKET. IOC can fill
+partially or expire, including EXPIRED_IN_MATCH. No automatic resubmission
+is introduced. Retain capital through terminal reconciliation and ledger
+acknowledgement. Above-cap fills or fee-inclusive spend overruns durably
+latch health without discarding executions. Principal is bounded by
+quantity times cap; quote fees still use estimated 1% headroom. The
+zero-slippage-allowance policy does not guarantee fills, exact total fees
+or backtest equivalence. Ordinary limit and market-sell behavior is unchanged.
+
 This is a single managed account/schema guard, not account-wide fencing
 between multiple processes or coordination with external traders.
-Market order spend is estimated and subject to exchange execution; fee
+Managed market-buy principal is exchange-price-bounded, but fee
 headroom is not an exact asset-specific fee reservation. No native
 derivative, stop/stop-limit, or continuously refreshed operator balance
 view is included. The serialized network preflight has latency costs;

@@ -219,9 +219,18 @@ async fn durable_reservation_restores_after_manager_restart_and_releases_on_term
     restarted.cancel_order(id).await.unwrap();
     assert!(restarted.submit_child_order(other).await.is_ok());
     let pool = PgPool::connect(&fixture.url).await.unwrap();
-    let evidence: (String,String,Decimal,bool) = sqlx::query_as("SELECT reserved_spend_asset,reserved_receipt_asset,reserved_amount,reservation_breached FROM orders WHERE id=$1")
+    let evidence: (String,String,Decimal,bool,Option<Decimal>) = sqlx::query_as("SELECT reserved_spend_asset,reserved_receipt_asset,reserved_amount,reservation_breached,reserved_market_buy_cap FROM orders WHERE id=$1")
         .bind(id.0).fetch_one(&pool).await.unwrap();
-    assert_eq!(evidence, ("USDT".into(), "BTC".into(), dec!(303), false));
+    assert_eq!(
+        evidence,
+        (
+            "USDT".into(),
+            "BTC".into(),
+            dec!(303),
+            false,
+            Some(dec!(100))
+        )
+    );
     drop(restarted);
     pool.close().await;
     fixture.cleanup().await;
@@ -234,8 +243,9 @@ async fn actual_spend_including_quote_fee_breaches_budget_without_losing_fill() 
     let mut manager = fixture.manager().await;
     let id = submit(&mut manager).await;
     let mut execution = fill("1", dec!(3), 0);
-    execution.price = dec!(101);
-    execution.fee = dec!(0.01);
+    // A fee-only breach at the capped execution price, independent of a price breach.
+    execution.price = dec!(100);
+    execution.fee = dec!(3.01);
     execution.fee_currency = Some("USDT".into());
     fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
     fixture.gateway.set_fills_for_order(id, vec![execution]);
@@ -263,6 +273,62 @@ async fn actual_spend_including_quote_fee_breaches_budget_without_losing_fill() 
         Err(OmsError::TradingHalted { .. })
     ));
     drop(restarted);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn bounded_ioc_partial_expiry_releases_capital_after_delivery() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    let mut execution = fill("1", dec!(1), 0);
+    execution.price = dec!(99);
+    fixture
+        .gateway
+        .set_exchange_state(id, OrderStatus::Cancelled);
+    fixture.gateway.set_fills_for_order(id, vec![execution]);
+    manager.reconcile().await.unwrap();
+    assert!(!manager.open_orders().contains_key(&id));
+    assert!(!fixture.health.is_engaged());
+    let mut other = intent();
+    other.symbol = "ETHUSDT".into();
+    assert!(manager.submit_child_order(other.clone()).await.is_err());
+    acknowledge(&mut manager, 1).await;
+    assert!(manager.submit_child_order(other).await.is_ok());
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn fill_above_cap_latches_breach_even_when_total_spend_is_under_budget() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    let mut execution = fill("1", dec!(1), 0);
+    execution.price = dec!(100.01);
+    fixture
+        .gateway
+        .set_exchange_state(id, OrderStatus::Cancelled);
+    fixture.gateway.set_fills_for_order(id, vec![execution]);
+    manager.reconcile().await.unwrap();
+    assert!(fixture.health.is_engaged());
+    acknowledge(&mut manager, 1).await;
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let evidence: (Decimal, bool) = sqlx::query_as(
+        "SELECT reserved_market_buy_cap,reservation_breached FROM orders WHERE id=$1",
+    )
+    .bind(id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence, (dec!(100), true));
+    let store = OrderStore::new(&fixture.url).await.unwrap();
+    assert_eq!(store.get_fills_for_order(id).await.unwrap().len(), 1);
+    drop(store);
+    drop(manager);
     pool.close().await;
     fixture.cleanup().await;
 }

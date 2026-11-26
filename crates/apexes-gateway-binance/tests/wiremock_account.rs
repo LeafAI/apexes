@@ -164,8 +164,9 @@ async fn market_preflight_requires_both_lot_filters_and_matching_average_window(
     Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT",
-                "status":"TRADING","isSpotTradingAllowed":true,"orderTypes":["MARKET"],
+                "status":"TRADING","isSpotTradingAllowed":true,"orderTypes":["MARKET","LIMIT"],
                 "filters":[{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"},
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
                 {"filterType":"MARKET_LOT_SIZE","minQty":"0.1","maxQty":"2","stepSize":"0.1"},
                 {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}]}]
         }))).mount(&server).await;
@@ -198,10 +199,9 @@ async fn market_preflight_requires_both_lot_filters_and_matching_average_window(
         leverage: None,
         margin_mode: None,
     };
-    assert_eq!(
-        gateway.spot_preflight(&intent).await.unwrap().quantity,
-        dec!(1.2)
-    );
+    let evidence = gateway.spot_preflight(&intent).await.unwrap();
+    assert_eq!(evidence.quantity, dec!(1.2));
+    assert_eq!(evidence.market_buy_cap, Some(dec!(100)));
     intent.quantity = dec!(2.2);
     assert!(gateway.spot_preflight(&intent).await.is_err());
     intent.quantity = dec!(1);

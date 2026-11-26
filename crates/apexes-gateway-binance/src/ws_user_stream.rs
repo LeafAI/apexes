@@ -468,6 +468,7 @@ mod tests {
             ("FILLED", OrderStatus::Filled),
             ("REJECTED", OrderStatus::Rejected),
             ("EXPIRED", OrderStatus::Cancelled),
+            ("EXPIRED_IN_MATCH", OrderStatus::Cancelled),
         ] {
             match parse_frame(&envelope(report(&id, 1, raw))) {
                 Frame::Update(u) => assert_eq!(u.status, expected, "{raw}"),
@@ -503,7 +504,7 @@ mod tests {
             envelope(report(
                 &uuid::Uuid::new_v4().to_string(),
                 1,
-                "EXPIRED_IN_MATCH",
+                "UNKNOWN_STATUS",
             )),
         ] {
             assert_eq!(parse_frame(&raw), Frame::Ignore, "{raw}");

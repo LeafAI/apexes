@@ -162,6 +162,8 @@ impl OrderStore {
                  + CASE WHEN f.fee_currency=o.reserved_spend_asset
                      OR (f.fee_currency IS NULL AND o.side='Buy')
                    THEN f.fee ELSE 0 END),0) FROM fills f WHERE f.order_id=o.id))
+             OR (o.reserved_market_buy_cap IS NOT NULL AND EXISTS
+                (SELECT 1 FROM fills f WHERE f.order_id=o.id AND f.price>o.reserved_market_buy_cap))
              WHERE o.id=$1 RETURNING reservation_breached",
         )
         .bind(candidate.id.0)

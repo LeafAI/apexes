@@ -141,6 +141,9 @@ impl ExecutionGateway for MockExecutionGateway {
             free_base,
             free_quote: *self.free_quote.lock().unwrap(),
             reference_price: intent.price.unwrap_or(rust_decimal::Decimal::from(100)),
+            market_buy_cap: (intent.side == apexes_core::Side::Buy
+                && intent.order_type == apexes_core::OrderType::Market)
+                .then_some(rust_decimal::Decimal::from(100)),
             quantity: intent.quantity,
             price: intent.price,
         })
@@ -155,6 +158,19 @@ impl ExecutionGateway for MockExecutionGateway {
             .clone()
             .ok_or_else(|| "mock spot inventory unavailable".into())
     }
+    async fn submit_bounded_spot_buy(
+        &self,
+        order: &Order,
+        cap: rust_decimal::Decimal,
+    ) -> GatewayOutcome {
+        if cap <= rust_decimal::Decimal::ZERO {
+            return GatewayOutcome::Rejected {
+                reason: "invalid mock cap".into(),
+            };
+        }
+        self.submit_order(order).await
+    }
+
     async fn submit_order(&self, order: &Order) -> GatewayOutcome {
         if let Some(outcome) = self.next_submit_outcome.lock().unwrap().take() {
             // Even for a programmed Accepted outcome, record the

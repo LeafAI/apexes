@@ -215,6 +215,31 @@ impl BinanceExecutionGateway {
             Some(price) => price,
             None => self.last_price(symbol).await?,
         };
+        // Preserve base-quantity semantics: a managed market buy is
+        // dispatched as a LIMIT IOC at a tick-aligned cap no greater
+        // than the observed last price. No price-slippage allowance.
+        let market_buy_cap = if market && intent.side == Side::Buy {
+            let mut bounded = intent.clone();
+            bounded.order_type = OrderType::Limit;
+            bounded.price = Some(reference_price);
+            conform_shape(&mut bounded, row)?;
+            if bounded.quantity != intent.quantity {
+                return Err("bounded buy quantity changed after market conformance".into());
+            }
+            let cap = bounded.price.ok_or("missing bounded buy limit price")?;
+            for (min, max, _) in notional_limits(row, false)? {
+                let value = intent
+                    .quantity
+                    .checked_mul(cap)
+                    .ok_or("bounded buy notional overflow")?;
+                if value < min || (max > Decimal::ZERO && value > max) {
+                    return Err("bounded buy violates limit notional bounds".into());
+                }
+            }
+            Some(cap)
+        } else {
+            None
+        };
         let limits = notional_limits(row, market)?;
         for (min, max, mins) in limits {
             if min.is_zero() && max.is_zero() {
@@ -253,7 +278,8 @@ impl BinanceExecutionGateway {
         Ok(SpotPreflight {
             base: base.into(),
             quote: quote.into(),
-            reference_price,
+            reference_price: market_buy_cap.unwrap_or(reference_price),
+            market_buy_cap,
             quantity: intent.quantity,
             price: intent.price,
             free_base: balances.get(base).map_or(Decimal::ZERO, |b| b.free),
