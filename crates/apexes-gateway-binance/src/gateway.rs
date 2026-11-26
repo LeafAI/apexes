@@ -6,7 +6,10 @@ use apexes_core::{
     AssetClass, FundMovement, FundMovementStatus, MarginMode, Order, OrderId, OrderStatus, WalletId,
 };
 use apexes_oms::{ExchangeFill, ExecutionGateway, GatewayOutcome};
-use apexes_strategy::Position;
+use apexes_strategy::{OrderIntent, Position};
+
+#[path = "spot_preflight.rs"]
+mod spot_preflight;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -951,6 +954,12 @@ fn millis_to_datetime(millis: i64) -> Result<DateTime<Utc>, String> {
 
 #[async_trait]
 impl ExecutionGateway for BinanceExecutionGateway {
+    async fn spot_preflight(
+        &self,
+        intent: &OrderIntent,
+    ) -> Result<apexes_oms::SpotPreflight, String> {
+        self.check_spot_intent(intent).await
+    }
     async fn spot_sell_inventory(&self, symbol: &str) -> Result<(String, Decimal), String> {
         if symbol.is_empty()
             || !symbol

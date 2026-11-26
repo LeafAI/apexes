@@ -436,3 +436,18 @@ indicators; the independent exit_retry_trades parameter (default five)
 paces repeated exit attempts. A working order still prevents another
 order. Reconcile and explicitly restart a halted managed session rather
 than attempting to override its safety gates.
+
+### Dynamic managed Spot rules and reservations (F02.05)
+
+Managed market and limit orders are conformed against current exchange
+filters at OMS submission, with fresh spendable wallet balances and
+notional validation. Missing metadata or a failed preflight refuses the
+order. Orders sharing a spend asset cannot overlap while a reservation
+is active; pending proceeds are not treated as spendable. Buy reserves
+use estimated notional plus one percent headroom, not a hard price or
+fee cap. The durable inventory and fill acknowledgement guards remain.
+EMS children must already match current lot size; a rounded child is
+refused rather than contradicting its parent's dispatch record.
+Reservations require terminal reconciliation before release, and unknown
+recovered working orders block submission. No stop-order/derivative
+extension or parent-level allocation is supplied by this increment.

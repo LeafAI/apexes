@@ -174,7 +174,29 @@ impl PreTradeCheck for LimitChecker {
                 Side::Buy => intent.quantity,
                 Side::Sell => -intent.quantity,
             };
-            let projected = (current + signed_delta).abs();
+            // Pending spot buys may all execute before the new buy;
+            // pending sales are not credited as capacity until filled.
+            let pending: Decimal =
+                if intent.asset_class == AssetClass::Spot && intent.side == Side::Buy {
+                    open_orders
+                        .values()
+                        .filter(|o| {
+                            o.symbol == intent.symbol
+                                && o.venue == intent.venue
+                                && o.asset_class == intent.asset_class
+                                && o.side == Side::Buy
+                                && matches!(
+                                    o.status,
+                                    apexes_core::OrderStatus::New
+                                        | apexes_core::OrderStatus::PartiallyFilled
+                                )
+                        })
+                        .map(|o| (o.quantity - o.filled_quantity).max(Decimal::ZERO))
+                        .sum()
+                } else {
+                    Decimal::ZERO
+                };
+            let projected = (current + signed_delta + pending).abs();
             if projected > max_position {
                 violations.push(RiskViolation::PositionLimitExceeded {
                     symbol: intent.symbol.clone(),

@@ -200,6 +200,89 @@ async fn managed_spot_sale_requires_durable_owned_free_inventory_and_no_working_
 
 #[tokio::test]
 #[ignore]
+async fn shared_quote_reservation_survives_partial_fill_until_terminal_reconciliation() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    fixture.gateway.set_spot_free_quote(dec!(302));
+    assert!(
+        manager
+            .submit_order(intent(), &HashMap::new(), &HashMap::new())
+            .await
+            .is_err()
+    );
+    assert!(manager.open_orders().is_empty());
+    fixture.gateway.set_spot_free_quote(dec!(1000));
+    let first = submit(&mut manager).await;
+    let mut other = intent();
+    other.symbol = "ETHUSDT".into();
+    let error = manager.submit_child_order(other.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("reserved"));
+    fixture
+        .gateway
+        .set_exchange_state(first, OrderStatus::PartiallyFilled);
+    fixture
+        .gateway
+        .set_fills_for_order(first, vec![fill("1", dec!(1), 0)]);
+    manager.reconcile().await.unwrap();
+    acknowledge(&mut manager, 1).await;
+    assert!(
+        manager
+            .submit_child_order(other.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reserved")
+    );
+    manager.cancel_order(first).await.unwrap();
+    assert!(!manager.open_orders().contains_key(&first));
+    let second = manager.submit_child_order(other).await.unwrap();
+    assert!(manager.open_orders().contains_key(&second));
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn managed_buy_risk_uses_durable_position_and_fresh_notional_without_caller_snapshot() {
+    let fixture = Fixture::new().await;
+    let checker = apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+        apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+            max_position_per_symbol: Some(dec!(4)),
+            max_order_notional: Some(dec!(350)),
+            ..Default::default()
+        }),
+    ));
+    fixture
+        .registry
+        .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), Arc::new(checker))
+        .unwrap();
+    let mut manager = fixture.manager().await;
+    let mut too_large = intent();
+    too_large.quantity = dec!(3.6);
+    assert!(matches!(
+        manager.submit_child_order(too_large).await,
+        Err(OmsError::RiskCheckFailed { .. })
+    ));
+    let id = submit(&mut manager).await;
+    fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
+    fixture
+        .gateway
+        .set_fills_for_order(id, vec![fill("1", dec!(3), 0)]);
+    manager.reconcile().await.unwrap();
+    acknowledge(&mut manager, 1).await;
+    let mut next = intent();
+    next.quantity = dec!(2);
+    assert!(matches!(
+        manager.submit_child_order(next).await,
+        Err(OmsError::RiskCheckFailed { .. })
+    ));
+    assert!(manager.open_orders().is_empty());
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn repeated_partial_and_cancel_deliver_each_execution_once() {
     let fixture = Fixture::new().await;
     let mut manager = fixture.manager().await;

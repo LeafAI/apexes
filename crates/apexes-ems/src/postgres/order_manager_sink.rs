@@ -7,12 +7,11 @@
 //! Known, deliberate limitation (documented in the Task 16 plan entry,
 //! not silently worked around): `ChildOrderSink::submit_child_order`
 //! has no `positions`/`balances` parameters, but
-//! `OrderManager::submit_order` requires them for its optional
-//! `CompositeRiskChecker` pass. This adapter passes EMPTY `HashMap`s
-//! for both, meaning EMS-scheduled child orders bypass
-//! balance/position-aware pre-trade risk checks even when a
-//! `CompositeRiskChecker` is configured on the same `OrderManager` a
-//! strategy's direct orders go through. A future iteration could
+//! legacy risk checks require them. Managed Spot children now use
+//! the OMS's fresh wallet, durable owned quantity and shared reservation
+//! gate, and must match their already-reserved dispatch quantity exactly.
+//! The remaining caller-snapshot-dependent equity floor is not supplied
+//! by the EMS adapter; it can refuse children conservatively. A future iteration could
 //! thread live position/balance snapshots into `ChildOrderSink`, but
 //! that would require either giving `apexes-ems` a
 //! `PortfolioLedger`-shaped dependency (a potential dependency cycle,
@@ -25,7 +24,6 @@
 //! `OrderManager::apply_exchange_update`/`reconcile()` handling, same
 //! as any other live order.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use apexes_core::{Order, OrderId};
@@ -67,12 +65,9 @@ impl ChildOrderSink for OrderManagerChildOrderSink {
             leverage: intent.leverage,
             margin_mode: intent.margin_mode,
         };
-        let empty_positions: HashMap<String, apexes_strategy::Position> = HashMap::new();
-        let empty_balances: HashMap<String, rust_decimal::Decimal> = HashMap::new();
-
         let mut order_manager = self.order_manager.lock().await;
         let order_id = order_manager
-            .submit_order(order_intent, &empty_positions, &empty_balances)
+            .submit_child_order(order_intent)
             .await
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),

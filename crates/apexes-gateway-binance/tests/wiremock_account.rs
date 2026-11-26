@@ -94,6 +94,124 @@ async fn fee_conversion_rejects_mismatched_pair_metadata() {
 }
 
 #[tokio::test]
+async fn spot_preflight_conforms_to_fresh_rules_and_uses_only_free_balance() {
+    use apexes_core::{AssetClass, OrderType, Side, Venue};
+    use apexes_oms::ExecutionGateway;
+    use apexes_strategy::{OrderIntent, OrderRouting};
+    let server = MockServer::start().await;
+    let gateway = gateway_against(&server).await;
+    let mut intent = OrderIntent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        quantity: dec!(1.27),
+        price: Some(dec!(101.27)),
+        stop_price: None,
+        execution_algo: None,
+        routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
+    };
+    for (step, expected, status) in [
+        ("0.01", dec!(1.27), "TRADING"),
+        ("0.1", dec!(1.2), "TRADING"),
+        ("0.1", dec!(1.2), "BREAK"),
+    ] {
+        server.reset().await;
+        mount_clock(&server).await;
+        Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT",
+                    "status":status,"isSpotTradingAllowed":true,"orderTypes":["LIMIT","MARKET"],
+                    "filters":[{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":step},
+                    {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                    {"filterType":"NOTIONAL","minNotional":"5","maxNotional":"200","applyMinToMarket":true,"applyMaxToMarket":true,"avgPriceMins":0}]}]
+            }))).mount(&server).await;
+        Mock::given(method("GET")).and(path("/api/v3/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "balances":[{"asset":"USDT","free":"50","locked":"900"},{"asset":"BTC","free":"2","locked":"3"}]
+            }))).mount(&server).await;
+        if status != "TRADING" {
+            assert!(gateway.spot_preflight(&intent).await.is_err());
+            continue;
+        }
+        let evidence = gateway.spot_preflight(&intent).await.unwrap();
+        assert_eq!(evidence.quantity, expected);
+        assert_eq!(evidence.price, Some(dec!(101.2)));
+        assert_eq!(evidence.free_quote, dec!(50));
+        assert_eq!(evidence.free_base, dec!(2));
+        intent.side = Side::Sell;
+        assert_eq!(
+            gateway.spot_preflight(&intent).await.unwrap().price,
+            Some(dec!(101.3))
+        );
+        intent.side = Side::Buy;
+        intent.quantity = dec!(3);
+        assert!(gateway.spot_preflight(&intent).await.is_err()); // max notional
+        intent.quantity = dec!(1.27);
+    }
+}
+
+#[tokio::test]
+async fn market_preflight_requires_both_lot_filters_and_matching_average_window() {
+    use apexes_core::{AssetClass, OrderType, Side, Venue};
+    use apexes_oms::ExecutionGateway;
+    use apexes_strategy::{OrderIntent, OrderRouting};
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT",
+                "status":"TRADING","isSpotTradingAllowed":true,"orderTypes":["MARKET"],
+                "filters":[{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"},
+                {"filterType":"MARKET_LOT_SIZE","minQty":"0.1","maxQty":"2","stepSize":"0.1"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}]}]
+        }))).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/ticker/price"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"price":"100"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET")).and(path("/api/v3/avgPrice"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"mins":5,"price":"100","closeTime":chrono::Utc::now().timestamp_millis()}))).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"balances":[{"asset":"USDT","free":"1000","locked":"0"}]}),
+        ))
+        .mount(&server)
+        .await;
+    let gateway = gateway_against(&server).await;
+    let mut intent = OrderIntent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        side: Side::Buy,
+        order_type: OrderType::Market,
+        quantity: dec!(1.27),
+        price: None,
+        stop_price: None,
+        execution_algo: None,
+        routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
+    };
+    assert_eq!(
+        gateway.spot_preflight(&intent).await.unwrap().quantity,
+        dec!(1.2)
+    );
+    intent.quantity = dec!(2.2);
+    assert!(gateway.spot_preflight(&intent).await.is_err());
+    intent.quantity = dec!(1);
+    Mock::given(method("GET")).and(path("/api/v3/avgPrice"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"mins":1,"price":"100","closeTime":chrono::Utc::now().timestamp_millis()})))
+        .with_priority(1).mount(&server).await;
+    assert!(gateway.spot_preflight(&intent).await.is_err());
+}
+
+#[tokio::test]
 async fn account_balances_merges_spot_and_futures_wallets() {
     let mock_server = MockServer::start().await;
     mount_clock(&mock_server).await;

@@ -887,7 +887,8 @@ async fn run_live_mode(
     let mut order_manager = OrderManager::new(order_store, registry)
         .await
         .map_err(EngineError::from)?
-        .with_kill_switch(Arc::clone(&kill_switch));
+        .with_kill_switch(Arc::clone(&kill_switch))
+        .with_spot_scope(&launch_config.instruments);
 
     // Seed the ledger from the exchange's real account state (not the
     // operator-supplied `initial_balances`), and refuse to start if
@@ -959,7 +960,10 @@ async fn run_live_mode(
         .map(|i| i.symbol.clone())
         .collect();
     let initial_prices = binance_gateway.last_prices(&symbols).await;
-    let symbol_rules = binance_gateway.symbol_rules(&symbols).await;
+    // Managed Spot conforms against fresh rules at final OMS dispatch,
+    // including EMS children. A stale startup filter must not reject
+    // an order that is valid under current exchange rules.
+    let symbol_rules = HashMap::new();
     let (fee_task, lifetime_pnl) = fee_pricing::spawn(
         fee_journal,
         Arc::clone(&binance_gateway),

@@ -31,6 +31,7 @@ pub struct MockExecutionGateway {
     /// Number of upcoming `query_fills_for_order` calls that must fail.
     failing_fill_queries: Mutex<u32>,
     spot_inventory: Mutex<Option<(String, rust_decimal::Decimal)>>,
+    free_quote: Mutex<rust_decimal::Decimal>,
 }
 
 impl Default for MockExecutionGateway {
@@ -48,11 +49,16 @@ impl MockExecutionGateway {
             fills: Mutex::new(HashMap::new()),
             failing_fill_queries: Mutex::new(0),
             spot_inventory: Mutex::new(None),
+            free_quote: Mutex::new(rust_decimal::Decimal::from(100000)),
         }
     }
 
     pub fn set_spot_sell_inventory(&self, asset: &str, free: rust_decimal::Decimal) {
         *self.spot_inventory.lock().unwrap() = Some((asset.into(), free));
+    }
+
+    pub fn set_spot_free_quote(&self, free: rust_decimal::Decimal) {
+        *self.free_quote.lock().unwrap() = free;
     }
 
     pub fn program_next_submit_outcome(&self, outcome: GatewayOutcome) {
@@ -113,6 +119,32 @@ impl MockExecutionGateway {
 
 #[async_trait]
 impl ExecutionGateway for MockExecutionGateway {
+    async fn spot_preflight(
+        &self,
+        intent: &apexes_strategy::OrderIntent,
+    ) -> Result<crate::SpotPreflight, String> {
+        let base = intent
+            .symbol
+            .strip_suffix("USDT")
+            .ok_or("unknown mock pair")?
+            .to_string();
+        let free_base = self
+            .spot_inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(asset, _)| asset == &base)
+            .map_or(rust_decimal::Decimal::ZERO, |(_, free)| *free);
+        Ok(crate::SpotPreflight {
+            base,
+            quote: "USDT".into(),
+            free_base,
+            free_quote: *self.free_quote.lock().unwrap(),
+            reference_price: intent.price.unwrap_or(rust_decimal::Decimal::from(100)),
+            quantity: intent.quantity,
+            price: intent.price,
+        })
+    }
     async fn spot_sell_inventory(
         &self,
         _symbol: &str,
