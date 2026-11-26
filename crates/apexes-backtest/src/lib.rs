@@ -16,6 +16,7 @@
 pub mod error;
 
 pub mod control;
+mod diagnostics;
 pub mod evaluation;
 pub mod history;
 pub mod order_log;
