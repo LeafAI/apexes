@@ -23,15 +23,46 @@
 
 use apexes_core::binance_network::BinanceNetwork;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent, Venue};
+use apexes_oms::KillSwitch;
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+#[derive(Clone)]
+struct LiveGuard {
+    kill_switch: Arc<KillSwitch>,
+    max_event_age: Duration,
+}
+
+impl LiveGuard {
+    fn halt(&self, reason: &'static str) {
+        self.kill_switch.engage(reason);
+    }
+
+    fn fresh(&self, event: &MarketEvent) -> bool {
+        let timestamp = match event {
+            MarketEvent::Trade(e) => e.timestamp,
+            MarketEvent::Tick(e) => e.timestamp,
+            MarketEvent::Depth(e) => e.timestamp,
+            MarketEvent::Bar(e) => e.close_time,
+            MarketEvent::MarkPrice(e) => e.timestamp,
+        };
+        let age = chrono::Utc::now().signed_duration_since(timestamp);
+        age >= -chrono::Duration::seconds(5)
+            && age.to_std().map_or(true, |age| age <= self.max_event_age)
+    }
+}
 
 /// Tracks the exponential-backoff delay across reconnect attempts,
 /// identical in shape to `apexes-ui`'s own `BackoffState`
@@ -77,6 +108,7 @@ pub struct GatewayMarketDataProvider {
     /// When set, the gateway must announce this network in its
     /// `x-apexes-network` response header on every connect.
     expected_network: Option<BinanceNetwork>,
+    live_guard: Option<LiveGuard>,
 }
 
 /// Keeps only events for a set of symbols. `None`: keep everything.
@@ -150,6 +182,7 @@ impl GatewayMarketDataProvider {
             gateway_url: gateway_url.into(),
             token: None,
             expected_network: None,
+            live_guard: None,
         }
     }
 
@@ -158,6 +191,19 @@ impl GatewayMarketDataProvider {
     /// the stream instead of feeding it wrong prices.
     pub fn with_expected_network(mut self, network: BinanceNetwork) -> Self {
         self.expected_network = Some(network);
+        self
+    }
+
+    /// Fail closed on a transport gap or stale source event in a live session.
+    pub fn with_live_guard(
+        mut self,
+        kill_switch: Arc<KillSwitch>,
+        max_event_age: Duration,
+    ) -> Self {
+        self.live_guard = Some(LiveGuard {
+            kill_switch,
+            max_event_age,
+        });
         self
     }
 
@@ -176,7 +222,7 @@ impl MarketDataProvider for GatewayMarketDataProvider {
         instruments: &[Instrument],
     ) -> Result<BoxStream<'static, MarketEvent>, ApexesError> {
         let filter = SymbolFilter::for_instruments(instruments);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         // With an expected network, connect once up front so a mismatch is
         // a `subscribe` error rather than something found in a log later.
         let first_socket = match self.expected_network {
@@ -198,12 +244,13 @@ impl MarketDataProvider for GatewayMarketDataProvider {
             self.expected_network,
             first_socket,
             filter,
+            self.live_guard.clone(),
             tx,
         ));
 
-        // Adapts the `mpsc::UnboundedReceiver` into a `Stream` via
+        // Adapts the `mpsc::Receiver` into a `Stream` via
         // `futures::stream::unfold` rather than pulling in
-        // `tokio-stream`'s `UnboundedReceiverStream` wrapper as a new
+        // `tokio-stream`'s `ReceiverStream` wrapper as a new
         // dependency purely for this one call site.
         let stream = stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|event| (event, rx))
@@ -252,8 +299,9 @@ async fn connect_with_headers(
                 .map_err(|_| "invalid characters in gateway token".to_string())?,
         );
     }
-    tokio_tungstenite::connect_async(request)
+    tokio::time::timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(request))
         .await
+        .map_err(|_| "gateway handshake timed out".to_string())?
         .map(|(socket, response)| {
             let announced = response
                 .headers()
@@ -275,10 +323,14 @@ async fn run_connection_loop(
     expected_network: Option<BinanceNetwork>,
     mut first_socket: Option<GatewaySocket>,
     filter: SymbolFilter,
-    tx: mpsc::UnboundedSender<MarketEvent>,
+    live_guard: Option<LiveGuard>,
+    tx: mpsc::Sender<MarketEvent>,
 ) {
     let mut backoff = BackoffState::new();
     loop {
+        if tx.is_closed() {
+            return;
+        }
         let attempt = match first_socket.take() {
             Some(socket) => Ok(socket),
             None => match expected_network {
@@ -293,6 +345,9 @@ async fn run_connection_loop(
                                     // retried: ending the stream stops the
                                     // session rather than feeding it bad prices.
                                     tracing::error!(%reason, "apexes-engine gateway_client: stopping");
+                                    if let Some(guard) = &live_guard {
+                                        guard.halt("market data network mismatch");
+                                    }
                                     return;
                                 }
                             }
@@ -304,47 +359,22 @@ async fn run_connection_loop(
             },
         };
         match attempt {
-            Ok(socket) => {
-                tracing::info!(%url, "apexes-engine gateway_client: connected");
-                backoff.reset();
-                let (_write, mut read) = socket.split();
-                loop {
-                    match read.next().await {
-                        Some(Ok(Message::Text(text))) => {
-                            match serde_json::from_str::<MarketEvent>(&text) {
-                                Ok(event) if !filter.allows(&event) => {}
-                                Ok(event) => {
-                                    if tx.send(event).is_err() {
-                                        tracing::info!(
-                                            "apexes-engine gateway_client: output channel closed, stopping"
-                                        );
-                                        return;
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        ?error,
-                                        "apexes-engine gateway_client: failed to parse MarketEvent JSON, skipping frame"
-                                    );
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                ?error,
-                                "apexes-engine gateway_client: WebSocket error, reconnecting"
-                            );
-                            break;
-                        }
-                        None => {
-                            tracing::warn!(
-                                "apexes-engine gateway_client: WebSocket stream ended, reconnecting"
-                            );
-                            break;
-                        }
-                    }
+            Ok(mut socket) => {
+                tracing::info!("apexes-engine gateway_client: connected");
+                let reason = receive_connection(
+                    &mut socket,
+                    &filter,
+                    live_guard.as_ref(),
+                    &tx,
+                    &mut backoff,
+                )
+                .await;
+                if tx.is_closed() {
+                    return;
+                }
+                tracing::warn!(reason, "market data gateway connection lost; reconnecting");
+                if let Some(guard) = &live_guard {
+                    guard.halt(reason);
                 }
             }
             Err(error) => {
@@ -352,9 +382,75 @@ async fn run_connection_loop(
                     ?error,
                     "apexes-engine gateway_client: failed to connect, retrying"
                 );
+                if let Some(guard) = &live_guard {
+                    guard.halt("market data gateway unavailable");
+                }
             }
         }
-        tokio::time::sleep(backoff.next_delay()).await;
+        tokio::select! {
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep(backoff.next_delay()) => {}
+        }
+    }
+}
+
+async fn receive_connection(
+    socket: &mut GatewaySocket,
+    filter: &SymbolFilter,
+    guard: Option<&LiveGuard>,
+    tx: &mpsc::Sender<MarketEvent>,
+    backoff: &mut BackoffState,
+) -> &'static str {
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+    loop {
+        tokio::select! {
+            _ = tx.closed() => return "market data consumer closed",
+            _ = tokio::time::sleep_until(deadline) => return "market data gateway heartbeat timed out",
+            _ = heartbeat.tick() => {
+                if !matches!(tokio::time::timeout(IO_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) {
+                    return "market data gateway heartbeat send failed";
+                }
+            }
+            frame = socket.next() => {
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+                        let Ok(event) = serde_json::from_str::<MarketEvent>(&text) else {
+                            return "market data gateway sent malformed event";
+                        };
+                        backoff.reset();
+                        if !filter.allows(&event) { continue; }
+                        if let Some(guard) = guard {
+                            if !guard.fresh(&event) { return "market data gateway sent stale event"; }
+                            if matches!(&event, MarketEvent::Depth(depth) if depth.is_invalidation()) {
+                                guard.halt("market data order book invalidated");
+                            }
+                        }
+                        if tx.try_send(event).is_err() {
+                            return "market data gateway consumer queue overflow";
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+                        backoff.reset();
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+                        if !matches!(tokio::time::timeout(IO_TIMEOUT, socket.flush()).await, Ok(Ok(()))) {
+                            return "market data gateway pong failed";
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return "market data gateway disconnected",
+                    Some(Err(_)) => return "market data gateway WebSocket error",
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
     }
 }
 
@@ -462,5 +558,109 @@ mod tests {
     #[test]
     fn the_header_name_matches_the_gateways() {
         assert_eq!(GATEWAY_NETWORK_HEADER, "x-apexes-network");
+    }
+    #[test]
+    fn live_guard_rejects_old_and_implausibly_future_exchange_events() {
+        let guard = LiveGuard {
+            kill_switch: Arc::new(KillSwitch::new()),
+            max_event_age: Duration::from_secs(10),
+        };
+        let MarketEvent::Trade(mut event) = trade("ETHUSDT") else {
+            unreachable!()
+        };
+        assert!(guard.fresh(&MarketEvent::Trade(event.clone())));
+        event.timestamp -= chrono::Duration::seconds(20);
+        assert!(!guard.fresh(&MarketEvent::Trade(event.clone())));
+        event.timestamp = chrono::Utc::now() + chrono::Duration::seconds(60);
+        assert!(!guard.fresh(&MarketEvent::Trade(event)));
+    }
+
+    async fn socket_pair() -> (
+        GatewaySocket,
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("ws://{address}");
+        let (client, server) = tokio::join!(connect(&url, None), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        (client.unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_halts_live_session_before_reconnecting() {
+        let (client, mut server) = socket_pair().await;
+        let (tx, _rx) = mpsc::channel(4);
+        let kill_switch = Arc::new(KillSwitch::new());
+        let guard = LiveGuard {
+            kill_switch: kill_switch.clone(),
+            max_event_age: Duration::from_secs(30),
+        };
+        let task = tokio::spawn(run_connection_loop(
+            "ws://127.0.0.1:1".into(),
+            None,
+            None,
+            Some(client),
+            SymbolFilter::for_instruments(&[]),
+            Some(guard),
+            tx,
+        ));
+        server
+            .send(Message::Text("invalid JSON".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !kill_switch.is_engaged() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(kill_switch.reason().unwrap().contains("malformed"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn full_event_queue_is_a_gap_not_a_silent_drop() {
+        let (mut client, mut server) = socket_pair().await;
+        let (tx, _rx) = mpsc::channel(1);
+        let payload = serde_json::to_string(&trade("ETHUSDT")).unwrap();
+        server
+            .send(Message::Text(payload.clone().into()))
+            .await
+            .unwrap();
+        server.send(Message::Text(payload.into())).await.unwrap();
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_connection(
+                &mut client,
+                &SymbolFilter::for_instruments(&[]),
+                None,
+                &tx,
+                &mut BackoffState::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, "market data gateway consumer queue overflow");
+    }
+
+    #[tokio::test]
+    async fn silent_socket_times_out_even_without_a_tcp_close() {
+        let (mut client, _server) = socket_pair().await;
+        tokio::time::pause();
+        let (tx, _rx) = mpsc::channel(4);
+        let filter = SymbolFilter::for_instruments(&[]);
+        let mut backoff = BackoffState::new();
+        let receive = receive_connection(&mut client, &filter, None, &tx, &mut backoff);
+        tokio::pin!(receive);
+        // Poll once to establish the deadline, then explicitly advance
+        // virtual time: the real loopback socket can keep Tokio's I/O
+        // driver from automatically advancing paused time.
+        assert!(futures::poll!(&mut receive).is_pending());
+        tokio::time::advance(HEARTBEAT_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(receive.await, "market data gateway heartbeat timed out");
     }
 }

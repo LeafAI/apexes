@@ -38,5 +38,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rust_decimal_macros = "1.40"
 uuid = { workspace = true, features = ["v4"] }

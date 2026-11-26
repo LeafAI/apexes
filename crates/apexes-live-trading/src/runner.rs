@@ -24,7 +24,7 @@ use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Venue};
 use apexes_ems::Ems;
 use apexes_ems::postgres::{OrderManagerChildOrderSink, PostgresEms};
-use apexes_message_bus::{MarketEventBus, receiver_into_stream};
+use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExchangeUpdate, OrderManager};
 use apexes_risk::CompositeRiskChecker;
 use apexes_strategy::{MarginTierTable, OrderExecutor, Strategy, VenueScorer};
@@ -221,7 +221,9 @@ pub async fn run_live_trading(
     // arm most likely to be the one actually driving forward progress)
     // is gated with `take_until(stop_signal)`, and `None` is passed as
     // `run_unified_event_loop`'s own `stop_signal` parameter.
-    let activity_clock = Arc::new(crate::halt::ActivityClock::new());
+    let activity_clock = Arc::new(crate::halt::ActivityClock::for_instruments(
+        &config.instruments,
+    ));
     let mut halt_tasks = Vec::new();
     if let Some(kill_switch) = &config.kill_switch {
         let flatten = config
@@ -256,15 +258,30 @@ pub async fn run_live_trading(
         });
     }
 
-    let market_events = subscribe_all_venues(registry, &config.instruments)
-        .await?
-        .inspect({
-            let activity_clock = Arc::clone(&activity_clock);
-            move |_| activity_clock.touch()
-        })
-        .take_until(Box::pin(async move {
-            let _ = stop_signal.await;
-        }));
+    let market_events =
+        subscribe_all_venues(registry, &config.instruments, config.kill_switch.clone())
+            .await?
+            .inspect({
+                let activity_clock = Arc::clone(&activity_clock);
+                let kill_switch = config.kill_switch.clone();
+                let stale_after = config.stale_data_timeout;
+                move |event| {
+                    // Check before refreshing, so the first event after a long
+                    // stall cannot conceal the outage before the strategy runs.
+                    if let (Some(ks), Some(limit)) = (&kill_switch, stale_after) {
+                        activity_clock.enforce(ks, limit);
+                    }
+                    if let Some(ks) = &kill_switch
+                        && matches!(event, MarketEvent::Depth(depth) if depth.is_invalidation())
+                    {
+                        ks.engage("market data order book invalidated");
+                    }
+                    activity_clock.observe(event);
+                }
+            })
+            .take_until(Box::pin(async move {
+                let _ = stop_signal.await;
+            }));
 
     // Once `exchange_updates` ends (returns `None`), chain in a
     // `pending()` stream that never resolves, so `LiveSupplementalFillSource`'s
@@ -369,6 +386,7 @@ pub async fn run_live_trading(
 async fn subscribe_all_venues(
     registry: &Registry,
     instruments: &[Instrument],
+    kill_switch: Option<Arc<apexes_oms::KillSwitch>>,
 ) -> Result<futures::stream::SelectAll<futures::stream::BoxStream<'static, MarketEvent>>, ApexesError>
 {
     let buses = registry.get::<Arc<MarketEventBus>, Venue>();
@@ -395,8 +413,36 @@ async fn subscribe_all_venues(
                 source_detail: None,
             })?;
         let receiver = bus.subscribe(&venue_instruments).await?;
-        streams.push(Box::pin(receiver_into_stream(receiver))
-            as futures::stream::BoxStream<'static, MarketEvent>);
+        let kill_switch = kill_switch.clone();
+        let stream = futures::stream::unfold(
+            (receiver, kill_switch),
+            move |(mut receiver, kill_switch)| async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) => return Some((event, (receiver, kill_switch))),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::error!(
+                                ?venue,
+                                skipped,
+                                "live market data consumer lost events"
+                            );
+                            if let Some(ks) = &kill_switch {
+                                ks.engage(format!(
+                                    "market data gap: {venue:?}, {skipped} events lost"
+                                ));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            if let Some(ks) = &kill_switch {
+                                ks.engage(format!("market data stream closed: {venue:?}"));
+                            }
+                            return None;
+                        }
+                    }
+                }
+            },
+        );
+        streams.push(Box::pin(stream) as futures::stream::BoxStream<'static, MarketEvent>);
     }
 
     Ok(futures::stream::select_all(streams))

@@ -8,8 +8,10 @@
 //! - [`spawn_staleness_watchdog`]: engages the switch when no market data
 //!   has arrived within a configurable window.
 
-use std::sync::Arc;
+use apexes_core::{Instrument, MarketEvent, Venue};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use apexes_oms::{KillSwitch, OrderManager};
@@ -26,6 +28,7 @@ const RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub struct ActivityClock {
     base: Instant,
     last_ms: AtomicU64,
+    instruments: Mutex<HashMap<(Venue, String), Instant>>,
 }
 
 impl ActivityClock {
@@ -33,6 +36,75 @@ impl ActivityClock {
         Self {
             base: Instant::now(),
             last_ms: AtomicU64::new(0),
+            instruments: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register each instrument before starting the stream. An active
+    /// neighbour must never reset another instrument's freshness.
+    pub fn for_instruments(instruments: &[Instrument]) -> Self {
+        let clock = Self::new();
+        if let Ok(mut entries) = clock.instruments.lock() {
+            let now = Instant::now();
+            entries.extend(
+                instruments
+                    .iter()
+                    .map(|i| ((i.venue, i.symbol.clone()), now)),
+            );
+        }
+        clock
+    }
+
+    pub fn observe(&self, event: &MarketEvent) {
+        // Mark prices alone do not establish a usable executable market.
+        if matches!(event, MarketEvent::MarkPrice(_))
+            || matches!(event, MarketEvent::Depth(d) if d.is_invalidation())
+        {
+            return;
+        }
+        if let Ok(mut entries) = self.instruments.lock()
+            && let Some(last) = entries.get_mut(&(event.venue(), event.symbol().to_string()))
+        {
+            *last = Instant::now();
+        }
+        self.touch();
+    }
+
+    fn reset_grace(&self) {
+        self.touch();
+        if let Ok(mut entries) = self.instruments.lock() {
+            let now = Instant::now();
+            entries.values_mut().for_each(|last| *last = now);
+        }
+    }
+
+    /// Return the stalest configured instrument (or aggregate clock for
+    /// legacy callers with no instrument set).
+    pub fn stalest(&self) -> (Option<(Venue, String)>, Duration) {
+        match self.instruments.lock() {
+            Ok(entries) => entries
+                .iter()
+                .map(|(key, last)| (Some(key.clone()), last.elapsed()))
+                .max_by_key(|(_, idle)| *idle)
+                .unwrap_or_else(|| (None, self.idle())),
+            Err(_) => (None, Duration::MAX),
+        }
+    }
+
+    pub fn enforce(&self, kill_switch: &KillSwitch, stale_after: Duration) {
+        let (instrument, idle) = self.stalest();
+        apexes_telemetry::metrics()
+            .market_data_idle_seconds
+            .set(idle.as_secs_f64());
+        if idle >= stale_after && !kill_switch.is_engaged() {
+            let label = instrument
+                .map(|(venue, symbol)| format!("{venue:?}:{symbol}"))
+                .unwrap_or_else(|| "session".into());
+            kill_switch.engage(format!(
+                "market data stale: {label}, no usable events for {:.1}s (limit {:.1}s)",
+                idle.as_secs_f64(),
+                stale_after.as_secs_f64()
+            ));
         }
     }
 
@@ -112,7 +184,7 @@ pub fn spawn_staleness_watchdog(
 ) -> JoinHandle<()> {
     let check_every = (stale_after / 4).max(Duration::from_millis(10));
     tokio::spawn(async move {
-        clock.touch();
+        clock.reset_grace();
         loop {
             tokio::time::sleep(check_every).await;
             if kill_switch.is_engaged() {
@@ -120,20 +192,10 @@ pub fn spawn_staleness_watchdog(
                 while kill_switch.is_engaged() {
                     tokio::time::sleep(RELEASE_POLL_INTERVAL).await;
                 }
-                clock.touch();
+                clock.reset_grace();
                 continue;
             }
-            let idle = clock.idle();
-            apexes_telemetry::metrics()
-                .market_data_idle_seconds
-                .set(idle.as_secs_f64());
-            if idle >= stale_after {
-                kill_switch.engage(format!(
-                    "market data stale: no events for {:.1}s (limit {:.1}s)",
-                    idle.as_secs_f64(),
-                    stale_after.as_secs_f64()
-                ));
-            }
+            clock.enforce(&kill_switch, stale_after);
         }
     })
 }
@@ -185,5 +247,44 @@ mod tests {
         let clock = ActivityClock::new();
         clock.touch();
         assert!(clock.idle() < Duration::from_millis(50));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn active_symbol_cannot_mask_another_stale_symbol() {
+        use apexes_core::{AssetClass, MarketType, TradeEvent};
+        use rust_decimal_macros::dec;
+        let instrument = |symbol: &str| {
+            Instrument::new(
+                symbol,
+                MarketType::Crypto,
+                Venue::Binance,
+                AssetClass::Spot,
+                None,
+                Some("USDT".into()),
+                dec!(0.01),
+                dec!(0.001),
+                dec!(1),
+            )
+            .unwrap()
+        };
+        let clock = Arc::new(ActivityClock::for_instruments(&[
+            instrument("BTCUSDT"),
+            instrument("ETHUSDT"),
+        ]));
+        let ks = Arc::new(KillSwitch::new());
+        let _wd = spawn_staleness_watchdog(ks.clone(), clock.clone(), Duration::from_secs(10));
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            clock.observe(&MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(1),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: chrono::Utc::now(),
+            }));
+        }
+        assert!(ks.is_engaged());
+        assert!(ks.reason().unwrap().contains("ETHUSDT"));
     }
 }
