@@ -602,7 +602,17 @@ timestamps retain input order. Pending intents at the end are counted
 without execution. Reports distinguish scheduled, arrived, refused
 and expired intents; arrival does not guarantee acceptance or fill.
 This observation-time model does not interpolate between events.
-EMS parent intents are refused until causal EMS scheduling is supplied;
-automatic liquidation and de-risking remain immediate. Live launch
+EMS parent intents now use the same admission delay and pretrade
+recheck. TWAP and VWAP anchor at admitted event time; subsequent events
+dispatch slices, with explicit event timestamps. TWAP does not burst
+missed slices; VWAP scales cumulative fractions to the requested
+duration and requires as-of history from prior complete UTC days.
+POV requires matching venue/symbol and positive trade quantity.
+Causal mode requires fixed routing and valid positive parameters.
+Children are submitted on the observed dispatch event, without a
+separate network delay. Parent completion tracks submitted quantity,
+not executed quantity. Independent child risk, capital reservations,
+and full historical provenance are not supplied by this model.
+Automatic liquidation and de-risking remain immediate. Live launch
 rejects the policy. Omission retains prior simulation timing behavior.
 Crossing-limit and queue calibration remain open.

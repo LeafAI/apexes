@@ -218,8 +218,45 @@ impl StorageReader {
         venue: Venue,
         lookback_days: u32,
     ) -> Result<VolumeCurve, StorageError> {
+        self.volume_curve_before(symbol, venue, lookback_days, None)
+            .await
+    }
+
+    /// Causal history only: strictly prior complete UTC days.
+    pub async fn intraday_volume_curve_as_of(
+        &self,
+        symbol: &str,
+        venue: Venue,
+        lookback_days: u32,
+        at: DateTime<Utc>,
+    ) -> Result<VolumeCurve, StorageError> {
+        self.volume_curve_before(
+            symbol,
+            venue,
+            lookback_days,
+            Some(day_boundary(at.date_naive())?),
+        )
+        .await
+    }
+
+    async fn volume_curve_before(
+        &self,
+        symbol: &str,
+        venue: Venue,
+        lookback_days: u32,
+        cutoff: Option<DateTime<Utc>>,
+    ) -> Result<VolumeCurve, StorageError> {
+        if lookback_days == 0 {
+            return Err(StorageError::QueryFailed {
+                reason: "lookback must be positive".into(),
+            });
+        }
         let venue_str = format!("{venue:?}");
-        let rows = self
+        let rows = if let Some(cutoff) = cutoff {
+            self.client.query("SELECT ?fields FROM bars WHERE venue = ? AND symbol = ? AND interval = 'OneHour' AND open_time < ? ORDER BY open_time DESC LIMIT 10000")
+                .bind(&venue_str).bind(symbol).bind(cutoff.format(CLICKHOUSE_DATETIME_FORMAT).to_string()).fetch_all::<BarRow>().await?
+        } else {
+            self
             .client
             .query(
                 "SELECT ?fields FROM bars WHERE venue = ? AND symbol = ? AND interval = 'OneHour' ORDER BY open_time DESC LIMIT 10000",
@@ -227,7 +264,8 @@ impl StorageReader {
             .bind(&venue_str)
             .bind(symbol)
             .fetch_all::<BarRow>()
-            .await?;
+            .await?
+        };
 
         // Group bars by calendar day (UTC), each day's bars by
         // hour-of-day offset from that day's midnight.
@@ -249,6 +287,13 @@ impl StorageReader {
                 .or_insert(Decimal::ZERO) += volume;
         }
 
+        if cutoff.is_some() {
+            by_day.retain(|_, hours| {
+                hours.len() == 24
+                    && hours.values().all(|v| *v >= Decimal::ZERO)
+                    && hours.values().copied().sum::<Decimal>() > Decimal::ZERO
+            });
+        }
         let available_days = by_day.len() as u32;
         if available_days < lookback_days {
             return Err(StorageError::InsufficientHistory {

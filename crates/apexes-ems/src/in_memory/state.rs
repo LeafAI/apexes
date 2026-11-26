@@ -34,6 +34,7 @@ impl VenueAllocation {
 
 pub(crate) struct ParentOrderState {
     pub request: AlgoOrderRequest,
+    pub ordinal: usize,
     pub status: ParentOrderStatus,
     /// One entry per venue this parent order was routed to (one entry
     /// for `Fixed`/`RouteToBest`, one per candidate for `Split`).

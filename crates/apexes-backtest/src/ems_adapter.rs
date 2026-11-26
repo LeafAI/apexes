@@ -81,6 +81,19 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         &self,
         intent: ChildOrderIntent,
     ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        let now = self
+            .engine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .event_time()
+            .unwrap_or_else(Utc::now);
+        self.submit_child_order_at(intent, now).await
+    }
+    async fn submit_child_order_at(
+        &self,
+        intent: ChildOrderIntent,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
         let order_intent = OrderIntent {
             symbol: intent.symbol,
             venue: intent.venue,
@@ -96,7 +109,6 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             margin_mode: intent.margin_mode,
         };
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-        let now = engine.event_time().unwrap_or_else(Utc::now);
         let (order, fills) = engine
             .submit_market_child(&order_intent, now)
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {

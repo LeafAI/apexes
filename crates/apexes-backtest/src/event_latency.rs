@@ -75,9 +75,7 @@ impl ArrivalQueue {
         let deadline = at.checked_add_signed(TimeDelta::milliseconds(i64::from(
             self.report.policy.delay_ms,
         )));
-        let reason = if intent.execution_algo.is_some() {
-            Some("event_latency_ems_unsupported")
-        } else if self
+        let reason = if self
             .pending
             .iter()
             .any(|(_, p)| p.venue == intent.venue && p.symbol == intent.symbol)
