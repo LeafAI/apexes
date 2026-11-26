@@ -318,6 +318,90 @@ impl BinanceExecutionGateway {
 }
 
 impl BinanceExecutionGateway {
+    /// Public direct-pair conversion from the last fully closed minute
+    /// ending no later than the requested instant. No credentials or
+    /// signed endpoint, no forward-looking partial candle.
+    pub async fn fee_conversion(
+        &self,
+        asset: &str,
+        quote: &str,
+        at: DateTime<Utc>,
+    ) -> Result<apexes_oms::FeeConversion, String> {
+        if asset == quote
+            || [asset, quote].iter().any(|s| {
+                s.is_empty()
+                    || s.len() > 24
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            })
+        {
+            return Err("invalid fee conversion pair".into());
+        }
+        let symbol = format!("{asset}{quote}");
+        let info = self
+            .rest
+            .public_get("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
+            .await?;
+        let info: serde_json::Value =
+            serde_json::from_str(&info).map_err(|_| "invalid conversion pair metadata")?;
+        let matches = info["symbols"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["symbol"].as_str() == Some(symbol.as_str())
+                    && row["baseAsset"].as_str() == Some(asset)
+                    && row["quoteAsset"].as_str() == Some(quote)
+                    && row["isSpotTradingAllowed"].as_bool() == Some(true)
+            })
+        });
+        if !matches {
+            return Err("direct spot fee conversion pair unavailable".into());
+        }
+        let end = at.timestamp_millis();
+        let start = end.saturating_sub(300_000);
+        let body = self
+            .rest
+            .public_get(
+                "/api/v3/klines",
+                &format!("symbol={symbol}&interval=1m&startTime={start}&endTime={end}&limit=6"),
+            )
+            .await?;
+        let rows: Vec<Vec<serde_json::Value>> =
+            serde_json::from_str(&body).map_err(|_| "invalid fee conversion candles")?;
+        let mut best: Option<apexes_oms::FeeConversion> = None;
+        for row in rows {
+            let (Some(open), Some(close), Some(price)) = (
+                row.first().and_then(|v| v.as_i64()),
+                row.get(6).and_then(|v| v.as_i64()),
+                row.get(4)
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<Decimal>().ok()),
+            ) else {
+                return Err("invalid fee conversion candle".into());
+            };
+            if close.checked_sub(open) != Some(59_999)
+                || open.rem_euclid(60_000) != 0
+                || price <= Decimal::ZERO
+            {
+                return Err("invalid fee conversion candle range or price".into());
+            }
+            let Some(observed_at) = DateTime::from_timestamp_millis(close) else {
+                continue;
+            };
+            if observed_at > at || at - observed_at > chrono::TimeDelta::minutes(5) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|b| observed_at > b.observed_at) {
+                best = Some(apexes_oms::FeeConversion {
+                    asset: asset.into(),
+                    quote: quote.into(),
+                    observed_at,
+                    rate: price,
+                });
+            }
+        }
+        best.ok_or_else(|| "no causal closed conversion candle".into())
+    }
+
     /// The latest traded price of each symbol, from the public ticker.
     ///
     /// Used once at session start to value every held asset before its first

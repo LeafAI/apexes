@@ -388,6 +388,29 @@ pub fn detail_groups(e: &EvaluationSummary) -> [Vec<(&'static str, String)>; 2] 
         money.push(("Fee cost at fill", formatted(fees)));
         money.push(("Spot net", formatted(net)));
     }
+    if let Some(lifetime) = &e.lifetime_spot_pnl {
+        money.push(("Journal fills", lifetime.fill_count.to_string()));
+        money.push((
+            "Journal marks at",
+            lifetime.as_of.format("%H:%M:%S UTC").to_string(),
+        ));
+        let mut lifetime_by_quote = std::collections::BTreeMap::new();
+        for pnl in lifetime.per_symbol.values() {
+            let (net, fees) = lifetime_by_quote
+                .entry(&pnl.quote_currency)
+                .or_insert((Some(Decimal::ZERO), Some(Decimal::ZERO)));
+            *net = net.zip(pnl.net_pnl).map(|(a, b)| a + b);
+            *fees = fees.zip(pnl.fee_at_execution).map(|(a, b)| a + b);
+        }
+        for (quote, (net, fees)) in lifetime_by_quote {
+            let formatted = |value: Option<Decimal>| match value {
+                Some(value) => format!("{} {quote}", signed(value)),
+                None => format!("unpriced {quote}"),
+            };
+            money.push(("Lifetime fee cost", formatted(fees)));
+            money.push(("Lifetime spot net", formatted(net)));
+        }
+    }
     let behaviour = vec![
         ("Drawdown (now)", percent(drawdown_now(e))),
         ("Drawdown (max)", percent(drawdown_max(e))),
@@ -623,6 +646,7 @@ mod tests {
             gross_exposure_fraction: dec!(0.87),
             fees_paid: std::collections::HashMap::new(),
             spot_pnl: std::collections::HashMap::new(),
+            lifetime_spot_pnl: None,
             trade_count: 2,
             turnover: dec!(90.45),
             time_in_market_fraction: dec!(0.0136),

@@ -59,15 +59,45 @@ and EvaluationSummary carry backward-compatible spot_pnl fields. The
 operator details show gross, execution fee cost and net by quote, with
 unpriced values explicitly labeled.
 
-This increment covers spot execution attribution for configured direct
-market pairs. A dedicated fee-only conversion feed, automatic historical
-price retrieval for unconfigured fee assets (such as BNB in a BTCUSDT-only
-session), persisted conversion provenance and lifetime attribution across
-restarts remain to be implemented. Current marks are latest observed
-marks, not a synchronized account valuation snapshot. Existing quote
-accounting and leveraged P&L remain unchanged. F02.03 is in progress
-until these remaining conversion/reconciliation requirements are addressed.
-No real orders or live databases are used.
+The session attribution covers configured direct market pairs. PR #22
+merged after green CI. The follow-up adds independent live pricing and
+lifetime attribution as described below. Existing wallet equity, quote
+accounting, risk and leveraged P&L remain unchanged.
+
+## Durable conversion follow-up
+
+A managed engine obtains a FeeJournal handle from its bound OrderStore
+before transferring ownership to the OMS. The pricing task uses the
+shared connection pool without acquiring the OMS mutex. It reads a
+chronological snapshot of durable Spot executions, resolves missing
+third-asset rates from the configured Binance network's public
+exchangeInfo and 1-minute kline endpoints, and stores evidence directly
+on the fill row. Pair identity is checked against base/quote metadata.
+Only fully closed minute candles at or before execution, no older than
+five minutes, are accepted. The rate is a causal approximation, not an
+exact fee-time trade. Evidence is immutable and retries are idempotent;
+invalid or conflicting evidence is rejected. The source is the direct
+Binance Spot closed-minute candle defined by this version of the design.
+
+The worker reconstructs gross execution history and accumulated fees
+from all durable fills, using the persisted rates without modifying
+positions or wallet balances. Fresh independent direct-pair marks value
+the fee assets, even if those assets are not traded by the strategy.
+Lifetime attribution is published through a watch channel to the
+control snapshot and operator details, distinct from session equity.
+No extra strategy subscription, private endpoint, or order submission
+is involved. Missing prices stay unknown. The worker retries on a
+30-second delay after each cycle, bounds individual lookup time to
+three seconds and attempts at most 16 historical fills and 32 mark
+pairs per cycle. Missing historical rates rotate across retries. The
+full journal is scanned each refresh; this is not optimized for large
+historical datasets. If more than 32 mark pairs are needed, excess pairs
+remain unpriced. No multi-hop conversion, account-wide funding replay,
+offline historical fee dataset, or retrospective modification of
+session-only attribution is provided. The reported timestamp describes
+mark lookup cutoff rather than an atomic wallet snapshot. Real service
+pricing and large-journal qualification remain pending. No live database
+or real orders are used for qualification.
 
 ## Qualification
 

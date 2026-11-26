@@ -30,6 +30,8 @@
 //!   `run_live_trading`, whose internal `subscribe_all_venues` looks
 //!   buses up by `Venue`.
 
+mod fee_pricing;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -876,6 +878,12 @@ async fn run_live_mode(
     .to_string();
     let mut order_store = OrderStore::new(&ems_postgres_url).await?;
     order_store.bind_spot_inventory(&owner).await?;
+    let fee_journal =
+        order_store
+            .fee_journal()
+            .ok_or_else(|| apexes_oms::OmsError::InvalidRow {
+                reason: "live fee journal not bound".into(),
+            })?;
     let mut order_manager = OrderManager::new(order_store, registry)
         .await
         .map_err(EngineError::from)?
@@ -952,6 +960,11 @@ async fn run_live_mode(
         .collect();
     let initial_prices = binance_gateway.last_prices(&symbols).await;
     let symbol_rules = binance_gateway.symbol_rules(&symbols).await;
+    let (fee_task, lifetime_pnl) = fee_pricing::spawn(
+        fee_journal,
+        Arc::clone(&binance_gateway),
+        launch_config.instruments.clone(),
+    );
 
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
@@ -966,7 +979,7 @@ async fn run_live_mode(
         risk_free_return: launch_config.risk_free_return,
         reconcile_interval,
         ems_postgres_url,
-        control: Some(control_handle),
+        control: Some(control_handle.with_lifetime_spot_pnl(lifetime_pnl)),
         kill_switch: Some(Arc::clone(&kill_switch)),
         stale_data_timeout: Some(stale_data_timeout.unwrap_or(std::time::Duration::from_secs(30))),
         resync: Some(_user_data_stream_handle.resync_notifier()),
@@ -993,6 +1006,7 @@ async fn run_live_mode(
     )
     .await;
     ready_task.abort();
+    fee_task.abort();
     if result.is_err() {
         kill_switch.fault("live trading loop failed");
     }

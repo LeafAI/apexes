@@ -55,6 +55,7 @@ fn snapshot_spanning(network: &str, span: Duration, points: i64) -> SessionSnaps
             gross_exposure_fraction: dec!(0.2),
             fees_paid: HashMap::from([("USDT".to_string(), dec!(0.4))]),
             spot_pnl: HashMap::new(),
+            lifetime_spot_pnl: None,
             trade_count: 6,
             turnover: dec!(120),
             time_in_market_fraction: dec!(0.5),

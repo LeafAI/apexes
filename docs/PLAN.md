@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (spot fee attribution qualification)_
+_Last updated: 2026-11-26 (durable fee conversion qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)); automatic historical conversion retrieval and durable provenance remain in progress before F02.04 protective exits. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up is locally qualified; remote CI remains pending. Next: F02.04 protective exits. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -171,6 +171,21 @@ durable conversion provenance and lifetime attribution across restarts
 remain open. Existing balance/position and leveraged accounting semantics
 are preserved. No live database or real exchange orders used. Remote CI
 and independent review pending.
+
+F02.03 durable conversion follow-up local qualification (Rust 1.99.0,
+locked): workspace build, formatting, Clippy with warnings denied,
+80 test binaries and 30 doc-test suites passed. 1,389 executed tests
+(127 OMS/EMS/live-trading including isolated PostgreSQL, 937 other core,
+63 supervisor, 262 UI); zero failures, 44 remaining ignored external/manual
+tests. Four new regressions cover immutable causal pricing evidence after
+restart, public pair identity and closed candle selection, and lifetime
+reconstruction. Live worker queries direct Binance Spot pairs independently
+of the OMS, using bounded lookups and immutable persisted rates. Lifetime
+journal attribution is separate from session equity. Direct pair absence,
+offline conversion datasets, historical external wallet funding and
+large-journal performance remain limits; current session-only attribution
+can still be unpriced. No real orders or live database used. Remote CI,
+independent review and real-service pricing qualification remain pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

@@ -96,6 +96,9 @@ pub struct EvaluationSummary {
     /// Explicit spot fee and P&L attribution; empty for old snapshots.
     #[serde(default)]
     pub spot_pnl: HashMap<String, crate::spot_accounting::SpotPnlSummary>,
+    /// Bound journal lifetime attribution; absent for non-live or unavailable pricing.
+    #[serde(default)]
+    pub lifetime_spot_pnl: Option<crate::spot_accounting::LifetimeSpotPnl>,
     pub trade_count: u64,
     pub turnover: Decimal,
     /// Fraction of observed time holding any position.
@@ -357,6 +360,7 @@ impl EvaluationTracker {
             gross_exposure_fraction: exposure_fraction,
             fees_paid: self.fees_paid.clone(),
             spot_pnl: HashMap::new(),
+            lifetime_spot_pnl: None,
             trade_count: self.trade_count,
             turnover: self.turnover,
             time_in_market_fraction: time_fraction,
