@@ -135,12 +135,15 @@ pub async fn run_backtest(
     let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
         crate::ems_adapter::MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
     );
-    let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
-        child_order_sink,
-        venue_scorer,
-        HashMap::new(),
-        volume_curve_provider,
-    ));
+    let ems: Arc<dyn Ems> = Arc::new(
+        apexes_ems::InMemoryEms::new(
+            child_order_sink,
+            venue_scorer,
+            HashMap::new(),
+            volume_curve_provider,
+        )
+        .with_event_time(latency.is_some()),
+    );
 
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,

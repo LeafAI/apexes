@@ -19,10 +19,35 @@ pub trait VolumeCurveProvider: Send + Sync {
         venue: Venue,
         lookback_days: u32,
     ) -> Result<VolumeCurve, EmsError>;
+    /// A causal provider must explicitly implement historical cutoff semantics.
+    async fn intraday_volume_curve_as_of(
+        &self,
+        _symbol: &str,
+        _venue: Venue,
+        _lookback_days: u32,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<VolumeCurve, EmsError> {
+        Err(EmsError::InsufficientVwapHistory {
+            reason: "provider has no causal history support".into(),
+        })
+    }
 }
 
 #[async_trait]
 impl VolumeCurveProvider for apexes_storage::StorageReader {
+    async fn intraday_volume_curve_as_of(
+        &self,
+        symbol: &str,
+        venue: Venue,
+        lookback_days: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<VolumeCurve, EmsError> {
+        self.intraday_volume_curve_as_of(symbol, venue, lookback_days, at)
+            .await
+            .map_err(|error| EmsError::InsufficientVwapHistory {
+                reason: error.to_string(),
+            })
+    }
     async fn intraday_volume_curve(
         &self,
         symbol: &str,

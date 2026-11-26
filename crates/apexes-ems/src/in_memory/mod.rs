@@ -39,6 +39,8 @@ pub struct InMemoryEms {
     volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
     parent_orders: Mutex<HashMap<ParentOrderId, ParentOrderState>>,
     market_state: Mutex<MarketStateTracker>,
+    causal: bool,
+    event_time: Mutex<Option<DateTime<Utc>>>,
 }
 
 /// The fixed per-slice attributes every algorithm's slice-submission
@@ -69,7 +71,19 @@ impl InMemoryEms {
             volume_curve_provider,
             parent_orders: Mutex::new(HashMap::new()),
             market_state: Mutex::new(MarketStateTracker::default()),
+            causal: false,
+            event_time: Mutex::new(None),
         }
+    }
+
+    pub fn with_event_time(mut self, enabled: bool) -> Self {
+        self.causal = enabled;
+        self
+    }
+
+    fn sort_parents<T>(&self, items: &mut [T], id: impl Fn(&T) -> ParentOrderId) {
+        let parents = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        items.sort_by_key(|item| parents.get(&id(item)).map_or(usize::MAX, |p| p.ordinal));
     }
 
     fn build_market_state(&self, candidates: &[AssetClass], symbol: &str) -> VenueMarketState {
@@ -102,22 +116,27 @@ impl InMemoryEms {
         params: &SliceParams,
         quantity: Decimal,
     ) -> Result<(apexes_core::OrderId, Vec<Fill>), EmsError> {
-        let result = self
-            .sink
-            .submit_child_order(ChildOrderIntent {
-                symbol: params.symbol.clone(),
-                venue: params.venue,
-                asset_class: params.asset_class,
-                side: params.side,
-                quantity,
-                leverage: params.leverage,
-                margin_mode: params.margin_mode,
-            })
-            .await
-            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
-                parent_id,
-                reason: error.to_string(),
-            });
+        let intent = ChildOrderIntent {
+            symbol: params.symbol.clone(),
+            venue: params.venue,
+            asset_class: params.asset_class,
+            side: params.side,
+            quantity,
+            leverage: params.leverage,
+            margin_mode: params.margin_mode,
+        };
+        let at = *self.event_time.lock().unwrap_or_else(|p| p.into_inner());
+        let result = if self.causal {
+            self.sink
+                .submit_child_order_at(intent, at.ok_or(EmsError::SchedulingSuspended)?)
+                .await
+        } else {
+            self.sink.submit_child_order(intent).await
+        }
+        .map_err(|error| EmsError::ChildOrderSubmissionFailed {
+            parent_id,
+            reason: error.to_string(),
+        });
         match &result {
             Ok((order_id, _)) => {
                 tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %order_id.0)
@@ -247,10 +266,15 @@ impl InMemoryEms {
         request: AlgoOrderRequest,
         reason: String,
     ) -> Result<ParentOrderId, EmsError> {
+        if self.causal {
+            return Err(EmsError::ParentAdmissionRejected { reason });
+        }
         let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        let ordinal = parent_orders.len();
         parent_orders.insert(
             parent_id,
             ParentOrderState {
+                ordinal,
                 request,
                 status: ParentOrderStatus::Failed { reason },
                 allocations: Vec::new(),
@@ -273,7 +297,7 @@ impl InMemoryEms {
     /// Returns every fill produced synchronously by this call's slice
     /// submissions, in submission order.
     async fn process_iceberg_parents(&self) -> Result<Vec<Fill>, EmsError> {
-        let candidates: Vec<ParentOrderId> = {
+        let mut candidates: Vec<ParentOrderId> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
                 .iter()
@@ -285,6 +309,9 @@ impl InMemoryEms {
                 .collect()
         };
 
+        if self.causal {
+            self.sort_parents(&mut candidates, |id| *id);
+        }
         let mut fills = Vec::new();
         for parent_id in candidates {
             fills.extend(self.process_one_iceberg_parent(parent_id).await?);
@@ -426,7 +453,7 @@ impl InMemoryEms {
         &self,
         trade: &apexes_core::TradeEvent,
     ) -> Result<Vec<Fill>, EmsError> {
-        let candidates: Vec<(ParentOrderId, Decimal)> = {
+        let mut candidates: Vec<(ParentOrderId, Decimal)> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
                 .iter()
@@ -434,7 +461,9 @@ impl InMemoryEms {
                     let SchedulingState::Pov { participation_rate } = &state.scheduling else {
                         return None;
                     };
-                    if state.request.symbol != trade.symbol
+                    if (self.causal
+                        && (state.request.venue != trade.venue || trade.quantity <= Decimal::ZERO))
+                        || state.request.symbol != trade.symbol
                         || !matches!(state.status, ParentOrderStatus::Scheduling)
                     {
                         return None;
@@ -444,6 +473,9 @@ impl InMemoryEms {
                 .collect()
         };
 
+        if self.causal {
+            self.sort_parents(&mut candidates, |item| item.0);
+        }
         let mut fills = Vec::new();
         for (parent_id, participation_rate) in candidates {
             let target_quantity = trade.quantity * participation_rate;
@@ -539,7 +571,7 @@ impl InMemoryEms {
     /// submitted. Returns every fill produced synchronously by this
     /// call's slice submissions, in submission order.
     async fn process_vwap_parents(&self, now: DateTime<Utc>) -> Result<Vec<Fill>, EmsError> {
-        let candidates: Vec<(ParentOrderId, Decimal)> = {
+        let mut candidates: Vec<(ParentOrderId, Decimal)> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
                 .iter()
@@ -560,6 +592,9 @@ impl InMemoryEms {
                 .collect()
         };
 
+        if self.causal {
+            self.sort_parents(&mut candidates, |item| item.0);
+        }
         let mut fills = Vec::new();
         for (parent_id, target_fraction) in candidates {
             fills.extend(
@@ -682,6 +717,17 @@ impl Ems for InMemoryEms {
         &self,
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
+        let started_at = if self.causal {
+            let at = (*self.event_time.lock().unwrap_or_else(|p| p.into_inner())).ok_or(
+                EmsError::ParentAdmissionRejected {
+                    reason: "no observed event time".into(),
+                },
+            )?;
+            validate_causal_request(&request, at)?;
+            at
+        } else {
+            Utc::now()
+        };
         let parent_id = ParentOrderId(Uuid::new_v4());
         self.sink.reserve_parent(parent_id, &request).await?;
 
@@ -708,7 +754,7 @@ impl Ems for InMemoryEms {
                     .unwrap_or(chrono::Duration::zero())
                     / slices as i32;
                 SchedulingState::Twap {
-                    next_slice_at: Utc::now(),
+                    next_slice_at: started_at,
                     slice_interval,
                     slice_quantity: request.quantity / Decimal::from(slices),
                     slices_remaining: slices,
@@ -725,13 +771,25 @@ impl Ems for InMemoryEms {
                         )
                         .await;
                 };
-                match provider
-                    .intraday_volume_curve(&request.symbol, request.venue, *lookback_days)
-                    .await
-                {
+                let curve = if self.causal {
+                    provider
+                        .intraday_volume_curve_as_of(
+                            &request.symbol,
+                            request.venue,
+                            *lookback_days,
+                            started_at,
+                        )
+                        .await
+                        .and_then(|curve| scale_causal_curve(curve, &execution_algo))
+                } else {
+                    provider
+                        .intraday_volume_curve(&request.symbol, request.venue, *lookback_days)
+                        .await
+                };
+                match curve {
                     Ok(curve) => SchedulingState::Vwap {
                         curve,
-                        started_at: Utc::now(),
+                        started_at,
                         last_target_fraction_submitted: Decimal::ZERO,
                     },
                     Err(error) => {
@@ -754,9 +812,11 @@ impl Ems for InMemoryEms {
         };
 
         let mut parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
+        let ordinal = parent_orders.len();
         parent_orders.insert(
             parent_id,
             ParentOrderState {
+                ordinal,
                 request,
                 status: ParentOrderStatus::Scheduling,
                 allocations,
@@ -792,6 +852,21 @@ impl Ems for InMemoryEms {
     }
 
     async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError> {
+        let now = if self.causal {
+            match event {
+                MarketEvent::Bar(bar) => bar.close_time,
+                _ => event_timestamp(event),
+            }
+        } else {
+            event_timestamp(event)
+        };
+        if self.causal {
+            let mut clock = self.event_time.lock().unwrap_or_else(|p| p.into_inner());
+            if clock.is_some_and(|at| now < at) {
+                return Ok(Vec::new());
+            }
+            *clock = Some(now);
+        }
         if let MarketEvent::Depth(update) = event {
             let mut tracker = self.market_state.lock().unwrap_or_else(|p| p.into_inner());
             for asset_class in [AssetClass::Spot, AssetClass::Perpetual] {
@@ -799,8 +874,7 @@ impl Ems for InMemoryEms {
             }
         }
 
-        let now = event_timestamp(event);
-        let due: Vec<ParentOrderId> = {
+        let mut due: Vec<ParentOrderId> = {
             let parent_orders = self.parent_orders.lock().unwrap_or_else(|p| p.into_inner());
             parent_orders
                 .iter()
@@ -815,6 +889,9 @@ impl Ems for InMemoryEms {
                 .collect()
         };
 
+        if self.causal {
+            self.sort_parents(&mut due, |id| *id);
+        }
         let mut all_fills = Vec::new();
         for parent_id in due {
             all_fills.extend(self.submit_due_twap_slice(parent_id, now).await?);
@@ -829,6 +906,9 @@ impl Ems for InMemoryEms {
         Ok(all_fills)
     }
 }
+
+mod causal;
+use causal::{scale_causal_curve, validate_causal_request};
 
 fn event_timestamp(event: &MarketEvent) -> DateTime<Utc> {
     match event {
@@ -955,6 +1035,185 @@ mod tests {
             is_snapshot: true,
             timestamp: now,
         })
+    }
+
+    #[tokio::test]
+    async fn causal_twap_uses_historical_clock_and_admission_order() {
+        use chrono::TimeZone;
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        )
+        .with_event_time(true);
+        let at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        assert!(ems.submit_algo_order(sample_request()).await.is_err());
+        ems.on_market_event(&depth_event(at)).await.unwrap();
+        let first = ems.submit_algo_order(sample_request()).await.unwrap();
+        let mut other = sample_request();
+        other.quantity = dec!(8);
+        let second = ems.submit_algo_order(other).await.unwrap();
+        ems.on_market_event(&depth_event(at - chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        for offset in [1, 5, 11, 21, 31] {
+            ems.on_market_event(&depth_event(at + chrono::Duration::seconds(offset)))
+                .await
+                .unwrap();
+        }
+        let quantities = sink
+            .submitted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.quantity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            quantities,
+            vec![
+                dec!(1),
+                dec!(2),
+                dec!(1),
+                dec!(2),
+                dec!(1),
+                dec!(2),
+                dec!(1),
+                dec!(2)
+            ]
+        );
+        for id in [first, second] {
+            assert_eq!(
+                ems.parent_order_status(id).await.unwrap(),
+                Some(ParentOrderStatus::Completed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn causal_pov_rejects_other_venues_and_regressing_trades() {
+        use chrono::TimeZone;
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        )
+        .with_event_time(true);
+        let at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        ems.on_market_event(&depth_event(at)).await.unwrap();
+        assert!(ems.submit_algo_order(pov_request(dec!(1.1))).await.is_err());
+        let id = ems.submit_algo_order(pov_request(dec!(0.1))).await.unwrap();
+        let MarketEvent::Trade(mut wrong) = trade_event("BTCUSDT", dec!(10), at) else {
+            panic!("fixture")
+        };
+        wrong.venue = Venue::Okx;
+        ems.on_market_event(&MarketEvent::Trade(wrong))
+            .await
+            .unwrap();
+        ems.on_market_event(&trade_event(
+            "BTCUSDT",
+            dec!(10),
+            at - chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+        ems.on_market_event(&trade_event("BTCUSDT", dec!(-1), at))
+            .await
+            .unwrap();
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        ems.on_market_event(&trade_event(
+            "BTCUSDT",
+            dec!(10),
+            at + chrono::Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(sink.submitted.lock().unwrap()[0].quantity, dec!(1));
+        ems.cancel_parent_order(id).await.unwrap();
+        ems.on_market_event(&trade_event(
+            "BTCUSDT",
+            dec!(10),
+            at + chrono::Duration::seconds(2),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn causal_vwap_uses_as_of_curve_and_requested_duration() {
+        use chrono::TimeZone;
+        struct CausalCurve(DateTime<Utc>);
+        #[async_trait]
+        impl VolumeCurveProvider for CausalCurve {
+            async fn intraday_volume_curve(
+                &self,
+                _: &str,
+                _: Venue,
+                _: u32,
+            ) -> Result<VolumeCurve, EmsError> {
+                panic!("noncausal provider called")
+            }
+            async fn intraday_volume_curve_as_of(
+                &self,
+                _: &str,
+                _: Venue,
+                days: u32,
+                at: DateTime<Utc>,
+            ) -> Result<VolumeCurve, EmsError> {
+                assert_eq!(at, self.0);
+                assert_eq!(days, 5);
+                Ok(VolumeCurve {
+                    cumulative_fractions: vec![
+                        (chrono::Duration::zero(), dec!(0.25)),
+                        (chrono::Duration::hours(12), dec!(0.5)),
+                        (chrono::Duration::hours(24), Decimal::ONE),
+                    ],
+                })
+            }
+        }
+        let at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let sink = Arc::new(RecordingSink::new());
+        let ems = InMemoryEms::new(
+            sink.clone(),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            Some(Arc::new(CausalCurve(at))),
+        )
+        .with_event_time(true);
+        ems.on_market_event(&depth_event(at)).await.unwrap();
+        let id = ems.submit_algo_order(vwap_request()).await.unwrap();
+        for offset in [1, 1799, 1800, 3600] {
+            ems.on_market_event(&depth_event(at + chrono::Duration::seconds(offset)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            sink.submitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.quantity)
+                .collect::<Vec<_>>(),
+            vec![dec!(2.5), dec!(2.5), dec!(5)]
+        );
+        assert_eq!(
+            ems.parent_order_status(id).await.unwrap(),
+            Some(ParentOrderStatus::Completed)
+        );
+        let legacy = InMemoryEms::new(
+            sink,
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            Some(Arc::new(AlwaysInsufficientHistory)),
+        )
+        .with_event_time(true);
+        legacy.on_market_event(&depth_event(at)).await.unwrap();
+        assert!(legacy.submit_algo_order(vwap_request()).await.is_err());
     }
 
     #[tokio::test]

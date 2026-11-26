@@ -171,6 +171,80 @@ async fn event_latency_executes_against_arrival_depth_and_counts_unarrived_order
 }
 
 #[tokio::test]
+async fn event_latency_admits_twap_parent_then_dispatches_on_observed_events() {
+    struct TwapOnce(BuyOnceStrategy);
+    impl Strategy for TwapOnce {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            self.0
+                .on_market_event(event, ctx)
+                .into_iter()
+                .map(|mut i| {
+                    i.quantity = dec!(2);
+                    i.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                        duration: std::time::Duration::from_secs(2),
+                        slices: 2,
+                    });
+                    i
+                })
+                .collect()
+        }
+    }
+    let mut events = sample_events();
+    let MarketEvent::Depth(first) = events[0].clone() else {
+        panic!("depth fixture")
+    };
+    for (offset, price, seq) in [(500, dec!(2), 2), (600, dec!(3), 3), (1600, dec!(4), 4)] {
+        let mut d = first.clone();
+        d.timestamp += chrono::Duration::milliseconds(offset);
+        d.sequence = Some(seq);
+        d.asks[0].price = price;
+        events.push(MarketEvent::Depth(d));
+    }
+    events.sort_by_key(|e| match e {
+        MarketEvent::Depth(d) => d.timestamp,
+        MarketEvent::Trade(t) => t.timestamp,
+        _ => unreachable!(),
+    });
+    let registry = apexes_core::registry::Registry::new();
+    registry
+        .register::<apexes_backtest::EventLatencyPolicy, ()>(
+            (),
+            apexes_backtest::EventLatencyPolicy { delay_ms: 500 },
+        )
+        .unwrap();
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        TwapOnce(BuyOnceStrategy { has_bought: false }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    assert_eq!(
+        report.trades.iter().map(|f| f.price).collect::<Vec<_>>(),
+        vec![dec!(3), dec!(4)]
+    );
+    assert_eq!(
+        report.trades[0].filled_at,
+        first.timestamp + chrono::Duration::milliseconds(600)
+    );
+    assert_eq!(
+        report.trades[1].filled_at,
+        first.timestamp + chrono::Duration::milliseconds(1600)
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (latency.scheduled, latency.arrived, latency.expired_at_end),
+        (1, 1, 0)
+    );
+}
+
+#[tokio::test]
 async fn event_latency_rechecks_risk_at_arrival() {
     use apexes_core::{Order, OrderId};
     use apexes_risk::{PreTradeCheck, RiskViolation};

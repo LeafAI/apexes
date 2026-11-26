@@ -137,12 +137,18 @@ pub async fn run_paper_trading(
     let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> = Arc::new(
         MatchingEngineChildOrderSink::new(Arc::clone(&matching_engine)),
     );
-    let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
-        child_order_sink,
-        venue_scorer,
-        HashMap::new(),
-        volume_curve_provider,
-    ));
+    let ems: Arc<dyn Ems> = Arc::new(
+        apexes_ems::InMemoryEms::new(
+            child_order_sink,
+            venue_scorer,
+            HashMap::new(),
+            volume_curve_provider,
+        )
+        .with_event_time(matches!(
+            latency,
+            apexes_backtest::LatencyModel::EventTime(_)
+        )),
+    );
 
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,

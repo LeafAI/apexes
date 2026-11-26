@@ -84,6 +84,15 @@ pub trait ChildOrderSink: Send + Sync {
         intent: ChildOrderIntent,
     ) -> Result<(OrderId, Vec<Fill>), EmsError>;
 
+    /// Explicit event time for simulated execution; live sinks retain their existing API.
+    async fn submit_child_order_at(
+        &self,
+        intent: ChildOrderIntent,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError> {
+        self.submit_child_order(intent).await
+    }
+
     /// Cancels a previously-submitted child order, if still active.
     /// Implementations should treat cancelling an already-terminal
     /// order as a no-op success, not an error (mirrors
