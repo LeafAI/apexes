@@ -10,6 +10,9 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+#[path = "crossing_limit.rs"]
+mod crossing_limit;
+
 /// Result of walking a sequence of price levels to fill `quantity`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookWalkResult {
@@ -410,6 +413,16 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<Order, ApexesError> {
+        let order = self.prepare_limit_order(intent, now)?;
+        self.rest_limit_order(&order);
+        Ok(order)
+    }
+
+    fn prepare_limit_order(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Order, ApexesError> {
         self.execution.validate_intent(intent)?;
         self.advance_depth_time(now);
         self.require_depth(intent, now)?;
@@ -433,9 +446,13 @@ impl MatchingEngine {
             reason: "Limit order requires a price".to_string(),
         })?;
 
-        let order_id = OrderId(Uuid::new_v4());
+        if limit_price <= Decimal::ZERO {
+            return Err(ApexesError::OrderRejected {
+                reason: "Limit price must be positive".into(),
+            });
+        }
         let order = Order {
-            id: order_id,
+            id: OrderId(Uuid::new_v4()),
             exchange_order_id: None,
             symbol: intent.symbol.clone(),
             venue: intent.venue,
@@ -453,21 +470,32 @@ impl MatchingEngine {
             updated_at: now,
         };
 
+        Ok(order)
+    }
+
+    fn rest_limit_order(&mut self, order: &Order) {
+        let Some(limit_price) = order.price else {
+            return;
+        };
         // Determine how much visible volume is currently resting ahead of
         // us at (or better than) our limit price, on the SAME side of the
         // book we're joining (other resting orders we'd have to queue
         // behind), to seed queue_position_factor's threshold.
         let book = self
             .books
-            .entry((intent.venue, intent.symbol.clone()))
+            .entry((order.venue, order.symbol.clone()))
             .or_default();
-        let levels = match intent.side {
-            Side::Buy => book.bids(),  // joining the bid side
-            Side::Sell => book.asks(), // joining the ask side
+        let levels = if !book.is_causal_at(order.updated_at) {
+            Vec::new()
+        } else {
+            match order.side {
+                Side::Buy => book.bids(),  // joining the bid side
+                Side::Sell => book.asks(), // joining the ask side
+            }
         };
         let visible_volume_at_price: Decimal = levels
             .iter()
-            .filter(|level| match intent.side {
+            .filter(|level| match order.side {
                 Side::Buy => level.price >= limit_price,
                 Side::Sell => level.price <= limit_price,
             })
@@ -475,18 +503,16 @@ impl MatchingEngine {
             .sum();
 
         let resting = RestingOrder {
-            order_id,
+            order_id: order.id,
             order: order.clone(),
-            remaining_quantity: intent.quantity,
+            remaining_quantity: order.quantity - order.filled_quantity,
             volume_ahead_required: visible_volume_at_price * self.queue_position_factor,
             volume_observed: Decimal::ZERO,
         };
         self.resting_orders
-            .entry((intent.venue, intent.symbol.clone()))
+            .entry((order.venue, order.symbol.clone()))
             .or_default()
             .push(resting);
-
-        Ok(order)
     }
 
     /// Submits a Stop or StopLimit `OrderIntent`. The order does not rest
