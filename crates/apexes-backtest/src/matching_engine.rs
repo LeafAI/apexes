@@ -524,9 +524,16 @@ impl MatchingEngine {
             .ok_or_else(|| ApexesError::OrderRejected {
                 reason: "Stop/StopLimit order requires a stop_price".to_string(),
             })?;
-        if intent.order_type == OrderType::StopLimit && intent.price.is_none() {
+        if stop_price <= Decimal::ZERO {
             return Err(ApexesError::OrderRejected {
-                reason: "StopLimit order requires both stop_price and price".to_string(),
+                reason: "Stop price must be positive".into(),
+            });
+        }
+        if intent.order_type == OrderType::StopLimit
+            && intent.price.is_none_or(|price| price <= Decimal::ZERO)
+        {
+            return Err(ApexesError::OrderRejected {
+                reason: "StopLimit order requires a positive limit price".to_string(),
             });
         }
         if intent.quantity <= Decimal::ZERO {
@@ -588,14 +595,10 @@ impl MatchingEngine {
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
-        // Check pending triggers FIRST: triggered Stop orders convert to
-        // Market orders and fill immediately (their fills are returned
-        // through `results` below, keyed by the ORIGINAL Stop order's ID);
-        // triggered StopLimit orders are returned as Limit intents and
-        // submitted AFTER this call's resting-order pass below, so the
-        // trade that triggered a StopLimit can never also fill it in the
-        // same call (the order was not yet resting when that trade
-        // occurred).
+        // Stop-market orders execute first. Existing maker orders then
+        // receive the print's budget. Newly triggered stop-limits execute
+        // against causal opposite-side depth only after that maker pass;
+        // their remainder cannot receive the print that triggered them.
         self.advance_time(now);
         if trade.price > Decimal::ZERO && trade.timestamp <= now {
             let key = (trade.venue, trade.symbol.clone());
@@ -609,7 +612,9 @@ impl MatchingEngine {
             }
         }
         if !self.depth_available(trade.venue, &trade.symbol, now)
-            || (self.depth_policy.is_some() && trade.timestamp > now)
+            || trade.timestamp > now
+            || trade.price <= Decimal::ZERO
+            || trade.quantity <= Decimal::ZERO
         {
             return Vec::new();
         }
@@ -630,24 +635,23 @@ impl MatchingEngine {
         }
 
         for (original_order_id, limit_intent) in trigger_result.stop_limit_conversions {
-            match self.submit_limit_order(&limit_intent, now) {
-                Ok(order) => {
-                    if let Some(resting) = self
-                        .resting_orders
-                        .get_mut(&(order.venue, order.symbol.clone()))
-                        .and_then(|orders| orders.iter_mut().find(|r| r.order_id == order.id))
-                    {
-                        resting.order_id = original_order_id;
-                        resting.order.id = original_order_id;
+            let result = self
+                .prepare_limit_order(&limit_intent, now)
+                .and_then(|mut order| {
+                    order.id = original_order_id;
+                    self.execute_prepared_limit(order, now)
+                });
+            match result {
+                Ok((_order, fills)) => {
+                    if !fills.is_empty() {
+                        results.push((original_order_id, fills));
                     }
-                    tracing::info!(symbol=%trade.symbol,order_id=?original_order_id,
-                        "StopLimit order triggered and converted to resting Limit order");
                 }
                 Err(error) => tracing::warn!(
                     symbol = %trade.symbol,
                     order_id = ?original_order_id,
                     ?error,
-                    "StopLimit order triggered but failed to convert to a resting Limit order"
+                    "StopLimit order triggered but failed to execute as a Limit order"
                 ),
             }
         }
@@ -668,12 +672,9 @@ impl MatchingEngine {
     /// fills (ledger, equity curve, `BacktestReport.trades`). A triggered
     /// `StopLimit` is returned as an `(OrderId, Limit OrderIntent)` pair
     /// (the original order's ID alongside the converted intent) for the
-    /// caller (`on_trade_event`) to submit via `submit_limit_order` AFTER the
-    /// current call's resting-order pass -- the trade that triggered the
-    /// StopLimit must not also fill it in the same call, because the
-    /// order was not yet resting when that trade occurred. The converted
-    /// Limit order is eligible for fills from the NEXT `on_trade_event`
-    /// call onward, exactly like any other resting limit order.
+    /// caller to execute against causal depth AFTER the current maker
+    /// pass. Only its unfilled remainder joins the queue; the trigger
+    /// print itself cannot also supply a maker fill.
     ///
     /// Returns a `TriggerCheckResult`: triggered-Stop
     /// fills keyed by the ORIGINAL `OrderId` `submit_stop_order` returned,
@@ -701,7 +702,7 @@ impl MatchingEngine {
                 Side::Buy => trade.price >= trigger.stop_price,
                 Side::Sell => trade.price <= trigger.stop_price,
             };
-            if is_triggered && now >= trigger.created_at {
+            if is_triggered && trade.timestamp >= trigger.created_at {
                 triggered.push(trigger);
             } else {
                 still_pending.push(trigger);
