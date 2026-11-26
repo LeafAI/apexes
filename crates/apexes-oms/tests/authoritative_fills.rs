@@ -335,6 +335,126 @@ async fn fill_above_cap_latches_breach_even_when_total_spend_is_under_budget() {
 
 #[tokio::test]
 #[ignore]
+async fn parent_budget_is_exclusive_and_children_consume_it_durably() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let parent = Uuid::new_v4();
+    fixture.gateway.set_spot_free_quote(dec!(302));
+    assert!(manager.reserve_ems_parent(parent, intent()).await.is_err());
+    fixture.gateway.set_spot_free_quote(dec!(1000));
+    manager.reserve_ems_parent(parent, intent()).await.unwrap();
+    let mut other = intent();
+    other.symbol = "ETHUSDT".into();
+    assert!(
+        manager
+            .reserve_ems_parent(Uuid::new_v4(), other.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("EMS parent")
+    );
+    assert!(
+        manager
+            .submit_child_order(other.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("EMS parent")
+    );
+    let mut child = intent();
+    child.quantity = dec!(1);
+    let id = manager
+        .submit_allocated_child(parent, child.clone())
+        .await
+        .unwrap();
+    manager.cancel_order(id).await.unwrap();
+    // No recycling of allocated budgets on cancellation.
+    drop(manager);
+    let mut manager = fixture.manager().await;
+    manager
+        .verify_ems_parent(parent, "BTCUSDT", Side::Buy, dec!(3), dec!(1))
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .verify_ems_parent(parent, "BTCUSDT", Side::Buy, dec!(3), dec!(0))
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .submit_allocated_child(Uuid::new_v4(), child.clone())
+            .await
+            .is_err()
+    );
+    fixture.gateway.set_spot_commission(dec!(0.02), None);
+    child.quantity = dec!(2);
+    assert!(
+        manager
+            .submit_allocated_child(parent, child.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("parent allocation")
+    );
+    fixture.gateway.set_spot_commission(dec!(0.01), None);
+    let second = manager.submit_allocated_child(parent, child).await.unwrap();
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let allocation:(Decimal,Decimal,Decimal) = sqlx::query_as("SELECT budget,allocated_amount,allocated_quantity FROM spot_parent_allocations WHERE id=$1")
+        .bind(parent).fetch_one(&pool).await.unwrap();
+    assert_eq!(allocation, (dec!(303), dec!(303), dec!(3)));
+    let link: Uuid = sqlx::query_scalar("SELECT parent_allocation_id FROM orders WHERE id=$1")
+        .bind(second.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(link, parent);
+    manager.release_ems_parent(parent).await.unwrap();
+    assert!(manager.submit_child_order(other.clone()).await.is_err());
+    manager.cancel_order(second).await.unwrap();
+    assert!(manager.submit_child_order(other).await.is_ok());
+    drop(manager);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn orphan_parent_reservation_survives_restart_and_missing_parent_refuses_dispatch() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let parent = Uuid::new_v4();
+    manager.reserve_ems_parent(parent, intent()).await.unwrap();
+    // Simulate a crash before the EMS scheduling row is written.
+    drop(manager);
+    let mut restarted = fixture.manager().await;
+    assert!(
+        restarted
+            .submit_child_order(intent())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("EMS parent")
+    );
+    assert!(
+        restarted
+            .submit_allocated_child(Uuid::new_v4(), intent())
+            .await
+            .is_err()
+    );
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    drop(restarted);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn commission_rate_drives_buy_reservation_and_is_persisted() {
     let fixture = Fixture::new().await;
     let mut manager = fixture.manager().await;

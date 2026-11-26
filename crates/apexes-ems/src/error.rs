@@ -16,6 +16,9 @@ pub enum EmsError {
     #[error("database query failed: {reason}")]
     QueryFailed { reason: String },
 
+    #[error("parent admission refused: {reason}")]
+    ParentAdmissionRejected { reason: String },
+
     #[error("parent order {id:?} not found")]
     ParentOrderNotFound { id: ParentOrderId },
 

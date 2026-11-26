@@ -184,6 +184,19 @@ impl PostgresEms {
             return Err(EmsError::SchedulingSuspended);
         }
         for row in &rows {
+            if row.status == "Scheduling" {
+                self.sink
+                    .verify_parent(
+                        row.parent_id(),
+                        &row.symbol,
+                        parse_side(&row.side)?,
+                        row.total_quantity,
+                        row.filled_quantity,
+                    )
+                    .await?;
+            } else {
+                self.sink.release_parent(row.parent_id()).await?;
+            }
             self.state.register(row)?;
         }
         let mut recover = Vec::new();
@@ -544,7 +557,7 @@ impl SchedulingDeps {
         // this return value.
         let (child_order_id, _fills) = self
             .sink
-            .submit_child_order(ChildOrderIntent {
+            .submit_allocated_child(parent_id, ChildOrderIntent {
                 symbol: row.symbol.clone(),
                 venue,
                 // See in_memory/routing.rs's Fixed-routing note (Task
@@ -625,6 +638,7 @@ impl SchedulingDeps {
             if updated.rows_affected() == 1 {
                 self.state
                     .set_status(parent_id, ParentOrderStatus::Completed);
+                self.sink.release_parent(parent_id).await?;
             }
         }
         Ok(())
@@ -646,6 +660,7 @@ impl SchedulingDeps {
         if updated.rows_affected() == 1 {
             self.state
                 .set_status(parent_id, ParentOrderStatus::Failed { reason });
+            self.sink.release_parent(parent_id).await?;
         }
         Ok(())
     }
@@ -683,6 +698,10 @@ impl PostgresEms {
                 }
             })?;
 
+        // The OMS allocation is durable before the parent can schedule.
+        // A crash between these records leaves an orphan lock, never
+        // an unfunded scheduling parent. Audit is required to release it.
+        self.sink.reserve_parent(parent_id, &request).await?;
         let row: ParentOrderRow = sqlx::query_as(
             "INSERT INTO parent_orders (id, symbol, venue, side, total_quantity, filled_quantity, algo_spec, routing, status, failure_reason, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Scheduling', NULL, $9, $9) RETURNING *",
@@ -716,7 +735,10 @@ impl Ems for PostgresEms {
             return Err(EmsError::SchedulingSuspended);
         }
         let result = self.submit_parent(request).await;
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|e| !matches!(e, EmsError::ParentAdmissionRejected { .. }))
+        {
             self.state.trip("EMS parent persistence failed");
         }
         result
@@ -768,6 +790,10 @@ impl Ems for PostgresEms {
                 .await
                 .inspect_err(|_| self.state.trip("EMS child cancellation failed"))?;
         }
+        self.sink
+            .release_parent(id)
+            .await
+            .inspect_err(|_| self.state.trip("EMS parent allocation release failed"))?;
         Ok(())
     }
 

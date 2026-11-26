@@ -50,8 +50,8 @@ pending sales as position capacity.
 EMS child quantities must already satisfy current rules because the
 parent journal reserves the requested child amount before dispatch.
 Refuse rather than silently round an EMS child; direct orders can round
-down. Parent-level capital reservation across independently scheduled
-parents remains unimplemented. Caller-snapshot-dependent equity checks
+down. Parent-level capital reservation is described in the follow-up
+below. Caller-snapshot-dependent equity checks
 can still conservatively refuse children.
 
 ## Limits and qualification
@@ -97,8 +97,50 @@ a discount asset or fall back to received-asset fees. External discount
 tokens are protected by exclusivity but are not numerically reserved;
 their precise quantity depends on execution-time conversion. The
 existing actual-spend and price-cap breach checks remain mandatory.
-Live-service compatibility, exact fee-token funding and parent-level
-capital allocation remain open. No real exchange requests in tests.
+Live-service compatibility and exact fee-token funding remain open.
+No real exchange requests in tests.
+
+### EMS parent capital follow-up
+
+Reserve the complete parent quantity before scheduling in a separate
+durable OMS allocation record using fresh managed Spot preflight.
+Admission requires fixed routing, exact whole-quantity conformity,
+available spend balance and owned sell inventory; all spend, receipt
+and possible discount assets are exclusive against competing parents
+and working orders. The admission uses the existing serialized OMS
+boundary and a detached task for network preflight. A normal budget
+refusal does not latch EMS health. The allocation stores quantity,
+budget, commission evidence, reference price and potential fee asset.
+Child dispatch revalidates fresh rules, fees, available funds and risk.
+The child identity, amount and quantity are checked against the
+parent's remaining budget; allocation consumption and the durable
+child pre-dispatch order record commit atomically. A higher price or
+fee rate may exhaust the budget. There is no automatic recycling of
+unused child amounts, including rejected or partially filled children.
+The existing EMS dispatch_pending marker still protects the separate
+scheduler-link transaction. A failed or ambiguous dispatch is not
+automatically retried. Parent completion remains submitted quantity,
+not actual filled quantity.
+
+Terminal scheduling requests release; the allocation remains active
+while any linked durable child is working. The global fill delivery
+gate still protects terminal proceeds. Terminal child cancellation
+checks persisted terminal status rather than treating a missing
+working-map entry as proof of cancellation. Startup verifies scheduling
+identity, submitted quantity and durable child reservation totals;
+legacy scheduling parents lacking allocations refuse recovery.
+Reservation precedes scheduler insertion, so an interruption between
+them leaves an orphan lock, never an unfunded scheduling parent.
+Audited reconciliation is required to release an orphan. The managed
+engine still requires quiescent startup.
+
+This conservative scope requires the whole parent to pass single-order
+exchange filters, excludes flexible shared-asset allocation and
+does not guarantee execution or a numerically reserved external fee
+token. Child risk checks remain necessary; no aggregate risk cap
+is waived. Qualification uses isolated PostgreSQL and mock execution,
+including an end-to-end managed POV parent through the actual sink.
+Real-service behavior and simulation parity remain unqualified.
 
 This is a single managed account/schema guard, not account-wide fencing
 between multiple processes or coordination with external traders.
