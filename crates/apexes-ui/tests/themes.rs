@@ -39,6 +39,7 @@ fn snapshot_spanning(network: &str, span: Duration, points: i64) -> SessionSnaps
             network: Some(network.to_string()),
             mode: "live".to_string(),
             strategy: "example".to_string(),
+            fee_label: None,
         }),
         evaluation: Some(EvaluationSummary {
             start_equity: dec!(10000),

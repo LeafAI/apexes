@@ -79,7 +79,7 @@ pub struct BacktestConfig {
 /// risk checking is performed, preserving this crate's pre-existing
 /// `None`-means-no-risk-checking behavior exactly.
 pub async fn run_backtest(
-    config: BacktestConfig,
+    mut config: BacktestConfig,
     registry: &Registry,
     market_data: impl HistoricalMarketDataSource,
     strategy: impl Strategy,
@@ -101,6 +101,7 @@ pub async fn run_backtest(
             reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
         })?;
 
+    let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let events = market_data.events().await?;
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
@@ -150,7 +151,7 @@ pub async fn run_backtest(
         symbol_rules: HashMap::new(),
     };
 
-    run_unified_event_loop(
+    let mut report = run_unified_event_loop(
         unified_loop_config,
         event_stream,
         clock,
@@ -162,7 +163,9 @@ pub async fn run_backtest(
         None,
         None,
     )
-    .await
+    .await?;
+    report.simulated_fees = Some(simulated_fees);
+    Ok(report)
 }
 
 #[cfg(test)]

@@ -60,7 +60,8 @@ pub use apexes_strategy::{OrderIntent, OrderRouting, Position, Strategy, Strateg
 pub use clock::ReplaySpeed;
 pub use control::{ControlHandle, OpenOrderView, SessionCommand, SessionIdentity, SessionSnapshot};
 pub use cost_model::{
-    BinanceSpotVipFeeSchedule, CostModel, FeeSchedule, FillLiquidity, FlatFeeSchedule,
+    BinanceSpotVipFeeSchedule, CostModel, FeeRates, FeeSchedule, FillLiquidity, FlatFeeSchedule,
+    SimulatedFeeReport, SimulatedFees,
 };
 pub use error::ApexesError;
 pub use evaluation::{EvaluationSummary, EvaluationTracker, LimitSpec, LimitUsage};

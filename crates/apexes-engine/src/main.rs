@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use apexes_backtest::market_data_source::StorageMarketDataSource;
-use apexes_backtest::{BacktestConfig, CostModel, FlatFeeSchedule, ReplaySpeed, run_backtest};
+use apexes_backtest::{BacktestConfig, ReplaySpeed, run_backtest};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
@@ -261,21 +261,6 @@ fn write_pid_file(session_id: &str, port: u16) {
             port,
             "apexes-engine: wrote PID file"
         );
-    }
-}
-
-/// A zero-fee `CostModel` used by `Backtest`/`Paper` mode's internal
-/// `MatchingEngine` -- `LaunchConfig` deliberately does not carry a
-/// user-selectable cost model (design spec §4.2; see
-/// `launch_config.rs`'s own doc comment on why `cost_model` is a fixed
-/// engine-internal default rather than a launch parameter).
-fn default_cost_model() -> CostModel {
-    CostModel {
-        fee_schedule: Box::new(FlatFeeSchedule {
-            maker_bps: rust_decimal::Decimal::ZERO,
-            taker_bps: rust_decimal::Decimal::ZERO,
-        }),
-        funding_rate_bps: None,
     }
 }
 
@@ -717,7 +702,7 @@ async fn run_backtest_mode(
         instruments: launch_config.instruments.clone(),
         date_range,
         initial_balances: launch_config.initial_balances.clone(),
-        cost_model: default_cost_model(),
+        cost_model: launch_config.cost_model(),
         speed: ReplaySpeed::AsFastAsPossible,
         queue_position_factor: rust_decimal::Decimal::ZERO,
         risk_free_return: launch_config.risk_free_return,
@@ -756,7 +741,7 @@ async fn run_paper_mode(
     let config = PaperTradingConfig {
         instruments: launch_config.instruments.clone(),
         initial_balances: launch_config.initial_balances.clone(),
-        cost_model: default_cost_model(),
+        cost_model: launch_config.cost_model(),
         queue_position_factor: rust_decimal::Decimal::ZERO,
         risk_free_return: launch_config.risk_free_return,
         latency_model: LatencyModel::None,
@@ -974,7 +959,7 @@ async fn run_live_mode(
         instruments: launch_config.instruments.clone(),
         initial_balances: session_balances,
         initial_positions: recovered_positions,
-        cost_model: default_cost_model(),
+        cost_model: launch_config.cost_model(),
         margin_tiers: launch_config.margin_tiers.clone(),
         market_condition_config: launch_config.market_condition_config.clone(),
         auto_derisk_live,
@@ -1143,6 +1128,7 @@ mod tests {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             risk_free_return: dec!(0),
+            simulated_fees: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }

@@ -109,8 +109,9 @@ pub fn environment_banner(identity: Option<&SessionIdentity>) -> EnvironmentBann
         },
         (mode, _) => EnvironmentBanner {
             text: format!(
-                "{} (simulated, no exchange)   |   {}   |   {}",
+                "{} (simulated, no exchange)   |   {}   |   {}   |   {}",
                 mode.to_uppercase(),
+                identity.fee_label.as_deref().unwrap_or("Fees unknown"),
                 identity.session_id,
                 identity.strategy
             ),
@@ -505,6 +506,7 @@ mod tests {
             network: network.map(str::to_string),
             mode: mode.to_string(),
             strategy: "demo.drift".to_string(),
+            fee_label: None,
         }
     }
 
@@ -561,6 +563,28 @@ mod tests {
             assert_eq!(b.kind, EnvironmentKind::Simulated);
             assert!(b.text.to_lowercase().contains("simulated"));
         }
+    }
+
+    #[test]
+    fn simulated_banner_distinguishes_zero_and_unknown_fees() {
+        let mut session = identity("backtest", None);
+        assert!(
+            environment_banner(Some(&session))
+                .text
+                .contains("Fees unknown")
+        );
+        session.fee_label = Some("ZERO FEES".into());
+        assert!(
+            environment_banner(Some(&session))
+                .text
+                .contains("ZERO FEES")
+        );
+        session.fee_label = Some("Modeled fees".into());
+        assert!(
+            environment_banner(Some(&session))
+                .text
+                .contains("Modeled fees")
+        );
     }
 
     #[test]

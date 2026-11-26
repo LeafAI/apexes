@@ -996,6 +996,7 @@ pub async fn run_unified_event_loop(
         equity_curve: overall_tracker.equity_curve().to_vec(),
         trades: all_fills,
         spot_pnl: ledger.spot_pnl(),
+        simulated_fees: None,
     })
 }
 
@@ -2366,6 +2367,7 @@ mod tests {
                 network: Some("testnet".to_string()),
                 mode: "live".to_string(),
                 strategy: "demo.drift".to_string(),
+                fee_label: None,
             })
             .with_limits(crate::evaluation::LimitSpec {
                 max_position_per_symbol: Some(dec!(1)),

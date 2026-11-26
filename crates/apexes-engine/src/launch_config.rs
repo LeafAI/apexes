@@ -35,13 +35,8 @@
 //!   own `main.rs` into gateway credentials read from env/local config,
 //!   design spec §4.4 -- included here so `main.rs` knows which
 //!   credentials to resolve).
-//! - `cost_model`/`speed`/`queue_position_factor` (`BacktestConfig`),
-//!   `cost_model`/`latency_model` (`PaperTradingConfig`), `cost_model`
-//!   (`LiveTradingConfig`): deliberately NOT carried in `LaunchConfig`.
-//!   These are engine-internal simulation-fidelity knobs, not
-//!   session-launch parameters a UI user picks -- Task 7's `main.rs`
-//!   constructs sensible fixed defaults for these directly, matching
-//!   this brief's own field list (which also omits them).
+//! - F03.01: simulated fees are configurable; live uses actual exchange
+//!   commissions. Replay speed, queue factor and latency are unchanged.
 //! - `snapshot_min_interval`: new, not present on any of the three
 //!   configs -- consumed by Task 7's `main.rs` to construct the
 //!   `ControlHandle` (design spec §五), not passed through to any of
@@ -161,6 +156,9 @@ pub struct LaunchConfig {
     pub margin_tiers: HashMap<String, MarginTierTable>,
     pub market_condition_config: Option<MarketConditionConfig>,
     pub risk_free_return: Decimal,
+    /// Optional in legacy JSON: zero rates are explicitly labeled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_fees: Option<apexes_backtest::SimulatedFees>,
     /// `apexes-market-data-gateway`'s `/market` WS URL this engine
     /// subscribes to for live market data (backtest mode ignores this
     /// -- historical replay reads from `apexes-storage` instead).
@@ -172,6 +170,8 @@ pub struct LaunchConfig {
 pub enum LaunchConfigError {
     #[error(transparent)]
     RiskLimits(#[from] RiskLimitsError),
+    #[error("invalid simulated fees: {0}")]
+    SimulatedFees(String),
     #[error("live sessions need at least one instrument")]
     NoInstruments,
     #[error(
@@ -189,6 +189,15 @@ impl LaunchConfig {
     /// positive, and every live instrument is a Binance Spot instrument.
     /// Backtest and paper configs are not constrained here.
     pub fn validate(&self) -> Result<(), LaunchConfigError> {
+        if let Some(fees) = &self.simulated_fees {
+            if matches!(self.mode, SessionMode::Live { .. }) {
+                return Err(LaunchConfigError::SimulatedFees(
+                    "live sessions use actual exchange fees".into(),
+                ));
+            }
+            fees.validate(&self.instruments)
+                .map_err(LaunchConfigError::SimulatedFees)?;
+        }
         let SessionMode::Live { risk_limits, .. } = &self.mode else {
             return Ok(());
         };
@@ -206,6 +215,10 @@ impl LaunchConfig {
             }
         }
         Ok(())
+    }
+
+    pub fn cost_model(&self) -> apexes_backtest::CostModel {
+        self.simulated_fees.clone().unwrap_or_default().cost_model()
     }
 
     /// What this session is, as shown in the operator console. Built from
@@ -229,6 +242,15 @@ impl LaunchConfig {
             network,
             mode: mode.to_string(),
             strategy,
+            fee_label: Some(if mode == "live" {
+                "Exchange fees".to_string()
+            } else {
+                let mut model = self.cost_model();
+                model.freeze_fees(&self.instruments).map_or_else(
+                    |_| "Fees unknown".to_string(),
+                    |report| report.label().to_string(),
+                )
+            }),
         }
     }
 
@@ -312,6 +334,7 @@ mod tests {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             risk_free_return: dec!(0.02),
+            simulated_fees: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -345,6 +368,7 @@ mod tests {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             risk_free_return: dec!(0.02),
+            simulated_fees: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -374,6 +398,78 @@ mod tests {
             StrategyRef::DriftScript { .. }
         ));
         assert!(!config.instruments.is_empty());
+    }
+
+    #[test]
+    fn simulated_fee_config_validates_round_trips_and_labels_legacy_zero() {
+        use apexes_backtest::{FillLiquidity, SimulatedFees};
+        let mut config = sample_backtest_config();
+        let legacy: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(legacy.simulated_fees.is_none());
+        assert_eq!(legacy.identity().fee_label.as_deref(), Some("ZERO FEES"));
+        config.simulated_fees = Some(SimulatedFees::Flat {
+            maker_bps: dec!(5),
+            taker_bps: dec!(10),
+        });
+        let roundtrip: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        roundtrip.validate().unwrap();
+        assert_eq!(roundtrip.simulated_fees, config.simulated_fees);
+        assert_eq!(
+            roundtrip.identity().fee_label.as_deref(),
+            Some("Modeled fees")
+        );
+        assert_eq!(
+            roundtrip
+                .cost_model()
+                .fee_for_fill(Venue::Binance, FillLiquidity::Maker, dec!(1000)),
+            dec!(0.5)
+        );
+        assert_eq!(
+            roundtrip
+                .cost_model()
+                .fee_for_fill(Venue::Binance, FillLiquidity::Taker, dec!(1000)),
+            dec!(1)
+        );
+        for bad in [
+            SimulatedFees::Flat {
+                maker_bps: dec!(-1),
+                taker_bps: dec!(10),
+            },
+            SimulatedFees::Flat {
+                maker_bps: dec!(1),
+                taker_bps: dec!(10000),
+            },
+            SimulatedFees::BinanceSpotVip { tier: 10 },
+        ] {
+            config.simulated_fees = Some(bad);
+            assert!(config.validate().is_err());
+        }
+        config.simulated_fees = Some(SimulatedFees::BinanceSpotVip { tier: 4 });
+        config.validate().unwrap();
+        assert_eq!(
+            config
+                .cost_model()
+                .fee_for_fill(Venue::Binance, FillLiquidity::Taker, dec!(10000)),
+            dec!(5.2)
+        );
+        config.instruments[0].venue = Venue::Okx;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn live_configuration_cannot_override_authoritative_fees() {
+        let mut config = sample_live_config();
+        assert_eq!(
+            config.identity().fee_label.as_deref(),
+            Some("Exchange fees")
+        );
+        config.simulated_fees = Some(apexes_backtest::SimulatedFees::Zero);
+        assert!(matches!(
+            config.validate(),
+            Err(LaunchConfigError::SimulatedFees(_))
+        ));
     }
 
     #[test]

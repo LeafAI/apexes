@@ -170,6 +170,7 @@ impl ValidRequest {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             risk_free_return: Decimal::ZERO,
+            simulated_fees: None,
             gateway_url: format!("ws://127.0.0.1:{gateway_port}/market"),
         };
         config

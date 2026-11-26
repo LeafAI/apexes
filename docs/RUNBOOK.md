@@ -500,3 +500,22 @@ Recovery verifies the scheduling journal against the allocation and
 linked durable orders. Missing evidence or unresolved dispatch stops
 recovery; a crash before parent insertion can leave an orphan lock
 that needs audited reconciliation. Do not clear it automatically.
+
+### Simulated execution fees (F03.01)
+
+Backtest and paper launch JSON accepts optional `simulated_fees`:
+
+```json
+{"simulated_fees":{"kind":"flat","maker_bps":"5","taker_bps":"10"}}
+```
+
+Other policies: `{"kind":"zero"}` and
+`{"kind":"binance_spot_vip","tier":4}` (only Binance Spot instruments).
+One basis point is 0.01%; rates must be nonnegative and below 10,000
+bps, and VIP tiers must be 0–9. Missing policy preserves legacy zero
+fees and the console explicitly labels it. Do not interpret a zero-fee
+run as an economically realistic result. Reports contain the frozen
+rates for configured venues; old reports lacking this field have
+unknown assumptions. Live sessions reject any simulated fee policy;
+actual exchange fill commissions remain authoritative. The cost model
+does not add an artificial spread or causal latency in this increment.
