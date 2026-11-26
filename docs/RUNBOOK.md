@@ -29,6 +29,13 @@ has passed startup recovery; if it refuses, the launcher shows its log.
 Everything the app starts is logged under `~/.apexes/` (`*.log`, mode 0600),
 alongside a per-session control token it generates itself.
 
+Gateways are per symbol set, not one per network: a session reuses a running
+gateway that carries all its symbols (the smallest such one), otherwise a new
+gateway starts for exactly its symbols, so a BTCUSDT session and an ETHUSDT
+session run side by side and neither is restarted. Each engine receives only its
+own symbols. Gateway files live in `~/.apexes/gateways/<network>-<id>.*`; files
+of a gateway that has been dead for 10 minutes are tidied at the next launch.
+
 **Mainnet** is the same flow with the Network switched and the word `MAINNET`
 typed to confirm. It trades real funds; do not use it until a testnet run has
 behaved the way you expect.
@@ -143,6 +150,13 @@ checks — reducing exposure must not be blockable.
   `apexes_unflattened_positions` stays above zero: **close them manually**.
 - The automatic stale-data halt does not flatten (a dead feed is a poor moment
   to fire market orders unattended); send a `Halt` with `flatten` if you want it.
+- **After a stale-data halt the engine stays halted until you press Resume**, even
+  once data is flowing again (a person should look first). The gateway now
+  replaces a connection that goes quiet for 30 s (trades: 120 s) by itself, so the
+  feed normally recovers within a minute; if the halt reason shows a long gap, check
+  the gateway log for `the connection looks dead, reconnecting`. A gateway that was
+  started **before** this fix cannot recover from a silent connection: stop it and
+  its sessions and start them again.
 
 ## Operator console
 

@@ -70,6 +70,13 @@ pub struct LiveTradingConfig {
     /// (row 6.4), which NEVER auto-executes in live trading regardless
     /// of configuration.
     pub auto_derisk_live: bool,
+    /// A last price per symbol fetched from the exchange before the first
+    /// event, so held assets are valued from the start. See
+    /// `UnifiedLoopConfig::initial_prices`.
+    pub initial_prices: HashMap<String, Decimal>,
+    /// The exchange's rules per symbol, applied to every order before it is
+    /// sent. See `UnifiedLoopConfig::symbol_rules`.
+    pub symbol_rules: HashMap<String, apexes_core::SymbolRules>,
     pub risk_free_return: Decimal,
     /// Fallback polling interval for `OrderManager::reconcile()`,
     /// running alongside (not instead of) the push-based
@@ -304,6 +311,8 @@ pub async fn run_live_trading(
         margin_tiers: config.margin_tiers,
         market_condition_config: config.market_condition_config,
         control: config.control,
+        initial_prices: config.initial_prices,
+        symbol_rules: config.symbol_rules,
     };
 
     let report = run_unified_event_loop(

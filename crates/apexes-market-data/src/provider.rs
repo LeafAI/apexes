@@ -166,38 +166,19 @@ impl MarketDataProvider for BinanceMarketDataProvider {
     }
 }
 
-/// Runs a market-data task on a dedicated OS thread with its own
-/// current-thread tokio runtime. This is required because `barter-data`
-/// 0.11's `StreamBuilder::init()` awaits `Pin<Box<dyn Future>>` (non-`Send`)
-/// subscription futures, so the task futures cannot be `tokio::spawn`ed
-/// onto a multi-threaded runtime. The task future is constructed inside the
-/// thread (via `make_task`) to avoid moving a non-`Send` future across
-/// threads. `Runtime::block_on` itself has no `Send` bound.
-fn spawn_task_thread<F, Fut>(task_name: &'static str, make_task: F)
+/// Runs a market-data task on a dedicated OS thread. The task blocks that
+/// thread for its whole life and owns its runtimes (`crate::supervised`
+/// builds a fresh one per connection attempt): `barter-data` 0.11's
+/// `StreamBuilder::init()` awaits non-`Send` futures, so it cannot be
+/// `tokio::spawn`ed onto a multi-threaded runtime, and a fresh runtime per
+/// attempt is what lets a dead connection's tasks be torn down.
+fn spawn_task_thread<F>(task_name: &'static str, task: F)
 where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
+    F: FnOnce() + Send + 'static,
 {
     let spawned = std::thread::Builder::new()
         .name(task_name.to_string())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        task_name,
-                        "failed to build market-data task runtime, task will not run"
-                    );
-                    return;
-                }
-            };
-            runtime.block_on(make_task());
-        });
-
+        .spawn(task);
     if let Err(error) = spawned {
         tracing::warn!(
             ?error,

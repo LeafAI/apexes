@@ -31,18 +31,6 @@ pub enum SupervisorError {
         source: std::io::Error,
     },
     #[error(
-        "a {network} market-data gateway is already running with instruments {running:?}, which do not cover the requested {requested:?}. Stop it (or request only those instruments); sessions already using it would be disturbed by a restart"
-    )]
-    GatewayInstrumentMismatch {
-        network: BinanceNetwork,
-        running: Vec<String>,
-        requested: Vec<String>,
-    },
-    #[error(
-        "a {network} market-data gateway is running but this supervisor did not start it, so its instruments are unknown. Stop it first"
-    )]
-    GatewayUnknownInstruments { network: BinanceNetwork },
-    #[error(
         "the {network} market-data gateway is still used by running session(s) {sessions:?}; stop those first"
     )]
     GatewayInUse {

@@ -98,50 +98,75 @@ impl PortfolioLedger {
         let notional = fill.price * fill.quantity;
         let fee_currency = fill.fee_currency.clone().unwrap_or_else(|| quote.clone());
 
-        // Phase 1: compute every (asset, debit_amount) this fill requires,
-        // merging same-asset debits (e.g. fee_currency == quote) so the
-        // balance check below is correct even when both debits draw from
-        // the same asset.
-        let mut required_debits: HashMap<String, Decimal> = HashMap::new();
+        // Phase 1: the NET change this fill makes to each asset. A fee is
+        // netted against what the same fill credits: Binance takes it from
+        // the asset RECEIVED (base on a buy, quote on a sell), so checking
+        // the fee against the balance before the credit refused valid fills.
+        let mut deltas: HashMap<String, Decimal> = HashMap::new();
+        let mut add = |asset: &str, amount: Decimal| {
+            *deltas.entry(asset.to_string()).or_insert(Decimal::ZERO) += amount;
+        };
         match fill.side {
             Side::Buy => {
-                *required_debits
-                    .entry(quote.clone())
-                    .or_insert(Decimal::ZERO) += notional;
+                add(&quote, -notional);
+                add(&base, fill.quantity);
             }
             Side::Sell => {
-                *required_debits.entry(base.clone()).or_insert(Decimal::ZERO) += fill.quantity;
+                add(&base, -fill.quantity);
+                add(&quote, notional);
             }
         }
-        *required_debits
-            .entry(fee_currency.clone())
-            .or_insert(Decimal::ZERO) += fill.fee;
-
-        // Phase 2: validate every required debit against current balances
-        // before mutating anything.
-        for (asset, amount) in &required_debits {
-            let available = self.balances.get(asset).copied().unwrap_or(Decimal::ZERO);
-            if available < *amount {
-                return Err(ApexesError::InsufficientBalance {
-                    asset: asset.clone(),
-                    required: *amount,
-                    available,
-                });
+        if !fill.fee.is_zero() {
+            if self.tracks_asset(&fee_currency, &base, &quote) {
+                add(&fee_currency, -fill.fee);
+            } else {
+                // The session holds only this symbol's assets, so a fee in
+                // another one (BNB with "pay fees in BNB") has no balance to
+                // come out of. The trade still happened on the exchange; the
+                // fee is left out of the ledger rather than undoing the fill.
+                // The evaluation's fee total still counts it.
+                tracing::debug!(
+                    asset = %fee_currency,
+                    fee = %fill.fee,
+                    "fee in an asset this session does not track; not debited from the ledger"
+                );
             }
         }
 
-        // Phase 3: all checks passed -- apply every mutation.
-        for (asset, amount) in &required_debits {
-            self.credit(asset, -*amount); // debit via negative credit (balance already validated)
-        }
-        match fill.side {
-            Side::Buy => self.credit(&base, fill.quantity),
-            Side::Sell => self.credit(&quote, notional),
+        // Phase 2: every asset that goes down must stay non-negative,
+        // validated before anything changes (atomic).
+        for (asset, delta) in &deltas {
+            if delta.is_sign_negative() && !delta.is_zero() {
+                let available = self.balances.get(asset).copied().unwrap_or(Decimal::ZERO);
+                if available + *delta < Decimal::ZERO {
+                    return Err(ApexesError::InsufficientBalance {
+                        asset: asset.clone(),
+                        required: -*delta,
+                        available,
+                    });
+                }
+            }
         }
 
-        self.update_position(fill);
+        // Phase 3: apply.
+        for (asset, delta) in &deltas {
+            self.credit(asset, *delta);
+        }
+
+        let base_fee = if fill.fee_currency.as_deref() == Some(base.as_str()) {
+            fill.fee
+        } else {
+            Decimal::ZERO
+        };
+        self.update_position(fill, base_fee);
 
         Ok(())
+    }
+
+    /// Whether the ledger keeps a balance for `asset`: the symbol's own two
+    /// assets, or any asset the session was seeded with.
+    fn tracks_asset(&self, asset: &str, base: &str, quote: &str) -> bool {
+        asset == base || asset == quote || self.balances.contains_key(asset)
     }
 
     /// Settles one funding payment for every currently-open leveraged
@@ -745,11 +770,17 @@ impl PortfolioLedger {
         *balance += amount;
     }
 
-    fn update_position(&mut self, fill: &Fill) {
+    /// `base_fee` is a fee taken in the base asset itself (Binance's default
+    /// on a buy): the account then holds `quantity - base_fee`, so that is the
+    /// position, and the whole cost is still spent on it, so the fee raises the
+    /// average entry price instead of vanishing.
+    fn update_position(&mut self, fill: &Fill, base_fee: Decimal) {
         let signed_quantity = match fill.side {
-            Side::Buy => fill.quantity,
+            Side::Buy => fill.quantity - base_fee,
             Side::Sell => -fill.quantity,
         };
+        // What was paid for the position, before any base fee came off it.
+        let paid_for = fill.quantity;
 
         let existing = self.positions.get(&fill.symbol).cloned();
         let (existing_quantity, existing_average_entry_price) = existing
@@ -789,7 +820,7 @@ impl PortfolioLedger {
 
         if same_direction {
             let existing_value = position.quantity.abs() * position.average_entry_price;
-            let new_value = signed_quantity.abs() * fill.price;
+            let new_value = paid_for * fill.price;
             let new_quantity = position.quantity + signed_quantity;
             if !new_quantity.is_zero() {
                 position.average_entry_price = (existing_value + new_value) / new_quantity.abs();
@@ -802,6 +833,21 @@ impl PortfolioLedger {
             } else {
                 position.quantity = new_quantity;
                 position.average_entry_price = fill.price;
+            }
+            // A base-asset fee on a sell also leaves the account: it is a
+            // quantity lost for nothing, so it comes off the position and is
+            // booked as a loss at the entry price.
+            if fill.side == Side::Sell
+                && !base_fee.is_zero()
+                && position.quantity.is_sign_positive()
+            {
+                let lost = base_fee.min(position.quantity);
+                position.quantity -= lost;
+                let entry = position.average_entry_price;
+                *self
+                    .realized_pnl
+                    .entry(fill.symbol.clone())
+                    .or_insert(Decimal::ZERO) -= entry * lost;
             }
         }
     }
@@ -854,6 +900,246 @@ mod tests {
         let mut initial_balances = HashMap::new();
         initial_balances.insert("USDT".to_string(), dec!(10000));
         PortfolioLedger::new(instruments, initial_balances)
+    }
+
+    fn fill_with_fee(
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        fee: Decimal,
+        currency: &str,
+    ) -> Fill {
+        Fill {
+            fee_currency: Some(currency.to_string()),
+            ..sample_fill(side, price, quantity, fee)
+        }
+    }
+
+    fn ledger_holding(balances: &[(&str, Decimal)]) -> PortfolioLedger {
+        let mut instruments = HashMap::new();
+        instruments.insert("BTCUSDT".to_string(), btc_usdt());
+        PortfolioLedger::new(
+            instruments,
+            balances
+                .iter()
+                .map(|(asset, amount)| (asset.to_string(), *amount))
+                .collect(),
+        )
+    }
+
+    // ---- Fees: how a real exchange charges them -------------------------
+    //
+    // Binance's default takes the fee in the asset you RECEIVE: the base
+    // asset on a buy, the quote asset on a sell. With "pay fees in BNB" it is
+    // BNB, an asset a one-symbol session does not hold. The Spot testnet
+    // charges nothing, so none of this showed until a mainnet-style fee was
+    // fed in.
+
+    /// A fresh session holds only quote. A buy whose fee is taken from the
+    /// base it just received used to be refused ("required 0.0000277 ETH,
+    /// available 0") because the fee was checked before the base was credited.
+    #[test]
+    fn a_buy_with_the_fee_in_the_asset_just_received_is_applied_from_a_flat_start() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000))]);
+        let fill = fill_with_fee(Side::Buy, dec!(60000), dec!(0.5), dec!(0.0005), "BTC");
+        ledger
+            .apply_fill(&fill)
+            .expect("the fee is paid out of what was just bought");
+        assert_eq!(ledger.balances()["BTC"], dec!(0.4995));
+        assert_eq!(ledger.balances()["USDT"], dec!(70000));
+    }
+
+    #[test]
+    fn a_sell_with_the_fee_in_the_quote_asset_is_applied_when_no_quote_is_held() {
+        let mut ledger = ledger_holding(&[("BTC", dec!(1))]);
+        let fill = fill_with_fee(Side::Sell, dec!(60000), dec!(0.5), dec!(30), "USDT");
+        ledger
+            .apply_fill(&fill)
+            .expect("the fee is paid out of the proceeds");
+        assert_eq!(ledger.balances()["BTC"], dec!(0.5));
+        assert_eq!(ledger.balances()["USDT"], dec!(29970));
+    }
+
+    /// The position the strategy sees must be what the account really holds,
+    /// or it will try to sell more than it owns and the exchange refuses.
+    #[test]
+    fn the_position_is_net_of_a_fee_taken_in_the_base_asset() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000))]);
+        let fill = fill_with_fee(Side::Buy, dec!(60000), dec!(0.5), dec!(0.0005), "BTC");
+        ledger.apply_fill(&fill).unwrap();
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.4995));
+        assert_eq!(
+            ledger.positions()["BTCUSDT"].quantity,
+            ledger.balances()["BTC"],
+            "position and holding agree"
+        );
+    }
+
+    #[test]
+    fn everything_bought_net_of_a_base_fee_can_be_sold_again() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000))]);
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Buy,
+                dec!(60000),
+                dec!(0.5),
+                dec!(0.0005),
+                "BTC",
+            ))
+            .unwrap();
+        let held = ledger.positions()["BTCUSDT"].quantity;
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Sell,
+                dec!(61000),
+                held,
+                dec!(30),
+                "USDT",
+            ))
+            .expect("selling exactly what the position says must be affordable");
+        assert!(ledger.positions()["BTCUSDT"].quantity.is_zero());
+        assert!(ledger.balances()["BTC"].is_zero());
+    }
+
+    #[test]
+    fn the_fee_is_part_of_the_cost_basis() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000))]);
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Buy,
+                dec!(100),
+                dec!(1),
+                dec!(0.01),
+                "BTC",
+            ))
+            .unwrap();
+        let position = &ledger.positions()["BTCUSDT"];
+        assert_eq!(position.quantity, dec!(0.99));
+        // 100 USDT bought 0.99 BTC, so the break-even price is above 100.
+        let cost = position.average_entry_price * position.quantity;
+        assert!((cost - dec!(100)).abs() < dec!(0.000000001), "{cost}");
+    }
+
+    #[test]
+    fn a_fee_in_the_base_asset_on_a_sell_leaves_the_position_too() {
+        let mut ledger = ledger_holding(&[("BTC", dec!(1))]).with_positions(HashMap::from([(
+            "BTCUSDT".to_string(),
+            Position {
+                symbol: "BTCUSDT".to_string(),
+                quantity: dec!(1),
+                average_entry_price: dec!(100),
+                leverage: None,
+                margin_mode: None,
+                allocated_margin: Decimal::ZERO,
+            },
+        )]));
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Sell,
+                dec!(110),
+                dec!(0.5),
+                dec!(0.001),
+                "BTC",
+            ))
+            .unwrap();
+        assert_eq!(ledger.balances()["BTC"], dec!(0.499));
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.499));
+    }
+
+    /// The reported-risk case: "pay fees in BNB" on a session that holds only
+    /// the symbol's own assets. The fill happened on the exchange, so the
+    /// ledger must take it; refusing it left the position and PnL out of step.
+    #[test]
+    fn a_fee_in_an_asset_the_session_does_not_hold_does_not_reject_the_fill() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000))]);
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Buy,
+                dec!(60000),
+                dec!(0.5),
+                dec!(0.0004),
+                "BNB",
+            ))
+            .expect("a BNB fee must not undo a real trade");
+        assert_eq!(
+            ledger.balances()["BTC"],
+            dec!(0.5),
+            "the full quantity arrives"
+        );
+        assert_eq!(ledger.balances()["USDT"], dec!(70000));
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+        assert!(
+            !ledger.balances().contains_key("BNB"),
+            "no phantom negative BNB balance: {:?}",
+            ledger.balances()
+        );
+    }
+
+    /// If the session does hold the fee asset (a BNB symbol, or BNB seeded),
+    /// the fee really does come out of it and must be affordable.
+    #[test]
+    fn a_fee_in_a_held_third_asset_is_debited_from_it() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000)), ("BNB", dec!(1))]);
+        ledger
+            .apply_fill(&fill_with_fee(
+                Side::Buy,
+                dec!(60000),
+                dec!(0.5),
+                dec!(0.001),
+                "BNB",
+            ))
+            .unwrap();
+        assert_eq!(ledger.balances()["BNB"], dec!(0.999));
+    }
+
+    #[test]
+    fn an_unaffordable_fee_in_a_held_asset_still_rejects_and_changes_nothing() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(100000)), ("BNB", dec!(0.0001))]);
+        let before = ledger.balances().clone();
+        let result = ledger.apply_fill(&fill_with_fee(
+            Side::Buy,
+            dec!(60000),
+            dec!(0.5),
+            dec!(2),
+            "BNB",
+        ));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
+        assert_eq!(ledger.balances(), &before, "atomic: nothing was applied");
+        assert!(ledger.positions().is_empty());
+    }
+
+    /// Receiving the fee asset is not a free pass: the primary debit is still
+    /// checked, so a sell of more than is held fails whatever the fee asset.
+    #[test]
+    fn crediting_the_fee_asset_does_not_excuse_an_unaffordable_primary_debit() {
+        let mut ledger = ledger_holding(&[("BTC", dec!(0.1))]);
+        let before = ledger.balances().clone();
+        let result = ledger.apply_fill(&fill_with_fee(
+            Side::Sell,
+            dec!(60000),
+            dec!(5),
+            dec!(1),
+            "USDT",
+        ));
+        assert!(matches!(
+            result,
+            Err(ApexesError::InsufficientBalance { .. })
+        ));
+        assert_eq!(ledger.balances(), &before);
+        let result = ledger.apply_fill(&fill_with_fee(
+            Side::Buy,
+            dec!(60000),
+            dec!(5),
+            dec!(0.001),
+            "BTC",
+        ));
+        assert!(
+            matches!(result, Err(ApexesError::InsufficientBalance { .. })),
+            "no quote at all to pay for the buy"
+        );
     }
 
     #[test]

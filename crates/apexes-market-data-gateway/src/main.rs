@@ -11,7 +11,8 @@
 //!
 //! On successful startup (after binding the listener, before
 //! `axum::serve` starts accepting connections), this process writes a
-//! PID file at `~/.apexes/market-data-gateway-<network>.pid` (`<network>` is
+//! PID file at `--pid-file` if given, otherwise at
+//! `~/.apexes/market-data-gateway-<network>.pid` (`<network>` is
 //! `mainnet` or `testnet`, so a testnet and a mainnet gateway never overwrite
 //! each other's file; `~/.apexes/` is created first if it doesn't exist). The file's
 //! entire content is exactly two lines, `\n`-terminated, in this
@@ -113,6 +114,12 @@ struct Cli {
     /// refuses to use this gateway. Testnet has no order-book depth.
     #[arg(long)]
     network: apexes_core::binance_network::BinanceNetwork,
+
+    /// Where to write the PID file (`<pid>\n<port>\n`). Default:
+    /// `~/.apexes/market-data-gateway-<network>.pid`. A supervisor running
+    /// several gateways for one network gives each its own file.
+    #[arg(long, value_name = "PATH")]
+    pid_file: Option<PathBuf>,
 }
 
 fn resolve_port(cli: &Cli) -> u16 {
@@ -231,19 +238,31 @@ fn pin_current_thread_round_robin(
 /// and does NOT abort startup -- the gateway is still fully functional
 /// for clients that already know its port; only auto-discovery by a
 /// future supervisor degrades.
-fn write_pid_file(network: apexes_core::binance_network::BinanceNetwork, port: u16) {
-    let Some(home) = std::env::var_os("HOME") else {
-        tracing::error!(
-            "apexes-market-data-gateway: HOME environment variable not set, skipping PID file"
-        );
-        return;
+fn write_pid_file(
+    network: apexes_core::binance_network::BinanceNetwork,
+    port: u16,
+    explicit: Option<&std::path::Path>,
+) {
+    let path = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let Some(home) = std::env::var_os("HOME") else {
+                tracing::error!(
+                    "apexes-market-data-gateway: HOME environment variable not set, skipping PID file"
+                );
+                return;
+            };
+            PathBuf::from(home)
+                .join(".apexes")
+                .join(format!("market-data-gateway-{network}.pid"))
+        }
     };
-    let dir: PathBuf = PathBuf::from(home).join(".apexes");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
+    if let Some(dir) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(dir)
+    {
         tracing::error!(?error, path = ?dir, "apexes-market-data-gateway: failed to create PID file directory, skipping PID file");
         return;
     }
-    let path = dir.join(format!("market-data-gateway-{network}.pid"));
     let contents = format!("{}\n{}\n", std::process::id(), port);
     if let Err(error) = std::fs::write(&path, contents) {
         tracing::error!(?error, path = ?path, "apexes-market-data-gateway: failed to write PID file");
@@ -376,7 +395,7 @@ async fn run(cli: Cli, port: u16) {
         }
     });
 
-    write_pid_file(cli.network, port);
+    write_pid_file(cli.network, port, cli.pid_file.as_deref());
 
     let token = apexes_security::BearerToken::from_env("APEXES_GATEWAY_TOKEN").map(Arc::new);
     if token.is_none() {

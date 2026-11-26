@@ -11,7 +11,9 @@
 
 use crate::app_state::AppState;
 use crate::chart_state::ChartState;
+use crate::chrome::Chrome;
 use crate::client::ConnectionStatus;
+use crate::theme::palette_of;
 use apexes_chart::candlestick::CandlestickChart;
 use apexes_chart::tick_line::TickLineChart;
 use apexes_chart::view_state::ViewState;
@@ -73,6 +75,7 @@ pub struct DashboardApp {
     view: ViewState,
     candlestick_chart: Option<CandlestickChart>,
     tick_line_chart: Option<TickLineChart>,
+    chrome: Chrome,
 }
 
 impl DashboardApp {
@@ -102,6 +105,7 @@ impl DashboardApp {
             view: ViewState::new_following_live(),
             candlestick_chart: None,
             tick_line_chart: None,
+            chrome: Chrome::from_home(),
         }
     }
 
@@ -127,6 +131,7 @@ impl DashboardApp {
             view: ViewState::new_following_live(),
             candlestick_chart: None,
             tick_line_chart: None,
+            chrome: Chrome::load(None),
         }
     }
 
@@ -193,7 +198,17 @@ impl eframe::App for DashboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_updates();
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
+        self.chrome.update(ui.ctx());
+        crate::theme::page(ui, |ui| self.draw(ui, frame));
+    }
 
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        crate::theme::clear_color(visuals)
+    }
+}
+
+impl DashboardApp {
+    fn draw(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.candlestick_chart.is_none()
             && let Some(render_state) = frame.wgpu_render_state.as_ref()
         {
@@ -207,14 +222,18 @@ impl eframe::App for DashboardApp {
             ));
         }
 
+        let palette = palette_of(ui.ctx());
         let (label, color) = match self.connection_status {
-            ConnectionStatus::Connected => ("Connected", egui::Color32::GREEN),
-            ConnectionStatus::Reconnecting => ("Reconnecting...", egui::Color32::YELLOW),
-            ConnectionStatus::Disconnected => ("Disconnected", egui::Color32::RED),
+            ConnectionStatus::Connected => ("Connected", palette.good),
+            ConnectionStatus::Reconnecting => ("Reconnecting...", palette.warn),
+            ConnectionStatus::Disconnected => ("Disconnected", palette.danger),
         };
         ui.horizontal(|ui| {
-            ui.colored_label(color, "\u{25CF}");
+            crate::theme::status_dot(ui, color);
             ui.label(label);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.chrome.selector(ui);
+            });
         });
 
         ui.separator();

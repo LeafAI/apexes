@@ -104,6 +104,10 @@ impl From<&apexes_core::Order> for OpenOrderView {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub positions: HashMap<String, Position>,
@@ -130,6 +134,21 @@ pub struct SessionSnapshot {
     /// timeline. Bounded (see `evaluation::SNAPSHOT_HISTORY_POINTS`).
     #[serde(default)]
     pub equity_history: Vec<(DateTime<Utc>, Decimal)>,
+    /// The most recent orders this session sent, newest first, whether they
+    /// filled, are still working, or were refused. Bounded (see
+    /// `order_log::ORDER_LOG_CAP`). Empty from older engines.
+    #[serde(default)]
+    pub recent_orders: Vec<crate::order_log::OrderRecord>,
+    /// Each traded symbol's recent trade prices, oldest first, for the
+    /// console's price charts. Bounded per symbol (see
+    /// `evaluation::SNAPSHOT_HISTORY_POINTS`). Empty from older engines.
+    #[serde(default)]
+    pub price_history: HashMap<String, Vec<(DateTime<Utc>, Decimal)>>,
+    /// False while an asset the account holds has no price yet: `equity` then
+    /// values it at the ledger's 1.0 placeholder and is not a real number.
+    /// True from older engines, which never reported it.
+    #[serde(default = "default_true")]
+    pub equity_priced: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -306,6 +325,9 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
+            price_history: HashMap::new(),
+            equity_priced: true,
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,
