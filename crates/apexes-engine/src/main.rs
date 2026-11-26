@@ -440,6 +440,9 @@ async fn run_inner(
     strategy: Box<dyn Strategy>,
 ) -> Result<(), EngineError> {
     let registry = Registry::new();
+    if let Some(policy) = launch_config.simulated_execution.clone() {
+        registry.register::<apexes_backtest::SimulatedExecution, ()>((), policy)?;
+    }
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
     let control_handle = control_handle
@@ -1129,6 +1132,7 @@ mod tests {
             market_condition_config: None,
             risk_free_return: dec!(0),
             simulated_fees: None,
+            simulated_execution: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }

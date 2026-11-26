@@ -79,6 +79,8 @@ pub fn walk_book(levels: &[PriceLevel], quantity: Decimal) -> Option<BookWalkRes
 pub struct MatchingEngine {
     books: HashMap<(Venue, String), ReplayOrderBook>,
     event_time: Option<DateTime<Utc>>,
+    execution: crate::SimulatedExecution,
+    trade_references: HashMap<(Venue, String), (DateTime<Utc>, Decimal)>,
     cost_model: CostModel,
     /// 0.0 (optimistic) .. 1.0 (pessimistic), see design spec §7.3.
     queue_position_factor: Decimal,
@@ -152,11 +154,21 @@ impl MatchingEngine {
         Self {
             books: HashMap::new(),
             event_time: None,
+            execution: crate::SimulatedExecution::default(),
+            trade_references: HashMap::new(),
             cost_model,
             queue_position_factor,
             resting_orders: HashMap::new(),
             pending_triggers: HashMap::new(),
         }
+    }
+
+    pub fn with_execution(mut self, execution: crate::SimulatedExecution) -> Self {
+        self.execution = execution;
+        self
+    }
+    pub(crate) fn execution_policy(&self) -> &crate::SimulatedExecution {
+        &self.execution
     }
 
     /// Updates the local order book for `update.symbol` from a new
@@ -197,6 +209,23 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit_market_inner(intent, now, false)
+    }
+
+    pub(crate) fn submit_market_child(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit_market_inner(intent, now, true)
+    }
+
+    fn submit_market_inner(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+        exact_quantity: bool,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
         if intent.order_type != OrderType::Market {
             return Err(ApexesError::OrderRejected {
                 reason: format!(
@@ -214,6 +243,16 @@ impl MatchingEngine {
             });
         }
 
+        let (quantity, cap) = self.execution.market_buy(
+            intent,
+            now,
+            self.trade_references
+                .get(&(intent.venue, intent.symbol.clone()))
+                .copied(),
+            exact_quantity,
+        )?;
+        let mut intent = intent.clone();
+        intent.quantity = quantity;
         let book = self
             .books
             .entry((intent.venue, intent.symbol.clone()))
@@ -234,7 +273,7 @@ impl MatchingEngine {
         let mut fills = Vec::new();
 
         for level in &levels {
-            if remaining.is_zero() {
+            if remaining.is_zero() || cap.is_some_and(|p| level.price > p) {
                 break;
             }
             let fill_quantity = remaining.min(level.quantity);
@@ -292,7 +331,7 @@ impl MatchingEngine {
             side: intent.side,
             order_type: intent.order_type,
             quantity: intent.quantity,
-            price: None,
+            price: cap,
             stop_price: None,
             leverage: intent.leverage,
             margin_mode: intent.margin_mode,
@@ -314,6 +353,7 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<Order, ApexesError> {
+        self.execution.validate_intent(intent)?;
         if intent.order_type != OrderType::Limit {
             return Err(ApexesError::OrderRejected {
                 reason: format!(
@@ -401,6 +441,7 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<Order, ApexesError> {
+        self.execution.validate_intent(intent)?;
         if intent.order_type != OrderType::Stop && intent.order_type != OrderType::StopLimit {
             return Err(ApexesError::OrderRejected {
                 reason: format!(
@@ -489,6 +530,17 @@ impl MatchingEngine {
         // same call (the order was not yet resting when that trade
         // occurred).
         self.advance_time(now);
+        if trade.price > Decimal::ZERO && trade.timestamp <= now {
+            let key = (trade.venue, trade.symbol.clone());
+            if self
+                .trade_references
+                .get(&key)
+                .is_none_or(|(at, _)| trade.timestamp >= *at)
+            {
+                self.trade_references
+                    .insert(key, (trade.timestamp, trade.price));
+            }
+        }
         let trigger_result = self.check_pending_triggers(trade, now);
 
         let mut results = trigger_result.stop_fills;
@@ -840,6 +892,140 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    fn bounded_policy() -> crate::SimulatedExecution {
+        crate::SimulatedExecution::BoundedSpotIoc {
+            rules: std::collections::BTreeMap::from([(
+                "BTCUSDT".into(),
+                apexes_core::SymbolRules {
+                    quantity_step: dec!(0.1),
+                    min_quantity: dec!(0.1),
+                    max_quantity: dec!(100),
+                    price_tick: dec!(0.1),
+                    min_notional: dec!(5),
+                },
+            )]),
+            max_reference_age_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn bounded_ioc_walks_only_eligible_depth_and_charges_taker_fees() {
+        let mut engine = MatchingEngine::new(
+            CostModel {
+                fee_schedule: Box::new(FlatFeeSchedule {
+                    maker_bps: dec!(5),
+                    taker_bps: dec!(10),
+                }),
+                funding_rate_bps: None,
+            },
+            dec!(0),
+        )
+        .with_execution(bounded_policy());
+        let depth = snapshot(
+            "BTCUSDT",
+            vec![],
+            vec![
+                level(dec!(99.9), dec!(1)),
+                level(dec!(100), dec!(1)),
+                level(dec!(100.1), dec!(5)),
+            ],
+        );
+        let at = depth.timestamp;
+        engine.on_depth_update(&depth);
+        engine.on_trade_event(
+            &apexes_core::TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(100.09),
+                quantity: dec!(1),
+                side: Some(Side::Buy),
+                trade_id: None,
+                timestamp: at,
+            },
+            at,
+        );
+        let intent = buy_intent("BTCUSDT", dec!(3.05));
+        let (order, fills) = engine.submit_market_order(&intent, at).unwrap();
+        assert_eq!(order.price, Some(dec!(100)));
+        assert_eq!(order.quantity, dec!(3));
+        assert_eq!(order.filled_quantity, dec!(2));
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(fills.len(), 2);
+        assert!(fills.iter().all(|f| f.price <= dec!(100)));
+        assert_eq!(fills.iter().map(|f| f.fee).sum::<Decimal>(), dec!(0.1999));
+        assert!(!engine.is_working(order.id));
+        assert!(engine.submit_market_child(&intent, at).is_err());
+        let (empty, fills) = engine
+            .submit_market_order(&buy_intent("BTCUSDT", dec!(1)), at)
+            .unwrap();
+        assert_eq!(empty.status, OrderStatus::Cancelled);
+        assert!(fills.is_empty());
+        // The above-cap level was never consumed.
+        engine.on_trade_event(
+            &apexes_core::TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(100.1),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: at,
+            },
+            at,
+        );
+        let (full, fills) = engine
+            .submit_market_child(&buy_intent("BTCUSDT", dec!(1)), at)
+            .unwrap();
+        assert_eq!(full.status, OrderStatus::Filled);
+        assert_eq!(fills[0].price, dec!(100.1));
+    }
+
+    #[test]
+    fn bounded_ioc_refuses_missing_stale_future_and_wrong_venue_reference() {
+        let mut engine = no_fee_engine().with_execution(bounded_policy());
+        let depth = snapshot("BTCUSDT", vec![], vec![level(dec!(99), dec!(2))]);
+        let at = depth.timestamp;
+        engine.on_depth_update(&depth);
+        let intent = buy_intent("BTCUSDT", dec!(1));
+        assert!(engine.submit_market_order(&intent, at).is_err());
+        let mut trade = apexes_core::TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Okx,
+            price: dec!(100),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: at,
+        };
+        engine.on_trade_event(&trade, at);
+        assert!(engine.submit_market_order(&intent, at).is_err());
+        trade.venue = Venue::Binance;
+        engine.on_trade_event(&trade, at);
+        assert!(
+            engine
+                .submit_market_order(&intent, at - chrono::Duration::milliseconds(1))
+                .is_err()
+        );
+        assert!(
+            engine
+                .submit_market_order(&intent, at + chrono::Duration::milliseconds(1001))
+                .is_err()
+        );
+        assert!(
+            engine
+                .submit_market_order(&buy_intent("BTCUSDT", dec!(0.01)), at)
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .submit_market_order(&intent, at)
+                .unwrap()
+                .0
+                .filled_quantity,
+            dec!(1)
+        );
     }
 
     #[test]

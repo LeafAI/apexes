@@ -75,6 +75,8 @@ pub async fn run_paper_trading(
     strategy: impl Strategy,
     stop_signal: oneshot::Receiver<()>,
 ) -> Result<BacktestReport, ApexesError> {
+    let execution =
+        apexes_backtest::SimulatedExecution::from_registry(registry, &config.instruments)?;
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let risk_checker = registry
         .try_one::<Arc<CompositeRiskChecker>>()
@@ -120,10 +122,10 @@ pub async fn run_paper_trading(
     // (direct strategy orders) and the EMS child-order sink (algo
     // orders), so both interact through a single simulated order book --
     // the same wiring `run_backtest` performs.
-    let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(
-        config.cost_model,
-        config.queue_position_factor,
-    )));
+    let matching_engine = Arc::new(Mutex::new(
+        MatchingEngine::new(config.cost_model, config.queue_position_factor)
+            .with_execution(execution.clone()),
+    ));
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
     )));
@@ -165,6 +167,7 @@ pub async fn run_paper_trading(
     )
     .await?;
     report.simulated_fees = Some(simulated_fees);
+    report.simulated_execution = Some(execution);
     Ok(report)
 }
 
@@ -296,6 +299,54 @@ mod tests {
             market_condition_config: None,
             control: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_ioc_policy_applies_to_paper_and_is_reported() {
+        let mut events = sample_events();
+        if let MarketEvent::Depth(depth) = &mut events[0] {
+            depth.asks[0].price = dec!(100.01);
+        }
+        let bus = MarketEventBus::new(Box::new(MockMarketDataProvider { events }));
+        let registry = Registry::new();
+        let policy = apexes_backtest::SimulatedExecution::BoundedSpotIoc {
+            rules: std::collections::BTreeMap::from([(
+                "BTCUSDT".into(),
+                apexes_core::SymbolRules {
+                    quantity_step: dec!(0.001),
+                    min_quantity: dec!(0.001),
+                    max_quantity: dec!(100),
+                    price_tick: dec!(0.01),
+                    min_notional: dec!(5),
+                },
+            )]),
+            max_reference_age_ms: 1000,
+        };
+        registry
+            .register::<apexes_backtest::SimulatedExecution, ()>((), policy.clone())
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
+        let report = run_paper_trading(
+            base_config(),
+            &registry,
+            &bus,
+            BuyOnceStrategy { bought: false },
+            rx,
+        )
+        .await
+        .unwrap();
+        assert!(report.trades.is_empty());
+        assert_eq!(report.simulated_execution, Some(policy));
+        assert!(
+            report
+                .equity_curve
+                .iter()
+                .all(|(_, equity)| *equity == dec!(100000))
+        );
     }
 
     #[tokio::test]

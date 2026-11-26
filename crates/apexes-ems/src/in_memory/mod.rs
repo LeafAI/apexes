@@ -683,6 +683,7 @@ impl Ems for InMemoryEms {
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
         let parent_id = ParentOrderId(Uuid::new_v4());
+        self.sink.reserve_parent(parent_id, &request).await?;
 
         let candidates = [AssetClass::Spot, AssetClass::Perpetual];
         let market_state = self.build_market_state(&candidates, &request.symbol);

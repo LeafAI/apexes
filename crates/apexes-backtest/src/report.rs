@@ -26,6 +26,8 @@ pub struct BacktestReport {
     /// None means fee assumptions are unrecorded, not zero.
     #[serde(default)]
     pub simulated_fees: Option<crate::SimulatedFeeReport>,
+    #[serde(default)]
+    pub simulated_execution: Option<crate::SimulatedExecution>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

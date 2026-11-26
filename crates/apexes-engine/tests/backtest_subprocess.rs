@@ -84,6 +84,7 @@ async fn apexes_engine_binary_runs_a_backtest_session_to_completion() {
         market_condition_config: None,
         risk_free_return: dec!(0),
         simulated_fees: None,
+        simulated_execution: None,
         gateway_url: "ws://localhost:9001/market".to_string(),
     };
 

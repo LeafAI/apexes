@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (causal liquidity and lifecycle qualification)_
+_Last updated: 2026-11-26 (bounded Spot IOC simulation qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up passed CI and merged in PR #23. F02.04 protective exits (see [design](superpowers/specs/2026-11-26-apexes-protective-exits-design.md)) passed CI and merged in PR #24. F02.05 dynamic Spot rules and reservations passed CI and merged in PR #25 (see [design](superpowers/specs/2026-11-26-apexes-dynamic-spot-rules-design.md)). The durable reservation follow-up passed CI and merged in PR #26. Bounded market-buy execution passed CI and merged in PR #27. Fee-aware reservation follow-up passed CI and merged in PR #28. EMS parent-level capital allocation passed CI and merged in PR #29. F02.05 exact external fee-token funding and real-service qualification remain open. F03.01 [configurable execution fees](superpowers/specs/2026-11-26-apexes-configurable-costs-design.md) passed CI and merged in PR #30. F03.02 [causal liquidity and lifecycle](superpowers/specs/2026-11-26-apexes-causal-execution-design.md) is locally qualified; remote CI and bounded IOC, causal scheduling/latency and remaining depth/queue qualification are pending. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up passed CI and merged in PR #23. F02.04 protective exits (see [design](superpowers/specs/2026-11-26-apexes-protective-exits-design.md)) passed CI and merged in PR #24. F02.05 dynamic Spot rules and reservations passed CI and merged in PR #25 (see [design](superpowers/specs/2026-11-26-apexes-dynamic-spot-rules-design.md)). The durable reservation follow-up passed CI and merged in PR #26. Bounded market-buy execution passed CI and merged in PR #27. Fee-aware reservation follow-up passed CI and merged in PR #28. EMS parent-level capital allocation passed CI and merged in PR #29. F02.05 exact external fee-token funding and real-service qualification remain open. F03.01 [configurable execution fees](superpowers/specs/2026-11-26-apexes-configurable-costs-design.md) passed CI and merged in PR #30. F03.02 [causal liquidity and lifecycle](superpowers/specs/2026-11-26-apexes-causal-execution-design.md) passed CI and merged in PR #31. [Bounded Spot IOC simulation](superpowers/specs/2026-11-26-apexes-simulated-ioc-design.md) is locally qualified; remote CI, causal scheduling/latency and remaining depth/queue qualification are pending. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -317,6 +317,25 @@ strict stale/gap handling, queue calibration, crossing-limit behavior
 and bounded managed Spot IOC remain open. The original Trend Guard
 baseline is unchanged. No real exchange orders or live database used.
 Independent review and remote CI remain pending.
+
+F03.02 bounded Spot IOC increment (Rust 1.99.0, locked): workspace
+build, formatting, Clippy with warnings denied, all 80 test binaries
+and 30 doc-test suites passed. 1,424 executed tests (140 database
+group, 958 core, 63 supervisor, 263 UI), zero failures; 44 external/manual
+tests remain ignored. Five new regressions cover capped depth/fees,
+invalid trade references, launch validation, Drift replay comparison
+and paper execution. The opt-in policy requires explicit historical
+rules and a positive trade-reference maximum age. Backtest and paper
+record the policy in their reports; legacy runs remain unrestricted.
+Market buys consume only depth priced at or below the causal
+tick-rounded cap; remainder expires. EMS children require exact
+quantity conformance. The existing unrestricted Trend Guard fixture
+is unchanged; bounded mode produces no fills in that fixture because
+asks exceed the trade reference. This is not a profitability forecast.
+Rule provenance, full exchange filter/fee/account parity, strict book
+freshness, causal arrival and EMS scheduling, and queue calibration
+remain open. No independent reviewer, real orders or live database
+used. Remote CI pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

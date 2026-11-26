@@ -171,6 +171,7 @@ impl ValidRequest {
             market_condition_config: None,
             risk_free_return: Decimal::ZERO,
             simulated_fees: None,
+            simulated_execution: None,
             gateway_url: format!("ws://127.0.0.1:{gateway_port}/market"),
         };
         config

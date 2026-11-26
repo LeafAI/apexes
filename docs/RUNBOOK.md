@@ -534,7 +534,27 @@ expiry. StopLimit conversions retain their original identity.
 Simulated child fills use the latest observed matching event time when
 available, and the current event is processed before EMS dispatch.
 Historical snapshots/absolute updates are not a counterfactual market
-impact model. This increment does not enforce strict stale-book limits,
-model causal order-arrival latency, or implement managed Spot buy IOC
-parity. Do not treat the existing unrestricted-market benchmark as a
+impact model. Strict stale-book limits and causal order-arrival latency
+remain open. Do not treat the unrestricted-market benchmark as a
 realistic live execution forecast.
+
+### Bounded Spot IOC simulation
+
+Backtest and paper launch JSON accepts an optional policy, for example:
+
+```json
+{"simulated_execution":{"kind":"bounded_spot_ioc","max_reference_age_ms":1000,"rules":{"BTCUSDT":{"quantity_step":"0.001","min_quantity":"0.001","max_quantity":"100","price_tick":"0.01","min_notional":"5"}}}}
+```
+
+These rules are illustrative, not current exchange metadata. Supply
+appropriate historical rules for every configured Binance Spot symbol.
+Buys use the latest observed causal trade price rounded down to the
+tick and execute only against eligible asks. Missing, future or stale
+trade references refuse the buy. Unfilled remainder expires; child
+quantities must conform exactly. Bounded mode excludes unsupported
+venues, asset classes, stop orders and non-fixed routing. Market sells
+retain the existing behavior. The policy and supplied rules are saved
+in reports. Missing launch policy or explicit `{"kind":"unrestricted_market"}`
+selects the legacy benchmark. Live launch rejects simulation policies.
+This models the live price bound, not all dynamic exchange filters,
+fees, inventory controls or order-arrival latency.

@@ -159,6 +159,8 @@ pub struct LaunchConfig {
     /// Optional in legacy JSON: zero rates are explicitly labeled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simulated_fees: Option<apexes_backtest::SimulatedFees>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_execution: Option<apexes_backtest::SimulatedExecution>,
     /// `apexes-market-data-gateway`'s `/market` WS URL this engine
     /// subscribes to for live market data (backtest mode ignores this
     /// -- historical replay reads from `apexes-storage` instead).
@@ -172,6 +174,8 @@ pub enum LaunchConfigError {
     RiskLimits(#[from] RiskLimitsError),
     #[error("invalid simulated fees: {0}")]
     SimulatedFees(String),
+    #[error("invalid simulated execution: {0}")]
+    SimulatedExecution(String),
     #[error("live sessions need at least one instrument")]
     NoInstruments,
     #[error(
@@ -197,6 +201,16 @@ impl LaunchConfig {
             }
             fees.validate(&self.instruments)
                 .map_err(LaunchConfigError::SimulatedFees)?;
+        }
+        if let Some(policy) = &self.simulated_execution {
+            if matches!(self.mode, SessionMode::Live { .. }) {
+                return Err(LaunchConfigError::SimulatedExecution(
+                    "live uses actual exchange execution".into(),
+                ));
+            }
+            policy
+                .validate(&self.instruments)
+                .map_err(LaunchConfigError::SimulatedExecution)?;
         }
         let SessionMode::Live { risk_limits, .. } = &self.mode else {
             return Ok(());
@@ -335,6 +349,7 @@ mod tests {
             market_condition_config: None,
             risk_free_return: dec!(0.02),
             simulated_fees: None,
+            simulated_execution: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -369,6 +384,7 @@ mod tests {
             market_condition_config: None,
             risk_free_return: dec!(0.02),
             simulated_fees: None,
+            simulated_execution: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -398,6 +414,41 @@ mod tests {
             StrategyRef::DriftScript { .. }
         ));
         assert!(!config.instruments.is_empty());
+    }
+
+    #[test]
+    fn bounded_execution_config_round_trips_and_live_refuses_it() {
+        use apexes_backtest::SimulatedExecution;
+        let mut config = sample_backtest_config();
+        let old: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(old.simulated_execution.is_none());
+        let policy = SimulatedExecution::BoundedSpotIoc {
+            rules: std::collections::BTreeMap::from([(
+                "BTCUSDT".into(),
+                apexes_core::SymbolRules {
+                    quantity_step: dec!(0.001),
+                    min_quantity: dec!(0.001),
+                    max_quantity: dec!(100),
+                    price_tick: dec!(0.01),
+                    min_notional: dec!(5),
+                },
+            )]),
+            max_reference_age_ms: 500,
+        };
+        config.simulated_execution = Some(policy.clone());
+        let roundtrip: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.simulated_execution, Some(policy.clone()));
+        roundtrip.validate().unwrap();
+        config.instruments[0].venue = Venue::Okx;
+        assert!(config.validate().is_err());
+        let mut live = sample_live_config();
+        live.simulated_execution = Some(policy);
+        assert!(matches!(
+            live.validate(),
+            Err(LaunchConfigError::SimulatedExecution(_))
+        ));
     }
 
     #[test]
