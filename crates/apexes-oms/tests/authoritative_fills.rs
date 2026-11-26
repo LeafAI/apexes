@@ -200,6 +200,75 @@ async fn managed_spot_sale_requires_durable_owned_free_inventory_and_no_working_
 
 #[tokio::test]
 #[ignore]
+async fn durable_reservation_restores_after_manager_restart_and_releases_on_terminal() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    drop(manager);
+    let mut restarted = fixture.manager().await;
+    let mut other = intent();
+    other.symbol = "ETHUSDT".into();
+    assert!(
+        restarted
+            .submit_child_order(other.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reserved or awaiting receipt")
+    );
+    restarted.cancel_order(id).await.unwrap();
+    assert!(restarted.submit_child_order(other).await.is_ok());
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let evidence: (String,String,Decimal,bool) = sqlx::query_as("SELECT reserved_spend_asset,reserved_receipt_asset,reserved_amount,reservation_breached FROM orders WHERE id=$1")
+        .bind(id.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(evidence, ("USDT".into(), "BTC".into(), dec!(303), false));
+    drop(restarted);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn actual_spend_including_quote_fee_breaches_budget_without_losing_fill() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    let mut execution = fill("1", dec!(3), 0);
+    execution.price = dec!(101);
+    execution.fee = dec!(0.01);
+    execution.fee_currency = Some("USDT".into());
+    fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
+    fixture.gateway.set_fills_for_order(id, vec![execution]);
+    manager.reconcile().await.unwrap();
+    assert!(fixture.health.is_engaged());
+    assert!(!manager.open_orders().contains_key(&id));
+    acknowledge(&mut manager, 1).await;
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let breached: bool = sqlx::query_scalar("SELECT reservation_breached FROM orders WHERE id=$1")
+        .bind(id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(breached);
+    let store = OrderStore::new(&fixture.url).await.unwrap();
+    assert_eq!(store.get_fills_for_order(id).await.unwrap().len(), 1);
+    drop(store);
+    drop(manager);
+    let mut store = OrderStore::new(&fixture.url).await.unwrap();
+    store.bind_spot_inventory("fixture-owner").await.unwrap();
+    let mut restarted = OrderManager::new(store, &fixture.registry).await.unwrap();
+    assert!(restarted.spot_inventory_fills().await.is_err());
+    assert!(matches!(
+        restarted.submit_child_order(intent()).await,
+        Err(OmsError::TradingHalted { .. })
+    ));
+    drop(restarted);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn shared_quote_reservation_survives_partial_fill_until_terminal_reconciliation() {
     let fixture = Fixture::new().await;
     let mut manager = fixture.manager().await;

@@ -91,7 +91,7 @@ impl OrderStore {
         candidate: &mut Order,
         exchange_fills: Vec<ExchangeFill>,
         expected: Option<Decimal>,
-    ) -> Result<Vec<Fill>, OmsError> {
+    ) -> Result<(Vec<Fill>, bool), OmsError> {
         if let Some(quantity) = expected
             && (!consistent_status(candidate, quantity) || quantity < candidate.filled_quantity)
         {
@@ -150,9 +150,26 @@ impl OrderStore {
                 "order disappeared during execution reconciliation",
             ));
         }
+        // Do not discard an authoritative execution because it exceeded
+        // its pre-dispatch budget. Persist the breach with the execution,
+        // including cumulative native spend-asset fees, then latch health.
+        // For legacy rows without a reservation, no budget is invented.
+        let breached: bool = sqlx::query_scalar(
+            "UPDATE orders o SET reservation_breached = o.reservation_breached OR
+             (o.reserved_amount IS NOT NULL AND o.reserved_amount <
+               (SELECT COALESCE(SUM(
+                 CASE WHEN o.side='Buy' THEN f.price*f.quantity ELSE f.quantity END
+                 + CASE WHEN f.fee_currency=o.reserved_spend_asset
+                     OR (f.fee_currency IS NULL AND o.side='Buy')
+                   THEN f.fee ELSE 0 END),0) FROM fills f WHERE f.order_id=o.id))
+             WHERE o.id=$1 RETURNING reservation_breached",
+        )
+        .bind(candidate.id.0)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
         candidate.filled_quantity = total;
-        Ok(new_fills)
+        Ok((new_fills, breached))
     }
 
     pub(crate) async fn latest_fill_sequence(&self) -> Result<i64, OmsError> {

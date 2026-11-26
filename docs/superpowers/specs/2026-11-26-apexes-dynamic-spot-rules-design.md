@@ -30,8 +30,18 @@ exchange free rather than free plus locked balances. A subsequent order
 cannot spend an asset reserved by or expected as a receipt from a working
 order; pending receipts do not fund new orders. Keep reservations until
 authoritative terminal state, and retain the fill-acknowledgement gate.
-An unknown recovered reservation blocks submission: startup remains
-quiescent, not an online restoration of working reservations.
+The follow-up persists reservation evidence atomically with the original
+order before dispatch. The OMS restores working-order reservations from
+that record; terminal reconciliation releases active reservations but
+retains audit evidence. Unknown recovered reservations block submission.
+Managed engine startup remains quiescent; restoring OMS evidence is not
+yet permission to resume a session with working orders or locked funds.
+Cumulative actual spend, including fees in the spend asset, is checked
+against the reservation in the same transaction as execution persistence.
+A breach is durably latched without discarding actual fills and prevents
+new submissions and startup until audited reconciliation. There is no
+automatic clearing path. The check is post-execution detection, not a
+hard market-buy spending cap or exact pre-trade fee guarantee.
 Durable owned Spot inventory guards sales and informs buy position
 limits even when EMS passes no caller position snapshot. The risk checker
 includes outstanding unfilled same-symbol buys and does not credit

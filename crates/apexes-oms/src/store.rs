@@ -7,6 +7,8 @@ use apexes_core::{Fill, Order, OrderId, OrderStatus};
 use sqlx::PgPool;
 
 use crate::error::OmsError;
+use crate::manager::SpotReservation;
+use std::collections::HashMap;
 
 #[path = "fill_reconciliation.rs"]
 mod fill_reconciliation;
@@ -89,6 +91,17 @@ impl OrderStore {
             .execute(&pool).await?;
 
         crate::FeeJournal::migrate(&pool).await?;
+        sqlx::query(
+            "ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS reserved_spend_asset TEXT,
+            ADD COLUMN IF NOT EXISTS reserved_receipt_asset TEXT,
+            ADD COLUMN IF NOT EXISTS reserved_amount NUMERIC,
+            ADD COLUMN IF NOT EXISTS reserved_owned_quantity NUMERIC,
+            ADD COLUMN IF NOT EXISTS reserved_reference_price NUMERIC,
+            ADD COLUMN IF NOT EXISTS reservation_breached BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&pool)
+        .await?;
         Ok(Self {
             pool,
             inventory_lease: None,
@@ -213,6 +226,13 @@ impl OrderStore {
             .ok_or_else(|| OmsError::InvalidRow {
                 reason: "inventory history is not bound to a live owner".into(),
             })?;
+        let breached: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orders WHERE reservation_breached)")
+                .fetch_one(&mut *connection)
+                .await?;
+        if breached {
+            return Err(OmsError::InvalidRow { reason: "persisted spot reservation breach requires audited reconciliation before startup".into() });
+        }
         let inconsistent: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM orders o LEFT JOIN
               (SELECT order_id, SUM(quantity) AS quantity FROM fills GROUP BY order_id) f ON f.order_id = o.id
@@ -245,13 +265,97 @@ impl OrderStore {
     /// lifecycle: once at creation, again after gateway submission
     /// updates `exchange_order_id`, again on every status change.
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
-        self.write_order(order, SubmissionState::from_order(order))
+        self.write_order(order, SubmissionState::from_order(order), None)
             .await
     }
 
     /// Persist the client ID and a pre-dispatch marker before any exchange I/O.
-    pub(crate) async fn begin_submission(&self, order: &Order) -> Result<(), OmsError> {
-        self.write_order(order, SubmissionState::Submitting).await
+    pub(crate) async fn begin_submission(
+        &self,
+        order: &Order,
+        reservation: Option<&SpotReservation>,
+    ) -> Result<(), OmsError> {
+        if self.inventory_bound() && reservation.is_none() {
+            return Err(OmsError::InvalidRow {
+                reason: "managed submission requires durable reservation".into(),
+            });
+        }
+        self.write_order(order, SubmissionState::Submitting, reservation)
+            .await
+    }
+
+    pub(crate) async fn has_reservation_breach(&self) -> Result<bool, OmsError> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orders WHERE reservation_breached)")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Restore evidence only for orders that may still consume capital.
+    /// Legacy working orders have no evidence and remain blocked by OMS.
+    /// Terminal rows retain their original reservation for audit.
+    pub(crate) async fn load_spot_reservations(
+        &self,
+    ) -> Result<HashMap<OrderId, SpotReservation>, OmsError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: uuid::Uuid,
+            reserved_spend_asset: Option<String>,
+            reserved_receipt_asset: Option<String>,
+            reserved_amount: Option<rust_decimal::Decimal>,
+            reserved_owned_quantity: Option<rust_decimal::Decimal>,
+            reserved_reference_price: Option<rust_decimal::Decimal>,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, reserved_spend_asset, reserved_receipt_asset,
+            reserved_amount, reserved_owned_quantity, reserved_reference_price FROM orders
+            WHERE status IN ('New','PartiallyFilled')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut result = HashMap::new();
+        for row in rows {
+            match (
+                row.reserved_spend_asset,
+                row.reserved_receipt_asset,
+                row.reserved_amount,
+                row.reserved_owned_quantity,
+                row.reserved_reference_price,
+            ) {
+                (None, None, None, None, None) => {}
+                (
+                    Some(spend_asset),
+                    Some(receipt_asset),
+                    Some(amount),
+                    Some(owned_quantity),
+                    Some(reference_price),
+                ) if !spend_asset.is_empty()
+                    && !receipt_asset.is_empty()
+                    && spend_asset != receipt_asset
+                    && amount > rust_decimal::Decimal::ZERO
+                    && owned_quantity >= rust_decimal::Decimal::ZERO
+                    && reference_price > rust_decimal::Decimal::ZERO =>
+                {
+                    result.insert(
+                        OrderId(row.id),
+                        SpotReservation {
+                            spend_asset,
+                            receipt_asset,
+                            amount,
+                            owned_quantity,
+                            reference_price,
+                        },
+                    );
+                }
+                _ => {
+                    return Err(OmsError::InvalidRow {
+                        reason: "invalid persisted spot reservation".into(),
+                    });
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub async fn get_submission_state(
@@ -276,11 +380,17 @@ impl OrderStore {
             .transpose()
     }
 
-    async fn write_order(&self, order: &Order, state: SubmissionState) -> Result<(), OmsError> {
+    async fn write_order(
+        &self,
+        order: &Order,
+        state: SubmissionState,
+        reservation: Option<&SpotReservation>,
+    ) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
         let result = sqlx::query(
-            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state,
+                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 leverage = EXCLUDED.leverage,
@@ -308,6 +418,11 @@ impl OrderStore {
         .bind(row.created_at)
         .bind(row.updated_at)
         .bind(state.as_str())
+        .bind(reservation.map(|r| r.spend_asset.as_str()))
+        .bind(reservation.map(|r| r.receipt_asset.as_str()))
+        .bind(reservation.map(|r| r.amount))
+        .bind(reservation.map(|r| r.owned_quantity))
+        .bind(reservation.map(|r| r.reference_price))
         .execute(&self.pool)
         .await?;
         if result.rows_affected() != 1 {
