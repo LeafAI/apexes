@@ -462,7 +462,25 @@ the valid tick; base quantity never increases. Persist the cap before
 dispatch, keep the original client ID, and reconcile partial execution or
 expiry before releasing capital. There is no slippage allowance: a buy
 can expire without filling. Principal is bounded by quantity times cap;
-the 1% quote-fee headroom remains an estimate. Any above-cap fill or
+the current undiscounted account commission rate replaces the fixed
+1% quote-fee headroom. Any above-cap fill or
 cumulative reservation breach is recorded and durably halts trading.
 No fallback to MARKET, stop-order/derivative extension or parent-level
 allocation is supplied.
+
+Managed Spot preflight now reads signed account commission rates for
+the symbol. Missing or malformed evidence refuses submission. The
+OMS budgets using the larger of combined maker/taker rates for the
+order side, including standard, tax and special fees, with no discount
+assumed. The rate, local observation time and possible discount asset
+are persisted with the pre-dispatch reservation. A possible discount
+asset is held exclusively against competing working orders until
+terminal reconciliation; a possible base-asset fee on sales must fit
+owned and free inventory. Cross-symbol managed base fee attribution
+is refused. Legacy working orders without commission evidence block
+new submissions until reconciled. A full sale of the discount asset
+may require disabling the discount or reducing the sale quantity.
+External fee-token quantities are not numerically reserved; discounts
+may fall back to received-asset charges. Rate changes, actual fee
+rounding and future conversion prices remain uncertain. Actual spend
+breaches still halt durably.

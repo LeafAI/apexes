@@ -1,8 +1,9 @@
 //! F02.05: passive conformance and fail-closed validation of managed Spot orders against
 //! fresh exchange filters. The exchange remains the final authority.
+use super::ApiFamily;
 use super::{BinanceExecutionGateway, wire_decimal};
 use apexes_core::{AssetClass, OrderType, Side, Venue};
-use apexes_oms::SpotPreflight;
+use apexes_oms::{SpotCommission, SpotPreflight};
 use apexes_strategy::OrderIntent;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -178,7 +179,76 @@ fn notional_limits(row: &Value, market: bool) -> Result<Vec<(Decimal, Decimal, u
     Ok(limits)
 }
 
+fn commission_evidence(body: &Value, symbol: &str, side: Side) -> Result<SpotCommission, String> {
+    if body["symbol"].as_str() != Some(symbol) {
+        return Err("commission symbol mismatch".into());
+    }
+    let side_key = if side == Side::Buy { "buyer" } else { "seller" };
+    let mut maker = Decimal::ZERO;
+    let mut taker = Decimal::ZERO;
+    for category in ["standardCommission", "specialCommission", "taxCommission"] {
+        let row = &body[category];
+        let side_rate = number(row, side_key)?;
+        maker = maker
+            .checked_add(number(row, "maker")?)
+            .and_then(|r| r.checked_add(side_rate))
+            .ok_or("commission overflow")?;
+        taker = taker
+            .checked_add(number(row, "taker")?)
+            .and_then(|r| r.checked_add(side_rate))
+            .ok_or("commission overflow")?;
+    }
+    let rate = maker.max(taker);
+    if rate >= Decimal::ONE {
+        return Err("invalid combined commission rate".into());
+    }
+    let discount = &body["discount"];
+    let account = discount["enabledForAccount"]
+        .as_bool()
+        .ok_or("missing account fee discount state")?;
+    let symbol_enabled = discount["enabledForSymbol"]
+        .as_bool()
+        .ok_or("missing symbol fee discount state")?;
+    let asset = discount["discountAsset"]
+        .as_str()
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 24
+                && s.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+        .ok_or("invalid discount asset")?;
+    let discount_rate = number(discount, "discount")?;
+    if discount_rate > Decimal::ONE {
+        return Err("invalid discount rate".into());
+    }
+    Ok(SpotCommission {
+        rate,
+        observed_at: chrono::Utc::now(),
+        discount_asset: (account && symbol_enabled).then(|| asset.to_owned()),
+    })
+}
+
 impl BinanceExecutionGateway {
+    async fn spot_commission(&self, symbol: &str, side: Side) -> Result<SpotCommission, String> {
+        let (status, body) = self
+            .rest
+            .signed_request(
+                "GET",
+                ApiFamily::Spot,
+                "/api/v3/account/commission",
+                &format!("symbol={symbol}"),
+            )
+            .await
+            .map_err(|_| "spot commission request failed")?;
+        if !status.is_success() {
+            return Err("spot commission unavailable".into());
+        }
+        let value: Value =
+            serde_json::from_str(&body).map_err(|_| "invalid commission response")?;
+        commission_evidence(&value, symbol, side)
+    }
+
     pub(super) async fn check_spot_intent(
         &self,
         intent: &OrderIntent,
@@ -274,8 +344,10 @@ impl BinanceExecutionGateway {
                 return Err("order violates current exchange notional limits".into());
             }
         }
+        let commission = self.spot_commission(symbol, intent.side).await?;
         let balances = self.spot_balances().await?;
         Ok(SpotPreflight {
+            commission,
             base: base.into(),
             quote: quote.into(),
             reference_price: market_buy_cap.unwrap_or(reference_price),

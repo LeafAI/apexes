@@ -69,6 +69,7 @@ pub(crate) struct SpotReservation {
     pub(crate) owned_quantity: Decimal,
     pub(crate) reference_price: Decimal,
     pub(crate) market_buy_cap: Option<Decimal>,
+    pub(crate) commission: Option<crate::SpotCommission>,
 }
 
 pub struct OrderManager {
@@ -431,11 +432,11 @@ impl OrderManager {
         }
         self.spot_reservations
             .retain(|id, _| self.open_orders.contains_key(id));
-        if self
-            .open_orders
-            .keys()
-            .any(|id| !self.spot_reservations.contains_key(id))
-        {
+        if self.open_orders.keys().any(|id| {
+            self.spot_reservations
+                .get(id)
+                .is_none_or(|r| r.commission.is_none())
+        }) {
             return Err(reject(
                 "working order lacks a verified reservation; reconcile before trading",
             ));
@@ -497,6 +498,27 @@ impl OrderManager {
                 "missing or invalid exchange-enforceable market-buy cap",
             ));
         }
+        let commission = evidence.commission;
+        let age = Utc::now() - commission.observed_at;
+        if !commission.valid()
+            || age < chrono::TimeDelta::zero()
+            || age > chrono::TimeDelta::seconds(5)
+        {
+            return Err(reject("missing, invalid or stale Spot commission evidence"));
+        }
+        // Fees paid in another managed base asset cannot be attributed
+        // to this symbol's inventory. Require discount disabled there.
+        if let Some(fee_asset) = &commission.discount_asset
+            && self.spot_scope.as_ref().is_some_and(|scope| {
+                scope
+                    .iter()
+                    .any(|(symbol, (base, _))| symbol != &intent.symbol && base == fee_asset)
+            })
+        {
+            return Err(reject(
+                "discount fee asset belongs to another managed inventory; disable discount or reconcile scope",
+            ));
+        }
         intent.quantity = evidence.quantity;
         intent.price = evidence.price;
         let owned = self
@@ -522,30 +544,49 @@ impl OrderManager {
                         "spot inventory discrepancy; reconcile before trading",
                     ));
                 }
-                if intent.quantity > owned {
-                    return Err(reject("sale exceeds strategy-owned inventory"));
+                // Normal Spot sale fees come from quote receipts, not
+                // base principal. If the discount asset is the base,
+                // reserve the undiscounted base-equivalent amount too.
+                let required =
+                    if commission.discount_asset.as_deref() == Some(evidence.base.as_str()) {
+                        intent
+                            .quantity
+                            .checked_mul(Decimal::ONE + commission.rate)
+                            .ok_or_else(|| reject("spot fee reservation overflow"))?
+                    } else {
+                        intent.quantity
+                    };
+                if required > owned {
+                    return Err(reject(
+                        "sale and possible base fee exceed strategy-owned inventory",
+                    ));
                 }
-                (
-                    evidence.base,
-                    evidence.quote,
-                    intent.quantity,
-                    evidence.free_base,
-                )
+                (evidence.base, evidence.quote, required, evidence.free_base)
             }
             Side::Buy => {
                 let cost = intent
                     .quantity
                     .checked_mul(evidence.reference_price)
-                    .and_then(|v| v.checked_mul(Decimal::new(101, 2)))
+                    .and_then(|v| v.checked_mul(Decimal::ONE + commission.rate))
                     .ok_or_else(|| reject("spot reservation amount overflow"))?;
                 (evidence.quote, evidence.base, cost, evidence.free_quote)
             }
         };
-        if self
-            .spot_reservations
-            .values()
-            .any(|reserved| reserved.spend_asset == asset || reserved.receipt_asset == asset)
-        {
+        if self.spot_reservations.values().any(|reserved| {
+            let existing_fee = reserved
+                .commission
+                .as_ref()
+                .and_then(|c| c.discount_asset.as_deref());
+            let new_fee = commission.discount_asset.as_deref();
+            reserved.spend_asset == asset
+                || reserved.receipt_asset == asset
+                || existing_fee.is_some_and(|fee| fee == asset || fee == receipt_asset)
+                || new_fee.is_some_and(|fee| {
+                    fee == reserved.spend_asset
+                        || fee == reserved.receipt_asset
+                        || Some(fee) == existing_fee
+                })
+        }) {
             return Err(reject(
                 "spend asset reserved or awaiting receipt from a working order",
             ));
@@ -562,6 +603,7 @@ impl OrderManager {
             owned_quantity: owned,
             reference_price: evidence.reference_price,
             market_buy_cap: evidence.market_buy_cap,
+            commission: Some(commission),
         }))
     }
 
