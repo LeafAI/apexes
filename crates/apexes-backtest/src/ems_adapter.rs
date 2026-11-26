@@ -22,7 +22,6 @@ use apexes_ems::{ChildOrderIntent, ChildOrderSink, EmsError};
 use apexes_strategy::OrderIntent;
 use async_trait::async_trait;
 use chrono::Utc;
-use rust_decimal::Decimal;
 
 use crate::matching_engine::MatchingEngine;
 
@@ -70,44 +69,20 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
             margin_mode: intent.margin_mode,
         };
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let now = engine.event_time().unwrap_or_else(Utc::now);
         let (order, fills) = engine
-            .submit_market_order(&order_intent, Utc::now())
+            .submit_market_order(&order_intent, now)
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
                 reason: error.to_string(),
             })?;
 
-        // `submit_market_order` runs synchronously to completion -- this
-        // order will NEVER receive any further fill or status change
-        // once this call returns (there is no resting-order concept for
-        // Market orders), regardless of whether `order.status` came
-        // back as `Filled` (fully executed), `PartiallyFilled`
-        // (insufficient book depth), or `New` (no liquidity at all, see
-        // `MatchingEngine::submit_market_order`'s own `tracing::warn!`
-        // for that case). Record it as `Filled` (any quantity filled)
-        // or `Rejected` (none filled) here -- NOT the literal
-        // `order.status` -- so `order_status` reports one of the
-        // genuinely terminal statuses `Ems`'s Iceberg scheduling
-        // (`refill_iceberg_allocation`) checks for. Reporting the
-        // literal `New`/`PartiallyFilled` status instead would make
-        // Iceberg wait forever for a "resting" order that, for this
-        // Market-only sink, never actually rests -- this was a real bug
-        // caught in sub-project #9's Task 18 whole-branch review: every
-        // Iceberg parent order submitted through this adapter in a real
-        // backtest/paper-trading run would submit exactly one slice and
-        // then stall in `Scheduling` permanently, since this method
-        // previously always returned `Ok(None)`.
-        let terminal_status = if order.filled_quantity > Decimal::ZERO {
-            apexes_core::OrderStatus::Filled
-        } else {
-            apexes_core::OrderStatus::Rejected
-        };
-        let mut tracked_order = order.clone();
-        tracked_order.status = terminal_status;
+        // The matching engine already returns the truthful terminal
+        // status and actual executed quantity for immediate orders.
         self.submitted
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(order.id, tracked_order);
+            .insert(order.id, order.clone());
 
         Ok((order.id, fills))
     }
@@ -199,6 +174,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_shares_consumed_depth_and_uses_replay_time() {
+        use chrono::TimeZone;
+        let engine = engine_with_book();
+        let at = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let child = ChildOrderIntent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
+            side: Side::Buy,
+            quantity: dec!(8),
+            leverage: None,
+            margin_mode: None,
+        };
+        {
+            let mut shared = engine.lock().unwrap();
+            shared.on_depth_update(&DepthUpdate {
+                symbol: child.symbol.clone(),
+                venue: child.venue,
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: dec!(100),
+                    quantity: dec!(10),
+                }],
+                sequence: Some(2),
+                is_snapshot: true,
+                timestamp: at,
+            });
+            let direct = OrderIntent {
+                symbol: child.symbol.clone(),
+                venue: child.venue,
+                asset_class: child.asset_class,
+                side: child.side,
+                order_type: OrderType::Market,
+                quantity: dec!(6),
+                price: None,
+                stop_price: None,
+                execution_algo: None,
+                routing: apexes_strategy::OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            };
+            assert_eq!(
+                shared
+                    .submit_market_order(&direct, at)
+                    .unwrap()
+                    .0
+                    .filled_quantity,
+                dec!(6)
+            );
+        }
+        let sink = MatchingEngineChildOrderSink::new(engine);
+        let (id, fills) = sink.submit_child_order(child).await.unwrap();
+        assert_eq!(fills[0].filled_at, at);
+        assert_eq!(fills[0].quantity, dec!(4));
+        let order = sink.order_status(id).await.unwrap().unwrap();
+        assert_eq!(order.status, apexes_core::OrderStatus::Cancelled);
+        assert_eq!(order.filled_quantity, dec!(4));
+    }
+
+    #[tokio::test]
     async fn cancel_child_order_is_a_no_op_success() {
         let engine = engine_with_book();
         let sink = MatchingEngineChildOrderSink::new(engine);
@@ -254,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_status_reports_rejected_for_a_submitted_order_with_no_liquidity() {
+    async fn order_status_reports_expired_for_a_submitted_order_with_no_liquidity() {
         // Same bug as above, exercised via the "no book depth at all"
         // path (`filled_quantity` stays zero) -- must still report a
         // TERMINAL status, not `None`/`New`, so Iceberg does not stall.
@@ -285,7 +320,7 @@ mod tests {
         let status = sink.order_status(order_id).await.unwrap();
         assert_eq!(
             status.map(|order| order.status),
-            Some(apexes_core::OrderStatus::Rejected)
+            Some(apexes_core::OrderStatus::Cancelled)
         );
     }
 

@@ -301,41 +301,6 @@ pub async fn run_unified_event_loop(
                     tracing::warn!(?violations, "market condition monitor flagged a violation");
                 }
 
-                let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
-                    ApexesError::InvalidBacktestConfig {
-                        reason: format!("ems.on_market_event failed: {error}"),
-                    }
-                })?;
-                if !ems_fills.is_empty() {
-                    if let Some(log) = &mut order_log {
-                        log.filled(&ems_fills);
-                    }
-                    apply_fills(
-                        diagnostics, "ems",
-                        &mut ledger,
-                        &mut overall_tracker,
-                        &mut per_symbol_trackers,
-                        &mut per_venue_trackers,
-                        &mut all_fills,
-                        &ems_fills,
-                        config.risk_free_return,
-                    )?;
-                    if let Some(checker) = &mut risk_checker {
-                        for fill in &ems_fills {
-                            if let Err(violations) =
-                                checker.on_fill(fill, ledger.positions(), ledger.balances())
-                            {
-                                tracing::warn!(
-                                    ?violations,
-                                    symbol = %fill.symbol,
-                                    "in-trade risk monitor flagged a violation"
-                                );
-                            }
-                        }
-                    }
-                }
-                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
-
                 // Price-map maintenance, split by event type exactly as
                 // before: `last_prices` (used to value non-quote-currency
                 // balances) is keyed by BASE ASSET (e.g. "BTC") from Trade
@@ -397,6 +362,41 @@ pub async fn run_unified_event_loop(
                         }
                     }
                 }
+
+                let ems_fills = ems.on_market_event(&event).await.map_err(|error| {
+                    ApexesError::InvalidBacktestConfig {
+                        reason: format!("ems.on_market_event failed: {error}"),
+                    }
+                })?;
+                if !ems_fills.is_empty() {
+                    if let Some(log) = &mut order_log {
+                        log.filled(&ems_fills);
+                    }
+                    apply_fills(
+                        diagnostics, "ems",
+                        &mut ledger,
+                        &mut overall_tracker,
+                        &mut per_symbol_trackers,
+                        &mut per_venue_trackers,
+                        &mut all_fills,
+                        &ems_fills,
+                        config.risk_free_return,
+                    )?;
+                    if let Some(checker) = &mut risk_checker {
+                        for fill in &ems_fills {
+                            if let Err(violations) =
+                                checker.on_fill(fill, ledger.positions(), ledger.balances())
+                            {
+                                tracing::warn!(
+                                    ?violations,
+                                    symbol = %fill.symbol,
+                                    "in-trade risk monitor flagged a violation"
+                                );
+                            }
+                        }
+                    }
+                }
+                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
 
                 // Funding settlement: once per crossed Binance-aligned 8-hour
                 // UTC boundary (00:00/08:00/16:00) -- not per-boundary-precise
@@ -753,6 +753,7 @@ pub async fn run_unified_event_loop(
                             if let Some(log) = &mut order_log {
                                 log.submitted(&order);
                                 log.filled(&fills);
+                                log.terminal_submission(&order);
                             }
                             // Accepted for execution: only now does the order use up
                             // daily allowance. An order the exchange rejects never does,

@@ -168,6 +168,29 @@ impl OrderLog {
         }
     }
 
+    /// Record an authoritative terminal submission after applying its fills.
+    pub fn terminal_submission(&mut self, order: &Order) {
+        if !matches!(
+            order.status,
+            apexes_core::OrderStatus::Cancelled | apexes_core::OrderStatus::Rejected
+        ) {
+            return;
+        }
+        let id = order.id.0.to_string();
+        if let Some(record) = self.records.iter_mut().find(|r| r.id == id) {
+            record.status = if order.status == apexes_core::OrderStatus::Rejected {
+                REJECTED
+            } else {
+                CLOSED
+            }
+            .into();
+            record.detail = Some(format!(
+                "terminal {:?}: filled {} of {}",
+                order.status, record.filled_quantity, record.quantity
+            ));
+        }
+    }
+
     /// Marks orders that are neither filled nor in `open_ids` as closed (they
     /// were cancelled, expired or refused after being accepted), once they
     /// have been absent long enough to be sure.
@@ -255,6 +278,21 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn partial_terminal_submission_preserves_fill_and_closes_immediately() {
+        let mut log = OrderLog::default();
+        let mut o = order(Side::Buy, dec!(3), 0);
+        o.filled_quantity = dec!(1);
+        o.status = OrderStatus::Cancelled;
+        log.submitted(&o);
+        log.filled(&[fill_of(&o, dec!(100), dec!(1))]);
+        log.terminal_submission(&o);
+        let records = log.view(1);
+        assert_eq!(records[0].status, CLOSED);
+        assert_eq!(records[0].filled_quantity, dec!(1));
+        assert_eq!(records[0].avg_fill_price, Some(dec!(100)));
     }
 
     #[test]

@@ -101,7 +101,8 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
     fn on_market_event(&self, event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
         match event {
             MarketEvent::Trade(trade) => {
-                let fill_results = self.lock_engine().on_trade_event(trade, trade.timestamp);
+                let mut engine = self.lock_engine();
+                let fill_results = engine.on_trade_event(trade, trade.timestamp);
                 let mut open_orders = self.lock_open_orders();
                 for (order_id, fills) in &fill_results {
                     // Mirror `event_loop.rs`'s `MarketEvent::Trade` arm
@@ -120,19 +121,22 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
                         }
                     }
                 }
-                open_orders.retain(|_, order| {
-                    matches!(
-                        order.status,
-                        OrderStatus::New | OrderStatus::PartiallyFilled
-                    )
-                });
+                open_orders.retain(|id, _| engine.is_working(*id));
                 fill_results
             }
             MarketEvent::Depth(update) => {
                 self.lock_engine().on_depth_update(update);
                 Vec::new()
             }
-            MarketEvent::Tick(_) | MarketEvent::Bar(_) | MarketEvent::MarkPrice(_) => Vec::new(),
+            MarketEvent::Tick(tick) => {
+                self.lock_engine().advance_time(tick.timestamp);
+                Vec::new()
+            }
+            MarketEvent::MarkPrice(mark) => {
+                self.lock_engine().advance_time(mark.timestamp);
+                Vec::new()
+            }
+            MarketEvent::Bar(_) => Vec::new(),
         }
     }
 
@@ -238,6 +242,102 @@ mod tests {
         );
         assert_eq!(order.status, OrderStatus::Filled);
         assert!(!executor.open_orders().await.contains_key(&order.id));
+    }
+
+    #[tokio::test]
+    async fn partial_market_order_never_enters_working_view() {
+        let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+        let mut intent = market_intent(OrderType::Market, None);
+        intent.quantity = dec!(15);
+        let (order, fills) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.filled_quantity, dec!(10));
+        assert_eq!(fills.iter().map(|f| f.quantity).sum::<Decimal>(), dec!(10));
+        assert!(executor.open_orders().await.is_empty());
+        let (empty, fills) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(empty.status, OrderStatus::Cancelled);
+        assert!(fills.is_empty());
+        assert!(executor.open_orders().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn triggered_stop_market_expires_and_preserves_original_fill_id() {
+        let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+        let mut intent = market_intent(OrderType::Stop, None);
+        intent.quantity = dec!(15);
+        intent.stop_price = Some(dec!(65000));
+        let (order, _) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        let event = MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(65010),
+            quantity: dec!(1),
+            side: Some(Side::Buy),
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        let result = executor.on_market_event(&event);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, order.id);
+        assert_eq!(result[0].1[0].order_id, order.id);
+        assert_eq!(result[0].1[0].quantity, dec!(10));
+        assert!(executor.open_orders().await.is_empty());
+        let (empty, _) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        assert!(executor.open_orders().await.contains_key(&empty.id));
+        let event = MarketEvent::Trade(TradeEvent {
+            timestamp: Utc::now(),
+            ..match event {
+                MarketEvent::Trade(t) => t,
+                _ => unreachable!(),
+            }
+        });
+        assert!(executor.on_market_event(&event).is_empty());
+        assert!(executor.open_orders().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_limit_keeps_original_identity_across_conversion() {
+        let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+        let mut intent = market_intent(OrderType::StopLimit, Some(dec!(65010)));
+        intent.stop_price = Some(dec!(65000));
+        let (order, _) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        let trade = TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(65010),
+            quantity: dec!(5),
+            side: Some(Side::Sell),
+            trade_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(
+            executor
+                .on_market_event(&MarketEvent::Trade(trade.clone()))
+                .is_empty()
+        );
+        assert!(executor.open_orders().await.contains_key(&order.id));
+        let fills = executor.on_market_event(&MarketEvent::Trade(TradeEvent {
+            timestamp: trade.timestamp + chrono::Duration::milliseconds(1),
+            ..trade
+        }));
+        assert_eq!(fills[0].0, order.id);
+        assert_eq!(fills[0].1[0].order_id, order.id);
+        assert!(executor.open_orders().await.is_empty());
     }
 
     #[tokio::test]
