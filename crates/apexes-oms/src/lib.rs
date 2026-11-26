@@ -27,4 +27,4 @@ pub use gateway::{ExchangeFill, ExecutionGateway, GatewayOutcome};
 pub use kill_switch::KillSwitch;
 pub use manager::{CancelAllReport, OrderManager};
 pub use mock_gateway::MockExecutionGateway;
-pub use store::OrderStore;
+pub use store::{OrderStore, SubmissionState};

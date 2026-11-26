@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (exchange clock qualification)_
+_Last updated: 2026-11-26 (reliable submission qualification)_
 
 ---
 
@@ -27,9 +27,9 @@ offline replay through the real Drift runtime and matching engine. See the
 [feature plan](superpowers/plans/2026-11-25-apexes-quantitative-enhancement.md)
 and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design.md).
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
-F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, PR #14 has green CI but master policy blocks normal merge.
-F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)).
-Next: F01.02 reliable submission, then remaining safety/reliability and configurable costs. Feature statuses remain in FEATURES.md.
+F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
+F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
+F01.02 reliable submission is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)). Next: F01.03 market-data recovery, then remaining safety/reliability and configurable costs. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -52,7 +52,7 @@ A new temporary loopback PostgreSQL 17 database was used for the default
 database-dependent tests and stopped afterwards. New tests cover real
 Drift order/fill correlation, pretrade refusal, synthetic-secret omission,
 and supplemental fill ledger success/failure. No live exchange or database
-was used. PR #13 passed database/workspace CI and Docker builds; PR #14 promotion to master has green CI but awaits branch-policy requirements. Live-network tests remain unverified.
+was used. PR #13 passed database/workspace CI and Docker builds; PR #14 promotion to master passed CI and merged. Live-network tests remain unverified.
 The log target, correlation contract and known redaction boundary are
 documented in the design and RUNBOOK. The log does not repair ledger
 discrepancies; F02.02 addresses reconciliation.
@@ -65,8 +65,22 @@ cover explicit timestamp retry and same client order ID, bounded/ambiguous
 responses, family separation and clone sharing, stale samples, invalid/slow
 preflight, rate limits, failure cooldown, synchronized WebSocket subscription,
 and receive-window configuration. No real exchange requests or orders were
-used for qualification. Ignored external tests and remote CI remain pending.
-Do not merge before required CI and the master branch rules are satisfied.
+used for qualification. PR #15 passed remote lint, test and Docker checks and merged; live-exchange tests remain unverified.
+
+F01.02 local qualification (Rust 1.99.0, locked): full workspace build,
+formatting, Clippy with warnings denied, 78 default test binaries (1,310
+passed, 0 failed, 78 ignored), and 30 doc-test suites passed. All 53 OMS
+tests passed with ignored database tests enabled, including 26 not run
+by the default suite. All 91 default Binance gateway tests passed. Both
+database runs used temporary isolated loopback PostgreSQL instances,
+stopped afterwards. Five new tests cover interrupted submission, durable
+explicit rejection, late fill recovery after restart, ambiguous Binance
+errors, and false negative lookup responses. An existing age-expiry
+regression now tests conservative unknown-outcome retention. No real
+exchange orders were placed. Remote CI and remaining external qualification
+are pending. Same-instrument guarding is scoped to one OMS and its recovered
+database; account-wide capital reservations, durable ledger delivery and
+operator health controls are later features.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

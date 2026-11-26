@@ -15,10 +15,15 @@ use std::time::Duration;
 
 use apexes_core::registry::Registry;
 use apexes_core::{AssetClass, Fill, FillId, Order, OrderId, OrderStatus, OrderType, Side, Venue};
-use apexes_oms::{ExchangeFill, ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore};
+use apexes_oms::{
+    ExchangeFill, ExecutionGateway, GatewayOutcome, MockExecutionGateway, OmsError, OrderManager,
+    OrderStore, SubmissionState,
+};
+use apexes_strategy::{OrderIntent, OrderRouting};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
@@ -124,7 +129,7 @@ async fn fills_total(store: &OrderStore, id: OrderId) -> (usize, Decimal) {
 
 #[tokio::test]
 #[ignore]
-async fn crash_after_persist_before_submit_resolves_to_rejected_after_the_grace_period() {
+async fn crash_with_no_exchange_ack_remains_uncertain_even_after_grace_period() {
     let h = harness().await;
     let setup = OrderStore::new(POSTGRES_URL).await.unwrap();
     // The process wrote the order, then died before calling the gateway.
@@ -137,13 +142,18 @@ async fn crash_after_persist_before_submit_resolves_to_rejected_after_the_grace_
     assert_eq!(manager.open_orders().len(), 2);
     manager.reconcile().await.unwrap();
 
-    // The exchange never heard of the stale one: it must not stay "open" forever.
+    // A negative lookup and the age of a record cannot distinguish
+    // pre-dispatch crash from a delayed exchange acceptance.
     assert_eq!(
         store.get_order(stale.id).await.unwrap().unwrap().status,
-        OrderStatus::Rejected
+        OrderStatus::New
     );
-    assert!(!manager.open_orders().contains_key(&stale.id));
-    // The young one's submit may still be in flight: left alone.
+    assert!(manager.open_orders().contains_key(&stale.id));
+    assert_eq!(
+        store.get_submission_state(stale.id).await.unwrap(),
+        Some(SubmissionState::Uncertain)
+    );
+    // The young order is also unresolved.
     assert!(manager.open_orders().contains_key(&young.id));
     assert_eq!(
         store.get_order(young.id).await.unwrap().unwrap().status,
@@ -168,6 +178,10 @@ async fn crash_after_exchange_accepted_before_ack_persisted_recovers_the_exchang
     let stored = store.get_order(o.id).await.unwrap().unwrap();
     assert_eq!(stored.exchange_order_id.as_deref(), Some("EX-1"));
     assert_eq!(stored.status, OrderStatus::New);
+    assert_eq!(
+        store.get_submission_state(o.id).await.unwrap(),
+        Some(SubmissionState::Accepted)
+    );
     // And it is now cancellable (needs the id).
     manager.cancel_order(o.id).await.unwrap();
 }
@@ -294,4 +308,128 @@ async fn partial_fills_on_a_cancelled_order_are_recorded() {
     assert_eq!(stored.status, OrderStatus::Cancelled);
     assert_eq!(stored.filled_quantity, dec!(0.75));
     assert_eq!(fills_total(&store, o.id).await, (1, dec!(0.75)));
+}
+
+fn intent(symbol: &str) -> OrderIntent {
+    OrderIntent {
+        symbol: symbol.into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        side: Side::Buy,
+        order_type: OrderType::Market,
+        quantity: dec!(1),
+        price: None,
+        stop_price: None,
+        execution_algo: None,
+        routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn uncertain_order_blocks_same_instrument_across_restart_until_late_fill_is_reconciled() {
+    let h = harness().await;
+    let (mut manager, store) = h.restart().await;
+    h.gateway
+        .program_next_submit_outcome(GatewayOutcome::Uncertain {
+            reason: "lost acknowledgement".into(),
+        });
+    let id = manager
+        .submit_order(intent("BTCUSDT"), &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_submission_state(id).await.unwrap(),
+        Some(SubmissionState::Uncertain)
+    );
+    // Repeated negative lookups, even after the warning threshold, do not
+    // establish non-execution or authorize a replacement.
+    manager = manager.with_unsent_order_grace(Duration::ZERO);
+    for _ in 0..2 {
+        manager.reconcile().await.unwrap();
+        assert!(
+            matches!(manager.submit_order(intent("BTCUSDT"), &HashMap::new(), &HashMap::new()).await,
+            Err(OmsError::SubmissionUnresolved { order_id }) if order_id == id)
+        );
+    }
+    drop(manager);
+    let (mut recovered, _) = h.restart().await;
+    assert!(
+        matches!(recovered.submit_flatten_order(intent("BTCUSDT")).await,
+        Err(OmsError::SubmissionUnresolved { order_id }) if order_id == id)
+    );
+    // Different instruments are independent; account-wide risk is a separate control.
+    let other = recovered
+        .submit_order(intent("ETHUSDT"), &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_submission_state(other).await.unwrap(),
+        Some(SubmissionState::Accepted)
+    );
+    h.gateway
+        .force_register_exchange_order(id, "EX-LATE", OrderStatus::Filled, AssetClass::Spot);
+    h.gateway
+        .set_fills_for_order(id, vec![exchange_fill("LATE-1", dec!(1))]);
+    let changes = recovered.reconcile().await.unwrap();
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|(oid, _)| *oid == id)
+            .map(|(_, f)| f.len())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        store.get_submission_state(id).await.unwrap(),
+        Some(SubmissionState::Accepted)
+    );
+    assert_eq!(
+        store.get_order(id).await.unwrap().unwrap().status,
+        OrderStatus::Filled
+    );
+    assert!(!recovered.open_orders().contains_key(&id));
+    recovered.reconcile().await.unwrap();
+    assert_eq!(fills_total(&store, id).await, (1, dec!(1)));
+    assert!(
+        recovered
+            .submit_order(intent("BTCUSDT"), &HashMap::new(), &HashMap::new())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn explicit_rejection_releases_guard_and_is_durable() {
+    let h = harness().await;
+    let (mut manager, store) = h.restart().await;
+    h.gateway
+        .program_next_submit_outcome(GatewayOutcome::Rejected {
+            reason: "insufficient balance".into(),
+        });
+    assert!(matches!(
+        manager
+            .submit_order(intent("BTCUSDT"), &HashMap::new(), &HashMap::new())
+            .await,
+        Err(OmsError::OrderRejected { .. })
+    ));
+    assert!(manager.open_orders().is_empty());
+    let pool = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let rejected: Uuid = sqlx::query_scalar("SELECT id FROM orders WHERE status = 'Rejected'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_submission_state(OrderId(rejected)).await.unwrap(),
+        Some(SubmissionState::Rejected)
+    );
+    assert!(
+        manager
+            .submit_order(intent("BTCUSDT"), &HashMap::new(), &HashMap::new())
+            .await
+            .is_ok()
+    );
 }

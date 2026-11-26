@@ -23,6 +23,11 @@ pub enum OmsError {
     #[error("trading halted by kill switch: {reason}")]
     TradingHalted { reason: String },
 
+    #[error(
+        "submission blocked: order {order_id:?} on this instrument has an unresolved exchange outcome"
+    )]
+    SubmissionUnresolved { order_id: OrderId },
+
     #[error("order rejected by exchange: {reason}")]
     OrderRejected { reason: String },
 

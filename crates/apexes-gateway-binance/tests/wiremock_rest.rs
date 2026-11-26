@@ -560,3 +560,56 @@ async fn count_foreign_open_orders_counts_only_orders_not_placed_by_this_system(
         2
     );
 }
+
+#[tokio::test]
+async fn submit_does_not_treat_uncertain_or_duplicate_client_id_errors_as_rejections() {
+    for (code, message) in [
+        (-1006, "Unexpected response; execution status unknown"),
+        (-1007, "Timeout; execution status unknown"),
+        (-2010, "Duplicate order sent."),
+        (-9999, "Unrecognized exchange error"),
+    ] {
+        let server = MockServer::start().await;
+        mount_clock(&server).await;
+        let id = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order"))
+            .and(query_param("newClientOrderId", id.to_string()))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code":code,"msg":message})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = gateway_against(&server)
+            .await
+            .submit_order(&sample_order(id))
+            .await;
+        assert!(
+            matches!(outcome, GatewayOutcome::Uncertain { .. }),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_error_with_order_not_found_body_is_not_a_definitive_negative_lookup() {
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(serde_json::json!({"code":-2013,"msg":"Order does not exist."})),
+        )
+        .mount(&server)
+        .await;
+    assert!(
+        gateway_against(&server)
+            .await
+            .query_order_by_client_id(&sample_order(Uuid::new_v4()))
+            .await
+            .is_err()
+    );
+}
