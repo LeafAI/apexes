@@ -202,10 +202,9 @@ impl BinanceExecutionGateway {
     /// Maps a raw `(status, body)` REST response into `GatewayOutcome`,
     /// per this crate's design (`docs/superpowers/specs/2026-08-01-apexes-gateway-binance-design.md`
     /// §六): HTTP success + parseable order JSON -> `Accepted`; HTTP
-    /// 4xx + a parseable `{"code": <negative>, "msg": ...}` body ->
-    /// `Rejected` (an explicit business-logic refusal); anything else
-    /// (network failure already surfaced as `Err` by `signed_request`,
-    /// HTTP 5xx, or an unparseable body) -> `Uncertain`.
+    /// 4xx with an allowlisted explicit refusal -> `Rejected`.
+    /// Unknown execution, duplicate client IDs, unrecognized errors,
+    /// malformed responses, and HTTP 5xx remain `Uncertain`.
     fn map_order_response(
         status: reqwest::StatusCode,
         body: &str,
@@ -219,8 +218,30 @@ impl BinanceExecutionGateway {
             }
         } else if status.is_client_error() {
             match serde_json::from_str::<BinanceApiError>(body) {
-                Ok(api_error) => Err(GatewayOutcome::Rejected {
-                    reason: format!("{} (code {})", api_error.msg, api_error.code),
+                Ok(api_error)
+                    if matches!(
+                        api_error.code,
+                        -1003
+                            | -1013
+                            | -1015
+                            | -1021
+                            | -1022
+                            | -2011
+                            | -2014
+                            | -2015
+                            | -2019
+                            | -2021
+                            | -2022
+                            | -1136..=-1100
+                    ) || (api_error.code == -2010
+                        && !api_error.msg.to_ascii_lowercase().contains("duplicate")) =>
+                {
+                    Err(GatewayOutcome::Rejected {
+                        reason: format!("{} (code {})", api_error.msg, api_error.code),
+                    })
+                }
+                Ok(api_error) => Err(GatewayOutcome::Uncertain {
+                    reason: format!("unconfirmed exchange execution (code {})", api_error.code),
                 }),
                 Err(_) => Err(GatewayOutcome::Uncertain {
                     reason: format!("HTTP {status} with unparseable error body: {body}"),
@@ -951,7 +972,7 @@ impl ExecutionGateway for BinanceExecutionGateway {
             .rest
             .signed_request("GET", family, Self::order_path(family), &params)
             .await?;
-        if is_order_does_not_exist(&body) {
+        if status == reqwest::StatusCode::BAD_REQUEST && is_order_does_not_exist(&body) {
             return Ok(None);
         }
         if !status.is_success() {

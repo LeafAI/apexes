@@ -3,7 +3,7 @@
 //! validation). [`crate::manager::OrderManager`] is the business-logic
 //! layer built on top of this.
 
-use apexes_core::{Fill, Order, OrderId};
+use apexes_core::{Fill, Order, OrderId, OrderStatus};
 use sqlx::PgPool;
 
 use crate::error::OmsError;
@@ -11,6 +11,36 @@ use crate::schema::{
     FILLS_ORDER_ID_INDEX_DDL, FILLS_TABLE_DDL, FillRow, ORDERS_ADD_LEVERAGE_COLUMNS_DDL,
     ORDERS_EXCHANGE_ID_INDEX_DDL, ORDERS_TABLE_DDL, OrderRow,
 };
+
+/// Durable submission state, separate from the exchange order lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionState {
+    Submitting,
+    Uncertain,
+    Accepted,
+    Rejected,
+}
+
+impl SubmissionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitting => "Submitting",
+            Self::Uncertain => "Uncertain",
+            Self::Accepted => "Accepted",
+            Self::Rejected => "Rejected",
+        }
+    }
+
+    fn from_order(order: &Order) -> Self {
+        if order.exchange_order_id.is_some() {
+            Self::Accepted
+        } else if order.status == OrderStatus::Rejected {
+            Self::Rejected
+        } else {
+            Self::Uncertain
+        }
+    }
+}
 
 pub struct OrderStore {
     pool: PgPool,
@@ -30,6 +60,12 @@ impl OrderStore {
         sqlx::query(ORDERS_ADD_LEVERAGE_COLUMNS_DDL)
             .execute(&pool)
             .await?;
+        // Existing rows without an exchange ID are conservatively uncertain.
+        // No migration infers non-execution from an order's age.
+        sqlx::query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS submission_state TEXT NOT NULL DEFAULT 'Uncertain'")
+            .execute(&pool).await?;
+        sqlx::query("UPDATE orders SET submission_state = CASE WHEN exchange_order_id IS NOT NULL THEN 'Accepted' ELSE 'Rejected' END WHERE submission_state = 'Uncertain' AND (exchange_order_id IS NOT NULL OR status = 'Rejected')")
+            .execute(&pool).await?;
         sqlx::query(ORDERS_EXCHANGE_ID_INDEX_DDL)
             .execute(&pool)
             .await?;
@@ -45,17 +81,51 @@ impl OrderStore {
     /// lifecycle: once at creation, again after gateway submission
     /// updates `exchange_order_id`, again on every status change.
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
+        self.write_order(order, SubmissionState::from_order(order))
+            .await
+    }
+
+    /// Persist the client ID and a pre-dispatch marker before any exchange I/O.
+    pub(crate) async fn begin_submission(&self, order: &Order) -> Result<(), OmsError> {
+        self.write_order(order, SubmissionState::Submitting).await
+    }
+
+    pub async fn get_submission_state(
+        &self,
+        id: OrderId,
+    ) -> Result<Option<SubmissionState>, OmsError> {
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT submission_state FROM orders WHERE id = $1")
+                .bind(id.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        state
+            .map(|value| match value.as_str() {
+                "Submitting" => Ok(SubmissionState::Submitting),
+                "Uncertain" => Ok(SubmissionState::Uncertain),
+                "Accepted" => Ok(SubmissionState::Accepted),
+                "Rejected" => Ok(SubmissionState::Rejected),
+                _ => Err(OmsError::InvalidRow {
+                    reason: "invalid submission state".into(),
+                }),
+            })
+            .transpose()
+    }
+
+    async fn write_order(&self, order: &Order, state: SubmissionState) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
-        sqlx::query(
-            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        let result = sqlx::query(
+            "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 leverage = EXCLUDED.leverage,
                 margin_mode = EXCLUDED.margin_mode,
                 filled_quantity = EXCLUDED.filled_quantity,
                 status = EXCLUDED.status,
-                updated_at = EXCLUDED.updated_at",
+                updated_at = EXCLUDED.updated_at,
+                submission_state = EXCLUDED.submission_state
+             WHERE $17 <> 'Submitting'",
         )
         .bind(row.id)
         .bind(&row.exchange_order_id)
@@ -73,8 +143,14 @@ impl OrderStore {
         .bind(&row.status)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(state.as_str())
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() != 1 {
+            return Err(OmsError::QueryFailed {
+                reason: "client order ID already exists".into(),
+            });
+        }
         Ok(())
     }
 
