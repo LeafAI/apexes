@@ -71,6 +71,35 @@ quantity times cap; quote fees still use estimated 1% headroom. The
 zero-slippage-allowance policy does not guarantee fills, exact total fees
 or backtest equivalence. Ordinary limit and market-sell behavior is unchanged.
 
+### Fee-aware reservation follow-up
+
+Use signed GET /api/v3/account/commission for the exact symbol (see
+[Binance commission FAQ](https://developers.binance.com/docs/binance-spot-api-docs/faqs/commission_faq)).
+Sum standard, special and tax rates including the relevant buyer/seller
+component, separately for maker and taker, then take the larger total.
+Do not reduce the budget for a possible discount. Refuse missing,
+malformed, mismatched or stale locally observed evidence. Persist the
+rate, observation timestamp and possible discount asset atomically
+with the reservation. The preflight still has a five-second deadline;
+no cached fallback. New buy reservation equals capped principal times
+(1 + observed rate), replacing the fixed 1% headroom. Normal sell fees
+are taken from receipts; if the possible discount asset is the sold
+base, reserve quantity times (1 + rate) against owned and free base
+inventory. A possible fee asset is held exclusively against other
+working orders' spend, receipt and discount assets. Refuse a fee asset
+belonging to another configured managed base inventory, since its fee
+attribution is not modeled across symbols. Legacy working orders
+without commission evidence block new submissions until reconciled.
+
+This is a conservative rate-derived budget, not an exact final fee
+guarantee. The exchange can change rates, charge rounded fees and use
+a discount asset or fall back to received-asset fees. External discount
+tokens are protected by exclusivity but are not numerically reserved;
+their precise quantity depends on execution-time conversion. The
+existing actual-spend and price-cap breach checks remain mandatory.
+Live-service compatibility, exact fee-token funding and parent-level
+capital allocation remain open. No real exchange requests in tests.
+
 This is a single managed account/schema guard, not account-wide fencing
 between multiple processes or coordination with external traders.
 Managed market-buy principal is exchange-price-bounded, but fee

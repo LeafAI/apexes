@@ -32,6 +32,7 @@ pub struct MockExecutionGateway {
     failing_fill_queries: Mutex<u32>,
     spot_inventory: Mutex<Option<(String, rust_decimal::Decimal)>>,
     free_quote: Mutex<rust_decimal::Decimal>,
+    spot_commission: Mutex<(rust_decimal::Decimal, Option<String>)>,
 }
 
 impl Default for MockExecutionGateway {
@@ -50,6 +51,7 @@ impl MockExecutionGateway {
             failing_fill_queries: Mutex::new(0),
             spot_inventory: Mutex::new(None),
             free_quote: Mutex::new(rust_decimal::Decimal::from(100000)),
+            spot_commission: Mutex::new((rust_decimal::Decimal::new(1, 2), None)),
         }
     }
 
@@ -59,6 +61,10 @@ impl MockExecutionGateway {
 
     pub fn set_spot_free_quote(&self, free: rust_decimal::Decimal) {
         *self.free_quote.lock().unwrap() = free;
+    }
+
+    pub fn set_spot_commission(&self, rate: rust_decimal::Decimal, discount_asset: Option<&str>) {
+        *self.spot_commission.lock().unwrap() = (rate, discount_asset.map(str::to_owned));
     }
 
     pub fn program_next_submit_outcome(&self, outcome: GatewayOutcome) {
@@ -135,7 +141,13 @@ impl ExecutionGateway for MockExecutionGateway {
             .as_ref()
             .filter(|(asset, _)| asset == &base)
             .map_or(rust_decimal::Decimal::ZERO, |(_, free)| *free);
+        let (rate, discount_asset) = self.spot_commission.lock().unwrap().clone();
         Ok(crate::SpotPreflight {
+            commission: crate::SpotCommission {
+                rate,
+                discount_asset,
+                observed_at: chrono::Utc::now(),
+            },
             base,
             quote: "USDT".into(),
             free_base,

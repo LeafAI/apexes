@@ -35,6 +35,36 @@ async fn mount_clock(server: &MockServer) {
     }
 }
 
+fn commission_response(symbol: &str) -> serde_json::Value {
+    serde_json::json!({
+        "symbol":symbol,
+        "standardCommission":{"maker":"0.001","taker":"0.002","buyer":"0.0001","seller":"0.0002"},
+        "specialCommission":{"maker":"0.003","taker":"0.001","buyer":"0.0003","seller":"0.0004"},
+        "taxCommission":{"maker":"0.0001","taker":"0.0002","buyer":"0.00001","seller":"0.00002"},
+        "discount":{"enabledForAccount":true,"enabledForSymbol":true,"discountAsset":"BNB","discount":"0.25"}
+    })
+}
+
+async fn mount_commission(server: &MockServer) {
+    use wiremock::matchers::{header, query_param};
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account/commission"))
+        .and(query_param("symbol", "BTCUSDT"))
+        .and(header("X-MBX-APIKEY", "test-api-key"))
+        .respond_with(|request: &wiremock::Request| {
+            assert!(
+                request
+                    .url
+                    .query()
+                    .unwrap_or_default()
+                    .contains("signature=")
+            );
+            ResponseTemplate::new(200).set_body_json(commission_response("BTCUSDT"))
+        })
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn fee_conversion_uses_unsigned_verified_pair_and_closed_causal_candle() {
     use wiremock::matchers::{header_exists, query_param};
@@ -121,6 +151,7 @@ async fn spot_preflight_conforms_to_fresh_rules_and_uses_only_free_balance() {
     ] {
         server.reset().await;
         mount_clock(&server).await;
+        mount_commission(&server).await;
         Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT",
@@ -142,11 +173,12 @@ async fn spot_preflight_conforms_to_fresh_rules_and_uses_only_free_balance() {
         assert_eq!(evidence.price, Some(dec!(101.2)));
         assert_eq!(evidence.free_quote, dec!(50));
         assert_eq!(evidence.free_base, dec!(2));
+        assert_eq!(evidence.commission.rate, dec!(0.00451));
+        assert_eq!(evidence.commission.discount_asset.as_deref(), Some("BNB"));
         intent.side = Side::Sell;
-        assert_eq!(
-            gateway.spot_preflight(&intent).await.unwrap().price,
-            Some(dec!(101.3))
-        );
+        let sell = gateway.spot_preflight(&intent).await.unwrap();
+        assert_eq!(sell.price, Some(dec!(101.3)));
+        assert_eq!(sell.commission.rate, dec!(0.00472));
         intent.side = Side::Buy;
         intent.quantity = dec!(3);
         assert!(gateway.spot_preflight(&intent).await.is_err()); // max notional
@@ -161,6 +193,7 @@ async fn market_preflight_requires_both_lot_filters_and_matching_average_window(
     use apexes_strategy::{OrderIntent, OrderRouting};
     let server = MockServer::start().await;
     mount_clock(&server).await;
+    mount_commission(&server).await;
     Mock::given(method("GET")).and(path("/api/v3/exchangeInfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT",
@@ -202,6 +235,16 @@ async fn market_preflight_requires_both_lot_filters_and_matching_average_window(
     let evidence = gateway.spot_preflight(&intent).await.unwrap();
     assert_eq!(evidence.quantity, dec!(1.2));
     assert_eq!(evidence.market_buy_cap, Some(dec!(100)));
+    assert_eq!(evidence.commission.rate, dec!(0.00451));
+    let mut missing_tax = commission_response("BTCUSDT");
+    missing_tax.as_object_mut().unwrap().remove("taxCommission");
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account/commission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(missing_tax))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    assert!(gateway.spot_preflight(&intent).await.is_err());
     intent.quantity = dec!(2.2);
     assert!(gateway.spot_preflight(&intent).await.is_err());
     intent.quantity = dec!(1);

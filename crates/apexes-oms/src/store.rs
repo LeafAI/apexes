@@ -99,6 +99,9 @@ impl OrderStore {
             ADD COLUMN IF NOT EXISTS reserved_owned_quantity NUMERIC,
             ADD COLUMN IF NOT EXISTS reserved_reference_price NUMERIC,
             ADD COLUMN IF NOT EXISTS reserved_market_buy_cap NUMERIC,
+            ADD COLUMN IF NOT EXISTS reserved_commission_rate NUMERIC,
+            ADD COLUMN IF NOT EXISTS reserved_commission_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS reserved_discount_asset TEXT,
             ADD COLUMN IF NOT EXISTS reservation_breached BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&pool)
@@ -276,7 +279,7 @@ impl OrderStore {
         order: &Order,
         reservation: Option<&SpotReservation>,
     ) -> Result<(), OmsError> {
-        if self.inventory_bound() && reservation.is_none() {
+        if self.inventory_bound() && reservation.is_none_or(|r| r.commission.is_none()) {
             return Err(OmsError::InvalidRow {
                 reason: "managed submission requires durable reservation".into(),
             });
@@ -308,16 +311,44 @@ impl OrderStore {
             reserved_owned_quantity: Option<rust_decimal::Decimal>,
             reserved_reference_price: Option<rust_decimal::Decimal>,
             reserved_market_buy_cap: Option<rust_decimal::Decimal>,
+            reserved_commission_rate: Option<rust_decimal::Decimal>,
+            reserved_commission_at: Option<chrono::DateTime<chrono::Utc>>,
+            reserved_discount_asset: Option<String>,
         }
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT id, reserved_spend_asset, reserved_receipt_asset,
-            reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap FROM orders
+            reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset FROM orders
             WHERE status IN ('New','PartiallyFilled')",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut result = HashMap::new();
         for row in rows {
+            let commission = match (
+                row.reserved_commission_rate,
+                row.reserved_commission_at,
+                row.reserved_discount_asset,
+            ) {
+                (None, None, None) => None,
+                (Some(rate), Some(observed_at), discount_asset) => {
+                    let c = crate::SpotCommission {
+                        rate,
+                        observed_at,
+                        discount_asset,
+                    };
+                    if !c.valid() {
+                        return Err(OmsError::InvalidRow {
+                            reason: "invalid persisted commission evidence".into(),
+                        });
+                    }
+                    Some(c)
+                }
+                _ => {
+                    return Err(OmsError::InvalidRow {
+                        reason: "incomplete persisted commission evidence".into(),
+                    });
+                }
+            };
             match (
                 row.reserved_spend_asset,
                 row.reserved_receipt_asset,
@@ -325,7 +356,8 @@ impl OrderStore {
                 row.reserved_owned_quantity,
                 row.reserved_reference_price,
             ) {
-                (None, None, None, None, None) if row.reserved_market_buy_cap.is_none() => {}
+                (None, None, None, None, None)
+                    if row.reserved_market_buy_cap.is_none() && commission.is_none() => {}
                 (
                     Some(spend_asset),
                     Some(receipt_asset),
@@ -351,6 +383,7 @@ impl OrderStore {
                             owned_quantity,
                             reference_price,
                             market_buy_cap: row.reserved_market_buy_cap,
+                            commission,
                         },
                     );
                 }
@@ -395,8 +428,8 @@ impl OrderStore {
         let row = OrderRow::from(order);
         let result = sqlx::query(
             "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state,
-                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 leverage = EXCLUDED.leverage,
@@ -430,6 +463,9 @@ impl OrderStore {
         .bind(reservation.map(|r| r.owned_quantity))
         .bind(reservation.map(|r| r.reference_price))
         .bind(reservation.and_then(|r| r.market_buy_cap))
+        .bind(reservation.and_then(|r| r.commission.as_ref().map(|c| c.rate)))
+        .bind(reservation.and_then(|r| r.commission.as_ref().map(|c| c.observed_at)))
+        .bind(reservation.and_then(|r| r.commission.as_ref().and_then(|c| c.discount_asset.as_deref())))
         .execute(&self.pool)
         .await?;
         if result.rows_affected() != 1 {

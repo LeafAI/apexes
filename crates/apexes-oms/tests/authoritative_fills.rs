@@ -335,6 +335,126 @@ async fn fill_above_cap_latches_breach_even_when_total_spend_is_under_budget() {
 
 #[tokio::test]
 #[ignore]
+async fn commission_rate_drives_buy_reservation_and_is_persisted() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    fixture.gateway.set_spot_free_quote(dec!(305));
+    fixture.gateway.set_spot_commission(dec!(0.02), None);
+    assert!(
+        manager
+            .submit_child_order(intent())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient")
+    );
+    fixture.gateway.set_spot_commission(dec!(-0.01), None);
+    assert!(
+        manager
+            .submit_child_order(intent())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("commission evidence")
+    );
+    fixture
+        .gateway
+        .set_spot_commission(dec!(0.002), Some("BNB"));
+    let id = submit(&mut manager).await;
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let evidence: (Decimal,Decimal,chrono::DateTime<Utc>,String) = sqlx::query_as(
+        "SELECT reserved_amount,reserved_commission_rate,reserved_commission_at,reserved_discount_asset FROM orders WHERE id=$1")
+        .bind(id.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(evidence.0, dec!(300.6));
+    assert_eq!(evidence.1, dec!(0.002));
+    assert!(evidence.2 <= Utc::now());
+    assert_eq!(evidence.3, "BNB");
+    drop(manager);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn possible_discount_asset_is_exclusive_across_restart_and_released_at_terminal() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let mut eth = intent();
+    eth.symbol = "ETHUSDT".into();
+    let eth_id = manager.submit_child_order(eth.clone()).await.unwrap();
+    let mut execution = fill("1", dec!(3), 0);
+    execution.fee_currency = Some("ETH".into());
+    fixture
+        .gateway
+        .set_exchange_state(eth_id, OrderStatus::Filled);
+    fixture.gateway.set_fills_for_order(eth_id, vec![execution]);
+    manager.reconcile().await.unwrap();
+    acknowledge(&mut manager, 1).await;
+    fixture.gateway.set_spot_sell_inventory("ETH", dec!(2.99));
+    fixture
+        .gateway
+        .set_spot_commission(dec!(0.002), Some("BNB"));
+    let id = submit(&mut manager).await;
+    drop(manager);
+    let mut restarted = fixture.manager().await;
+    eth.side = Side::Sell;
+    eth.quantity = dec!(1);
+    assert!(
+        restarted
+            .submit_child_order(eth.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reserved or awaiting receipt")
+    );
+    restarted.cancel_order(id).await.unwrap();
+    assert!(restarted.submit_child_order(eth).await.is_ok());
+    drop(restarted);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn possible_base_discount_fee_cannot_consume_unowned_inventory() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let mut bnb = intent();
+    bnb.symbol = "BNBUSDT".into();
+    let id = manager.submit_child_order(bnb.clone()).await.unwrap();
+    let mut execution = fill("1", dec!(3), 0);
+    execution.fee_currency = Some("BNB".into());
+    fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
+    fixture.gateway.set_fills_for_order(id, vec![execution]);
+    manager.reconcile().await.unwrap();
+    acknowledge(&mut manager, 1).await;
+    fixture.gateway.set_spot_sell_inventory("BNB", dec!(2.99));
+    fixture.gateway.set_spot_commission(dec!(0.02), Some("BNB"));
+    bnb.side = Side::Sell;
+    bnb.quantity = dec!(2.99);
+    assert!(
+        manager
+            .submit_child_order(bnb.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("possible base fee")
+    );
+    bnb.quantity = dec!(2.9);
+    let id = manager.submit_child_order(bnb).await.unwrap();
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let amount: Decimal = sqlx::query_scalar("SELECT reserved_amount FROM orders WHERE id=$1")
+        .bind(id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(amount, dec!(2.958));
+    drop(manager);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn shared_quote_reservation_survives_partial_fill_until_terminal_reconciliation() {
     let fixture = Fixture::new().await;
     let mut manager = fixture.manager().await;

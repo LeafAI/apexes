@@ -56,6 +56,30 @@ pub struct OrderExecutionSnapshot {
     pub executed_quantity: Decimal,
 }
 
+/// Undiscounted commission evidence for the requested side. The rate
+/// covers standard, tax and special fees at the more expensive liquidity
+/// role. A discount asset is a possible fee debit, not guaranteed savings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotCommission {
+    pub rate: Decimal,
+    pub observed_at: DateTime<Utc>,
+    pub discount_asset: Option<String>,
+}
+
+impl SpotCommission {
+    pub(crate) fn valid(&self) -> bool {
+        self.rate >= Decimal::ZERO
+            && self.rate < Decimal::ONE
+            && self.discount_asset.as_ref().is_none_or(|asset| {
+                !asset.is_empty()
+                    && asset.len() <= 24
+                    && asset
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            })
+    }
+}
+
 /// Fresh exchange evidence for an exact managed Spot intent. All prices
 /// are in the instrument quote asset; free balances exclude exchange locks.
 #[derive(Debug, Clone)]
@@ -67,6 +91,7 @@ pub struct SpotPreflight {
     pub reference_price: Decimal,
     /// Exchange-enforceable limit price for a managed market-buy intent.
     pub market_buy_cap: Option<Decimal>,
+    pub commission: SpotCommission,
     pub quantity: Decimal,
     pub price: Option<Decimal>,
 }
