@@ -138,8 +138,17 @@ async fn handle_socket(socket: WebSocket, query: MarketQuery, state: AppState) {
     // particular, before the potentially-slow `replay_since` query
     // below) -- see this module's doc comment for why this ordering
     // matters for replay/live continuity.
-    let receiver = state.gateway.subscribe();
-    let (mut sender, _receiver_half) = socket.split();
+    let (snapshots, receiver) = if query.replay_from.is_some() {
+        (Vec::new(), state.gateway.subscribe())
+    } else {
+        state.gateway.subscribe_with_snapshots().await
+    };
+    let (mut sender, mut incoming) = socket.split();
+    for snapshot in snapshots {
+        if !send_event(&mut sender, &snapshot).await {
+            return;
+        }
+    }
 
     if let Some(replay_from) = query.replay_from {
         let Some(reader) = state.storage_reader.as_ref() else {
@@ -170,17 +179,42 @@ async fn handle_socket(socket: WebSocket, query: MarketQuery, state: AppState) {
         }
     }
 
-    // `Lagged` (a slow WS client falling behind the broadcast channel)
-    // is genuinely possible here -- this is the receiver-side consumer
-    // of `Gateway::subscribe()`'s bare `broadcast::Receiver`.
-    // `receiver_into_stream` already implements exactly this
-    // log-and-continue handling (see its own doc comment in
-    // `apexes-message-bus`), so it is reused here rather than
-    // reimplemented.
-    let mut event_stream = apexes_message_bus::receiver_into_stream(receiver);
-    while let Some(event) = event_stream.next().await {
-        if !send_event(&mut sender, &event).await {
-            return;
+    // A lagged connection has lost part of its market history. Close
+    // rather than silently forwarding the suffix as a continuous stream.
+    let mut receiver = receiver;
+    loop {
+        let received = tokio::select! {
+            received = receiver.recv() => received,
+            frame = incoming.next() => {
+                match frame {
+                    Some(Ok(Message::Ping(_))) => {
+                        // Tungstenite queues the automatic Pong while reading.
+                        if sender.flush().await.is_err() { return; }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        match received {
+            Ok(event) => {
+                if !send_event(&mut sender, &event).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "market data client lagged; closing to force recovery"
+                );
+                close_gracefully(&mut sender).await;
+                return;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                close_gracefully(&mut sender).await;
+                return;
+            }
         }
     }
 }
@@ -211,9 +245,9 @@ async fn send_event(
         Err(error) => {
             tracing::warn!(
                 ?error,
-                "apexes-market-data-gateway server: failed to serialize MarketEvent, skipping"
+                "apexes-market-data-gateway server: failed to serialize MarketEvent, closing"
             );
-            return true;
+            return false;
         }
     };
     if sender.send(Message::Text(json.into())).await.is_err() {
@@ -315,5 +349,34 @@ mod tests {
             "{raw}"
         );
         assert!(raw.contains("ok"));
+    }
+    #[tokio::test]
+    async fn quiet_gateway_replies_to_websocket_ping() {
+        let gateway = Arc::new(Gateway::new(Box::new(MockMarketDataProvider::new()), 16));
+        let app = build_app(gateway, None, vec![btc_usdt()]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/market"))
+                .await
+                .unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Ping(
+                vec![1, 2, 3].into(),
+            ))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(pong, tokio_tungstenite::tungstenite::Message::Pong(payload) if payload.as_ref() == [1,2,3])
+        );
+        task.abort();
     }
 }

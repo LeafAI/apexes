@@ -296,3 +296,17 @@ blindly delete the record, mark it rejected, or resubmit. A prior version
 may already have marked a lost-acknowledgement order rejected; the migration
 does not infer its actual exchange outcome. Account-wide risk and
 operator-assisted recovery are later enhancements.
+
+### Market-data recovery (F01.03)
+
+Live staleness monitoring tracks the worst age of configured venue/symbol
+pairs, not just aggregate activity. A heartbeat timeout, malformed frame,
+relay queue overflow, lost broadcast events or explicit depth invalidation
+can halt normal submissions even when another symbol is active. Inspect
+the kill-switch reason and market-data idle metric. The gateway attempts
+reconnection with bounded backoff, sends cached validated depth snapshots
+on reconnect, and resumes incremental updates. Reconnection does not
+automatically authorize new trading. Check data freshness, depth, open
+orders and positions before releasing the halt; do not release it merely
+because a socket has reconnected. Binance testnet depth remains unavailable.
+Full operator recovery gating is planned in F01.05.

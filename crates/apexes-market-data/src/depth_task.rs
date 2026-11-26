@@ -2,7 +2,7 @@ use crate::depth_converter;
 use crate::provider::BinanceExchangeKind;
 use crate::supervised::{self, Flow, Timings};
 use crate::symbol::{split_symbol, symbol_of};
-use apexes_core::{MarketEvent, Venue};
+use apexes_core::{DepthUpdate, MarketEvent, Venue};
 use barter_data::{
     exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
     streams::Streams,
@@ -29,10 +29,22 @@ pub fn run(symbols: Vec<String>, exchange: BinanceExchangeKind, tx: UnboundedSen
         );
         return;
     }
+    let invalidate_tx = tx.clone();
+    let mut attempted = false;
     supervised::run_isolated(
         "depth_task",
         Timings::default(),
-        move || connect(symbols.clone(), exchange),
+        move || {
+            // Outer supervisor replaces half-open connections as well as
+            // failed connections. Invalidate before attempting recovery.
+            if attempted {
+                for symbol in &symbols {
+                    let _ = invalidate_tx.send(invalidate_book(symbol));
+                }
+            }
+            attempted = true;
+            connect(symbols.clone(), exchange, invalidate_tx.clone())
+        },
         move |depth: MarketEvent| {
             if tx.send(depth).is_err() {
                 tracing::warn!("depth_task: output channel closed, stopping");
@@ -47,6 +59,7 @@ pub fn run(symbols: Vec<String>, exchange: BinanceExchangeKind, tx: UnboundedSen
 async fn connect(
     symbols: Vec<String>,
     exchange: BinanceExchangeKind,
+    invalidate_tx: UnboundedSender<MarketEvent>,
 ) -> Option<LocalBoxStream<'static, MarketEvent>> {
     let streams = match exchange {
         BinanceExchangeKind::Spot => {
@@ -81,12 +94,52 @@ async fn connect(
         }
     };
     match streams {
-        Ok(streams) => Some(
+        Ok(streams) => Some({
+            let mut ready = std::collections::HashSet::new();
             streams
                 .select_all()
-                .filter_map(|event| std::future::ready(to_depth(event)))
-                .boxed_local(),
-        ),
+                .scan((), move |_, event| {
+                    use barter_data::streams::reconnect::Event;
+                    let update = match event {
+                        Event::Item(Ok(event)) => {
+                            let symbol = symbol_of(&event.instrument);
+                            let update =
+                                depth_converter::convert(&symbol, Venue::Binance, &event.kind);
+                            if update.is_snapshot {
+                                ready.insert(symbol.clone());
+                            }
+                            Some(
+                                ready
+                                    .contains(&symbol)
+                                    .then_some(MarketEvent::Depth(update)),
+                            )
+                        }
+                        Event::Item(Err(error)) => {
+                            tracing::warn!(
+                                ?error,
+                                "depth stream error; rebuild connection from snapshot"
+                            );
+                            for symbol in &symbols {
+                                let _ = invalidate_tx.send(invalidate_book(symbol));
+                            }
+                            None
+                        }
+                        Event::Reconnecting(exchange) => {
+                            tracing::info!(
+                                ?exchange,
+                                "depth stream reconnecting; rebuild connection from snapshot"
+                            );
+                            for symbol in &symbols {
+                                let _ = invalidate_tx.send(invalidate_book(symbol));
+                            }
+                            None
+                        }
+                    };
+                    std::future::ready(update)
+                })
+                .filter_map(std::future::ready)
+                .boxed_local()
+        }),
         Err(error) => {
             tracing::warn!(
                 ?error,
@@ -97,41 +150,18 @@ async fn connect(
     }
 }
 
-fn to_depth(
-    event: barter_data::streams::reconnect::Event<
-        barter_instrument::exchange::ExchangeId,
-        Result<
-            barter_data::event::MarketEvent<
-                barter_instrument::instrument::market_data::MarketDataInstrument,
-                barter_data::subscription::book::OrderBookEvent,
-            >,
-            barter_data::error::DataError,
-        >,
-    >,
-) -> Option<MarketEvent> {
-    let market_event = match event {
-        barter_data::streams::reconnect::Event::Item(Ok(market_event)) => market_event,
-        barter_data::streams::reconnect::Event::Item(Err(error)) => {
-            tracing::warn!(
-                ?error,
-                "depth_task: received error item from barter-data stream"
-            );
-            return None;
-        }
-        barter_data::streams::reconnect::Event::Reconnecting(exchange) => {
-            tracing::info!(
-                ?exchange,
-                "depth_task: barter-data stream reconnecting (next update will be is_snapshot: true)"
-            );
-            return None;
-        }
-    };
-    let symbol = symbol_of(&market_event.instrument);
-    Some(MarketEvent::Depth(depth_converter::convert(
-        &symbol,
-        Venue::Binance,
-        &market_event.kind,
-    )))
+/// An empty snapshot without an exchange sequence explicitly invalidates
+/// the previously reconstructed book. It is not a tradable quote.
+fn invalidate_book(symbol: &str) -> MarketEvent {
+    MarketEvent::Depth(DepthUpdate {
+        symbol: symbol.to_string(),
+        venue: Venue::Binance,
+        bids: Vec::new(),
+        asks: Vec::new(),
+        sequence: None,
+        is_snapshot: true,
+        timestamp: chrono::Utc::now(),
+    })
 }
 
 /// Builds one subscription tuple per valid symbol via `make_tuple`,

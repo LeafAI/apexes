@@ -67,6 +67,14 @@ pub struct DepthUpdate {
     pub timestamp: DateTime<Utc>,
 }
 
+impl DepthUpdate {
+    /// Explicit upstream book invalidation (F01.03). An empty snapshot
+    /// without a sequence clears any previously synchronized depth.
+    pub fn is_invalidation(&self) -> bool {
+        self.is_snapshot && self.sequence.is_none() && self.bids.is_empty() && self.asks.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PriceLevel {
     pub price: Decimal,

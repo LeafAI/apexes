@@ -27,6 +27,7 @@
 //! sequence) -- see `main.rs`'s own doc comment for the PID file's
 //! authoritative format.
 
+mod book_cache;
 pub mod gateway;
 pub mod persistence;
 pub mod protocol;

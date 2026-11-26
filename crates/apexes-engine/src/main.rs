@@ -845,6 +845,10 @@ async fn run_live_mode(
         &launch_config.gateway_url,
         &launch_config.instruments,
         Some(network),
+        Some((
+            Arc::clone(&kill_switch),
+            stale_data_timeout.unwrap_or(std::time::Duration::from_secs(30)),
+        )),
     )?;
 
     let order_store = OrderStore::new(&ems_postgres_url).await?;
@@ -966,11 +970,15 @@ fn register_gateway_bus_for_all_venues(
     gateway_url: &str,
     instruments: &[Instrument],
     expected_network: Option<apexes_core::binance_network::BinanceNetwork>,
+    live_guard: Option<(Arc<apexes_oms::KillSwitch>, std::time::Duration)>,
 ) -> Result<(), EngineError> {
     let mut provider = GatewayMarketDataProvider::new(gateway_url.to_string())
         .with_token(std::env::var("APEXES_GATEWAY_TOKEN").ok());
     if let Some(network) = expected_network {
         provider = provider.with_expected_network(network);
+    }
+    if let Some((kill_switch, max_event_age)) = live_guard {
+        provider = provider.with_live_guard(kill_switch, max_event_age);
     }
     let bus = Arc::new(MarketEventBus::new(Box::new(provider)));
 
@@ -1089,6 +1097,7 @@ mod tests {
             &registry,
             "ws://localhost:9001/market",
             &instruments,
+            None,
             None,
         )
         .unwrap();

@@ -4,6 +4,7 @@
 //! (an in-process-only broadcast wrapper) -- see this crate's own
 //! `lib.rs` docs and the design spec for the full rationale.
 
+use crate::book_cache::BookCache;
 use crate::persistence::PersistenceBuffer;
 use apexes_core::{ApexesError, Instrument, MarketDataProvider, MarketEvent};
 use futures::StreamExt;
@@ -33,6 +34,7 @@ pub struct Gateway {
     provider: Box<dyn MarketDataProvider>,
     sender: broadcast::Sender<MarketEvent>,
     state: Mutex<ConnectState>,
+    books: Arc<Mutex<BookCache>>,
     /// `None` until/unless `attach_persistence` is called. Shared via
     /// `Arc` (not just `Mutex`) because `connect`'s forwarding loop
     /// runs in its own spawned task that outlives the `&self` borrow
@@ -59,6 +61,7 @@ impl Gateway {
             provider,
             sender,
             state: Mutex::new(ConnectState::NotConnected),
+            books: Arc::new(Mutex::new(BookCache::default())),
             persistence: Arc::new(Mutex::new(None)),
         }
     }
@@ -142,6 +145,7 @@ impl Gateway {
         let mut stream = self.provider.subscribe(instruments).await?;
         let forward_sender = self.sender.clone();
         let persistence = Arc::clone(&self.persistence);
+        let books = Arc::clone(&self.books);
         tokio::spawn(async move {
             while let Some(event) = stream.next().await {
                 // Buffering into `persistence` only appends to an
@@ -155,8 +159,19 @@ impl Gateway {
                 // A `send` error here means every receiver has been
                 // dropped -- nothing left to forward to, not a
                 // failure worth logging.
+                // The cache update and broadcast share the same critical
+                // section as subscribing with a snapshot. No network I/O
+                // takes place under this lock.
+                let mut cache = books.lock().await;
+                if let MarketEvent::Depth(update) = &event
+                    && !cache.apply(update)
+                {
+                    tracing::warn!(symbol = %update.symbol, "discarding depth delta without a valid base or with an old sequence");
+                    continue;
+                }
                 let _ = forward_sender.send(event);
             }
+            books.lock().await.clear();
             tracing::info!("Gateway: upstream provider stream ended, forwarding task exiting");
         });
         *state = ConnectState::Connected;
@@ -168,6 +183,15 @@ impl Gateway {
     /// connection). Can be called before `connect` -- the returned
     /// receiver simply sees no events until `connect` starts
     /// forwarding.
+    /// Atomic snapshot/subscribe boundary: the receiver begins strictly
+    /// after the cached book state. Preserve original exchange timestamps.
+    pub(crate) async fn subscribe_with_snapshots(
+        &self,
+    ) -> (Vec<MarketEvent>, broadcast::Receiver<MarketEvent>) {
+        let books = self.books.lock().await;
+        (books.snapshots(), self.sender.subscribe())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MarketEvent> {
         self.sender.subscribe()
     }
@@ -290,5 +314,46 @@ mod tests {
             1,
             "a rejected second connect() must not touch the upstream provider again"
         );
+    }
+    #[tokio::test]
+    async fn snapshot_subscription_has_no_gap_or_duplicate_delta() {
+        use apexes_core::{DepthUpdate, PriceLevel};
+        let mock = MockMarketDataProvider::new();
+        let handle = mock.handle();
+        let gateway = Gateway::new(Box::new(mock), 16);
+        gateway.connect(&[sample_instrument()]).await.unwrap();
+        let mut witness = gateway.subscribe();
+        let depth = |sequence, is_snapshot, quantity| {
+            MarketEvent::Depth(DepthUpdate {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                sequence: Some(sequence),
+                is_snapshot,
+                bids: vec![PriceLevel {
+                    price: dec!(100),
+                    quantity,
+                }],
+                asks: vec![PriceLevel {
+                    price: dec!(101),
+                    quantity: dec!(1),
+                }],
+                timestamp: chrono::Utc::now(),
+            })
+        };
+        for event in [depth(10, true, dec!(1)), depth(15, false, dec!(2))] {
+            handle.push_event(event.clone());
+            assert_eq!(witness.recv().await.unwrap(), event);
+        }
+        let (snapshots, mut subscriber) = gateway.subscribe_with_snapshots().await;
+        assert_eq!(snapshots.len(), 1);
+        let MarketEvent::Depth(snapshot) = &snapshots[0] else {
+            panic!("expected snapshot")
+        };
+        assert!(snapshot.is_snapshot);
+        assert_eq!(snapshot.sequence, Some(15));
+        assert_eq!(snapshot.bids[0].quantity, dec!(2));
+        let next = depth(20, false, dec!(3));
+        handle.push_event(next.clone());
+        assert_eq!(subscriber.recv().await.unwrap(), next);
     }
 }

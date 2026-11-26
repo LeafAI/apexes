@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (reliable submission qualification)_
+_Last updated: 2026-11-26 (market-data recovery qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)). Next: F01.03 market-data recovery, then remaining safety/reliability and configurable costs. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)). Next: F01.04 EMS database decoupling. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -77,10 +77,20 @@ stopped afterwards. Five new tests cover interrupted submission, durable
 explicit rejection, late fill recovery after restart, ambiguous Binance
 errors, and false negative lookup responses. An existing age-expiry
 regression now tests conservative unknown-outcome retention. No real
-exchange orders were placed. Remote CI and remaining external qualification
-are pending. Same-instrument guarding is scoped to one OMS and its recovered
+exchange orders were placed. PR #16 passed CI and merged; remaining live-network qualification is pending. Same-instrument guarding is scoped to one OMS and its recovered
 database; account-wide capital reservations, durable ledger delivery and
 operator health controls are later features.
+
+F01.03 local qualification (Rust 1.99.0, locked): workspace build,
+formatting, Clippy with warnings denied, 78 test binaries (1,318 passed,
+0 failed, 78 ignored), and 30 doc-test suites passed. The default
+database-dependent tests ran against a temporary isolated PostgreSQL 17
+instance, stopped afterwards. Eight new tests cover per-symbol freshness,
+old/future timestamps, malformed frames, queue overflow, silent sockets,
+book reconstruction, atomic snapshot/subscription continuity and Ping/Pong.
+Remote CI and ignored external tests remain pending. No real exchange
+orders were placed. Operator-controlled release is retained; stronger
+session-health recovery gates belong to F01.05.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 
