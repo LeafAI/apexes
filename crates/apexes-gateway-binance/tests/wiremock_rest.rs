@@ -44,9 +44,25 @@ async fn gateway_against(mock_server: &MockServer) -> BinanceExecutionGateway {
     })
 }
 
+async fn mount_clock(server: &MockServer) {
+    for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(time_path))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                )
+            })
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
 #[tokio::test]
 async fn submit_order_sends_signed_request_with_client_order_id() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("POST"))
@@ -73,6 +89,7 @@ async fn submit_order_sends_signed_request_with_client_order_id() {
 #[tokio::test]
 async fn submit_order_request_includes_a_signature_parameter() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("POST"))
@@ -100,6 +117,7 @@ async fn submit_order_request_includes_a_signature_parameter() {
 #[tokio::test]
 async fn submit_order_maps_explicit_binance_rejection_to_rejected_outcome() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("POST"))
@@ -124,6 +142,7 @@ async fn submit_order_maps_explicit_binance_rejection_to_rejected_outcome() {
 #[tokio::test]
 async fn submit_order_maps_server_error_to_uncertain_outcome() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("POST"))
@@ -142,6 +161,7 @@ async fn submit_order_maps_server_error_to_uncertain_outcome() {
 #[tokio::test]
 async fn submit_order_maps_unparseable_success_body_to_uncertain_outcome() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("POST"))
@@ -160,6 +180,7 @@ async fn submit_order_maps_unparseable_success_body_to_uncertain_outcome() {
 #[tokio::test]
 async fn submit_order_routes_perpetual_orders_to_futures_path() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.asset_class = AssetClass::Perpetual;
@@ -187,6 +208,7 @@ async fn submit_order_routes_perpetual_orders_to_futures_path() {
 #[tokio::test]
 async fn query_all_open_orders_parses_client_order_id_back_into_order_id() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
 
     Mock::given(method("GET"))
@@ -223,6 +245,7 @@ async fn query_all_open_orders_parses_client_order_id_back_into_order_id() {
 #[tokio::test]
 async fn query_all_open_orders_skips_unparseable_entries_without_losing_the_rest() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let good_order_id = Uuid::new_v4();
 
     Mock::given(method("GET"))
@@ -267,6 +290,7 @@ async fn query_all_open_orders_skips_unparseable_entries_without_losing_the_rest
 #[tokio::test]
 async fn query_fills_for_order_parses_trade_list() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.exchange_order_id = Some("777".to_string());
@@ -303,6 +327,7 @@ async fn query_fills_for_order_parses_trade_list() {
 #[tokio::test]
 async fn cancel_order_sends_symbol_and_order_id() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.exchange_order_id = Some("321".to_string());
@@ -332,6 +357,7 @@ async fn cancel_order_sends_symbol_and_order_id() {
 #[tokio::test]
 async fn cancel_order_with_no_exchange_order_id_is_rejected_without_a_network_call() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let order = sample_order(order_id); // exchange_order_id is None
 
@@ -349,6 +375,7 @@ async fn cancel_order_with_no_exchange_order_id_is_rejected_without_a_network_ca
 #[tokio::test]
 async fn submit_order_uses_spot_stop_loss_type_names_on_spot() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.order_type = OrderType::StopLimit;
@@ -375,6 +402,7 @@ async fn submit_order_uses_spot_stop_loss_type_names_on_spot() {
 #[tokio::test]
 async fn submit_order_uses_futures_stop_market_type_names_on_perpetual() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.asset_class = AssetClass::Perpetual;
@@ -407,6 +435,7 @@ async fn submit_order_uses_futures_stop_market_type_names_on_perpetual() {
 #[tokio::test]
 async fn submit_order_uses_futures_stop_limit_type_name_on_perpetual() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let order_id = Uuid::new_v4();
     let mut order = sample_order(order_id);
     order.asset_class = AssetClass::Perpetual;
@@ -440,6 +469,7 @@ async fn submit_order_uses_futures_stop_limit_type_name_on_perpetual() {
 #[tokio::test]
 async fn query_order_by_client_id_returns_exchange_id_and_status() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let id = Uuid::new_v4();
     Mock::given(method("GET"))
         .and(path("/api/v3/order"))
@@ -462,6 +492,7 @@ async fn query_order_by_client_id_returns_exchange_id_and_status() {
 #[tokio::test]
 async fn query_order_by_client_id_maps_binance_order_does_not_exist_to_none() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/api/v3/order"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -483,6 +514,7 @@ async fn query_order_by_client_id_maps_binance_order_does_not_exist_to_none() {
 #[tokio::test]
 async fn query_order_by_client_id_errors_on_other_failures_instead_of_claiming_unknown() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/api/v3/order"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -504,6 +536,7 @@ async fn query_order_by_client_id_errors_on_other_failures_instead_of_claiming_u
 #[tokio::test]
 async fn count_foreign_open_orders_counts_only_orders_not_placed_by_this_system() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
     let ours = Uuid::new_v4().to_string();
     Mock::given(method("GET"))
         .and(path("/api/v3/openOrders"))

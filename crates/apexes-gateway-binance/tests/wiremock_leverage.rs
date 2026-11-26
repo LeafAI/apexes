@@ -43,9 +43,25 @@ async fn gateway_against(mock_server: &MockServer) -> BinanceExecutionGateway {
     })
 }
 
+async fn mount_clock(server: &MockServer) {
+    for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(time_path))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                )
+            })
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
 #[tokio::test]
 async fn submit_order_sets_margin_type_and_leverage_before_submitting() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/fapi/v1/marginType"))
@@ -86,6 +102,7 @@ async fn submit_order_sets_margin_type_and_leverage_before_submitting() {
 #[tokio::test]
 async fn submit_order_does_not_re_set_leverage_for_the_same_symbol_and_settings() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/fapi/v1/marginType"))
@@ -118,6 +135,7 @@ async fn submit_order_does_not_re_set_leverage_for_the_same_symbol_and_settings(
 #[tokio::test]
 async fn submit_order_is_rejected_without_submitting_when_leverage_setup_fails() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/fapi/v1/marginType"))
