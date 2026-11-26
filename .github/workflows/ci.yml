@@ -81,8 +81,24 @@ jobs:
           cargo test -p apexes-backtest --locked --test live_storage_backtest -- --ignored --test-threads=1
           cargo test -p apexes-market-data-gateway --locked --test live_clickhouse -- --ignored --test-threads=1
           cargo test -p apexes-engine --locked --test backtest_subprocess -- --ignored --test-threads=1
-      # Everything else: hermetic. apexes-chart's render tests need a GPU
-      # adapter, which hosted runners lack.
+      # egui_kittest uses wgpu to render the UI layout regressions. Hosted
+      # Linux runners have no physical GPU, so provision Mesa's headless
+      # CPU Vulkan driver (lavapipe) rather than skipping those assertions.
+      - name: Configure headless Vulkan renderer
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          icd="$(dpkg -L mesa-vulkan-drivers | grep -E '/lvp_icd[^/]*\.json$' | head -n 1)"
+          test -f "$icd"
+          runtime_dir="$(mktemp -d "$RUNNER_TEMP/apexes-xdg.XXXXXX")"
+          chmod 700 "$runtime_dir"
+          export VK_DRIVER_FILES="$icd" WGPU_BACKEND=vulkan XDG_RUNTIME_DIR="$runtime_dir"
+          vulkaninfo --summary
+          printf 'VK_DRIVER_FILES=%s\nWGPU_BACKEND=%s\nXDG_RUNTIME_DIR=%s\n' \
+            "$VK_DRIVER_FILES" "$WGPU_BACKEND" "$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+      # Keep the existing chart-crate exclusion; the UI pixel-level
+      # regressions in apexes-ui remain enabled and exercise real rendering.
       - name: Remaining workspace tests
         run: >-
           cargo test --workspace --locked

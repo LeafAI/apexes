@@ -1,0 +1,193 @@
+// TESTNET ONLY. Long-only mean reversion for a RANGING market, Binance Spot.
+//
+// NOT a profit machine, and not proven to make money. Replayed on two weeks of
+// real ETHUSDT testnet trades (284,000 prints, split into a tuning half and an
+// untouched test half) it showed no edge that survived small changes to fill
+// timing, and at a mainnet-like 0.1% fee per side it loses. It exists to trade
+// often (about 25 round trips a day on ETH) so the platform, the orders panel
+// and the risk limits get exercised, with the risk controls below. The
+// testnet charges no fees, which is the only reason it can look fine there.
+//
+// Idea
+//   Price wanders around a rolling average. Buy when it is `entry_z` standard
+//   deviations BELOW the average and at least `min_edge_pct` percent under it
+//   (a dip worth more than the noise), sell when it gets back to the average,
+//   or on a stop, or after `max_hold` accepted trades.
+//
+// Glitch guard (the part that matters most on the testnet)
+//   The testnet feed prints garbage now and then (a burst of trades hundreds of
+//   dollars off the market). About 0.4% of prints. A strategy that believes
+//   them buys a "crash" that never happened. Any print more than `guard_pct`
+//   percent from a slow average of ACCEPTED prices is ignored and feeds nothing.
+//   If `guard_resync` prints in a row are rejected the market really moved, and
+//   the guard re-anchors on the new price.
+//
+// Brakes
+//   * one working order at a time, `order_gap` accepted trades between orders,
+//   * `cooldown` accepted trades after an exit before the next entry,
+//   * `max_entries` entries per session: the launch config's daily order limit
+//     (50 by default) counts buys AND sells, and a strategy that has spent it
+//     cannot sell. 20 entries is at most 40 orders. Raise the limit before
+//     raising this.
+//
+// Periods are counted in TRADES, not minutes. The window length (600) is fixed
+// at load; everything below is tunable from the console while running.
+//
+//   notional      USDT to hold when long (5 minimum on the testnet)
+//   step          smallest quantity increment (0.0001 for ETHUSDT; the engine
+//                 also rounds to the symbol's real step)
+//   enabled       1 = trade, 0 = sell what is held and stay flat
+//   entry_z       dip, in standard deviations, needed to buy
+//   min_edge_pct  dip, in percent under the average, needed to buy
+//   stop_pct      stop loss, % below the average entry price
+//   max_hold      accepted trades to hold before giving up on a reversion
+//   cooldown      accepted trades to wait after an exit
+//   order_gap     minimum accepted trades between any two orders
+//   max_entries   most entries per session (0 = no new entries)
+//   guard_pct     ignore prints this far (%) from the slow average of accepted
+//   guard_resync  rejected prints in a row after which the guard re-anchors
+//   min_notional  positions worth less than this (USDT) count as dust
+//
+// Assumes a single symbol per session: the indicators are shared.
+
+let mean_ind = indicators.sma(600);
+let dev_ind = indicators.stddev(600);
+
+// Script state. Persists between events in the script's top-level scope.
+let guard_px = null;
+let guard_rejects = 0;
+let seen = 0;
+let last_order_at = -1000000;
+let cooldown_until = 0;
+let entry_at = 0;
+let entries_sent = 0;
+
+function on_market_event(event, ctx) {
+  if (event.type != "trade") {
+    return [];
+  }
+
+  let notional = param("notional", 50);
+  let step = param("step", 0.0001);
+  let enabled = param("enabled", 1);
+  let entry_z = param("entry_z", 2.0);
+  let min_edge = param("min_edge_pct", 0.1);
+  let stop_pct = param("stop_pct", 0.5);
+  let max_hold = param("max_hold", 2000);
+  let cooldown = param("cooldown", 20);
+  let order_gap = param("order_gap", 5);
+  let max_entries = param("max_entries", 20);
+  let guard_pct = param("guard_pct", 1.0);
+  let guard_resync = param("guard_resync", 30);
+  let min_notional = param("min_notional", 6);
+
+  let price = event.price;
+
+  // ---- Glitch guard: runs first, and a rejected print feeds nothing ----
+  if (guard_px == null) {
+    guard_px = price;
+  } else {
+    let off_pct = math.abs(price / guard_px - 1) * 100;
+    if (off_pct > guard_pct) {
+      guard_rejects = guard_rejects + 1;
+      if (guard_rejects < guard_resync) {
+        return [];
+      }
+      // The market really moved: re-anchor on it and accept this print.
+      guard_px = price;
+      guard_rejects = 0;
+    } else {
+      guard_rejects = 0;
+      guard_px = guard_px + (price - guard_px) * 2 / 201;
+    }
+  }
+
+  seen = seen + 1;
+  let mean = mean_ind.update(price);
+  let dev = dev_ind.update(price);
+  if (mean == null) {
+    return [];
+  }
+  if (dev == null) {
+    return [];
+  }
+
+  if (ctx.has_open_order(event.symbol)) {
+    return [];
+  }
+  if (seen - last_order_at < order_gap) {
+    return [];
+  }
+
+  let z = 0;
+  if (dev > 0) {
+    z = (price - mean) / dev;
+  }
+
+  let position = ctx.get_position(event.symbol);
+  let held = position.quantity;
+  let in_position = held * price >= min_notional;
+
+  // ---- Exit ----
+  if (in_position) {
+    let entry = position.average_entry_price;
+    let hit_stop = entry > 0 && price <= entry * (1 - stop_pct / 100);
+    let reverted = z >= 0;
+    let timed_out = seen - entry_at >= max_hold;
+    let switched_off = enabled <= 0;
+
+    if (hit_stop || reverted || timed_out || switched_off) {
+      // Round DOWN to whole steps; the epsilon only absorbs float residue.
+      let sell_qty = math.floor(held / step + 0.000001) * step;
+      if (sell_qty <= 0) {
+        return [];
+      }
+      last_order_at = seen;
+      cooldown_until = seen + cooldown;
+      return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "sell",
+        order_type: "market",
+        quantity: sell_qty,
+      }];
+    }
+    return [];
+  }
+
+  // ---- Entry ----
+  if (enabled <= 0) {
+    return [];
+  }
+  if (entries_sent >= max_entries) {
+    return [];
+  }
+  if (seen < cooldown_until) {
+    return [];
+  }
+  if (z > 0 - entry_z) {
+    return [];
+  }
+  let edge_pct = (mean - price) / price * 100;
+  if (edge_pct < min_edge) {
+    return [];
+  }
+
+  let buy_qty = math.floor(notional / price / step + 0.000001) * step;
+  if (buy_qty <= 0) {
+    return [];
+  }
+
+  entries_sent = entries_sent + 1;
+  last_order_at = seen;
+  entry_at = seen;
+  return [{
+    symbol: event.symbol,
+    venue: event.venue,
+    asset_class: "spot",
+    side: "buy",
+    order_type: "market",
+    quantity: buy_qty,
+  }];
+}

@@ -112,6 +112,17 @@ pub struct UnifiedLoopConfig {
     /// silent no-op: no command draining, no pause gating, no
     /// snapshot pushes.
     pub control: Option<ControlHandle>,
+    /// A last price per symbol known before the first event (live startup
+    /// asks the exchange). Without it an asset the account holds is valued at
+    /// the ledger's 1.0 placeholder until its first trade arrives, which on a
+    /// quiet market can be minutes. Empty for backtest/paper.
+    pub initial_prices: HashMap<String, Decimal>,
+    /// The exchange's trading rules per symbol (quantity step, minimums, tick).
+    /// Every order is conformed to its symbol's rules before the risk check,
+    /// and one that cannot be made valid is refused with the reason. A symbol
+    /// without an entry is sent as the strategy asked, and the exchange
+    /// decides. Empty for backtest/paper.
+    pub symbol_rules: HashMap<String, apexes_core::SymbolRules>,
 }
 
 /// Runs the unified event loop: consumes `market_events` in order
@@ -167,6 +178,10 @@ pub async fn run_unified_event_loop(
         .map(|instrument| (instrument.symbol.clone(), instrument.clone()))
         .collect();
 
+    // What the account held before the session traded: the baseline the
+    // strategy's PnL is separated from. Taken here, before any fill moves a
+    // balance (the start equity is fixed after the first event's fills).
+    let starting_balances = config.initial_balances.clone();
     let mut ledger = PortfolioLedger::new(instruments_by_symbol.clone(), config.initial_balances)
         .with_positions(config.initial_positions);
     // A minimal, zero-fee `CostModel` existing solely to carry
@@ -186,7 +201,9 @@ pub async fn run_unified_event_loop(
     let mut overall_tracker = PerformanceTracker::new(config.risk_free_return);
     let mut per_symbol_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
     let mut per_venue_trackers: HashMap<String, PerformanceTracker> = HashMap::new();
-    let mut last_prices: HashMap<String, Decimal> = HashMap::new();
+    let mut last_prices: HashMap<String, Decimal> =
+        seeded_last_prices(&config.initial_prices, &instruments_by_symbol);
+    let mut price_history = crate::history::PriceHistory::new();
     let mut mark_prices: HashMap<String, Decimal> = HashMap::new();
     let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut all_fills: Vec<Fill> = Vec::new();
@@ -195,6 +212,11 @@ pub async fn run_unified_event_loop(
     let mut control = config.control;
     // Only built for sessions with a control handle: `control: None` stays
     // a true no-op (no extra state, no extra work per tick).
+    // What the operator sees under "Recent orders". Only kept when a console
+    // can be watching (a `control` handle), like the evaluation tracker.
+    let mut order_log = control
+        .as_ref()
+        .map(|_| crate::order_log::OrderLog::default());
     let mut evaluation = control
         .as_ref()
         .map(|handle| crate::evaluation::EvaluationTracker::new(handle.limit_spec()));
@@ -253,6 +275,11 @@ pub async fn run_unified_event_loop(
                     let initial_equity = ledger.equity(&last_prices)?;
                     overall_tracker.record_equity_point(event_timestamp(&event), initial_equity);
                     recorded_initial_equity = true;
+                    // The exchange's prices from before the first event are
+                    // real observations: the charts start from them.
+                    for (symbol, price) in &config.initial_prices {
+                        price_history.record(symbol, event_timestamp(&event), *price);
+                    }
                 }
 
                 let timestamp = event_timestamp(&event);
@@ -276,6 +303,9 @@ pub async fn run_unified_event_loop(
                     }
                 })?;
                 if !ems_fills.is_empty() {
+                    if let Some(log) = &mut order_log {
+                        log.filled(&ems_fills);
+                    }
                     apply_fills(
                         &mut ledger,
                         &mut overall_tracker,
@@ -312,6 +342,7 @@ pub async fn run_unified_event_loop(
                 // was inserted before `MatchingEngine::on_trade_event`).
                 match &event {
                     MarketEvent::Trade(trade) => {
+                        price_history.record(&trade.symbol, trade.timestamp, trade.price);
                         if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
                             && let Some(base) = &instrument.base_currency
                         {
@@ -560,6 +591,32 @@ pub async fn run_unified_event_loop(
                 };
 
                 for intent in intents {
+                    // Make the order valid for its symbol (round the quantity
+                    // down to the exchange's step, the price to its tick) before
+                    // anything judges it: the risk checks must see the order
+                    // that will really be sent, and one that cannot be made
+                    // valid is refused here, with the reason, not sent to be
+                    // refused by the exchange.
+                    let intent = match conform_to_rules(
+                        &intent,
+                        &config.symbol_rules,
+                        &instruments_by_symbol,
+                        &last_prices,
+                    ) {
+                        Ok(conformed) => conformed,
+                        Err(reason) => {
+                            tracing::warn!(
+                                symbol = %intent.symbol,
+                                quantity = %intent.quantity,
+                                %reason,
+                                "order refused: it cannot satisfy the exchange's trading rules"
+                            );
+                            if let Some(log) = &mut order_log {
+                                record_refusal(log, &intent, timestamp, &reason);
+                            }
+                            continue;
+                        }
+                    };
                     // Re-fetched per intent (not reusing `open_orders`
                     // above): the former loop's own map was updated as
                     // each intent was submitted, so a later intent's risk
@@ -582,6 +639,9 @@ pub async fn run_unified_event_loop(
                         )
                     {
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
+                        if let Some(log) = &mut order_log {
+                            record_refusal(log, &intent, timestamp, &join_violations(&violations));
+                        }
                         continue;
                     }
                     if let Some((pre_trade, _, _)) = &market_condition_monitor
@@ -594,6 +654,9 @@ pub async fn run_unified_event_loop(
                         )
                     {
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
+                        if let Some(log) = &mut order_log {
+                            record_refusal(log, &intent, timestamp, &join_violations(&violations));
+                        }
                         continue;
                     }
 
@@ -640,7 +703,11 @@ pub async fn run_unified_event_loop(
                         .submit(&intent, ledger.positions(), ledger.balances(), timestamp)
                         .await
                     {
-                        Ok((_order, fills)) => {
+                        Ok((order, fills)) => {
+                            if let Some(log) = &mut order_log {
+                                log.submitted(&order);
+                                log.filled(&fills);
+                            }
                             // Accepted for execution: only now does the order use up
                             // daily allowance. An order the exchange rejects never does,
                             // so a strategy sending rejected orders cannot exhaust the
@@ -683,6 +750,9 @@ pub async fn run_unified_event_loop(
                                 quantity = %intent.quantity,
                                 "order submission rejected"
                             );
+                            if let Some(log) = &mut order_log {
+                                record_refusal(log, &intent, timestamp, &error.to_string());
+                            }
                         }
                     }
                 }
@@ -696,12 +766,20 @@ pub async fn run_unified_event_loop(
                     && !matches!(event, MarketEvent::Bar(_))
                 {
                     tracker.observe_fills(&all_fills);
-                    tracker.record_equity(
+                    let started = tracker.record_equity_at(
                         timestamp,
                         equity,
                         ledger.positions().values().any(|p| !p.quantity.is_zero()),
                         holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                        &last_prices,
                     );
+                    if started {
+                        tracker.set_baseline(starting_holdings(
+                            &starting_balances,
+                            &last_prices,
+                            &instruments_by_symbol,
+                        ));
+                    }
                 }
 
                 if let Some(handle) = &mut control {
@@ -725,23 +803,42 @@ pub async fn run_unified_event_loop(
                         open_orders.sort_by_key(|o| o.created_at);
                         let (evaluation_summary, equity_history) = match &evaluation {
                             Some(tracker) => {
-                                let (gross_exposure, max_abs_position) = exposure_inputs(
+                                let (position_exposure, max_abs_position) = exposure_inputs(
                                     ledger.positions(),
                                     &last_prices,
                                     &instruments_by_symbol,
                                 );
+                                // Exposure is what the account has at risk to
+                                // price moves: its non-cash holdings, which
+                                // include a pre-existing balance the strategy
+                                // never traded (the positions alone miss it).
+                                let gross_exposure = position_exposure.max(holdings_value(
+                                    ledger.balances(),
+                                    &last_prices,
+                                    &instruments_by_symbol,
+                                ));
                                 let realized: Decimal = ledger.realized_pnl().values().copied().sum();
                                 (
-                                    Some(tracker.summary(
+                                    Some(tracker.summary_at(
                                         equity,
                                         realized,
                                         gross_exposure,
                                         max_abs_position,
+                                        &last_prices,
                                     )),
                                     tracker.equity_history(),
                                 )
                             }
                             None => (None, Vec::new()),
+                        };
+                        let recent_orders = match &mut order_log {
+                            Some(log) => {
+                                let open_ids: std::collections::HashSet<String> =
+                                    open_orders.iter().map(|o| o.id.clone()).collect();
+                                log.sync_open(timestamp, &open_ids);
+                                log.view(crate::order_log::ORDER_LOG_CAP)
+                            }
+                            None => Vec::new(),
                         };
                         let snapshot = SessionSnapshot {
                             identity: handle.identity(),
@@ -755,6 +852,14 @@ pub async fn run_unified_event_loop(
                             params: strategy.current_params(),
                             paused: handle.is_paused(),
                             open_orders,
+                            recent_orders,
+                            price_history: price_history
+                                .view(crate::evaluation::SNAPSHOT_HISTORY_POINTS),
+                            equity_priced: holdings_priced(
+                                ledger.balances(),
+                                &last_prices,
+                                &instruments_by_symbol,
+                            ),
                             timestamp,
                         };
                         handle.maybe_push_snapshot(snapshot);
@@ -787,6 +892,9 @@ pub async fn run_unified_event_loop(
                 if fills.is_empty() {
                     continue;
                 }
+                if let Some(log) = &mut order_log {
+                    log.filled(&fills);
+                }
                 apply_supplemental_fills(
                     &mut ledger,
                     &mut overall_tracker,
@@ -802,12 +910,20 @@ pub async fn run_unified_event_loop(
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {
                     tracker.observe_fills(&all_fills);
-                    tracker.record_equity(
+                    let started = tracker.record_equity_at(
                         now,
                         equity,
                         ledger.positions().values().any(|p| !p.quantity.is_zero()),
                         holdings_priced(ledger.balances(), &last_prices, &instruments_by_symbol),
+                        &last_prices,
                     );
+                    if started {
+                        tracker.set_baseline(starting_holdings(
+                            &starting_balances,
+                            &last_prices,
+                            &instruments_by_symbol,
+                        ));
+                    }
                 }
             }
         }
@@ -850,6 +966,47 @@ fn priced_for_risk_check(
     }
 }
 
+/// `intent` with its quantity (and limit price) made valid for its symbol's
+/// exchange rules. A symbol with no rules comes back unchanged. `Err` is the
+/// reason the order cannot be made valid, for the order log.
+fn conform_to_rules(
+    intent: &apexes_strategy::OrderIntent,
+    rules: &HashMap<String, apexes_core::SymbolRules>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+    last_prices: &HashMap<String, Decimal>,
+) -> Result<apexes_strategy::OrderIntent, String> {
+    let Some(rule) = rules.get(&intent.symbol) else {
+        return Ok(intent.clone());
+    };
+    let reference = instruments_by_symbol
+        .get(&intent.symbol)
+        .and_then(|instrument| instrument.base_currency.as_ref())
+        .and_then(|base| last_prices.get(base).copied());
+    rule.conform(intent.side, intent.quantity, intent.price, reference)
+        .map(|conformed| apexes_strategy::OrderIntent {
+            quantity: conformed.quantity,
+            price: conformed.price,
+            ..intent.clone()
+        })
+        .map_err(|violation| violation.to_string())
+}
+
+/// The seeded prices keyed the way the loop keeps them (by base asset), for
+/// the symbols the session actually trades. A non-positive price is ignored.
+fn seeded_last_prices(
+    initial_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> HashMap<String, Decimal> {
+    initial_prices
+        .iter()
+        .filter(|(_, price)| **price > Decimal::ZERO)
+        .filter_map(|(symbol, price)| {
+            let base = instruments_by_symbol.get(symbol)?.base_currency.clone()?;
+            Some((base, *price))
+        })
+        .collect()
+}
+
 /// True when every non-zero balance is either a quote currency of a traded
 /// instrument or has a last trade price. The ledger values an asset with no
 /// price at 1.0, so until this holds `ledger.equity` is not a real number.
@@ -865,6 +1022,76 @@ fn holdings_priced(
                 .values()
                 .any(|i| i.quote_currency.as_deref() == Some(asset.as_str()))
     })
+}
+
+/// Records an order that was refused, with its reason. The refused intent never
+/// became an `Order`, so it gets an id of its own to be listed by.
+fn record_refusal(
+    log: &mut crate::order_log::OrderLog,
+    intent: &apexes_strategy::OrderIntent,
+    at: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) {
+    log.rejected(
+        uuid::Uuid::new_v4().to_string(),
+        at,
+        &intent.symbol,
+        &format!("{:?}", intent.side),
+        &format!("{:?}", intent.order_type),
+        intent.quantity,
+        intent.price,
+        reason.to_string(),
+    );
+}
+
+fn join_violations(violations: &[apexes_risk::RiskViolation]) -> String {
+    violations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The non-cash assets the account holds, with the price each has now.
+/// A quote currency of a traded instrument is cash; so is anything without a
+/// price (its value is unknown, so it cannot be attributed a PnL).
+fn starting_holdings(
+    balances: &HashMap<String, Decimal>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> Vec<crate::evaluation::BaselineHolding> {
+    let is_cash = |asset: &str| {
+        instruments_by_symbol
+            .values()
+            .any(|i| i.quote_currency.as_deref() == Some(asset))
+    };
+    let mut holdings: Vec<_> = balances
+        .iter()
+        .filter(|(asset, balance)| !balance.is_zero() && !is_cash(asset))
+        .filter_map(|(asset, balance)| {
+            last_prices
+                .get(asset)
+                .map(|price| crate::evaluation::BaselineHolding {
+                    asset: asset.clone(),
+                    quantity: *balance,
+                    price: *price,
+                })
+        })
+        .collect();
+    holdings.sort_by(|a, b| a.asset.cmp(&b.asset));
+    holdings
+}
+
+/// Current value, in quote currency, of the non-cash assets held.
+fn holdings_value(
+    balances: &HashMap<String, Decimal>,
+    last_prices: &HashMap<String, Decimal>,
+    instruments_by_symbol: &HashMap<String, Instrument>,
+) -> Decimal {
+    starting_holdings(balances, last_prices, instruments_by_symbol)
+        .iter()
+        .map(|h| h.quantity * h.price)
+        .sum()
 }
 
 /// Gross exposure (sum of |position value| in quote currency) and the
@@ -1062,6 +1289,112 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
+    fn spot_btcusdt() -> Instrument {
+        Instrument {
+            asset_class: AssetClass::Spot,
+            ..btcusdt_perpetual_instrument()
+        }
+    }
+
+    fn live_fill(side: Side, quantity: Decimal, fee: Decimal, fee_currency: &str) -> Fill {
+        Fill {
+            id: apexes_core::FillId(uuid::Uuid::new_v4()),
+            order_id: apexes_core::OrderId(uuid::Uuid::new_v4()),
+            symbol: "BTCUSDT".to_string(),
+            venue: apexes_core::Venue::Binance,
+            side,
+            price: dec!(60000),
+            quantity,
+            fee,
+            fee_currency: Some(fee_currency.to_string()),
+            filled_at: Utc::now(),
+            leverage: None,
+            margin_mode: None,
+        }
+    }
+
+    /// Applies exchange-reported fills the way the live loop does and returns
+    /// the ledger and the overall tracker.
+    fn apply_live_fills(
+        balances: &[(&str, Decimal)],
+        fills: Vec<Fill>,
+    ) -> (PortfolioLedger, Vec<Fill>) {
+        let mut ledger = PortfolioLedger::new(
+            HashMap::from([("BTCUSDT".to_string(), spot_btcusdt())]),
+            balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
+        );
+        let mut tracker = PerformanceTracker::new(Decimal::ZERO);
+        let mut all_fills = Vec::new();
+        apply_supplemental_fills(
+            &mut ledger,
+            &mut tracker,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut None,
+            &mut all_fills,
+            fills,
+            Decimal::ZERO,
+        );
+        (ledger, all_fills)
+    }
+
+    /// The reported risk: a mainnet account that pays fees in BNB. The ledger
+    /// used to refuse the fill ("required 0.0004 BNB, available 0"), and this
+    /// loop logged and skipped it, so the session's position, balances and PnL
+    /// stopped matching the exchange.
+    #[test]
+    fn a_fill_whose_fee_is_paid_in_bnb_still_reaches_the_ledger_and_the_fee_total() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![live_fill(Side::Buy, dec!(0.5), dec!(0.0004), "BNB")],
+        );
+        assert_eq!(fills.len(), 1, "the fill was not skipped");
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+        assert_eq!(ledger.balances()["USDT"], dec!(70000));
+        // The evaluation's fee total reads the same fill list, so the BNB
+        // fee is reported in its own currency.
+        let mut evaluation =
+            crate::evaluation::EvaluationTracker::new(crate::evaluation::LimitSpec {
+                max_position_per_symbol: None,
+                max_daily_fills: None,
+            });
+        evaluation.observe_fills(&fills);
+        let summary = evaluation.summary(dec!(0), dec!(0), dec!(0), dec!(0));
+        assert_eq!(summary.fees_paid["BNB"], dec!(0.0004));
+    }
+
+    /// Binance's default fee is a slice of what was just bought.
+    #[test]
+    fn a_fill_whose_fee_is_taken_from_the_asset_bought_reaches_the_ledger() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![live_fill(Side::Buy, dec!(0.5), dec!(0.0005), "BTC")],
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.4995));
+    }
+
+    /// The safety net stays: a fill the ledger truly cannot afford is still
+    /// skipped (logged), and the ones before and after it are unaffected.
+    #[test]
+    fn a_genuinely_unaffordable_fill_is_still_skipped_without_blocking_the_rest() {
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![
+                live_fill(Side::Buy, dec!(0.5), dec!(0), "BTC"),
+                live_fill(Side::Sell, dec!(5), dec!(0), "USDT"), // sells 5 BTC, holds 0.5
+                live_fill(Side::Buy, dec!(0.1), dec!(0), "BTC"),
+            ],
+        );
+        // The ledger took the first and last and refused the middle one, which
+        // would have sold 5 BTC out of 0.5 (the fill list keeps all three: it
+        // is the record of what the exchange reported).
+        assert_eq!(fills.len(), 3);
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.6));
+        assert_eq!(ledger.balances()["BTC"], dec!(0.6));
+        assert_eq!(ledger.balances()["USDT"], dec!(100000) - dec!(36000));
+    }
+
     fn btcusdt_perpetual_instrument() -> Instrument {
         Instrument {
             symbol: "BTCUSDT".to_string(),
@@ -1243,6 +1576,8 @@ mod tests {
             margin_tiers,
             market_condition_config: None,
             control: None,
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         }
     }
 
@@ -1511,6 +1846,8 @@ mod tests {
             margin_tiers: HashMap::new(),
             market_condition_config: None,
             control: None,
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         };
 
         let report = run(
@@ -1563,6 +1900,8 @@ mod tests {
                 include_spot: true, // this test uses a SPOT buy-once strategy
             }),
             control: None,
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
         };
 
         let report = run(
@@ -1722,6 +2061,76 @@ mod tests {
         );
     }
 
+    /// The console's order list: every order the loop sends shows up in the
+    /// snapshot with what became of it, newest first. (The order manager only
+    /// holds WORKING orders, and a market order works for under a second, so
+    /// before this the console could never show what the strategy had done.)
+    #[tokio::test]
+    async fn the_snapshot_lists_the_orders_the_strategy_sent_and_how_they_ended() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(101), dec!(102)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let orders = &snapshot.recent_orders;
+        assert!(orders.len() >= 3, "one order per event: {}", orders.len());
+        assert!(
+            orders.windows(2).all(|w| w[0].at >= w[1].at),
+            "newest first"
+        );
+        let first = orders.last().expect("an order");
+        assert_eq!(first.side, "Buy");
+        assert_eq!(first.order_type, "Market");
+        assert_eq!(first.quantity, dec!(0.01));
+        let filled = orders
+            .iter()
+            .find(|o| o.status == crate::order_log::FILLED)
+            .expect("a market order fills at once in the simulator");
+        assert_eq!(filled.filled_quantity, dec!(0.01));
+        assert!(filled.avg_fill_price.is_some(), "the fill price is shown");
+    }
+
+    /// An order refused by a risk limit never reaches the exchange, so there is
+    /// nothing to look up afterwards: the console must be able to say why.
+    #[tokio::test]
+    async fn an_order_refused_by_a_risk_limit_is_listed_with_the_reason() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), t0 + Duration::seconds(1)),
+            trade_event(dec!(100), t0 + Duration::seconds(2)),
+        ];
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let checker = Arc::new(
+            apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+                apexes_risk::LimitChecker::new(apexes_risk::RiskLimits {
+                    max_order_notional: Some(dec!(0.5)),
+                    ..Default::default()
+                }),
+            )),
+        );
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
+            risk_checker: Some(checker),
+            ..unified_loop_config(dec!(100000), None, HashMap::new())
+        };
+        run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
+        let snapshot = snapshot_rx.borrow().clone();
+        let refused: Vec<_> = snapshot
+            .recent_orders
+            .iter()
+            .filter(|o| o.status == crate::order_log::REJECTED)
+            .collect();
+        assert!(!refused.is_empty(), "{:?}", snapshot.recent_orders);
+        let reason = refused[0].detail.as_deref().expect("a reason");
+        assert!(reason.contains("notional"), "{reason}");
+        assert_eq!(refused[0].filled_quantity, dec!(0));
+    }
+
     /// Never trades.
     struct NoopStrategy;
 
@@ -1768,6 +2177,9 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
+            price_history: HashMap::new(),
+            equity_priced: true,
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: Decimal::ZERO,
@@ -1812,6 +2224,8 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
 
@@ -1857,6 +2271,8 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
         let report = run(config, zero_cost_model(None), events, AlwaysBuyStrategy).await;
@@ -1911,6 +2327,8 @@ mod tests {
         balances.insert("BTC".to_string(), dec!(1));
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..unified_loop_config(dec!(10000), None, HashMap::new())
         };
         let config = UnifiedLoopConfig {
@@ -1934,6 +2352,421 @@ mod tests {
             evaluation.total_pnl
         );
         assert_eq!(evaluation.max_drawdown, dec!(0));
+    }
+
+    /// Runs the loop with a control handle and returns the last snapshot.
+    async fn snapshot_after(
+        balances: &[(&str, Decimal)],
+        prices: &[Decimal],
+        strategy: impl Strategy,
+    ) -> crate::control::SessionSnapshot {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut events = vec![depth_snapshot(t0)];
+        for (i, price) in prices.iter().enumerate() {
+            events.push(trade_event(*price, t0 + Duration::seconds(1 + i as i64)));
+        }
+        let (control_handle, _command_tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
+            initial_balances: balances.iter().map(|(a, v)| (a.to_string(), *v)).collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(config, zero_cost_model(None), events, strategy).await;
+        let snapshot = snapshot_rx.borrow();
+        snapshot.clone()
+    }
+
+    /// The screenshot's case end to end: 1 BTC already in the account, a
+    /// strategy that never trades, and BTC falling. The whole loss is the
+    /// market's, and exposure must show the holding even though the strategy
+    /// is flat.
+    #[tokio::test]
+    async fn a_session_that_never_trades_has_no_strategy_pnl_when_a_held_asset_moves() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100), dec!(95), dec!(90)],
+            NoopStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        assert_eq!(e.start_equity, dec!(10100));
+        assert_eq!(e.total_pnl, dec!(-10));
+        assert_eq!(e.holdings_pnl, dec!(-10), "1 BTC fell by 10");
+        assert_eq!(e.strategy_pnl, dec!(0));
+        assert_eq!(e.unrealized_pnl, dec!(0));
+        assert_eq!(e.holdings_value_at_start, dec!(100));
+        assert!(
+            e.gross_exposure_fraction > dec!(0.008),
+            "a 1 BTC holding is exposure even while the strategy is flat: {}",
+            e.gross_exposure_fraction
+        );
+    }
+
+    /// A strategy's own trades land in the strategy line and not the holdings one.
+    #[tokio::test]
+    async fn the_strategys_trades_are_attributed_to_the_strategy_not_the_holdings() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100), dec!(110)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        // The 1 BTC held from the start gained +10 whatever the strategy did.
+        assert_eq!(e.holdings_pnl, dec!(10));
+        assert_eq!(e.strategy_pnl + e.holdings_pnl, e.total_pnl);
+    }
+
+    /// A flat account has nothing to separate: the two views agree.
+    #[tokio::test]
+    async fn a_session_that_starts_flat_reports_no_holdings_pnl() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(110)],
+            AlwaysBuyStrategy,
+        )
+        .await;
+        let e = snapshot.evaluation.expect("evaluation");
+        assert_eq!(e.holdings_pnl, dec!(0));
+        assert_eq!(e.holdings_value_at_start, dec!(0));
+        assert_eq!(e.strategy_pnl, e.total_pnl);
+    }
+
+    /// A quiet market: the account holds 1 BTC and no trade has printed yet.
+    /// With the exchange's last price seeded, the session is valued at once;
+    /// without it, the headline equity is flagged as not yet real.
+    #[tokio::test]
+    async fn a_seeded_price_values_a_held_asset_before_its_first_trade() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [
+                ("USDT".to_string(), dec!(10000)),
+                ("BTC".to_string(), dec!(1)),
+            ]
+            .into_iter()
+            .collect(),
+            initial_prices: [("BTCUSDT".to_string(), dec!(100))].into_iter().collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+
+        let snapshot = snapshot_rx.borrow().clone();
+        assert!(snapshot.equity_priced);
+        assert_eq!(snapshot.equity, dec!(10100), "1 BTC at 100, not at 1.0");
+        let e = snapshot
+            .evaluation
+            .expect("evaluation starts without waiting for a trade");
+        assert_eq!(e.start_equity, dec!(10100));
+        assert_eq!(e.holdings_value_at_start, dec!(100));
+        assert_eq!(e.total_pnl, dec!(0));
+    }
+
+    #[tokio::test]
+    async fn without_a_price_the_held_asset_is_unpriced_and_equity_says_so() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [
+                ("USDT".to_string(), dec!(10000)),
+                ("BTC".to_string(), dec!(1)),
+            ]
+            .into_iter()
+            .collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+        let snapshot = snapshot_rx.borrow().clone();
+        assert!(
+            !snapshot.equity_priced,
+            "BTC has no price yet: equity is a placeholder"
+        );
+        assert!(
+            snapshot.equity_history.is_empty(),
+            "the placeholder equity must not be charted"
+        );
+    }
+
+    /// A flat account has nothing to price: equity is real from the start.
+    #[tokio::test]
+    async fn a_cash_only_account_is_always_priced() {
+        let snapshot = snapshot_after(&[("USDT", dec!(10000))], &[], NoopStrategy).await;
+        assert!(snapshot.equity_priced);
+    }
+
+    /// An unpriced holding is flagged, and the flag clears with its first trade.
+    #[tokio::test]
+    async fn the_first_trade_prices_an_unseeded_holding() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000)), ("BTC", dec!(1))],
+            &[dec!(100)],
+            NoopStrategy,
+        )
+        .await;
+        assert!(snapshot.equity_priced);
+        assert_eq!(snapshot.equity, dec!(10100));
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_carries_each_symbols_trade_prices_in_order() {
+        let snapshot = snapshot_after(
+            &[("USDT", dec!(10000))],
+            &[dec!(100), dec!(101), dec!(99)],
+            NoopStrategy,
+        )
+        .await;
+        let prices: Vec<Decimal> = snapshot.price_history["BTCUSDT"]
+            .iter()
+            .map(|(_, price)| *price)
+            .collect();
+        assert_eq!(prices, vec![dec!(100), dec!(101), dec!(99)]);
+        assert!(
+            snapshot.price_history["BTCUSDT"]
+                .windows(2)
+                .all(|w| w[0].0 <= w[1].0)
+        );
+    }
+
+    /// A seeded price is a real observation: the chart starts with it instead
+    /// of staying empty until a quiet symbol's first trade.
+    #[tokio::test]
+    async fn a_seeded_price_starts_the_symbols_price_history() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [("USDT".to_string(), dec!(10000))].into_iter().collect(),
+            initial_prices: [("BTCUSDT".to_string(), dec!(100))].into_iter().collect(),
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        run(
+            config,
+            zero_cost_model(None),
+            vec![depth_snapshot(t0)],
+            NoopStrategy,
+        )
+        .await;
+        let snapshot = snapshot_rx.borrow().clone();
+        assert_eq!(snapshot.price_history["BTCUSDT"], vec![(t0, dec!(100))]);
+    }
+
+    /// Asks for one fixed quantity on every tick, as `trend_guard` does for ETH
+    /// (a step of 0.0001) on a symbol whose own step is coarser.
+    struct FixedQuantity(Decimal, Side, OrderType, Option<Decimal>);
+
+    impl Strategy for FixedQuantity {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if !matches!(event, MarketEvent::Trade(_)) {
+                return Vec::new();
+            }
+            vec![OrderIntent {
+                symbol: "BTCUSDT".to_string(),
+                venue: apexes_core::Venue::Binance,
+                asset_class: AssetClass::Perpetual,
+                side: self.1,
+                order_type: self.2,
+                quantity: self.0,
+                price: self.3,
+                stop_price: None,
+                execution_algo: None,
+                routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            }]
+        }
+    }
+
+    /// Remembers every intent it is asked to submit, and accepts nothing.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(Decimal, Option<Decimal>)>>);
+
+    #[async_trait::async_trait]
+    impl OrderExecutor for Recorder {
+        async fn submit(
+            &self,
+            intent: &OrderIntent,
+            _positions: &HashMap<String, apexes_strategy::Position>,
+            _balances: &HashMap<String, Decimal>,
+            _now: chrono::DateTime<Utc>,
+        ) -> Result<(apexes_core::Order, Vec<Fill>), apexes_core::ApexesError> {
+            if let Ok(mut sent) = self.0.lock() {
+                sent.push((intent.quantity, intent.price));
+            }
+            Err(apexes_core::ApexesError::OrderRejected {
+                reason: "recorder accepts nothing".to_string(),
+            })
+        }
+        fn on_market_event(&self, _event: &MarketEvent) -> Vec<(apexes_core::OrderId, Vec<Fill>)> {
+            Vec::new()
+        }
+        async fn open_orders(&self) -> HashMap<apexes_core::OrderId, apexes_core::Order> {
+            HashMap::new()
+        }
+    }
+
+    fn bnb_like_rules() -> HashMap<String, apexes_core::SymbolRules> {
+        // The 0.001 step and 5 USDT minimum BNBUSDT really has, applied to the
+        // test symbol so the rejected order from the log can be replayed.
+        [(
+            "BTCUSDT".to_string(),
+            apexes_core::SymbolRules {
+                quantity_step: dec!(0.001),
+                min_quantity: dec!(0.001),
+                max_quantity: dec!(900000),
+                price_tick: dec!(0.01),
+                min_notional: dec!(5),
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// Runs `strategy` for two trades at `price` and returns what reached the
+    /// executor and the order log's last snapshot.
+    async fn through_rules(
+        strategy: FixedQuantity,
+        rules: HashMap<String, apexes_core::SymbolRules>,
+        price: Decimal,
+    ) -> (
+        Vec<(Decimal, Option<Decimal>)>,
+        crate::control::SessionSnapshot,
+    ) {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(price, t0 + Duration::seconds(1)),
+            trade_event(price, t0 + Duration::seconds(2)),
+        ];
+        let (control_handle, _tx, snapshot_rx) =
+            ControlHandle::new(std::time::Duration::ZERO, empty_session_snapshot());
+        let config = UnifiedLoopConfig {
+            control: Some(control_handle),
+            initial_balances: [("USDT".to_string(), dec!(100000))].into_iter().collect(),
+            symbol_rules: rules,
+            ..unified_loop_config(dec!(0), None, HashMap::new())
+        };
+        let recorder = Arc::new(Recorder::default());
+        let executor: Arc<dyn OrderExecutor> = recorder.clone();
+        let ems: Arc<dyn Ems> = Arc::new(apexes_ems::InMemoryEms::new(
+            Arc::new(crate::ems_adapter::MatchingEngineChildOrderSink::new(
+                Arc::new(Mutex::new(MatchingEngine::new(
+                    zero_cost_model(None),
+                    dec!(0.5),
+                ))),
+            )),
+            Arc::new(apexes_strategy::PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+        ));
+        run_unified_event_loop(
+            config,
+            futures::stream::iter(events),
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+            executor,
+            Arc::new(BacktestLiquidationPolicy),
+            NeverFillSupplementalFillSource,
+            ems,
+            strategy,
+            None,
+            None,
+        )
+        .await
+        .expect("loop");
+        let sent = recorder.0.lock().map(|s| s.clone()).unwrap_or_default();
+        let snapshot = snapshot_rx.borrow().clone();
+        (sent, snapshot)
+    }
+
+    /// The reported order: Buy 0.0846 against a 0.001 step.
+    #[tokio::test]
+    async fn an_off_step_quantity_is_rounded_down_before_it_is_sent() {
+        let strategy = FixedQuantity(dec!(0.0846), Side::Buy, OrderType::Market, None);
+        let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(q, _)| *q == dec!(0.084)), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn without_rules_the_order_is_sent_exactly_as_the_strategy_asked() {
+        let strategy = FixedQuantity(dec!(0.0846), Side::Buy, OrderType::Market, None);
+        let (sent, _) = through_rules(strategy, HashMap::new(), dec!(590)).await;
+        assert!(sent.iter().all(|(q, _)| *q == dec!(0.0846)), "{sent:?}");
+    }
+
+    /// Too small to be valid: never sent, and the operator is told why.
+    #[tokio::test]
+    async fn an_order_that_cannot_be_made_valid_is_refused_with_the_reason_and_never_sent() {
+        let strategy = FixedQuantity(dec!(0.0004), Side::Buy, OrderType::Market, None);
+        let (sent, snapshot) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert!(sent.is_empty(), "nothing reaches the exchange: {sent:?}");
+        let refused = snapshot
+            .recent_orders
+            .iter()
+            .find(|o| o.status == crate::order_log::REJECTED)
+            .expect("the refusal is listed under Recent orders");
+        let detail = refused.detail.clone().unwrap_or_default();
+        assert!(detail.contains("0.001"), "names the step: {detail}");
+    }
+
+    #[tokio::test]
+    async fn an_order_under_the_minimum_value_is_refused_not_sent() {
+        // 0.008 at 590 is 4.72 USDT, under the 5 minimum.
+        let strategy = FixedQuantity(dec!(0.008), Side::Buy, OrderType::Market, None);
+        let (sent, snapshot) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert!(sent.is_empty());
+        let detail = snapshot
+            .recent_orders
+            .iter()
+            .find_map(|o| o.detail.clone())
+            .unwrap_or_default();
+        assert!(detail.contains("minimum"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_limit_price_is_moved_to_the_tick_and_the_quantity_to_the_step() {
+        let strategy = FixedQuantity(
+            dec!(0.0846),
+            Side::Buy,
+            OrderType::Limit,
+            Some(dec!(590.019)),
+        );
+        let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+        assert_eq!(sent[0], (dec!(0.084), Some(dec!(590.01))));
+    }
+
+    /// The order the strategy asked for is what the risk checker sees only
+    /// after conforming: a rounded-down order is smaller, never larger.
+    #[tokio::test]
+    async fn conforming_never_makes_an_order_bigger_than_asked() {
+        for asked in [dec!(0.0846), dec!(0.0999), dec!(1.2345)] {
+            let strategy = FixedQuantity(asked, Side::Buy, OrderType::Market, None);
+            let (sent, _) = through_rules(strategy, bnb_like_rules(), dec!(590)).await;
+            assert!(sent.iter().all(|(q, _)| *q <= asked), "{asked}: {sent:?}");
+        }
     }
 
     /// `control: None` must stay free of evaluation work: no handle, no
@@ -2050,6 +2883,8 @@ mod tests {
         let config = unified_loop_config(dec!(10000), None, HashMap::new());
         let config = UnifiedLoopConfig {
             control: Some(control_handle),
+            initial_prices: HashMap::new(),
+            symbol_rules: HashMap::new(),
             ..config
         };
 

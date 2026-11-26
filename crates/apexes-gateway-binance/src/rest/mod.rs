@@ -128,6 +128,29 @@ impl BinanceRestClient {
         self
     }
 
+    /// One unsigned GET of a public market-data endpoint. Sends no API key and
+    /// no signature: the data is public, so the credentials stay out of it.
+    /// `query` is an already URL-encoded `key=value` string.
+    pub async fn public_get(&self, path: &str, query: &str) -> Result<String, String> {
+        let url = format!("{}{path}?{query}", self.base_url(ApiFamily::Spot));
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| format!("request failed: {error}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read response body: {error}"))?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(format!("HTTP {status}: {body}"))
+        }
+    }
+
     fn base_url(&self, family: ApiFamily) -> &str {
         match family {
             ApiFamily::Spot => &self.config.spot_base_url,

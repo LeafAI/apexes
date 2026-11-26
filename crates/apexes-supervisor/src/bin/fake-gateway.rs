@@ -1,6 +1,7 @@
 //! TEST DOUBLE for `apexes-market-data-gateway`, used only by this crate's
 //! integration tests. Follows the real gateway's contract: `--port`,
-//! `--instruments`, `--network` (required), and a `<pid>\n<port>\n` file at
+//! `--instruments`, `--network` (required), `--pid-file` (optional) and a
+//! `<pid>\n<port>\n` file at that path, or by default at
 //! `$HOME/.apexes/market-data-gateway-<network>.pid`. Default SIGTERM
 //! handling, like the real one.
 //!
@@ -67,15 +68,18 @@ fn main() {
         "gateway_token": std::env::var("APEXES_GATEWAY_TOKEN").ok(),
     });
     std::fs::write(
-        dir.join(format!("market-data-gateway-{network}.seen.json")),
+        dir.join(format!("market-data-gateway-{network}-{port}.seen.json")),
         seen.to_string(),
     )
     .unwrap_or_else(|e| fail(&format!("write seen: {e}"), 2));
-    std::fs::write(
-        dir.join(format!("market-data-gateway-{network}.pid")),
-        format!("{}\n{}\n", std::process::id(), port),
-    )
-    .unwrap_or_else(|e| fail(&format!("write pid: {e}"), 2));
+    let pid_path = flag(&args, "--pid-file")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join(format!("market-data-gateway-{network}.pid")));
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| fail(&format!("mkdir: {e}"), 2));
+    }
+    std::fs::write(&pid_path, format!("{}\n{}\n", std::process::id(), port))
+        .unwrap_or_else(|e| fail(&format!("write pid: {e}"), 2));
 
     for stream in listener.incoming() {
         drop(stream);

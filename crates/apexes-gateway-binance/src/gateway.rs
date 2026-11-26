@@ -1,6 +1,7 @@
 //! [`BinanceExecutionGateway`]: implements `apexes_oms::ExecutionGateway`
 //! against real Binance Spot and USDS-M Perpetual Futures REST APIs.
 
+use apexes_core::SymbolRules;
 use apexes_core::{
     AssetClass, FundMovement, FundMovementStatus, MarginMode, Order, OrderId, OrderStatus, WalletId,
 };
@@ -267,6 +268,82 @@ impl BinanceExecutionGateway {
             !self.spot_only,
         )
         .await
+    }
+}
+
+impl BinanceExecutionGateway {
+    /// The latest traded price of each symbol, from the public ticker.
+    ///
+    /// Used once at session start to value every held asset before its first
+    /// live trade arrives (a quiet market can take minutes). A symbol the
+    /// exchange refuses, answers garbled, or prices at zero or below is left
+    /// out and logged; the caller values it from its first trade instead.
+    pub async fn last_prices(&self, symbols: &[String]) -> HashMap<String, Decimal> {
+        let lookups = symbols
+            .iter()
+            .map(|symbol| async move { (symbol.clone(), self.last_price(symbol).await) });
+        let mut prices = HashMap::new();
+        for (symbol, outcome) in futures::future::join_all(lookups).await {
+            match outcome {
+                Ok(price) => {
+                    prices.insert(symbol, price);
+                }
+                Err(error) => {
+                    tracing::warn!(%symbol, %error, "no start price; valued from its first trade");
+                }
+            }
+        }
+        prices
+    }
+
+    /// Each symbol's trading rules (quantity step and bounds, price tick,
+    /// minimum order value) from the public `exchangeInfo`.
+    ///
+    /// Read once at session start so the engine can make an order valid
+    /// before sending it, instead of learning a symbol's step from a -1013
+    /// rejection. A symbol whose rules cannot be had is left out and logged:
+    /// its orders then go unconformed and the exchange decides, as before.
+    pub async fn symbol_rules(&self, symbols: &[String]) -> HashMap<String, SymbolRules> {
+        let lookups = symbols
+            .iter()
+            .map(|symbol| async move { (symbol.clone(), self.symbol_rule(symbol).await) });
+        let mut rules = HashMap::new();
+        for (symbol, outcome) in futures::future::join_all(lookups).await {
+            match outcome {
+                Ok(found) => {
+                    rules.insert(symbol, found);
+                }
+                Err(error) => {
+                    tracing::warn!(%symbol, %error, "no trading rules; the exchange will judge its orders");
+                }
+            }
+        }
+        rules
+    }
+
+    async fn symbol_rule(&self, symbol: &str) -> Result<SymbolRules, String> {
+        let body = self
+            .rest
+            .public_get("/api/v3/exchangeInfo", &format!("symbol={symbol}"))
+            .await?;
+        parse_symbol_rules(&body, symbol)
+    }
+
+    async fn last_price(&self, symbol: &str) -> Result<Decimal, String> {
+        #[derive(Deserialize)]
+        struct Ticker {
+            price: Decimal,
+        }
+        let body = self
+            .rest
+            .public_get("/api/v3/ticker/price", &format!("symbol={symbol}"))
+            .await?;
+        let ticker: Ticker =
+            serde_json::from_str(&body).map_err(|error| format!("unreadable price: {error}"))?;
+        if ticker.price <= Decimal::ZERO {
+            return Err(format!("non-positive price {}", ticker.price));
+        }
+        Ok(ticker.price)
     }
 }
 
@@ -598,6 +675,45 @@ struct WithdrawHistoryEntry {
 
 /// Binance's definitive "no such order" answer (`-2013`), returned with
 /// HTTP 400.
+/// Reads one symbol's `SymbolRules` out of an `exchangeInfo` response. A filter
+/// the symbol does not list leaves that rule at zero (not enforced).
+fn parse_symbol_rules(body: &str, symbol: &str) -> Result<SymbolRules, String> {
+    #[derive(Deserialize)]
+    struct Info {
+        symbols: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        symbol: String,
+        filters: Vec<serde_json::Value>,
+    }
+    let info: Info =
+        serde_json::from_str(body).map_err(|error| format!("unreadable exchangeInfo: {error}"))?;
+    let entry = info
+        .symbols
+        .into_iter()
+        .find(|entry| entry.symbol == symbol)
+        .ok_or_else(|| format!("{symbol} is not in the exchange's symbol list"))?;
+    let field = |filter: &str, name: &str| -> Option<Decimal> {
+        entry
+            .filters
+            .iter()
+            .find(|f| f["filterType"] == filter)
+            .and_then(|f| f[name].as_str())
+            .and_then(|text| text.parse::<Decimal>().ok())
+    };
+    let zero = Decimal::ZERO;
+    Ok(SymbolRules {
+        quantity_step: field("LOT_SIZE", "stepSize").unwrap_or(zero),
+        min_quantity: field("LOT_SIZE", "minQty").unwrap_or(zero),
+        max_quantity: field("LOT_SIZE", "maxQty").unwrap_or(zero),
+        price_tick: field("PRICE_FILTER", "tickSize").unwrap_or(zero),
+        min_notional: field("NOTIONAL", "minNotional")
+            .or_else(|| field("MIN_NOTIONAL", "minNotional"))
+            .unwrap_or(zero),
+    })
+}
+
 /// Most decimal places Binance accepts in a quantity or price field.
 const MAX_WIRE_DECIMALS: u32 = 8;
 

@@ -7,11 +7,7 @@ use apexes_supervisor::SessionInfo;
 use egui::{Color32, RichText};
 
 use crate::launcher::{LaunchStatus, LauncherState};
-
-const RED: Color32 = Color32::from_rgb(200, 40, 40);
-const GREEN: Color32 = Color32::from_rgb(40, 160, 70);
-const AMBER: Color32 = Color32::from_rgb(220, 150, 20);
-const BLUE: Color32 = Color32::from_rgb(60, 110, 190);
+use crate::theme::{Palette, palette_of};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LauncherAction {
@@ -69,21 +65,18 @@ fn network_picker(ui: &mut egui::Ui, state: &mut LauncherState) {
     match state.form.network {
         BinanceNetwork::Testnet => {
             ui.colored_label(
-                BLUE,
+                palette_of(ui.ctx()).info,
                 "Testnet: separate keys from testnet.binance.vision, virtual money, resets periodically.",
             );
         }
         BinanceNetwork::Mainnet => {
-            egui::Frame::new()
-                .fill(RED)
-                .inner_margin(6.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new("MAINNET: this trades real funds on your Binance account.")
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-                });
+            let palette = palette_of(ui.ctx());
+            crate::theme::banner(
+                ui,
+                &palette,
+                palette.danger,
+                "MAINNET: this trades real funds on your Binance account.",
+            );
             ui.horizontal(|ui| {
                 ui.label("Type MAINNET to confirm");
                 ui.text_edit_singleline(&mut state.form.mainnet_confirmation);
@@ -160,10 +153,16 @@ fn launch_button(ui: &mut egui::Ui, state: &LauncherState, actions: &mut Vec<Lau
         .and_then(|p| p.into_iter().next())
         && !state.busy()
     {
-        ui.colored_label(AMBER, format!("{}: {}", problem.field, problem.message));
+        ui.colored_label(
+            palette_of(ui.ctx()).warn,
+            format!("{}: {}", problem.field, problem.message),
+        );
     }
     if let Some(var) = &state.missing_credential {
-        ui.colored_label(RED, format!("Missing credential variable: {var}"));
+        ui.colored_label(
+            palette_of(ui.ctx()).danger,
+            format!("Missing credential variable: {var}"),
+        );
     }
     ui.horizontal(|ui| {
         let label = match state.form.network {
@@ -185,10 +184,10 @@ fn launch_button(ui: &mut egui::Ui, state: &LauncherState, actions: &mut Vec<Lau
                 ui.label("Starting (the engine checks the exchange before it goes live)...");
             }
             LaunchStatus::Failed(_) => {
-                ui.colored_label(RED, "Launch failed (details below)");
+                ui.colored_label(palette_of(ui.ctx()).danger, "Launch failed (details below)");
             }
             LaunchStatus::Launched { session_id } => {
-                ui.colored_label(GREEN, format!("Launched {session_id}"));
+                ui.colored_label(palette_of(ui.ctx()).good, format!("Launched {session_id}"));
             }
         }
     });
@@ -196,19 +195,19 @@ fn launch_button(ui: &mut egui::Ui, state: &LauncherState, actions: &mut Vec<Lau
         egui::ScrollArea::vertical()
             .max_height(140.0)
             .show(ui, |ui| {
-                ui.colored_label(RED, message);
+                ui.colored_label(palette_of(ui.ctx()).danger, message);
             });
     }
     if let Some(notice) = &state.notice {
-        ui.colored_label(AMBER, notice);
+        ui.colored_label(palette_of(ui.ctx()).warn, notice);
     }
 }
 
-fn network_label(info: &SessionInfo) -> (String, Color32) {
+fn network_label(info: &SessionInfo, palette: &Palette) -> (String, Color32) {
     match info.network {
-        Some(BinanceNetwork::Testnet) => ("TESTNET".to_string(), BLUE),
-        Some(BinanceNetwork::Mainnet) => ("MAINNET".to_string(), RED),
-        None => ("unknown network".to_string(), AMBER),
+        Some(BinanceNetwork::Testnet) => ("TESTNET".to_string(), palette.info),
+        Some(BinanceNetwork::Mainnet) => ("MAINNET".to_string(), palette.danger),
+        None => ("unknown network".to_string(), palette.warn),
     }
 }
 
@@ -230,13 +229,13 @@ fn sessions(
     }
     for info in &state.sessions {
         ui.horizontal(|ui| {
-            let (network, color) = network_label(info);
+            let (network, color) = network_label(info, &palette_of(ui.ctx()));
             ui.colored_label(color, RichText::new(network).strong());
             ui.label(info.id.as_str());
             if info.alive {
-                ui.colored_label(GREEN, "running");
+                ui.colored_label(palette_of(ui.ctx()).good, "running");
             } else {
-                ui.colored_label(AMBER, "stopped");
+                ui.colored_label(palette_of(ui.ctx()).warn, "stopped");
             }
             let id = info.id.to_string();
             if info.alive {
@@ -252,7 +251,7 @@ fn sessions(
                     });
                 }
                 if pending_stop == Some(id.as_str()) {
-                    ui.colored_label(RED, "Stop this session?");
+                    ui.colored_label(palette_of(ui.ctx()).danger, "Stop this session?");
                     if ui.button("Yes, stop").clicked() {
                         actions.push(LauncherAction::ConfirmStop {
                             session_id: id.clone(),

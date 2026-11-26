@@ -105,6 +105,10 @@ pub struct OperatorState {
     pub pending: Option<OperatorAction>,
     /// Text being typed into each parameter's edit box.
     pub param_edits: BTreeMap<String, String>,
+    /// Which chart the card shows. Kept here so it survives tab switches.
+    pub chart: crate::chart_view::ChartView,
+    /// The engine this console talks to, for the connection's hover text.
+    pub engine_url: String,
 }
 
 impl OperatorState {
@@ -235,6 +239,9 @@ mod tests {
             identity: None,
             evaluation: None,
             equity_history: Vec::new(),
+            recent_orders: Vec::new(),
+            price_history: Default::default(),
+            equity_priced: true,
             positions: HashMap::new(),
             balances: HashMap::new(),
             equity: dec!(100),

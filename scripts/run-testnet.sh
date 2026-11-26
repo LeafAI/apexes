@@ -2,8 +2,21 @@
 # Starts everything needed for a Binance Spot TESTNET session and opens the
 # Apexes operator app (launcher + console). Safe to run repeatedly.
 #
-#   scripts/run-testnet.sh            # check, build if needed, open the app
-#   scripts/run-testnet.sh --check    # only check prerequisites, start nothing
+#   scripts/run-testnet.sh                          # check, build the latest code, open the app
+#   scripts/run-testnet.sh --check                  # check and build the latest code, start nothing
+#   scripts/run-testnet.sh --strategy FILE.drift    # pre-fill the launcher with this strategy
+#
+# Every run rebuilds the release binaries from the current source first
+# (`cargo build --release`: a no-op of a second or two when nothing changed, a
+# minute or so after a code change). A failed build stops the script, so it can
+# never start binaries that do not match the source. A session or gateway that
+# is already running keeps the code it was started with; the script warns about
+# those, and never stops them.
+#
+# --strategy takes a path to any readable file (relative paths are taken from
+# where you run this, not from the repository). It only fills the Launcher's
+# "Strategy file" box; you still press Launch, and can change it there. Without
+# it the launcher starts with deploy/strategy.example.drift.
 #
 # Reads your testnet HMAC key from ~/.apexes/binance.yaml:
 #
@@ -20,10 +33,36 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${APEXES_BINANCE_CONFIG:-$HOME/.apexes/binance.yaml}"
 CHECK_ONLY=0
-[ "${1:-}" = "--check" ] && CHECK_ONLY=1
+STRATEGY=""
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 ok()   { echo "  ok  $*"; }
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '$d'; }
+
+# Arguments are checked before anything is started or any credential is read,
+# so a typo costs nothing.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK_ONLY=1 ;;
+    --strategy)
+      [ $# -ge 2 ] && [ -n "$2" ] || fail "--strategy needs a file path"
+      STRATEGY="$2"; shift ;;
+    --strategy=*)
+      STRATEGY="${1#--strategy=}"
+      [ -n "$STRATEGY" ] || fail "--strategy needs a file path" ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown argument: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+if [ -n "$STRATEGY" ]; then
+  [ -e "$STRATEGY" ] || fail "strategy file not found: $STRATEGY"
+  [ -f "$STRATEGY" ] || fail "strategy path is not a file: $STRATEGY"
+  [ -r "$STRATEGY" ] || fail "strategy file is not readable: $STRATEGY"
+  # Absolute, because the engine is started from another directory.
+  STRATEGY="$(cd "$(dirname "$STRATEGY")" && pwd)/$(basename "$STRATEGY")"
+fi
 
 echo "Apexes testnet launcher"
 
@@ -113,24 +152,67 @@ else
   ok "Binance testnet reachable; clock offset ${SKEW} ms"
 fi
 
-# 4. Binaries ------------------------------------------------------------------
+# 4. Binaries: always built from the current source ---------------------------
+# An existing binary says nothing about whether it matches the source (it was
+# once launched stale after a code change), so cargo decides every time. When
+# nothing changed this is a quick no-op.
 BIN="$ROOT/target/release"
-need_build=0
-for b in apexes-operator apexes-engine apexes-market-data-gateway; do
-  [ -x "$BIN/$b" ] || need_build=1
-done
-if [ "$need_build" = 1 ]; then
-  if [ "$CHECK_ONLY" = 1 ]; then
-    echo "  ..  binaries not built yet (the real run builds them: a few minutes the first time)"
-  else
-    echo "  ..  building release binaries (first time takes a few minutes)"
-    (cd "$ROOT" && cargo build --release -p apexes-engine -p apexes-market-data-gateway -p apexes-ui)
-  fi
-else
-  ok "release binaries present"
+command -v cargo >/dev/null || fail "cargo is not installed or not on PATH; it is needed to build the latest code (https://rustup.rs)"
+echo "  ..  building the latest code (cargo build --release; quick when nothing changed)"
+if ! (cd "$ROOT" && cargo build --release -p apexes-engine -p apexes-market-data-gateway -p apexes-ui); then
+  fail "the build failed, so nothing was started (running old binaries against new source is exactly what this stops). Fix the errors above and run again."
 fi
-[ -f "$ROOT/deploy/strategy.example.drift" ] || fail "deploy/strategy.example.drift is missing"
-ok "demo strategy present"
+for b in apexes-operator apexes-engine apexes-market-data-gateway; do
+  [ -x "$BIN/$b" ] || fail "$BIN/$b is missing after a successful build"
+done
+ok "release binaries built from the current source"
+
+# A process started before the rebuild keeps running the old code.
+python3 - "$BIN" <<'PY'
+import os, re, subprocess, sys, time
+
+bin_dir = os.path.realpath(sys.argv[1])
+names = ("apexes-operator", "apexes-engine", "apexes-market-data-gateway")
+binary_mtime = {n: os.stat(os.path.join(bin_dir, n)).st_mtime for n in names}
+
+
+def seconds(etime):
+    days, _, rest = etime.rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+now = time.time()
+stale = []
+out = subprocess.run(["ps", "-axo", "pid=,etime=,comm="], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    pid, etime, comm = (line.split(None, 2) + ["", ""])[:3]
+    if not re.fullmatch(r"\d+", pid) or not re.fullmatch(r"[\d:-]+", etime):
+        continue
+    path = os.path.realpath(comm)
+    name = os.path.basename(path)
+    if name in names and os.path.dirname(path) == bin_dir:
+        started = now - seconds(etime)
+        if binary_mtime[name] > started + 2:
+            stale.append((name, pid, time.strftime("%H:%M", time.localtime(started))))
+for name, pid, at in stale:
+    print(f"  WARN {name} (pid {pid}, started {at}) is running OLD code: it predates the build just made")
+if stale:
+    print("       Stop its session in the Launcher (Stop), then launch again. A running gateway is reused by new")
+    print("       sessions on its symbols, so stop it too once no session uses it: pkill -f apexes-market-data-gateway")
+PY
+if [ -n "$STRATEGY" ]; then
+  ok "strategy: $STRATEGY"
+  case "$STRATEGY" in
+    *.drift) ;;
+    *) echo "  WARN $STRATEGY does not end in .drift; the engine will still try to read it as a Drift script" ;;
+  esac
+else
+  [ -f "$ROOT/deploy/strategy.example.drift" ] || fail "deploy/strategy.example.drift is missing"
+  ok "demo strategy present"
+fi
 
 if [ "$CHECK_ONLY" = 1 ]; then
   echo "All checks done (nothing was started)."
@@ -143,5 +225,8 @@ fi
 cd "$ROOT"
 export APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY="$API_KEY"
 export APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET="$API_SECRET"
+ARGS=()
+[ -n "$STRATEGY" ] && ARGS+=(--strategy "$STRATEGY")
 echo "Starting the app. In the Launcher tab: leave Testnet selected, press 'Launch on TESTNET'."
-exec "$BIN/apexes-operator"
+[ -n "$STRATEGY" ] && echo "The Strategy file box is pre-filled with $STRATEGY"
+exec "$BIN/apexes-operator" ${ARGS[@]+"${ARGS[@]}"}

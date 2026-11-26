@@ -18,11 +18,30 @@ A short guide to getting one real session running and testing it by hand. Testne
 ## 2. Start
 
 ```sh
-scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability, clock; starts nothing
-scripts/run-testnet.sh           # starts Postgres if needed, builds if needed, opens the app
+scripts/run-testnet.sh --check   # verifies keys, Postgres, testnet reachability, clock and rebuilds; starts nothing
+scripts/run-testnet.sh           # starts Postgres if needed, rebuilds the latest code, opens the app
 ```
 
-The app has two tabs. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first). When the status turns green, press **Open console**.
+Two strategies ship, both for the testnet only and neither a profit machine: `deploy/strategy.example.drift` (a trend-following toy, trades rarely) and `deploy/strategy.mean_reversion.drift` (buys dips and sells the bounce, about 25 round trips a day on ETHUSDT, with a guard against the testnet's garbage prints; its header says what the replay did and did not show). Use the second to exercise orders, fills and the Recent orders panel.
+
+To start with a different strategy, pass it: `scripts/run-testnet.sh --strategy ~/Downloads/strategy.trend_guard.drift` (any readable file; a relative path is taken from where you run the script). It only pre-fills the Launcher's **Strategy file** box. You still press Launch, and can change the file there. Typos are caught before anything starts.
+
+The window has a **Launcher** tab and one tab per open session. In **Launcher**: leave **Testnet** selected, keep `BTCUSDT` and `deploy/strategy.example.drift`, press **Launch on TESTNET**. It takes 10-20 s (the engine reconciles with the exchange first); the new session's console then opens by itself.
+
+**Windows and tabs.** Open as many sessions as you like (**Open console** in the Launcher list); each keeps its own connection, and switching tabs loses nothing. A coloured dot on each tab shows its health, and a tab says `offline` or `HALTED` without you opening it; the active tab is the filled, underlined one. Closing a tab (the x, middle-click, or Cmd/Ctrl+W) only disconnects the console: the session keeps running.
+
+| Keys (Ctrl instead of Cmd off macOS) | Does |
+|---|---|
+| Cmd+1 ... Cmd+9 | Go to tab N (1 is the Launcher) |
+| Cmd+[ / Cmd+] | Previous / next tab, wrapping |
+| Cmd+W | Close the console in front (never the Launcher) |
+| Cmd+Shift+L | Cycle the theme: System, Light, Dark |
+
+**The console's layout.** Top to bottom: the environment banner; one status line (connection, a TRADING / PAUSED / HALTED pill, how old the data is, and the controls, with **HALT TRADING** the one red button); the key figures as tiles (Equity, PnL, Drawdown, Exposure, Trades; with holdings from before the session, *Strategy PnL* leads and *From holdings* gets its own tile); the chart card, whose selector switches between **Equity**, each symbol's price, and **All** (every symbol as percent change since its first price, so BTC and BNB can share one axis); then **details** in the main column, with the strategy parameters under it in up to three columns. In a wide window the right-hand column holds, top to bottom, **Recent orders, Positions (with Open orders), Risk limits and Balances** (it scrolls if they do not all fit); in a narrow one there is no right-hand column, so Positions go under Details, Risk limits and Balances sit beside them, and Recent orders goes below; while an asset you hold has no price yet, Equity reads **pricing…** instead of a number; the page scrolls, and the top (banner, status line, HALT) never does.
+
+**Recent orders.** Every order the strategy sends is listed, newest first, with its time, side, quantity, the price it filled at and its outcome: *Filled*, *Partially filled*, *Working*, *Rejected* (a risk limit or the exchange refused it; the reason is printed under the row) or *Closed* (it stopped working without filling). It sits in the empty space to the right of the tables when the window is wide, and under them when it is narrow; drag its left edge to resize. The last 100 are kept. The list is ten orders tall and scrolls for the rest (the column headings stay put), so a busy strategy does not push Positions, Risk limits and Balances off the screen.
+
+**Theme.** The **Theme** menu at the top right (every window) picks System (follows your OS), Light or Dark; the choice is remembered in `~/.apexes/ui.json`. The environment banner stays loud in both: MAINNET red, TESTNET blue. The window remembers its size and position, and will not shrink below a readable size.
 
 You should see a blue banner `TESTNET (virtual funds)`, equity of roughly 10 000 USDT plus the value of the base asset you trade (about 12 000 for ETHUSDT, about 75 000 for BTCUSDT), and the strategy's three parameters `notional`, `step` and `enabled`.
 
@@ -49,7 +68,7 @@ The risk limits default to: order value ≤ 100 USDT, order and position size �
 | What | Where |
 |---|---|
 | Session log | `~/.apexes/sessions/<id>.log` (the first place to look when something fails) |
-| Gateway log | `~/.apexes/market-data-gateway-testnet.log` |
+| Gateway logs | `~/.apexes/gateways/testnet-<id>.log`, one per gateway (a session on a symbol no running gateway carries starts its own; `ls ~/.apexes/gateways`). Gateways from an older build are in `~/.apexes/market-data-gateway-testnet.log` |
 | Audit log (commands, logins) | `~/.apexes/sessions/<id>.audit.jsonl` |
 | Per-session control token | `~/.apexes/sessions/<id>.token` (mode 600; generated for you) |
 | Orders in Postgres | `docker exec apexes-postgres psql -U apexes -d apexes_live -c "select id,symbol,status from orders order by created_at desc limit 10;"` (live sessions use `apexes_live`; the test suites use and wipe `apexes`) |
@@ -59,7 +78,7 @@ Metrics and health are on the engine's port (shown in the launcher): `/healthz`,
 ## 5. Stopping everything
 
 - A session: **Stop** in the Launcher (clean). Closing the window does **not** stop it.
-- The gateway, once no session uses it: `pkill -f apexes-market-data-gateway`.
+- The gateways, once no session uses them: `pkill -f apexes-market-data-gateway`.
 - Postgres: `docker compose stop postgres`.
 
 ## 6. If something goes wrong

@@ -65,8 +65,6 @@ pub struct ShellState {
     pub launcher: LauncherState,
     /// A Stop awaiting the operator's second click.
     pub pending_stop: Option<String>,
-    /// The session whose console is open.
-    pub connected: Option<String>,
 }
 
 impl ShellState {
@@ -103,10 +101,7 @@ impl ShellState {
                     .find(|s| s.id.as_str() == session_id && s.alive && s.token.is_some())
                     .cloned();
                 match found {
-                    Some(info) => {
-                        self.connected = Some(session_id);
-                        (Effect::Connect(info), None)
-                    }
+                    Some(info) => (Effect::Connect(info), None),
                     None => {
                         self.launcher.notice =
                             Some(format!("{session_id} is not running or has no saved token"));
@@ -137,23 +132,22 @@ impl ShellState {
         }
     }
 
-    pub fn apply_result(&mut self, result: WorkerResult) {
+    /// Applies a worker result. A successful launch returns the new session
+    /// so the app can open its console straight away.
+    pub fn apply_result(&mut self, result: WorkerResult) -> Option<SessionInfo> {
         match result {
             WorkerResult::Launched(session) => {
                 self.launcher.status = LaunchStatus::Launched {
                     session_id: session.info.id.to_string(),
                 };
                 self.launcher.notice = None;
+                return Some(session.info);
             }
             WorkerResult::LaunchFailed(message) => {
                 self.launcher.status = LaunchStatus::Failed(message);
             }
             WorkerResult::Stopped { session_id } => {
                 self.launcher.notice = Some(format!("Stopped {session_id}"));
-                if self.connected.as_deref() == Some(session_id.as_str()) {
-                    // The console stays up to show the final state; it will
-                    // report the lost connection itself.
-                }
             }
             WorkerResult::StopFailed {
                 session_id,
@@ -171,6 +165,7 @@ impl ShellState {
                 self.launcher.notice = Some(format!("Could not remove {session_id}: {message}"));
             }
         }
+        None
     }
 
     /// Replaces the session list and re-checks credentials for the selected
@@ -429,7 +424,6 @@ mod tests {
                 .0,
             Effect::Connect(_)
         ));
-        assert_eq!(shell.connected.as_deref(), Some("ok"));
         for id in ["notoken", "dead", "missing"] {
             let mut shell2 = ShellState::default();
             shell2.apply_sessions(
@@ -446,7 +440,6 @@ mod tests {
                 "{id}"
             );
             assert!(shell2.launcher.notice.is_some());
-            assert!(shell2.connected.is_none());
         }
     }
 
@@ -479,161 +472,5 @@ mod tests {
             message: "nope".into(),
         });
         assert!(shell.launcher.notice.as_deref().unwrap().contains("nope"));
-    }
-}
-
-/// The `eframe` application: the launcher on one tab and the console of the
-/// connected session on the other.
-pub mod app {
-    use super::*;
-    use crate::client::ConnectionStatus;
-    use crate::operator_client::{OperatorClientConfig, run};
-    use crate::operator_view::OperatorApp;
-    use tokio::sync::{mpsc, watch};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Tab {
-        Launcher,
-        Console,
-    }
-
-    pub struct ShellApp {
-        supervisor: Supervisor,
-        worker: Worker,
-        runtime: tokio::runtime::Handle,
-        shell: ShellState,
-        console: Option<OperatorApp>,
-        client_task: Option<tokio::task::JoinHandle<()>>,
-        tab: Tab,
-        last_refresh: Option<Instant>,
-    }
-
-    impl ShellApp {
-        pub fn new(supervisor: Supervisor, runtime: tokio::runtime::Handle) -> Self {
-            let worker = Worker::spawn(supervisor.clone());
-            let mut shell = ShellState::default();
-            shell.launcher.refresh_strategies();
-            Self {
-                supervisor,
-                worker,
-                runtime,
-                shell,
-                console: None,
-                client_task: None,
-                tab: Tab::Launcher,
-                last_refresh: None,
-            }
-        }
-
-        /// Opens a console for `info`, replacing any open one. The old
-        /// client task is aborted so only one connection exists.
-        fn connect(&mut self, info: &SessionInfo) {
-            if let Some(task) = self.client_task.take() {
-                task.abort();
-            }
-            let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let (status_tx, status_rx) = watch::channel(ConnectionStatus::default());
-            let (command_tx, command_rx) = mpsc::unbounded_channel();
-            let task = self.runtime.spawn(run(
-                OperatorClientConfig {
-                    url: info.control_url.clone(),
-                    token: info.token.clone(),
-                },
-                event_tx,
-                status_tx,
-                command_rx,
-            ));
-            self.client_task = Some(task);
-            self.console = Some(OperatorApp::new(
-                info.control_url.clone(),
-                event_rx,
-                status_rx,
-                command_tx,
-            ));
-            self.tab = Tab::Console;
-        }
-
-        fn refresh(&mut self) {
-            let (sessions, missing) = read_sessions(&self.supervisor, &self.shell.launcher);
-            self.shell.apply_sessions(sessions, missing);
-            self.last_refresh = Some(Instant::now());
-        }
-
-        fn drain_worker(&mut self) {
-            let results = self.worker.try_results();
-            let changed = !results.is_empty();
-            for result in results {
-                self.shell.apply_result(result);
-            }
-            if changed {
-                self.refresh();
-            }
-        }
-
-        fn perform(&mut self, effect: Effect, request: Option<LaunchRequest>) {
-            match effect {
-                Effect::None => {}
-                Effect::RefreshSessions => self.refresh(),
-                Effect::Connect(info) => self.connect(&info),
-                Effect::Job(JobKind::Launch(_)) => {
-                    if let Some(request) = request
-                        && !self.worker.submit(WorkerJob::Launch(Box::new(request)))
-                    {
-                        self.shell.apply_result(WorkerResult::LaunchFailed(
-                            "the supervisor worker has stopped; restart the app".to_string(),
-                        ));
-                    }
-                }
-                Effect::Job(JobKind::Stop(session_id)) => {
-                    self.worker.submit(WorkerJob::Stop { session_id });
-                }
-                Effect::Job(JobKind::Forget(session_id)) => {
-                    self.worker.submit(WorkerJob::Forget { session_id });
-                }
-            }
-        }
-    }
-
-    impl eframe::App for ShellApp {
-        fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
-            self.drain_worker();
-            if refresh_due(self.last_refresh) {
-                self.refresh();
-            }
-
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Launcher, "Launcher");
-                let label = match &self.shell.connected {
-                    Some(id) => format!("Console: {id}"),
-                    None => "Console".to_string(),
-                };
-                ui.add_enabled_ui(self.console.is_some(), |ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Console, label);
-                });
-            });
-            ui.separator();
-
-            match self.tab {
-                Tab::Launcher => {
-                    let pending = self.shell.pending_stop.clone();
-                    let actions = crate::launcher_view::show(
-                        ui,
-                        &mut self.shell.launcher,
-                        pending.as_deref(),
-                    );
-                    for action in actions {
-                        let (effect, request) = self.shell.handle(action);
-                        self.perform(effect, request);
-                    }
-                }
-                Tab::Console => match &mut self.console {
-                    Some(console) => console.render(ui),
-                    None => {
-                        ui.weak("Open a session from the launcher.");
-                    }
-                },
-            }
-        }
     }
 }
