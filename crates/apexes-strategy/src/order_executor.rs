@@ -68,6 +68,10 @@ pub trait OrderExecutor: Send + Sync {
     /// synchronously inside the `async fn` body without ever actually
     /// crossing an `.await` point.
     async fn open_orders(&self) -> HashMap<OrderId, Order>;
+
+    /// Acknowledge a supplemental batch only after the ledger processed it.
+    /// Simulated executors need no acknowledgement.
+    async fn acknowledge_supplemental_fills(&self, _fills: &[Fill], _applied: bool) {}
 }
 
 /// Distinguishes why a position is being force/partially-closed, since

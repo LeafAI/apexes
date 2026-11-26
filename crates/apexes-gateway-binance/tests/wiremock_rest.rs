@@ -60,6 +60,23 @@ async fn mount_clock(server: &MockServer) {
 }
 
 #[tokio::test]
+async fn authoritative_execution_snapshot_requires_identity_and_cumulative_quantity() {
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    let mut order = sample_order(Uuid::new_v4());
+    order.exchange_order_id = Some("12345".into());
+    Mock::given(method("GET")).and(path("/api/v3/order"))
+        .and(query_param("symbol", "BTCUSDT")).and(query_param("orderId", "12345"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId": 12345, "symbol": "BTCUSDT", "status": "PARTIALLY_FILLED", "executedQty": "0.25"
+        }))).expect(1).mount(&server).await;
+    let gateway = gateway_against(&server).await;
+    let snapshot = gateway.query_order_execution(&order).await.unwrap();
+    assert_eq!(snapshot.status, OrderStatus::PartiallyFilled);
+    assert_eq!(snapshot.executed_quantity, dec!(0.25));
+}
+
+#[tokio::test]
 async fn submit_order_sends_signed_request_with_client_order_id() {
     let mock_server = MockServer::start().await;
     mount_clock(&mock_server).await;

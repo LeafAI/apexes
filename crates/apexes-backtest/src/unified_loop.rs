@@ -38,7 +38,7 @@ use crate::latency::LatencyModel;
 use crate::ledger::PortfolioLedger;
 use crate::performance::PerformanceTracker;
 use crate::report::BacktestReport;
-use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, OrderType};
+use apexes_core::{ApexesError, Fill, FillId, Instrument, MarketEvent, OrderType};
 use apexes_ems::Ems;
 use apexes_risk::{CompositeRiskChecker, MarketConditionEventMonitor, PreTradeCheck};
 use apexes_strategy::{
@@ -47,7 +47,7 @@ use apexes_strategy::{
 };
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Configuration shared by every caller of [`run_unified_event_loop`]:
@@ -208,6 +208,7 @@ pub async fn run_unified_event_loop(
     let mut mark_prices: HashMap<String, Decimal> = HashMap::new();
     let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut all_fills: Vec<Fill> = Vec::new();
+    let mut supplemental_seen = HashSet::new();
     let mut recorded_initial_equity = false;
     let mut diagnostics = Diagnostics::new();
     let mut risk_checker = config.risk_checker;
@@ -919,10 +920,8 @@ pub async fn run_unified_event_loop(
                 if fills.is_empty() {
                     continue;
                 }
-                if let Some(log) = &mut order_log {
-                    log.filled(&fills);
-                }
-                apply_supplemental_fills(
+                let before = all_fills.len();
+                let applied = apply_supplemental_fills(
                     diagnostics,
                     &mut ledger,
                     &mut overall_tracker,
@@ -930,9 +929,16 @@ pub async fn run_unified_event_loop(
                     &mut per_venue_trackers,
                     &mut risk_checker,
                     &mut all_fills,
-                    fills,
+                    &mut supplemental_seen,
+                    &fills,
                     config.risk_free_return,
                 );
+                // A managed executor closes the submission gate until
+                // this acknowledgement succeeds, or latches a fault.
+                executor.acknowledge_supplemental_fills(&fills, applied).await;
+                if let Some(log) = &mut order_log {
+                    log.filled(&all_fills[before..]);
+                }
                 let equity = ledger.equity(&last_prices)?;
                 let now = chrono::Utc::now();
                 overall_tracker.record_equity_point(now, equity);
@@ -1185,15 +1191,10 @@ fn apply_fills(
 
 /// Applies a batch of `Fill`s that arrived from a
 /// [`SupplementalFillSource`] -- ported from `run_live_trading`'s
-/// `apply_new_fills`, whose error handling deliberately differs from
-/// [`apply_fills`]: a fill that the ledger rejects is LOGGED AND
-/// SKIPPED, never propagated as an error. These fills describe trades
-/// that already happened on a real exchange; failing the whole trading
-/// session because our local mirror of the books disagreed would be
-/// strictly worse than continuing with a logged discrepancy. A
-/// violation from `on_fill` is likewise logged, not propagated -- an
-/// in-trade monitor observes fills that have already happened; it
-/// cannot undo them, only flag them.
+/// `apply_new_fills`. A rejected execution is never counted in the
+/// local performance history. The caller acknowledges the batch outcome
+/// to the executor so managed live sessions latch the discrepancy and
+/// retain the durable history for restart recovery.
 #[allow(clippy::too_many_arguments)]
 fn apply_supplemental_fills(
     diagnostics: Diagnostics,
@@ -1203,16 +1204,24 @@ fn apply_supplemental_fills(
     per_venue_trackers: &mut HashMap<String, PerformanceTracker>,
     risk_checker: &mut Option<Arc<CompositeRiskChecker>>,
     all_fills: &mut Vec<Fill>,
-    new_fills: Vec<Fill>,
+    seen: &mut HashSet<FillId>,
+    new_fills: &[Fill],
     risk_free_return: Decimal,
-) {
-    for fill in &new_fills {
+) -> bool {
+    let mut applied = true;
+    for fill in new_fills {
+        if seen.contains(&fill.id) {
+            continue;
+        }
         let result = ledger.apply_fill(fill);
         diagnostics.fill(fill, "supplemental", result.as_ref().err());
         if let Err(error) = result {
             tracing::warn!(reason = error_code(&error), order_id = ?fill.order_id, "failed to apply fill to ledger");
+            applied = false;
             continue;
         }
+        seen.insert(fill.id);
+        all_fills.push(fill.clone());
         overall_tracker.record_fill(fill);
         record_fill_in_split_trackers(
             per_symbol_trackers,
@@ -1226,7 +1235,7 @@ fn apply_supplemental_fills(
             tracing::warn!(?violations, symbol = %fill.symbol, "in-trade risk monitor flagged a violation");
         }
     }
-    all_fills.extend(new_fills);
+    applied
 }
 
 /// Records `fill` into its per-symbol and per-venue `PerformanceTracker`,
@@ -1368,10 +1377,24 @@ mod tests {
             &mut HashMap::new(),
             &mut None,
             &mut all_fills,
-            fills,
+            &mut HashSet::new(),
+            &fills,
             Decimal::ZERO,
         );
         (ledger, all_fills)
+    }
+
+    #[test]
+    fn supplemental_duplicate_and_refused_execution_are_not_counted_twice_or_as_applied() {
+        let accepted = live_fill(Side::Buy, dec!(0.5), Decimal::ZERO, "USDT");
+        let refused = live_fill(Side::Buy, dec!(10), Decimal::ZERO, "USDT");
+        let (ledger, fills) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![accepted.clone(), accepted, refused],
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
+        assert_eq!(ledger.balances()["USDT"], dec!(70000));
     }
 
     #[test]
@@ -1446,10 +1469,10 @@ mod tests {
                 live_fill(Side::Buy, dec!(0.1), dec!(0), "BTC"),
             ],
         );
-        // The ledger took the first and last and refused the middle one, which
-        // would have sold 5 BTC out of 0.5 (the fill list keeps all three: it
-        // is the record of what the exchange reported).
-        assert_eq!(fills.len(), 3);
+        // The durable exchange journal retains all three, but the local
+        // applied-fill history must contain only the two accepted fills.
+        assert_eq!(fills.len(), 2);
+        assert!(fills.iter().all(|fill| fill.side == Side::Buy));
         assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.6));
         assert_eq!(ledger.balances()["BTC"], dec!(0.6));
         assert_eq!(ledger.balances()["USDT"], dec!(100000) - dec!(36000));

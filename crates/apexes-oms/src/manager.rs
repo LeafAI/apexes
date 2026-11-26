@@ -54,12 +54,22 @@ fn status_carries_fills(status: OrderStatus) -> bool {
 /// Default for [`OrderManager::with_unsent_order_grace`].
 const DEFAULT_UNSENT_ORDER_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+struct FillDelivery {
+    checkpoint: i64,
+    pending: Option<(i64, Vec<FillId>)>,
+    dirty: bool,
+    failed: bool,
+}
+
 pub struct OrderManager {
     store: OrderStore,
     gateway: Arc<dyn ExecutionGateway>,
     risk_checker: Option<Arc<CompositeRiskChecker>>,
     open_orders: HashMap<OrderId, Order>,
     kill_switch: Option<Arc<KillSwitch>>,
+    // Process-local acknowledgement watermark; startup rebuilds from all
+    // durable history before establishing a new watermark.
+    fill_delivery: Option<FillDelivery>,
     /// Age threshold for an unresolved-submission warning, not an expiry.
     unsent_order_grace: std::time::Duration,
 }
@@ -92,13 +102,85 @@ impl OrderManager {
             risk_checker,
             open_orders,
             kill_switch: None,
+            fill_delivery: None,
             unsent_order_grace: DEFAULT_UNSENT_ORDER_GRACE,
         })
     }
 
     /// The bound store's persisted spot fills after startup reconciliation.
     pub async fn spot_inventory_fills(&mut self) -> Result<Vec<Fill>, OmsError> {
-        self.store.spot_inventory_fills().await
+        let fills = self.store.spot_inventory_fills().await?;
+        // Before any background task or new submission is allowed, all
+        // persisted fills are represented by the recovered ledger.
+        self.fill_delivery = Some(FillDelivery {
+            checkpoint: self.store.latest_fill_sequence().await?,
+            pending: None,
+            dirty: false,
+            failed: false,
+        });
+        Ok(fills)
+    }
+
+    /// Managed sessions deliver from the journal, not from return values of
+    /// reconciliation/cancellation tasks. Legacy adapters use None.
+    pub async fn durable_fill_batch(&mut self) -> Option<Vec<Fill>> {
+        let delivery = self.fill_delivery.as_ref()?;
+        if delivery.failed {
+            return Some(Vec::new());
+        }
+        if delivery.pending.is_some() {
+            self.fail_fill_delivery();
+            return Some(Vec::new());
+        }
+        let checkpoint = delivery.checkpoint;
+        match self.store.fills_after(checkpoint).await {
+            Ok((high, fills)) => {
+                if let Some(delivery) = &mut self.fill_delivery {
+                    delivery.dirty = !fills.is_empty();
+                    if !fills.is_empty() {
+                        delivery.pending = Some((high, fills.iter().map(|f| f.id).collect()));
+                    }
+                }
+                Some(fills)
+            }
+            Err(_) => {
+                self.fail_fill_delivery();
+                Some(Vec::new())
+            }
+        }
+    }
+
+    pub async fn acknowledge_fill_batch(&mut self, ids: &[FillId], applied: bool) {
+        let Some(delivery) = &mut self.fill_delivery else {
+            if !applied {
+                self.report_health_fault("live ledger rejected exchange fill");
+            }
+            return;
+        };
+        let Some((high, pending)) = delivery.pending.take() else {
+            self.fail_fill_delivery();
+            return;
+        };
+        if !applied || pending != ids {
+            self.fail_fill_delivery();
+            return;
+        }
+        delivery.checkpoint = high;
+        // Another task may have recorded fills while the loop applied
+        // this batch. Keep the submission gate closed until they arrive.
+        match self.store.latest_fill_sequence().await {
+            Ok(latest) => delivery.dirty = latest > high,
+            Err(_) => self.fail_fill_delivery(),
+        }
+    }
+
+    fn fail_fill_delivery(&mut self) {
+        if let Some(delivery) = &mut self.fill_delivery {
+            delivery.failed = true;
+            delivery.dirty = true;
+        }
+        tracing::error!("durable fill delivery inconsistent; restart and reconcile required");
+        self.report_health_fault("live fill delivery or ledger discrepancy");
     }
 
     /// Sets the age threshold for warning about an unresolved submission.
@@ -157,6 +239,15 @@ impl OrderManager {
                     .reason()
                     .or_else(|| kill_switch.health_reason())
                     .unwrap_or_default(),
+            });
+        }
+        if self
+            .fill_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.dirty || delivery.failed)
+        {
+            return Err(OmsError::TradingHalted {
+                reason: "durable executions await ledger acknowledgement".into(),
             });
         }
         if let Some(checker) = &self.risk_checker {
@@ -347,10 +438,14 @@ impl OrderManager {
 
         match self.gateway.cancel_order(&order_snapshot).await {
             GatewayOutcome::Accepted { .. } => {
-                let mut order = self.open_orders.remove(&order_id).unwrap();
-                order.status = OrderStatus::Cancelled;
-                order.updated_at = Utc::now();
-                self.store.upsert_order(&order).await?;
+                // Cancellation may race with executions; do not retire
+                // the order before reconciling its trades.
+                self.apply_exchange_update(
+                    order_id,
+                    order_snapshot.exchange_order_id,
+                    OrderStatus::Cancelled,
+                )
+                .await?;
                 Ok(())
             }
             GatewayOutcome::Rejected { reason } => Err(OmsError::OrderRejected { reason }),
@@ -365,36 +460,8 @@ impl OrderManager {
         }
     }
 
-    /// Applies one authoritative exchange-reported status update to a
-    /// single local order -- the shared core both `reconcile()`'s two
-    /// passes (below) and live push-based updates (Binance User Data
-    /// Stream, via `apexes-gateway-binance`'s `ExchangeUpdate` stream)
-    /// call, so this overwrite/persist/fill-fetch logic exists in
-    /// exactly one place.
-    ///
-    /// Unconditionally overwrites local status with `status` if it
-    /// differs from the order's current status (same
-    /// authoritative-exchange rationale as this method's callers --
-    /// bypassing `OrderStatus::can_transition_to`'s normal-operation
-    /// validation is intentional: a transition it would reject during
-    /// live operation reflects a real event that happened while
-    /// disconnected or between poll intervals, not a bug). If
-    /// `exchange_order_id` is `Some` and differs from what's currently
-    /// stored, populates/updates it.
-    ///
-    /// If either the status or `exchange_order_id` changed, persists
-    /// the order via `store.upsert_order`. If the status transition
-    /// lands on `PartiallyFilled` or `Filled` (and actually changed --
-    /// a repeated push of the same already-applied status is a no-op),
-    /// calls `gateway.query_fills_for_order`, deduplicates each
-    /// returned `ExchangeFill` against `OrderStore` via
-    /// `exchange_trade_id`, persists any genuinely-new ones, and
-    /// returns them. If the new status is terminal (`Filled`,
-    /// `Cancelled`, `Rejected`), removes the order from `open_orders`.
-    ///
-    /// Returns `Ok(new_fills)` -- empty if the order wasn't found
-    /// locally (logs `tracing::error!`), if nothing changed, or if no
-    /// new fills were found beyond what was already recorded.
+    /// Reconcile authoritative executions, not merely status transitions.
+    /// Repeated PartiallyFilled updates can contain new executions.
     pub async fn apply_exchange_update(
         &mut self,
         client_order_id: OrderId,
@@ -404,8 +471,14 @@ impl OrderManager {
         let result = self
             .apply_exchange_update_inner(client_order_id, exchange_order_id, status)
             .await;
-        if result.is_err() {
-            self.report_health_fault("OMS exchange update persistence failed");
+        match &result {
+            Ok(fills) if !fills.is_empty() => {
+                if let Some(delivery) = &mut self.fill_delivery {
+                    delivery.dirty = true;
+                }
+            }
+            Err(_) => self.report_health_fault("OMS execution reconciliation failed"),
+            _ => {}
         }
         result
     }
@@ -416,98 +489,71 @@ impl OrderManager {
         exchange_order_id: Option<String>,
         status: OrderStatus,
     ) -> Result<Vec<Fill>, OmsError> {
-        let Some(previous_status) = self
-            .open_orders
-            .get(&client_order_id)
-            .map(|order| order.status)
-        else {
-            tracing::error!(
-                order_id = ?client_order_id,
-                "apply_exchange_update: exchange reports an order we have no local record of"
-            );
+        let managed = self.store.inventory_bound();
+        let mut candidate = if let Some(order) = self.open_orders.get(&client_order_id) {
+            order.clone()
+        } else if let Some(order) = self.store.get_order(client_order_id).await? {
+            if !managed || !status_carries_fills(status) {
+                return Ok(Vec::new());
+            }
+            order
+        } else {
+            self.report_health_fault("OMS untracked exchange update");
             return Ok(Vec::new());
         };
-
-        let status_changed = previous_status != status;
-        let exchange_order_id_changed = exchange_order_id.is_some()
-            && self
-                .open_orders
-                .get(&client_order_id)
-                .is_some_and(|order| order.exchange_order_id != exchange_order_id);
-
-        if !status_changed && !exchange_order_id_changed {
+        let previous_status = candidate.status;
+        let was_terminal = matches!(
+            previous_status,
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+        );
+        let id_changed =
+            exchange_order_id.is_some() && candidate.exchange_order_id != exchange_order_id;
+        if managed && id_changed && candidate.exchange_order_id.is_some() {
+            return Err(OmsError::InvalidRow {
+                reason: "exchange order identity changed".into(),
+            });
+        }
+        if id_changed {
+            candidate.exchange_order_id = exchange_order_id;
+        }
+        if previous_status == status && !id_changed && !status_carries_fills(status) {
             return Ok(Vec::new());
         }
 
-        // Work on a candidate copy and only commit it to `open_orders`
-        // once everything it depends on is durably stored. Ordering is
-        // what makes this crash-safe: FILLS are persisted BEFORE the
-        // order's new status, so no crash window leaves an order marked
-        // Filled/Cancelled with its fills unrecorded (such an order is no
-        // longer "open" and would never be re-examined: its fills would be
-        // lost for good). The reverse window (fills stored, status not) is
-        // harmless: the next reconcile re-applies the status and every
-        // fill dedups on `(order_id, exchange_trade_id)`.
-        let mut candidate = self.open_orders.get(&client_order_id).unwrap().clone();
-        if exchange_order_id_changed {
-            candidate.exchange_order_id = exchange_order_id;
-        }
+        // A push is a wake-up, not proof of current cumulative execution.
+        let expected = if managed {
+            let snapshot = self
+                .gateway
+                .query_order_execution(&candidate)
+                .await
+                .map_err(|_| OmsError::QueryFailed {
+                    reason: "authoritative execution snapshot unavailable".into(),
+                })?;
+            candidate.status = snapshot.status;
+            if was_terminal && candidate.status != previous_status {
+                return Err(OmsError::InvalidRow {
+                    reason: "terminal order status contradicted by exchange".into(),
+                });
+            }
+            Some(snapshot.executed_quantity)
+        } else {
+            if previous_status == OrderStatus::PartiallyFilled && status == OrderStatus::New {
+                return Ok(Vec::new());
+            }
+            candidate.status = status;
+            None
+        };
 
-        let mut new_fills = Vec::new();
-        if status_changed && status_carries_fills(status) {
+        let executions = if status_carries_fills(candidate.status) {
             if candidate.exchange_order_id.is_none() {
                 self.report_health_fault("OMS fill has no exchange order ID");
-                tracing::warn!(
-                    order_id = ?client_order_id,
-                    ?status,
-                    "apply_exchange_update: cannot fetch fills without an exchange_order_id; leaving order open for reconcile"
-                );
                 return Ok(Vec::new());
             }
             match self.gateway.query_fills_for_order(&candidate).await {
-                Ok(exchange_fills) => {
-                    for exchange_fill in exchange_fills {
-                        let fill = Fill {
-                            id: FillId(Uuid::new_v4()),
-                            order_id: client_order_id,
-                            symbol: candidate.symbol.clone(),
-                            venue: candidate.venue,
-                            side: candidate.side,
-                            price: exchange_fill.price,
-                            quantity: exchange_fill.quantity,
-                            fee: exchange_fill.fee,
-                            fee_currency: exchange_fill.fee_currency.clone(),
-                            filled_at: exchange_fill.filled_at,
-                            // Binance's fill/trade responses don't repeat an
-                            // order's leverage, so thread it from the order
-                            // instead -- without this, a leveraged position
-                            // opened via run_live_trading would silently
-                            // degrade to spot accounting the moment its fills
-                            // came back from the exchange.
-                            leverage: candidate.leverage,
-                            margin_mode: candidate.margin_mode,
-                        };
-                        let inserted = self
-                            .store
-                            .insert_fill(&fill, &exchange_fill.exchange_trade_id)
-                            .await?;
-                        if inserted {
-                            new_fills.push(fill);
-                        }
-                    }
-                }
-                Err(reason) => {
+                Ok(executions) => executions,
+                Err(_) => {
                     self.report_health_fault("OMS fill query failed");
-                    // Do NOT advance the status without the fills (see
-                    // above). The local order stays as it was, so the next
-                    // reconcile pass sees the same transition and retries.
-                    tracing::warn!(
-                        order_id = ?client_order_id,
-                        reason,
-                        "apply_exchange_update: query_fills_for_order failed; status NOT advanced, will retry on next reconcile"
-                    );
-                    if exchange_order_id_changed {
-                        // Still worth keeping a newly learnt exchange id.
+                    if id_changed {
                         candidate.status = previous_status;
                         self.store.upsert_order(&candidate).await?;
                         self.open_orders.insert(client_order_id, candidate);
@@ -515,37 +561,26 @@ impl OrderManager {
                     return Ok(Vec::new());
                 }
             }
-            // Recomputed from the store rather than incremented, so it is
-            // correct however many times / after however many crashes the
-            // fills were recorded.
-            candidate.filled_quantity = self
-                .store
-                .get_fills_for_order(client_order_id)
-                .await?
-                .iter()
-                .map(|fill| fill.quantity)
-                .sum();
-        }
-
-        if status_changed {
-            candidate.status = status;
-        }
+        } else {
+            Vec::new()
+        };
         candidate.updated_at = Utc::now();
-        self.store.upsert_order(&candidate).await?;
-
+        let fills = self
+            .store
+            .commit_exchange_update(&mut candidate, executions, expected)
+            .await?;
         if matches!(
-            status,
+            candidate.status,
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
         ) {
             self.open_orders.remove(&client_order_id);
         } else {
             self.open_orders.insert(client_order_id, candidate);
         }
-
         let telemetry = apexes_telemetry::metrics();
-        telemetry.fills.inc_by(new_fills.len() as u64);
+        telemetry.fills.inc_by(fills.len() as u64);
         telemetry.open_orders.set(self.open_orders.len() as i64);
-        Ok(new_fills)
+        Ok(fills)
     }
 
     /// Reconnect reconciliation, in two passes, both delegating the

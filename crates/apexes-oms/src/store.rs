@@ -7,6 +7,9 @@ use apexes_core::{Fill, Order, OrderId, OrderStatus};
 use sqlx::PgPool;
 
 use crate::error::OmsError;
+
+#[path = "fill_reconciliation.rs"]
+mod fill_reconciliation;
 use crate::schema::{
     FILLS_ORDER_ID_INDEX_DDL, FILLS_TABLE_DDL, FillRow, ORDERS_ADD_LEVERAGE_COLUMNS_DDL,
     ORDERS_EXCHANGE_ID_INDEX_DDL, ORDERS_TABLE_DDL, OrderRow,
@@ -74,6 +77,16 @@ impl OrderStore {
             .await?;
         sqlx::query(FILLS_TABLE_DDL).execute(&pool).await?;
         sqlx::query(FILLS_ORDER_ID_INDEX_DDL).execute(&pool).await?;
+        sqlx::query("ALTER TABLE fills ADD COLUMN IF NOT EXISTS delivery_seq BIGSERIAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_delivery_seq ON fills(delivery_seq)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_fills_exchange_identity ON fills(venue, symbol, exchange_trade_id)")
+            .execute(&pool).await?;
 
         Ok(Self {
             pool,
@@ -310,26 +323,8 @@ impl OrderStore {
         fill: &Fill,
         exchange_trade_id: &str,
     ) -> Result<bool, OmsError> {
-        let row = FillRow::from_fill(fill, exchange_trade_id);
-        let result = sqlx::query(
-            "INSERT INTO fills (id, order_id, exchange_trade_id, symbol, venue, side, price, quantity, fee, fee_currency, filled_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (order_id, exchange_trade_id) DO NOTHING",
-        )
-        .bind(row.id)
-        .bind(row.order_id)
-        .bind(&row.exchange_trade_id)
-        .bind(&row.symbol)
-        .bind(&row.venue)
-        .bind(&row.side)
-        .bind(row.price)
-        .bind(row.quantity)
-        .bind(row.fee)
-        .bind(&row.fee_currency)
-        .bind(row.filled_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        let mut connection = self.pool.acquire().await?;
+        fill_reconciliation::insert_fill_on(&mut connection, fill, exchange_trade_id).await
     }
 
     pub async fn get_fills_for_order(&self, order_id: OrderId) -> Result<Vec<Fill>, OmsError> {

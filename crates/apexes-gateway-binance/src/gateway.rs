@@ -1006,6 +1006,45 @@ impl ExecutionGateway for BinanceExecutionGateway {
         Ok(Some(parse_binance_status(&parsed.status)?))
     }
 
+    async fn query_order_execution(
+        &self,
+        order: &Order,
+    ) -> Result<apexes_oms::OrderExecutionSnapshot, String> {
+        let family = ApiFamily::from(order.asset_class);
+        let exchange_id = order
+            .exchange_order_id
+            .as_deref()
+            .ok_or("missing exchange order ID")?;
+        let params = format!("symbol={}&orderId={exchange_id}", order.symbol);
+        let (status, body) = self
+            .rest
+            .signed_request("GET", family, Self::order_path(family), &params)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("order execution snapshot: HTTP {status}"));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Execution {
+            order_id: i64,
+            symbol: String,
+            status: String,
+            executed_qty: Decimal,
+        }
+        let parsed: Execution =
+            serde_json::from_str(&body).map_err(|_| "invalid execution snapshot".to_string())?;
+        if parsed.order_id.to_string() != exchange_id
+            || parsed.symbol != order.symbol
+            || parsed.executed_qty < Decimal::ZERO
+        {
+            return Err("order execution snapshot identity or quantity mismatch".into());
+        }
+        Ok(apexes_oms::OrderExecutionSnapshot {
+            status: parse_binance_status(&parsed.status)?,
+            executed_quantity: parsed.executed_qty,
+        })
+    }
+
     /// Looks the order up by `origClientOrderId` (our `Order.id`, which
     /// `submit_order` sent as `newClientOrderId`). Binance answers
     /// `-2013 Order does not exist` for an order it never received.
