@@ -446,6 +446,9 @@ async fn run_inner(
     if let Some(policy) = launch_config.simulated_depth {
         registry.register::<apexes_backtest::SimulatedDepthPolicy, ()>((), policy)?;
     }
+    if let Some(policy) = launch_config.event_latency {
+        registry.register::<apexes_backtest::EventLatencyPolicy, ()>((), policy)?;
+    }
     let (control_handle, command_tx, snapshot_rx) =
         build_control_handle(launch_config.snapshot_min_interval);
     let control_handle = control_handle
@@ -1137,6 +1140,7 @@ mod tests {
             simulated_fees: None,
             simulated_execution: None,
             simulated_depth: None,
+            event_latency: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }

@@ -580,4 +580,29 @@ and trigger orders are discarded on integrity loss rather than assuming
 queue continuity. This is a conservative simulation cancellation
 assumption, not an exchange cancellation instruction. Reports record
 the policy. Omission preserves legacy depth behavior; live sessions
-reject this setting. Causal arrival and queue calibration remain open.
+reject this setting.
+
+### Event-time direct-order latency
+
+Backtest and paper launch JSON accepts:
+
+```json
+{"event_latency":{"delay_ms":500}}
+```
+
+The positive fixed delay is independent of the depth and IOC policies.
+A direct strategy intent is scheduled after current pretrade checks;
+at the first observed event at or after its deadline, that event is
+processed, then the intent is rechecked against current rules, risk
+and balances and submitted before the next strategy decision.
+No wall-clock sleep is used. One intent per venue/symbol may be in
+flight, with a bounded FIFO; duplicates are refused. Regressing event
+timestamps are skipped, bar timestamps use close time, and equal
+timestamps retain input order. Pending intents at the end are counted
+without execution. Reports distinguish scheduled, arrived, refused
+and expired intents; arrival does not guarantee acceptance or fill.
+This observation-time model does not interpolate between events.
+EMS parent intents are refused until causal EMS scheduling is supplied;
+automatic liquidation and de-risking remain immediate. Live launch
+rejects the policy. Omission retains prior simulation timing behavior.
+Crossing-limit and queue calibration remain open.

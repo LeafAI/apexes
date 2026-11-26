@@ -115,6 +115,120 @@ impl Strategy for BuyOnceStrategy {
 }
 
 #[tokio::test]
+async fn event_latency_executes_against_arrival_depth_and_counts_unarrived_orders() {
+    let mut events = sample_events();
+    let MarketEvent::Depth(mut replacement) = events[0].clone() else {
+        panic!("fixture depth")
+    };
+    replacement.timestamp += chrono::Duration::milliseconds(500);
+    replacement.asks[0].price = dec!(2);
+    replacement.sequence = Some(2);
+    events.insert(1, MarketEvent::Depth(replacement.clone()));
+    let registry = apexes_core::registry::Registry::new();
+    let policy = apexes_backtest::EventLatencyPolicy { delay_ms: 500 };
+    registry
+        .register::<apexes_backtest::EventLatencyPolicy, ()>((), policy)
+        .unwrap();
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(events.clone()),
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].price, dec!(2));
+    assert_eq!(report.trades[0].filled_at, replacement.timestamp);
+    let evidence = report.event_latency.unwrap();
+    assert_eq!(evidence.policy, policy);
+    assert_eq!(
+        (
+            evidence.scheduled,
+            evidence.arrived,
+            evidence.expired_at_end
+        ),
+        (1, 1, 0)
+    );
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(vec![events.remove(0)]),
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let evidence = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            evidence.scheduled,
+            evidence.arrived,
+            evidence.expired_at_end
+        ),
+        (1, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn event_latency_rechecks_risk_at_arrival() {
+    use apexes_core::{Order, OrderId};
+    use apexes_risk::{PreTradeCheck, RiskViolation};
+    use apexes_strategy::Position;
+    use rust_decimal::Decimal;
+    struct Cutoff(chrono::DateTime<Utc>);
+    impl PreTradeCheck for Cutoff {
+        fn check(
+            &self,
+            _: &OrderIntent,
+            _: &HashMap<String, Position>,
+            _: &HashMap<String, Decimal>,
+            _: &HashMap<OrderId, Order>,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<(), Vec<RiskViolation>> {
+            if now >= self.0 {
+                Err(vec![RiskViolation::OrderQuantityExceeded {
+                    actual: dec!(1),
+                    limit: dec!(0),
+                }])
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let registry = apexes_core::registry::Registry::new();
+    registry
+        .register::<apexes_backtest::EventLatencyPolicy, ()>(
+            (),
+            apexes_backtest::EventLatencyPolicy { delay_ms: 500 },
+        )
+        .unwrap();
+    let cutoff = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap();
+    let checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(Cutoff(cutoff)));
+    registry
+        .register::<std::sync::Arc<CompositeRiskChecker>, ()>((), std::sync::Arc::new(checker))
+        .unwrap();
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(sample_events()),
+        BuyOnceStrategy { has_bought: false },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let evidence = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            evidence.scheduled,
+            evidence.arrived,
+            evidence.expired_at_end
+        ),
+        (1, 1, 0)
+    );
+}
+
+#[tokio::test]
 async fn risk_checker_none_behaves_identically_to_no_risk_checking() {
     let config = base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
     let registry = apexes_core::registry::Registry::new();

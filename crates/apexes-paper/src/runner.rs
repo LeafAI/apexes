@@ -78,6 +78,9 @@ pub async fn run_paper_trading(
     let execution =
         apexes_backtest::SimulatedExecution::from_registry(registry, &config.instruments)?;
     let depth = apexes_backtest::SimulatedDepthPolicy::from_registry(registry)?;
+    let latency = apexes_backtest::EventLatencyPolicy::from_registry(registry)?
+        .map(apexes_backtest::LatencyModel::EventTime)
+        .unwrap_or(config.latency_model);
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let risk_checker = registry
         .try_one::<Arc<CompositeRiskChecker>>()
@@ -165,7 +168,7 @@ pub async fn run_paper_trading(
         ems,
         strategy,
         None,
-        Some(config.latency_model),
+        Some(latency),
     )
     .await?;
     report.simulated_fees = Some(simulated_fees);
@@ -302,6 +305,50 @@ mod tests {
             market_condition_config: None,
             control: None,
         }
+    }
+
+    #[tokio::test]
+    async fn event_latency_uses_arrival_book_in_paper() {
+        let mut events = sample_events();
+        let MarketEvent::Depth(mut next) = events[0].clone() else {
+            panic!("depth fixture")
+        };
+        next.timestamp += chrono::Duration::milliseconds(1500);
+        next.sequence = Some(2);
+        next.asks[0].price = dec!(102);
+        events.push(MarketEvent::Depth(next.clone()));
+        let bus = MarketEventBus::new(Box::new(MockMarketDataProvider { events }));
+        let registry = Registry::new();
+        let policy = apexes_backtest::EventLatencyPolicy { delay_ms: 500 };
+        registry
+            .register::<apexes_backtest::EventLatencyPolicy, ()>((), policy)
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
+        let report = run_paper_trading(
+            base_config(),
+            &registry,
+            &bus,
+            BuyOnceStrategy { bought: false },
+            rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].price, dec!(102));
+        assert_eq!(report.trades[0].filled_at, next.timestamp);
+        let evidence = report.event_latency.unwrap();
+        assert_eq!(
+            (
+                evidence.scheduled,
+                evidence.arrived,
+                evidence.expired_at_end
+            ),
+            (1, 1, 0)
+        );
     }
 
     #[tokio::test]
