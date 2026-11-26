@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (market-data recovery qualification)_
+_Last updated: 2026-11-26 (EMS database decoupling qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)). Next: F01.04 EMS database decoupling. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)). Next: F01.05 session health management. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -88,9 +88,34 @@ database-dependent tests ran against a temporary isolated PostgreSQL 17
 instance, stopped afterwards. Eight new tests cover per-symbol freshness,
 old/future timestamps, malformed frames, queue overflow, silent sockets,
 book reconstruction, atomic snapshot/subscription continuity and Ping/Pong.
-Remote CI and ignored external tests remain pending. No real exchange
+PR #17 passed CI and merged; remaining live-exchange qualification is pending. No real exchange
 orders were placed. Operator-controlled release is retained; stronger
 session-health recovery gates belong to F01.05.
+
+F01.04 local qualification (Rust 1.99.0, locked): full workspace build,
+formatting, Clippy with warnings denied, 78 default test binaries (1,318
+passed, 0 failed; 83 ignored in the workspace run), and 30 doc-test suites
+passed. A sixth new, ignored PostgreSQL regression was added afterward;
+the final EMS suite with ignored tests enabled passed all 26 tests
+(18 default plus 8 database-dependent). Both database qualification runs
+used temporary isolated PostgreSQL 17, stopped afterward. The six new
+regressions cover no SQL on the inactive event path, active POV recovery
+and venue/symbol routing, cancellation, unresolved dispatch at restart,
+child-link persistence failure, and slow sink/queue overflow. Remote CI
+and remaining external tests are pending. No live database or exchange
+orders were used. The EMS fault latch requires reconciliation/restart;
+operator health and recovery controls are the next feature.
+
+PR #18 CI follow-up: the initial PostgreSQL job failed six live-trading
+integration tests because an EMS failure-injection fixture left an
+unresolved dispatch marker in the shared public schema. The startup guard
+correctly refused recovery. All eight EMS database tests now use isolated
+UUID-named schemas and remove them on success. The original safety
+assertions and production scheduling code are unchanged. The exact CI
+PostgreSQL sequence passed locally on one fresh temporary PostgreSQL 17
+database: OMS 53, EMS 26, live-trading 30 (109 total, zero failures).
+Confirmed no EMS test schemas or public parent_orders table remained
+after the EMS suite. Workspace Clippy and fmt passed; remote CI pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

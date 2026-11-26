@@ -18,6 +18,7 @@
 
 mod order_manager_sink;
 mod schema;
+mod state;
 
 pub use order_manager_sink::OrderManagerChildOrderSink;
 pub use schema::PARENT_ORDERS_TABLE_DDL;
@@ -31,7 +32,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use tokio::sync::Mutex;
+use state::SchedulingState;
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::child_order_sink::{ChildOrderIntent, ChildOrderSink};
@@ -58,6 +61,8 @@ pub struct PostgresEms {
     /// `on_market_event` calls instead), so `cancel_parent_order` can
     /// abort the right task.
     background_tasks: Mutex<HashMap<ParentOrderId, tokio::task::JoinHandle<()>>>,
+    state: Arc<SchedulingState>,
+    pov_tx: mpsc::Sender<PovWork>,
 }
 
 /// The subset of `PostgresEms`'s state its background scheduling loops
@@ -71,7 +76,19 @@ struct SchedulingDeps {
     pool: PgPool,
     sink: Arc<dyn ChildOrderSink>,
     volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
+    state: Arc<SchedulingState>,
 }
+
+struct PovWork {
+    trade: apexes_core::TradeEvent,
+    parents: Vec<ParentOrderId>,
+    enqueued: tokio::time::Instant,
+}
+
+const POV_QUEUE_CAPACITY: usize = 256;
+const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+const DB_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_POV_AGE: Duration = Duration::from_secs(2);
 
 impl PostgresEms {
     /// Connects to PostgreSQL at `url`, ensures both tables exist, then
@@ -85,16 +102,51 @@ impl PostgresEms {
         estimated_fee_bps: HashMap<AssetClass, Decimal>,
         volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
     ) -> Result<Arc<Self>, EmsError> {
-        let pool = PgPool::connect(url)
+        Self::new_with_kill_switch(
+            url,
+            sink,
+            scorer,
+            estimated_fee_bps,
+            volume_curve_provider,
+            None,
+        )
+        .await
+    }
+
+    /// The live runner shares its OMS kill switch with EMS. A latched
+    /// scheduling fault requires restart/reconciliation, not auto-resume.
+    pub async fn new_with_kill_switch(
+        url: &str,
+        sink: Arc<dyn ChildOrderSink>,
+        scorer: Arc<dyn VenueScorer>,
+        estimated_fee_bps: HashMap<AssetClass, Decimal>,
+        volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
+        kill_switch: Option<Arc<apexes_oms::KillSwitch>>,
+    ) -> Result<Arc<Self>, EmsError> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(DB_TIMEOUT)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '2000ms'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
             .await
             .map_err(|error| EmsError::ConnectionFailed {
                 reason: error.to_string(),
             })?;
         sqlx::query(PARENT_ORDERS_TABLE_DDL).execute(&pool).await?;
+        sqlx::query("ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS dispatch_pending BOOLEAN NOT NULL DEFAULT FALSE")
+            .execute(&pool).await?;
         sqlx::query(PARENT_ORDER_CHILDREN_TABLE_DDL)
             .execute(&pool)
             .await?;
 
+        let state = Arc::new(SchedulingState::new(kill_switch));
+        let (pov_tx, pov_rx) = mpsc::channel(POV_QUEUE_CAPACITY);
         let ems = Arc::new(Self {
             pool,
             sink,
@@ -102,10 +154,13 @@ impl PostgresEms {
             estimated_fee_bps,
             volume_curve_provider,
             background_tasks: Mutex::new(HashMap::new()),
+            state,
+            pov_tx,
         });
 
         ems.recover_scheduling_parent_orders().await?;
-
+        Self::spawn_pov_worker(&ems, pov_rx);
+        Self::spawn_health_monitor(&ems);
         Ok(ems)
     }
 
@@ -114,19 +169,34 @@ impl PostgresEms {
             pool: self.pool.clone(),
             sink: Arc::clone(&self.sink),
             volume_curve_provider: self.volume_curve_provider.clone(),
+            state: Arc::clone(&self.state),
         }
     }
 
     async fn recover_scheduling_parent_orders(&self) -> Result<(), EmsError> {
-        let rows: Vec<ParentOrderRow> =
-            sqlx::query_as("SELECT * FROM parent_orders WHERE status = 'Scheduling'")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<ParentOrderRow> = sqlx::query_as("SELECT * FROM parent_orders")
+            .fetch_all(&self.pool)
+            .await?;
 
+        // Validate the entire recovery set before spawning any task.
+        if rows.iter().any(|row| row.dispatch_pending) {
+            self.state.trip("unresolved EMS child dispatch at startup");
+            return Err(EmsError::SchedulingSuspended);
+        }
+        for row in &rows {
+            self.state.register(row)?;
+        }
+        let mut recover = Vec::new();
         for row in rows {
+            if row.status != "Scheduling" {
+                continue;
+            }
             let parent_id = row.parent_id();
             let remaining = row.total_quantity - row.filled_quantity;
             if remaining <= Decimal::ZERO {
+                self.scheduling_deps()
+                    .mark_completed_if_fully_submitted(parent_id)
+                    .await?;
                 continue;
             }
             tracing::info!(
@@ -134,7 +204,10 @@ impl PostgresEms {
                 remaining = %remaining,
                 "PostgresEms: recovering in-flight parent order from a previous process"
             );
-            self.spawn_scheduling_task(parent_id, &row).await;
+            recover.push(row);
+        }
+        for row in recover {
+            self.spawn_scheduling_task(row.parent_id(), &row).await;
         }
         Ok(())
     }
@@ -142,9 +215,8 @@ impl PostgresEms {
     /// Spawns a background `tokio::spawn` task that paces TWAP/VWAP/
     /// Iceberg child-order submission using REAL wall-clock timers
     /// (`tokio::time::sleep`), independent of `on_market_event`. `Pov`
-    /// requests get NO background task (POV is driven entirely by
-    /// `on_market_event`'s `MarketEvent::Trade` handling instead, see
-    /// `process_pov_on_trade`) -- this method returns immediately
+    /// requests get NO per-parent task (POV uses the bounded worker
+    /// fed by `on_market_event`) -- this method returns immediately
     /// without spawning anything for a `Pov` parent order.
     async fn spawn_scheduling_task(&self, parent_id: ParentOrderId, row: &ParentOrderRow) {
         let algo_spec: apexes_strategy::ExecutionAlgoSpec = match serde_json::from_value::<
@@ -165,49 +237,92 @@ impl PostgresEms {
 
         let deps = self.scheduling_deps();
         let handle = tokio::spawn(async move {
-            if let Err(error) = deps.run_scheduling_loop(parent_id, algo_spec).await {
-                tracing::error!(?error, parent_id = ?parent_id, "PostgresEms: background scheduling task ended with an error");
+            if deps
+                .run_scheduling_loop(parent_id, algo_spec)
+                .await
+                .is_err()
+            {
+                tracing::error!(parent_id = ?parent_id, "PostgresEms: background scheduling task ended with an error");
+                deps.state.trip("EMS background scheduling failed");
             }
         });
 
         self.background_tasks.lock().await.insert(parent_id, handle);
     }
 
-    /// POV's entire scheduling is driven here, from `on_market_event`,
-    /// not from a background task (see `spawn_scheduling_task`'s doc
-    /// comment).
-    async fn process_pov_on_trade(&self, trade: &apexes_core::TradeEvent) -> Result<(), EmsError> {
-        let rows: Vec<ParentOrderRow> = sqlx::query_as(
-            "SELECT * FROM parent_orders WHERE status = 'Scheduling' AND symbol = $1",
-        )
-        .bind(&trade.symbol)
-        .fetch_all(&self.pool)
-        .await?;
+    fn spawn_pov_worker(ems: &Arc<Self>, mut rx: mpsc::Receiver<PovWork>) {
+        let weak = Arc::downgrade(ems);
+        tokio::spawn(async move {
+            while let Some(work) = rx.recv().await {
+                let Some(ems) = weak.upgrade() else {
+                    return;
+                };
+                if !ems.state.allowed() {
+                    continue;
+                }
+                if work.enqueued.elapsed() > MAX_POV_AGE {
+                    ems.state.trip("EMS POV queue stale");
+                    continue;
+                }
+                if ems.process_pov(work).await.is_err() {
+                    ems.state.trip("EMS POV scheduling failed");
+                }
+            }
+        });
+    }
 
+    fn spawn_health_monitor(ems: &Arc<Self>) {
+        let weak = Arc::downgrade(ems);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HEALTH_INTERVAL).await;
+                let Some(ems) = weak.upgrade() else {
+                    return;
+                };
+                if !ems.state.healthy() {
+                    ems.state.trip("EMS reconciliation required");
+                    continue;
+                }
+                let result =
+                    tokio::time::timeout(DB_TIMEOUT, sqlx::query("SELECT 1").execute(&ems.pool))
+                        .await;
+                if !matches!(result, Ok(Ok(_))) {
+                    ems.state.trip("EMS database unavailable");
+                }
+            }
+        });
+    }
+
+    async fn process_pov(&self, work: PovWork) -> Result<(), EmsError> {
         let deps = self.scheduling_deps();
-        for row in rows {
-            let Ok(spec_json) = serde_json::from_value::<AlgoSpecJson>(row.algo_spec.clone())
-            else {
-                continue;
-            };
-            let apexes_strategy::ExecutionAlgoSpec::Pov { participation_rate } = spec_json.into()
-            else {
-                continue;
-            };
-            let parent_id = row.parent_id();
-            let remaining = row.total_quantity - row.filled_quantity;
-            if remaining <= Decimal::ZERO {
-                deps.mark_completed_if_fully_submitted(parent_id).await?;
+        for parent_id in work.parents {
+            if !self.state.allowed() {
+                break;
+            }
+            if !self.state.is_active(parent_id) {
                 continue;
             }
-            // Cap at the remaining unsubmitted quantity, mirroring
-            // `InMemoryEms`'s POV (see `ExecutionAlgoSpec::Pov`'s doc).
-            let quantity = (trade.quantity * participation_rate).min(remaining);
+            let Some(row) = deps.load_parent_order(parent_id).await? else {
+                return Err(EmsError::ParentOrderNotFound { id: parent_id });
+            };
+            if row.status != "Scheduling" {
+                self.state.set_status(parent_id, row.parse_status()?);
+                continue;
+            }
+            let spec: apexes_strategy::ExecutionAlgoSpec =
+                serde_json::from_value::<AlgoSpecJson>(row.algo_spec.clone())
+                    .map_err(|_| EmsError::SchedulingSuspended)?
+                    .into();
+            let apexes_strategy::ExecutionAlgoSpec::Pov { participation_rate } = spec else {
+                continue;
+            };
+            let remaining = row.total_quantity - row.filled_quantity;
+            let quantity = (work.trade.quantity * participation_rate).min(remaining);
             if quantity > Decimal::ZERO {
                 deps.submit_and_record_child(parent_id, &row, quantity)
                     .await?;
-                deps.mark_completed_if_fully_submitted(parent_id).await?;
             }
+            deps.mark_completed_if_fully_submitted(parent_id).await?;
         }
         Ok(())
     }
@@ -383,6 +498,9 @@ impl SchedulingDeps {
         &self,
         parent_id: ParentOrderId,
     ) -> Result<Option<ParentOrderRow>, EmsError> {
+        if !self.state.allowed() {
+            return Err(EmsError::SchedulingSuspended);
+        }
         let row: Option<ParentOrderRow> =
             sqlx::query_as("SELECT * FROM parent_orders WHERE id = $1")
                 .bind(parent_id.0)
@@ -404,6 +522,16 @@ impl SchedulingDeps {
     ) -> Result<apexes_core::OrderId, EmsError> {
         let venue = parse_venue(&row.venue)?;
         let side = parse_side(&row.side)?;
+        if !self.state.allowed() {
+            return Err(EmsError::SchedulingSuspended);
+        }
+        // A committed reservation prevents another dispatcher (including
+        // after restart) from treating an interrupted child as unsent.
+        let reserved = sqlx::query("UPDATE parent_orders SET dispatch_pending = TRUE WHERE id = $1 AND status = 'Scheduling' AND NOT dispatch_pending AND filled_quantity + $2 <= total_quantity")
+            .bind(parent_id.0).bind(quantity).execute(&self.pool).await?;
+        if reserved.rows_affected() != 1 || !self.state.allowed() {
+            return Err(EmsError::SchedulingSuspended);
+        }
 
         // `_fills` is deliberately discarded here: this sink is always
         // `OrderManagerChildOrderSink`, which returns an empty `Vec` by
@@ -440,11 +568,13 @@ impl SchedulingDeps {
         // Record the accepted child even if the subsequent persistence fails.
         tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %child_order_id.0);
 
+        // Child link and submitted quantity are committed together.
+        let mut tx = self.pool.begin().await?;
         let child_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM parent_order_children WHERE parent_order_id = $1",
         )
         .bind(parent_id.0)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         let sequence_number =
             i32::try_from(child_count).map_err(|error| EmsError::QueryFailed {
@@ -458,17 +588,18 @@ impl SchedulingDeps {
         .bind(child_order_id.0)
         .bind(sequence_number)
         .bind(Utc::now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         sqlx::query(
-            "UPDATE parent_orders SET filled_quantity = filled_quantity + $2, updated_at = $3 WHERE id = $1",
+            "UPDATE parent_orders SET filled_quantity = filled_quantity + $2, updated_at = $3, dispatch_pending = FALSE WHERE id = $1",
         )
         .bind(parent_id.0)
         .bind(quantity)
         .bind(Utc::now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(child_order_id)
     }
@@ -481,13 +612,17 @@ impl SchedulingDeps {
             return Ok(());
         };
         if row.filled_quantity >= row.total_quantity && row.status == "Scheduling" {
-            sqlx::query(
-                "UPDATE parent_orders SET status = 'Completed', updated_at = $2 WHERE id = $1",
+            let updated = sqlx::query(
+                "UPDATE parent_orders SET status = 'Completed', updated_at = $2 WHERE id = $1 AND status = 'Scheduling' AND NOT dispatch_pending",
             )
             .bind(parent_id.0)
             .bind(Utc::now())
             .execute(&self.pool)
             .await?;
+            if updated.rows_affected() == 1 {
+                self.state
+                    .set_status(parent_id, ParentOrderStatus::Completed);
+            }
         }
         Ok(())
     }
@@ -497,24 +632,27 @@ impl SchedulingDeps {
         parent_id: ParentOrderId,
         reason: String,
     ) -> Result<(), EmsError> {
-        sqlx::query(
-            "UPDATE parent_orders SET status = 'Failed', failure_reason = $2, updated_at = $3 WHERE id = $1",
+        let updated = sqlx::query(
+            "UPDATE parent_orders SET status = 'Failed', failure_reason = $2, updated_at = $3 WHERE id = $1 AND status = 'Scheduling' AND NOT dispatch_pending",
         )
         .bind(parent_id.0)
         .bind(&reason)
         .bind(Utc::now())
         .execute(&self.pool)
         .await?;
+        if updated.rows_affected() == 1 {
+            self.state
+                .set_status(parent_id, ParentOrderStatus::Failed { reason });
+        }
         Ok(())
     }
 }
 
-#[async_trait]
-impl Ems for PostgresEms {
-    async fn submit_algo_order(
-        &self,
-        request: AlgoOrderRequest,
-    ) -> Result<ParentOrderId, EmsError> {
+impl PostgresEms {
+    async fn submit_parent(&self, request: AlgoOrderRequest) -> Result<ParentOrderId, EmsError> {
+        if !self.state.allowed() {
+            return Err(EmsError::SchedulingSuspended);
+        }
         if request.leverage.is_some() {
             // Known limitation (see `submit_and_record_child`): the
             // `parent_orders` table does not persist
@@ -542,9 +680,9 @@ impl Ems for PostgresEms {
                 }
             })?;
 
-        sqlx::query(
+        let row: ParentOrderRow = sqlx::query_as(
             "INSERT INTO parent_orders (id, symbol, venue, side, total_quantity, filled_quantity, algo_spec, routing, status, failure_reason, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Scheduling', NULL, $9, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Scheduling', NULL, $9, $9) RETURNING *",
         )
         .bind(parent_id.0)
         .bind(&request.symbol)
@@ -555,37 +693,56 @@ impl Ems for PostgresEms {
         .bind(algo_spec_json)
         .bind(routing_json)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        let row: ParentOrderRow = sqlx::query_as("SELECT * FROM parent_orders WHERE id = $1")
-            .bind(parent_id.0)
-            .fetch_one(&self.pool)
-            .await?;
-
+        self.state.register(&row)?;
         self.spawn_scheduling_task(parent_id, &row).await;
 
         Ok(parent_id)
+    }
+}
+
+#[async_trait]
+impl Ems for PostgresEms {
+    async fn submit_algo_order(
+        &self,
+        request: AlgoOrderRequest,
+    ) -> Result<ParentOrderId, EmsError> {
+        if !self.state.allowed() {
+            return Err(EmsError::SchedulingSuspended);
+        }
+        let result = self.submit_parent(request).await;
+        if result.is_err() {
+            self.state.trip("EMS parent persistence failed");
+        }
+        result
     }
 
     async fn parent_order_status(
         &self,
         id: ParentOrderId,
     ) -> Result<Option<ParentOrderStatus>, EmsError> {
-        let row: Option<ParentOrderRow> =
-            sqlx::query_as("SELECT * FROM parent_orders WHERE id = $1")
-                .bind(id.0)
-                .fetch_optional(&self.pool)
-                .await?;
-        row.map(|row| row.parse_status()).transpose()
+        // Every recovered/new parent is cached; polling the trading loop
+        // never performs a database read for a known parent.
+        if let Some(status) = self.state.status(id) {
+            return Ok(Some(status));
+        }
+        Ok(None)
     }
 
     async fn cancel_parent_order(&self, id: ParentOrderId) -> Result<(), EmsError> {
-        sqlx::query("UPDATE parent_orders SET status = 'Cancelled', updated_at = $2 WHERE id = $1")
-            .bind(id.0)
-            .bind(Utc::now())
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query("UPDATE parent_orders SET status = 'Cancelled', updated_at = $2 WHERE id = $1 AND NOT dispatch_pending")
+            .bind(id.0).bind(Utc::now()).execute(&self.pool).await;
+        match result {
+            Ok(result) if result.rows_affected() == 1 => {
+                self.state.set_status(id, ParentOrderStatus::Cancelled)
+            }
+            _ => {
+                self.state.trip("EMS cancellation requires reconciliation");
+                return Err(EmsError::SchedulingSuspended);
+            }
+        }
 
         if let Some(handle) = self.background_tasks.lock().await.remove(&id) {
             handle.abort();
@@ -596,11 +753,17 @@ impl Ems for PostgresEms {
         )
         .bind(id.0)
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|error| {
+            self.state
+                .trip("EMS child lookup failed during cancellation");
+            EmsError::from(error)
+        })?;
         for (child_uuid,) in child_ids {
             self.sink
                 .cancel_child_order(apexes_core::OrderId(child_uuid))
-                .await?;
+                .await
+                .inspect_err(|_| self.state.trip("EMS child cancellation failed"))?;
         }
         Ok(())
     }
@@ -619,10 +782,33 @@ impl Ems for PostgresEms {
         // `OrderManagerChildOrderSink`, whose fills surface later via
         // `OrderManager::apply_exchange_update`/`reconcile()`, not
         // synchronously here).
+        if !self.state.allowed() {
+            return Ok(Vec::new());
+        }
         if let MarketEvent::Trade(trade) = event {
-            self.process_pov_on_trade(trade).await?;
+            let parents = self.state.active_for(trade.venue, &trade.symbol);
+            if !parents.is_empty()
+                && self
+                    .pov_tx
+                    .try_send(PovWork {
+                        trade: trade.clone(),
+                        parents,
+                        enqueued: tokio::time::Instant::now(),
+                    })
+                    .is_err()
+            {
+                self.state.trip("EMS POV queue overflow or worker stopped");
+            }
         }
         Ok(Vec::new())
+    }
+}
+
+impl Drop for PostgresEms {
+    fn drop(&mut self) {
+        for (_, handle) in self.background_tasks.get_mut().drain() {
+            handle.abort();
+        }
     }
 }
 
@@ -649,5 +835,110 @@ fn parse_side(s: &str) -> Result<Side, EmsError> {
         other => Err(EmsError::QueryFailed {
             reason: format!("unknown persisted Side: {other:?}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexes_core::OrderId;
+    use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, PriceAndFeeScorer};
+    use rust_decimal_macros::dec;
+
+    struct NoDispatch;
+    #[async_trait]
+    impl ChildOrderSink for NoDispatch {
+        async fn submit_child_order(
+            &self,
+            _: ChildOrderIntent,
+        ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+            panic!("unexpected child dispatch")
+        }
+        async fn cancel_child_order(&self, _: OrderId) -> Result<(), EmsError> {
+            Ok(())
+        }
+        async fn order_status(&self, _: OrderId) -> Result<Option<apexes_core::Order>, EmsError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn idle_and_unmatched_events_need_no_database_and_outage_latches_halt() {
+        let base_url = "postgres://apexes:apexes@localhost:5432/apexes";
+        let pool = PgPool::connect(base_url).await.unwrap();
+        // SQL identifier is generated exclusively from a fixed prefix and UUID hex.
+        let schema = format!("ems_test_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let url = format!("{base_url}?options[search_path]={schema}");
+        let ks = Arc::new(apexes_oms::KillSwitch::new());
+        let ems = PostgresEms::new_with_kill_switch(
+            &url,
+            Arc::new(NoDispatch),
+            Arc::new(PriceAndFeeScorer),
+            HashMap::new(),
+            None,
+            Some(ks.clone()),
+        )
+        .await
+        .unwrap();
+        let id = ems
+            .submit_algo_order(AlgoOrderRequest {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                side: Side::Buy,
+                quantity: dec!(1),
+                execution_algo: ExecutionAlgoSpec::Pov {
+                    participation_rate: dec!(0.5),
+                },
+                routing: OrderRouting::Fixed,
+                leverage: None,
+                margin_mode: None,
+            })
+            .await
+            .unwrap();
+        ems.pool.close().await;
+        let event = MarketEvent::Trade(apexes_core::TradeEvent {
+            symbol: "ETHUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(100),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        for _ in 0..1000 {
+            assert!(ems.on_market_event(&event).await.unwrap().is_empty());
+            assert_eq!(
+                ems.parent_order_status(id).await.unwrap(),
+                Some(ParentOrderStatus::Scheduling)
+            );
+        }
+        assert!(
+            !ks.is_engaged(),
+            "idle event path must not query closed pool"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ks.is_engaged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!ems.state.healthy());
+        ks.release();
+        ems.on_market_event(&event).await.unwrap();
+        assert!(
+            ks.is_engaged(),
+            "operator release cannot clear EMS fault latch"
+        );
+        drop(ems);
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

@@ -10,6 +10,9 @@ pub enum EmsError {
     #[error("failed to connect to PostgreSQL: {reason}")]
     ConnectionFailed { reason: String },
 
+    #[error("EMS scheduling suspended: reconciliation required")]
+    SchedulingSuspended,
+
     #[error("database query failed: {reason}")]
     QueryFailed { reason: String },
 

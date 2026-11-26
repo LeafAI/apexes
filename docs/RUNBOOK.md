@@ -310,3 +310,19 @@ automatically authorize new trading. Check data freshness, depth, open
 orders and positions before releasing the halt; do not release it merely
 because a socket has reconnected. Binance testnet depth remains unavailable.
 Full operator recovery gating is planned in F01.05.
+
+### EMS database outage and recovery (F01.04)
+
+The live EMS uses a durable-backed POV index and bounded worker rather
+than querying PostgreSQL on each inactive trade. A database probe failure,
+queue overflow/staleness or child persistence failure latches an EMS
+fault and engages the shared OMS halt. The market-event loop remains
+available for monitoring. Do not release the halt simply because the
+database is reachable again. Reconcile the original OMS client IDs,
+exchange orders/fills and parent_order_children records before restart.
+A parent_orders row with dispatch_pending=true may represent an accepted
+child whose acknowledgement could not be recorded. The engine refuses
+automatic EMS recovery in that case. Do not blindly clear the marker or
+resubmit: determine the actual outcome and reconcile the record first.
+The marker is not a complete cross-process attribution ledger. Explicit
+session recovery controls are planned for F01.05.

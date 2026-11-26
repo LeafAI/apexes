@@ -192,12 +192,13 @@ pub async fn run_live_trading(
     let order_manager = Arc::new(tokio::sync::Mutex::new(order_manager));
     let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> =
         Arc::new(OrderManagerChildOrderSink::new(Arc::clone(&order_manager)));
-    let ems: Arc<dyn Ems> = PostgresEms::new(
+    let ems: Arc<dyn Ems> = PostgresEms::new_with_kill_switch(
         &config.ems_postgres_url,
         child_order_sink,
         venue_scorer,
         HashMap::new(),
         volume_curve_provider,
+        config.kill_switch.clone(),
     )
     .await
     .map_err(|error| ApexesError::InvalidBacktestConfig {

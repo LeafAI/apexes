@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS parent_orders
     routing             JSONB NOT NULL,
     status              TEXT NOT NULL,
     failure_reason      TEXT,
+    dispatch_pending    BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMPTZ NOT NULL,
     updated_at          TIMESTAMPTZ NOT NULL
 )
@@ -184,6 +185,7 @@ pub struct ParentOrderRow {
     pub routing: serde_json::Value,
     pub status: String,
     pub failure_reason: Option<String>,
+    pub dispatch_pending: bool,
     /// Audit timestamps, persisted but not read by the scheduling
     /// loops (which pace themselves off real elapsed time instead).
     #[allow(dead_code)]
@@ -289,6 +291,7 @@ mod tests {
             routing: serde_json::json!({"kind": "Fixed"}),
             status: "Failed".to_string(),
             failure_reason: Some("boom".to_string()),
+            dispatch_pending: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
