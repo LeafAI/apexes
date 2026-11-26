@@ -24,7 +24,7 @@ pub mod store;
 pub use error::OmsError;
 pub use exchange_update::ExchangeUpdate;
 pub use gateway::{ExchangeFill, ExecutionGateway, GatewayOutcome};
-pub use kill_switch::KillSwitch;
+pub use kill_switch::{KillSwitch, SessionPhase};
 pub use manager::{CancelAllReport, OrderManager};
 pub use mock_gateway::MockExecutionGateway;
 pub use store::{OrderStore, SubmissionState};

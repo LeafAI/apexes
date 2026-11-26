@@ -241,6 +241,7 @@ pub(crate) async fn run_ws_stream(
     resync: Arc<Notify>,
     timings: StreamTimings,
     rest: Option<BinanceRestClient>,
+    health: Option<Arc<apexes_oms::KillSwitch>>,
 ) {
     let mut first = first;
     let mut failures = 0u32;
@@ -250,6 +251,9 @@ pub(crate) async fn run_ws_stream(
             None => match connect_and_subscribe_with_clock(&config, rest.as_ref()).await {
                 Ok(socket) => socket,
                 Err(reason) => {
+                    if let Some(ks) = &health {
+                        ks.fault("exchange user-data connection unavailable");
+                    }
                     tracing::warn!(
                         reason,
                         "user-data stream: could not (re)subscribe; will retry"
@@ -310,6 +314,9 @@ pub(crate) async fn run_ws_stream(
                 }
                 Ok(Some(Ok(_))) => {}
             }
+        }
+        if let Some(ks) = &health {
+            ks.fault("exchange user-data stream disconnected");
         }
         telemetry
             .stream_connected
@@ -721,6 +728,7 @@ mod tests {
             Arc::clone(&resync),
             fast(),
             None,
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), resync.notified())
@@ -754,6 +762,7 @@ mod tests {
             tx,
             Arc::clone(&resync),
             fast(),
+            None,
             None,
         ));
 
@@ -794,6 +803,7 @@ mod tests {
             Arc::new(Notify::new()),
             fast(),
             None,
+            None,
         ));
         for _ in 0..100 {
             if server.connections.load(Ordering::SeqCst) >= 2 {
@@ -825,6 +835,7 @@ mod tests {
             Arc::clone(&resync),
             fast(),
             None,
+            None,
         ));
         // first subscribe, then after two rejections a successful third
         tokio::time::timeout(Duration::from_secs(5), resync.notified())
@@ -853,6 +864,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             timings,
+            None,
             None,
         ));
         for _ in 0..100 {
@@ -885,10 +897,49 @@ mod tests {
             Arc::new(Notify::new()),
             fast(),
             None,
+            None,
         ));
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the task must stop once nobody is listening")
             .unwrap();
+    }
+    #[tokio::test]
+    async fn managed_exchange_disconnect_latches_session_even_after_resubscribe() {
+        let server = fake_ws_api(vec![
+            Behaviour::AcceptThenClose(vec![]),
+            Behaviour::Accept(vec![]),
+        ])
+        .await;
+        let cfg = config(&server.url);
+        let first = connect_and_subscribe(&cfg).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let resync = Arc::new(Notify::new());
+        let ks = Arc::new(apexes_oms::KillSwitch::managed());
+        ks.begin_reconciliation();
+        ks.startup_ready();
+        let task = tokio::spawn(run_ws_stream(
+            cfg,
+            Some(first),
+            tx,
+            resync.clone(),
+            fast(),
+            None,
+            Some(ks.clone()),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), ks.wait_engaged())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.connections.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ks.phase(), Some(apexes_oms::SessionPhase::Degraded));
+        assert!(ks.blocks_submissions());
+        assert!(ks.try_release().is_err());
+        task.abort();
     }
 }

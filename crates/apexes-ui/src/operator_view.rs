@@ -350,6 +350,27 @@ fn status_bar(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<Sessio
             palette.warn,
             "NO CONNECTION - state below may be out of date",
         );
+    } else if let Some(status) = &state.status
+        && let Some(health) = status.health_state.as_deref()
+        && health != "Running"
+    {
+        let reason = status.health_reason.as_deref().unwrap_or_default();
+        banner(
+            ui,
+            if status.halted {
+                palette.danger
+            } else {
+                palette.warn
+            },
+            &format!(
+                "{health}: {reason}{}",
+                if status.halted && status.resume_blocked {
+                    " — reconcile and restart required"
+                } else {
+                    ""
+                }
+            ),
+        );
     } else if state.halted() {
         let reason = state
             .status
@@ -374,6 +395,19 @@ fn status_bar(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<Sessio
 pub fn run_state(state: &OperatorState) -> (&'static str, RunTone) {
     if !state.connected() {
         ("OFFLINE", RunTone::Warn)
+    } else if let Some(health) = state
+        .status
+        .as_ref()
+        .and_then(|s| s.health_state.as_deref())
+        && health != "Running"
+    {
+        match health {
+            "Initializing" => ("INITIALIZING", RunTone::Warn),
+            "Reconciling" => ("RECONCILING", RunTone::Warn),
+            "Degraded" => ("DEGRADED", RunTone::Bad),
+            "Halted" => ("HALTED", RunTone::Bad),
+            _ => ("UNKNOWN", RunTone::Warn),
+        }
     } else if state.halted() {
         ("HALTED", RunTone::Bad)
     } else if state.paused() {
@@ -436,6 +470,7 @@ fn banner(ui: &mut egui::Ui, color: Color32, text: &str) {
 fn controls(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<SessionCommand>) {
     let enabled = state.can_command();
     let halted = state.halted();
+    let resume_blocked = state.status.as_ref().is_some_and(|s| s.resume_blocked);
     let paused = state.paused();
     let palette = palette_of(ui.ctx());
     let mut act =
@@ -454,7 +489,9 @@ fn controls(ui: &mut egui::Ui, state: &mut OperatorState, out: &mut Vec<SessionC
             }
         };
     let hint = "needs a connection with an operator token";
-    if halted {
+    if halted && resume_blocked {
+        ui.label("Reconcile and restart to resume");
+    } else if halted {
         act(
             ui,
             "Resume trading...",

@@ -278,6 +278,12 @@ pub async fn run_live_trading(
                         ks.engage("market data order book invalidated");
                     }
                     activity_clock.observe(event);
+                    if let Some(ks) = &kill_switch
+                        && ks.phase() == Some(apexes_oms::SessionPhase::Reconciling)
+                        && activity_clock.all_observed()
+                    {
+                        ks.startup_ready();
+                    }
                 }
             })
             .take_until(Box::pin(async move {

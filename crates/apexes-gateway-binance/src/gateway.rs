@@ -290,7 +290,20 @@ impl BinanceExecutionGateway {
         ),
         String,
     > {
-        crate::user_data_stream::start_user_data_stream(
+        self.start_user_data_stream_with_health(None).await
+    }
+
+    pub async fn start_user_data_stream_with_health(
+        &self,
+        health: Option<std::sync::Arc<apexes_oms::KillSwitch>>,
+    ) -> Result<
+        (
+            crate::user_data_stream::UserDataStreamHandle,
+            impl futures::Stream<Item = apexes_oms::ExchangeUpdate> + use<>,
+        ),
+        String,
+    > {
+        crate::user_data_stream::start_user_data_stream_guarded(
             self.rest.clone(),
             crate::ws_user_stream::SpotStreamConfig {
                 url: self.spot_ws_api.clone(),
@@ -298,6 +311,7 @@ impl BinanceExecutionGateway {
                 recv_window_ms: self.recv_window_ms,
             },
             !self.spot_only,
+            health,
         )
         .await
     }

@@ -48,6 +48,21 @@ impl SchedulingState {
         }
         !self.kill_switch.as_ref().is_some_and(|ks| ks.is_engaged())
     }
+    pub(super) async fn wait_startup_ready(&self) -> bool {
+        match &self.kill_switch {
+            Some(ks) => ks.wait_startup_ready().await && self.healthy(),
+            None => self.healthy(),
+        }
+    }
+
+    pub(super) fn trading_ready(&self) -> bool {
+        self.allowed()
+            && !self
+                .kill_switch
+                .as_ref()
+                .is_some_and(|ks| ks.blocks_submissions())
+    }
+
     pub(super) fn trip(&self, reason: &'static str) {
         if !self.faulted.swap(true, Ordering::AcqRel) {
             tracing::error!(reason, "EMS scheduling suspended; reconciliation required");

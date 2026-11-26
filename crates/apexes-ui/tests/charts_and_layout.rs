@@ -154,6 +154,9 @@ fn state(snapshot: SessionSnapshot) -> OperatorState {
         halted: false,
         halt_reason: None,
         flatten_requested: false,
+        health_state: None,
+        health_reason: None,
+        resume_blocked: false,
     }));
     s.apply(SessionMessage::Snapshot(snapshot));
     s

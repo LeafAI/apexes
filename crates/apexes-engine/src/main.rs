@@ -501,7 +501,11 @@ async fn run_inner(
     // rationale).
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
-    let kill_switch = Arc::new(apexes_oms::KillSwitch::new());
+    let kill_switch = Arc::new(if matches!(launch_config.mode, SessionMode::Live { .. }) {
+        apexes_oms::KillSwitch::managed()
+    } else {
+        apexes_oms::KillSwitch::new()
+    });
     spawn_snapshot_gauges(snapshot_rx.clone());
     let app = build_app_secured(
         command_tx,
@@ -831,7 +835,7 @@ async fn run_live_mode(
     // call below, rather than being dropped at the end of this
     // statement.
     let (_user_data_stream_handle, exchange_updates) = binance_gateway
-        .start_user_data_stream()
+        .start_user_data_stream_with_health(Some(Arc::clone(&kill_switch)))
         .await
         .map_err(|reason| EngineError::UserDataStream { reason })?;
     let exchange_updates = Box::pin(exchange_updates);
@@ -866,6 +870,7 @@ async fn run_live_mode(
              balances are recovered from the exchange"
         );
     }
+    kill_switch.begin_reconciliation();
     let recovered = apexes_live_trading::recover_live_state(
         &mut order_manager,
         &[
@@ -883,8 +888,6 @@ async fn run_live_mode(
 
     // Recovery succeeded: local and exchange state agree and the ledger is
     // seeded. Only now does this session count as started.
-    ready.mark_ready();
-
     let (session_balances, ignored_assets) =
         session_balances(recovered.snapshot.balances, &launch_config.instruments);
     if ignored_assets > 0 {
@@ -918,15 +921,23 @@ async fn run_live_mode(
         reconcile_interval,
         ems_postgres_url,
         control: Some(control_handle),
-        kill_switch: Some(kill_switch),
-        stale_data_timeout,
+        kill_switch: Some(Arc::clone(&kill_switch)),
+        stale_data_timeout: Some(stale_data_timeout.unwrap_or(std::time::Duration::from_secs(30))),
         resync: Some(_user_data_stream_handle.resync_notifier()),
         position_source: Some(Arc::new(BinancePositionSource(Arc::clone(
             &binance_gateway,
         )))),
     };
 
-    run_live_trading(
+    let ready_task = tokio::spawn({
+        let health = Arc::clone(&kill_switch);
+        async move {
+            if health.wait_startup_ready().await {
+                ready.mark_ready();
+            }
+        }
+    });
+    let result = run_live_trading(
         config,
         registry,
         strategy,
@@ -934,8 +945,12 @@ async fn run_live_mode(
         exchange_updates,
         stop_signal,
     )
-    .await
-    .map_err(EngineError::Run)?;
+    .await;
+    ready_task.abort();
+    if result.is_err() {
+        kill_switch.fault("live trading loop failed");
+    }
+    result.map_err(EngineError::Run)?;
     Ok(())
 }
 

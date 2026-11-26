@@ -326,3 +326,24 @@ automatic EMS recovery in that case. Do not blindly clear the marker or
 resubmit: determine the actual outcome and reconcile the record first.
 The marker is not a complete cross-process attribution ledger. Explicit
 session recovery controls are planned for F01.05.
+
+### Managed live session health (F01.05)
+
+The live engine reports Initializing, Reconciling, Running, Degraded and
+Halted independently of market snapshots. /readyz returns 503 until
+recovery and usable market data for every configured venue/symbol are
+established; /healthz remains a liveness endpoint. The PID readiness
+marker is published only after the startup gate passes. An unspecified
+live staleness limit defaults to 30 seconds.
+
+A fault or operator halt latches the session and blocks new ordinary
+orders. Reconnection alone is not sufficient to authorize trading.
+Halted means the cancel sweep completed, not necessarily that the
+account is flat. For this iteration managed ResumeTrading is refused
+even for a manual halt. Check the reason, reconcile exchange orders,
+fills, balances, positions and EMS pending dispatches, then explicitly
+restart only after reviewing the results. A fresh session repeats
+startup recovery; the health latch itself is not persisted across
+processes. Pause and Resume of strategy evaluation remain independent.
+The existing explicit flatten procedure is unchanged; never infer a
+safe flatten quantity from an unresolved order outcome.

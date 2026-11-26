@@ -100,6 +100,9 @@ fn state(network: &str, halted: bool) -> OperatorState {
         halted,
         halt_reason: halted.then(|| "stale market data".to_string()),
         flatten_requested: false,
+        health_state: None,
+        health_reason: None,
+        resume_blocked: false,
     }));
     s.apply(SessionMessage::Snapshot(snapshot(network)));
     s
