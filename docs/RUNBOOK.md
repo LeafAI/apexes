@@ -260,3 +260,21 @@ Reason codes are allowlisted rather than raw exchange error messages.
 Logs contain trading data: restrict access and manage retention. A ledger
 failure requires reconciliation; the diagnostic record alone does not repair
 account state.
+
+### Binance exchange clock (F01.01)
+
+Signed REST and gateway-managed Spot WebSocket requests use a cached
+server-time sample (per API family, refreshed on demand every 60 seconds).
+The default receive window is 5000 ms. To override it for engine,
+supervisor or compose launches, set `APEXES_BINANCE_RECV_WINDOW_MS`
+to a valid integer from 1 through 60000. Prefer the default unless a
+measured requirement justifies a change.
+
+Look for `Binance server clock synchronized` with `family`, `rtt_ms`
+and `offset_ms`. A failed or stale preflight prevents the signed
+request from being sent; retries of clock sampling are throttled.
+An explicit HTTP 400 / -1021 rejection permits one re-signing retry
+using the same client order ID. A timeout or ambiguous response is not
+permission to retry an order. Reconcile it before taking further action.
+The clock layer does not guarantee recovery when network delays exceed
+the receive window, and does not replace the session health controls.

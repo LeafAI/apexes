@@ -199,7 +199,7 @@ pub async fn start_user_data_stream(
     let (tx, rx) = mpsc::unbounded_channel();
     let resync = Arc::new(Notify::new());
 
-    let first = crate::ws_user_stream::connect_and_subscribe(&spot).await?;
+    let first = crate::ws_user_stream::connect_and_subscribe_with_clock(&spot, Some(&rest)).await?;
     if with_futures {
         obtain_listen_key(&rest, ApiFamily::Futures).await?;
     }
@@ -210,6 +210,7 @@ pub async fn start_user_data_stream(
         tx.clone(),
         Arc::clone(&resync),
         StreamTimings::default(),
+        Some(rest.clone()),
     ));
     let futures = with_futures.then(|| {
         tokio::spawn(run_stream_task(
@@ -372,9 +373,25 @@ mod tests {
         })
     }
 
+    async fn mount_clock(server: &MockServer) {
+        for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(time_path))
+                .respond_with(|_: &wiremock::Request| {
+                    wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                    )
+                })
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
+    }
+
     #[tokio::test]
     async fn obtain_listen_key_sends_post_and_parses_the_key() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("POST"))
             .and(path("/api/v3/userDataStream"))
@@ -394,6 +411,7 @@ mod tests {
     #[tokio::test]
     async fn obtain_listen_key_uses_futures_path_for_futures_family() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("POST"))
             .and(path("/fapi/v1/listenKey"))
@@ -413,6 +431,7 @@ mod tests {
     #[tokio::test]
     async fn obtain_listen_key_surfaces_an_error_on_non_success_status() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("POST"))
             .and(path("/api/v3/userDataStream"))
@@ -440,6 +459,7 @@ mod tests {
     #[tokio::test]
     async fn renew_listen_key_sends_put_with_the_listen_key_param() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("PUT"))
             .and(path("/api/v3/userDataStream"))
@@ -458,6 +478,7 @@ mod tests {
     #[tokio::test]
     async fn renew_listen_key_uses_futures_path_for_futures_family() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("PUT"))
             .and(path("/fapi/v1/listenKey"))
@@ -476,6 +497,7 @@ mod tests {
     #[tokio::test]
     async fn renew_listen_key_surfaces_an_error_on_non_success_status() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
 
         Mock::given(method("PUT"))
             .and(path("/api/v3/userDataStream"))
@@ -623,6 +645,7 @@ mod tests {
     #[tokio::test]
     async fn reconnects_with_a_fresh_listen_key_and_signals_resync_each_time() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         listen_key_mock(&server).await;
         let (port, connections) = fake_ws_server(vec![
             (vec![exec_report(1)], true), // sends one update then drops
@@ -670,6 +693,7 @@ mod tests {
     #[tokio::test]
     async fn failed_keepalive_forces_a_reconnect_with_a_new_key() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         listen_key_mock(&server).await;
         Mock::given(method("PUT"))
             .and(path("/api/v3/userDataStream"))
@@ -707,6 +731,7 @@ mod tests {
     #[tokio::test]
     async fn idle_socket_is_dropped_and_reconnected() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         listen_key_mock(&server).await;
         let (port, connections) = fake_ws_server(vec![]).await; // silent connections
 

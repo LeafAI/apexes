@@ -20,6 +20,7 @@ const PASSTHROUGH: &[&str] = &[
     "TMPDIR",
     "RUST_LOG",
     "APEXES_LOG_FORMAT",
+    "APEXES_BINANCE_RECV_WINDOW_MS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "HTTPS_PROXY",
