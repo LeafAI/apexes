@@ -50,6 +50,33 @@ impl MatchingEngineChildOrderSink {
 
 #[async_trait]
 impl ChildOrderSink for MatchingEngineChildOrderSink {
+    async fn reserve_parent(
+        &self,
+        _id: apexes_strategy::ParentOrderId,
+        request: &apexes_ems::AlgoOrderRequest,
+    ) -> Result<(), EmsError> {
+        let engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let intent = OrderIntent {
+            symbol: request.symbol.clone(),
+            venue: request.venue,
+            asset_class: apexes_core::AssetClass::Spot,
+            side: request.side,
+            order_type: OrderType::Market,
+            quantity: request.quantity,
+            price: None,
+            stop_price: None,
+            execution_algo: None,
+            routing: request.routing.clone(),
+            leverage: request.leverage,
+            margin_mode: request.margin_mode,
+        };
+        engine
+            .execution_policy()
+            .validate_intent(&intent)
+            .map_err(|e| EmsError::ParentAdmissionRejected {
+                reason: e.to_string(),
+            })
+    }
     async fn submit_child_order(
         &self,
         intent: ChildOrderIntent,
@@ -71,7 +98,7 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
         let now = engine.event_time().unwrap_or_else(Utc::now);
         let (order, fills) = engine
-            .submit_market_order(&order_intent, now)
+            .submit_market_child(&order_intent, now)
             .map_err(|error| EmsError::ChildOrderSubmissionFailed {
                 parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
                 reason: error.to_string(),

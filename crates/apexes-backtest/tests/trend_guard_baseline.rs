@@ -134,6 +134,48 @@ fn economic_report(report: &BacktestReport) -> serde_json::Value {
 }
 
 #[test]
+fn bounded_ioc_replay_does_not_buy_above_reference_and_reports_policy() {
+    let registry = Registry::new();
+    let policy = apexes_backtest::SimulatedExecution::BoundedSpotIoc {
+        rules: std::collections::BTreeMap::from([(
+            SYMBOL.into(),
+            apexes_core::SymbolRules {
+                quantity_step: dec!(0.0001),
+                min_quantity: dec!(0.0001),
+                max_quantity: dec!(100),
+                price_tick: dec!(0.01),
+                min_notional: dec!(5),
+            },
+        )]),
+        max_reference_age_ms: 1000,
+    };
+    registry
+        .register::<apexes_backtest::SimulatedExecution, ()>((), policy.clone())
+        .unwrap();
+    let prices = trending_prices();
+    let bounded = replay_with_registry(&prices, dec!(10), &registry);
+    assert!(
+        bounded.trades.is_empty(),
+        "all synthetic asks exceed the trade reference"
+    );
+    assert_eq!(bounded.simulated_execution, Some(policy));
+    let unrestricted = replay(&prices, dec!(10));
+    assert_eq!(unrestricted.trades.len(), 2);
+    assert_eq!(
+        unrestricted.simulated_execution,
+        Some(apexes_backtest::SimulatedExecution::UnrestrictedMarket)
+    );
+    let mut old = serde_json::to_value(&unrestricted).unwrap();
+    old.as_object_mut().unwrap().remove("simulated_execution");
+    assert!(
+        serde_json::from_value::<BacktestReport>(old)
+            .unwrap()
+            .simulated_execution
+            .is_none()
+    );
+}
+
+#[test]
 fn flat_market_does_not_create_orders() {
     let report = replay(&[dec!(100); 250], dec!(10));
     assert!(report.trades.is_empty());

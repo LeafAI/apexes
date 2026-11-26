@@ -34,7 +34,9 @@ pub mod order_book;
 // Populated in Task 5.
 pub mod cost_model;
 
+pub mod execution_policy;
 pub mod latency;
+pub use execution_policy::SimulatedExecution;
 pub mod mark_price_source;
 
 // Populated in Task 7.

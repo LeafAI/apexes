@@ -998,6 +998,7 @@ pub async fn run_unified_event_loop(
         trades: all_fills,
         spot_pnl: ledger.spot_pnl(),
         simulated_fees: None,
+        simulated_execution: None,
     })
 }
 
