@@ -383,3 +383,23 @@ from the complete durable journal; the acknowledgement watermark is
 process-local. Do not delete records or advance the cursor manually.
 Automatic historical pagination and online cost-basis correction remain
 outside this iteration.
+
+### Spot fee and P&L attribution (F02.03)
+
+The report and evaluation snapshot expose spot_pnl by symbol and quote
+unit, including gross realized/unrealized contribution, native fee
+amounts, execution-time cost, marked fee value, fee revaluation and net
+contribution. The operator details group these by quote currency.
+Never subtract fees again from already fee-adjusted wallet equity.
+Untracked fee assets are reported as external costs, not fictitious
+wallet balances. Unpriced costs are unknown, not zero.
+
+Base fees use the execution price and quote fees use unit value. A
+third-asset conversion requires an observed direct same-venue pair at
+or before execution, at most five minutes old, retained in bounded
+history. If that observation is unavailable, historical fee valuation
+remains unknown; current marked P&L may be priced separately. Current
+marks are latest observations rather than a synchronized account
+snapshot. Automatic retrieval for unconfigured fee assets, durable
+conversion provenance and lifetime attribution across restarts remain
+pending. Do not interpret session attribution as lifetime tax basis.

@@ -93,6 +93,9 @@ pub struct EvaluationSummary {
     /// Fees by fee currency (`""` when a fill reported none). Not summed
     /// across currencies: they are different units.
     pub fees_paid: HashMap<String, Decimal>,
+    /// Explicit spot fee and P&L attribution; empty for old snapshots.
+    #[serde(default)]
+    pub spot_pnl: HashMap<String, crate::spot_accounting::SpotPnlSummary>,
     pub trade_count: u64,
     pub turnover: Decimal,
     /// Fraction of observed time holding any position.
@@ -353,6 +356,7 @@ impl EvaluationTracker {
             strategy_max_drawdown: self.strategy_max_drawdown,
             gross_exposure_fraction: exposure_fraction,
             fees_paid: self.fees_paid.clone(),
+            spot_pnl: HashMap::new(),
             trade_count: self.trade_count,
             turnover: self.turnover,
             time_in_market_fraction: time_fraction,

@@ -20,6 +20,9 @@ pub struct BacktestReport {
     pub equity_curve: Vec<(DateTime<Utc>, rust_decimal::Decimal)>,
     /// Every `Fill` that occurred during the run, in chronological order.
     pub trades: Vec<Fill>,
+    /// Spot execution contribution by symbol, each in its own quote unit.
+    #[serde(default)]
+    pub spot_pnl: HashMap<String, crate::spot_accounting::SpotPnlSummary>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

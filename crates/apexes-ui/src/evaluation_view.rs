@@ -366,6 +366,28 @@ pub fn detail_groups(e: &EvaluationSummary) -> [Vec<(&'static str, String)>; 2] 
     let mut money = vec![("Start equity", number_format::money(e.start_equity))];
     money.extend(pnl_rows(e));
     money.push(("Fees paid", number_format::fees(&e.fees_paid)));
+    // Quote units must never be combined without an explicit conversion.
+    // Keep the account-equity split above distinct from execution attribution.
+    let mut by_quote = std::collections::BTreeMap::new();
+    for pnl in e.spot_pnl.values() {
+        let (gross, net, fees) = by_quote.entry(&pnl.quote_currency).or_insert((
+            Some(Decimal::ZERO),
+            Some(Decimal::ZERO),
+            Some(Decimal::ZERO),
+        ));
+        *gross = gross.zip(pnl.gross_pnl).map(|(a, b)| a + b);
+        *net = net.zip(pnl.net_pnl).map(|(a, b)| a + b);
+        *fees = fees.zip(pnl.fee_at_execution).map(|(a, b)| a + b);
+    }
+    for (quote, (gross, net, fees)) in by_quote {
+        let formatted = |value: Option<Decimal>| match value {
+            Some(value) => format!("{} {quote}", signed(value)),
+            None => format!("unpriced {quote}"),
+        };
+        money.push(("Spot gross", formatted(gross)));
+        money.push(("Fee cost at fill", formatted(fees)));
+        money.push(("Spot net", formatted(net)));
+    }
     let behaviour = vec![
         ("Drawdown (now)", percent(drawdown_now(e))),
         ("Drawdown (max)", percent(drawdown_max(e))),
@@ -543,6 +565,48 @@ mod tests {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
     }
 
+    #[test]
+    fn spot_attribution_preserves_quote_units_and_unknown_costs() {
+        use apexes_backtest::spot_accounting::SpotPnlSummary;
+        let mut summary = summary_with(Decimal::ZERO);
+        summary.spot_pnl.insert(
+            "BTCUSDT".into(),
+            SpotPnlSummary {
+                quote_currency: "USDT".into(),
+                gross_realized: dec!(10),
+                gross_unrealized: Some(Decimal::ZERO),
+                gross_pnl: Some(dec!(10)),
+                fees_by_asset: std::collections::HashMap::new(),
+                fee_at_execution: None,
+                fee_at_mark: None,
+                fee_revaluation: None,
+                net_realized: None,
+                net_unrealized: None,
+                net_pnl: None,
+                external_fees_by_asset: std::collections::HashMap::new(),
+                missing_execution_valuations: 1,
+            },
+        );
+        let mut eur = summary.spot_pnl["BTCUSDT"].clone();
+        eur.quote_currency = "EUR".into();
+        eur.gross_pnl = Some(dec!(4));
+        eur.fee_at_execution = Some(dec!(1));
+        eur.net_pnl = Some(dec!(3));
+        summary.spot_pnl.insert("BTCEUR".into(), eur);
+        let rows = detail_rows(&summary);
+        assert!(
+            rows.iter()
+                .any(|(name, value)| *name == "Spot net" && value == "unpriced USDT")
+        );
+        assert!(rows.iter().any(
+            |(name, value)| *name == "Spot net" && value == &format!("{} EUR", signed(dec!(3)))
+        ));
+        assert!(
+            rows.iter()
+                .any(|(name, value)| *name == "Fee cost at fill" && value == "unpriced USDT")
+        );
+    }
+
     fn summary_with(holdings_value: Decimal) -> EvaluationSummary {
         EvaluationSummary {
             start_equity: dec!(74350.26),
@@ -558,6 +622,7 @@ mod tests {
             strategy_max_drawdown: dec!(0.000002),
             gross_exposure_fraction: dec!(0.87),
             fees_paid: std::collections::HashMap::new(),
+            spot_pnl: std::collections::HashMap::new(),
             trade_count: 2,
             turnover: dec!(90.45),
             time_in_market_fraction: dec!(0.0136),

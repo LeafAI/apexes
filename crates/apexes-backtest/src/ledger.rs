@@ -18,6 +18,7 @@ pub struct PortfolioLedger {
     /// quantity is reduced). See `docs/superpowers/specs/2026-08-02-apexes-account-design.md`
     /// §五 for the full design rationale.
     realized_pnl: HashMap<String, Decimal>,
+    spot_accounting: crate::spot_accounting::SpotAccounting,
 }
 
 impl PortfolioLedger {
@@ -35,6 +36,7 @@ impl PortfolioLedger {
             balances: initial_balances,
             positions: HashMap::new(),
             realized_pnl: HashMap::new(),
+            spot_accounting: Default::default(),
         }
     }
 
@@ -56,6 +58,27 @@ impl PortfolioLedger {
 
     pub fn realized_pnl(&self) -> &HashMap<String, Decimal> {
         &self.realized_pnl
+    }
+
+    /// Record an observed conversion price for fee attribution, not a future quote.
+    pub fn observe_spot_price(
+        &mut self,
+        symbol: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        price: Decimal,
+    ) {
+        if let Some(instrument) = self.instruments.get(symbol)
+            && instrument.asset_class == apexes_core::AssetClass::Spot
+            && let (Some(base), Some(quote)) =
+                (&instrument.base_currency, &instrument.quote_currency)
+        {
+            self.spot_accounting
+                .observe(instrument.venue, base, quote, at, price);
+        }
+    }
+
+    pub fn spot_pnl(&self) -> HashMap<String, crate::spot_accounting::SpotPnlSummary> {
+        self.spot_accounting.summaries()
     }
 
     /// Applies a `Fill` to the ledger: debits/credits the base and quote
@@ -95,8 +118,10 @@ impl PortfolioLedger {
             }
         })?;
 
+        let is_spot = instrument.asset_class == apexes_core::AssetClass::Spot;
         let notional = fill.price * fill.quantity;
         let fee_currency = fill.fee_currency.clone().unwrap_or_else(|| quote.clone());
+        let external_fee = !self.tracks_asset(&fee_currency, &base, &quote);
 
         // Phase 1: the NET change this fill makes to each asset. A fee is
         // netted against what the same fill credits: Binance takes it from
@@ -159,6 +184,10 @@ impl PortfolioLedger {
             Decimal::ZERO
         };
         self.update_position(fill, base_fee);
+        if is_spot {
+            self.spot_accounting
+                .record(fill, &base, &quote, external_fee);
+        }
 
         Ok(())
     }
@@ -925,6 +954,52 @@ mod tests {
                 .map(|(asset, amount)| (asset.to_string(), *amount))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn spot_fee_attribution_matches_wallet_equity_for_held_third_asset() {
+        let mut bnb = btc_usdt();
+        bnb.symbol = "BNBUSDT".into();
+        bnb.base_currency = Some("BNB".into());
+        let mut ledger = PortfolioLedger::new(
+            HashMap::from([("BTCUSDT".into(), btc_usdt()), ("BNBUSDT".into(), bnb)]),
+            HashMap::from([("USDT".into(), dec!(1000)), ("BNB".into(), dec!(1))]),
+        );
+        let buy = fill_with_fee(Side::Buy, dec!(100), dec!(1), dec!(0.01), "BNB");
+        let sell = fill_with_fee(Side::Sell, dec!(110), dec!(1), dec!(1), "USDT");
+        ledger.observe_spot_price("BNBUSDT", buy.filled_at, dec!(300));
+        ledger.apply_fill(&buy).unwrap();
+        ledger.apply_fill(&sell).unwrap();
+        ledger.observe_spot_price(
+            "BNBUSDT",
+            sell.filled_at + chrono::TimeDelta::seconds(1),
+            dec!(400),
+        );
+        ledger.observe_spot_price("BTCUSDT", sell.filled_at, dec!(110));
+        let prices = HashMap::from([("BTC".into(), dec!(110)), ("BNB".into(), dec!(400))]);
+        let equity = ledger.equity(&prices).unwrap();
+        // Compare with the unchanged starting wallet at today's marks.
+        let baseline = dec!(1000) + dec!(400);
+        let pnl = &ledger.spot_pnl()["BTCUSDT"];
+        assert_eq!(ledger.balances()["BNB"], dec!(0.99));
+        assert_eq!(pnl.gross_pnl, Some(dec!(10)));
+        assert_eq!(pnl.fee_at_execution, Some(dec!(4)));
+        assert_eq!(pnl.net_pnl, Some(equity - baseline));
+        assert_eq!(pnl.net_pnl, Some(dec!(5)));
+        assert!(pnl.external_fees_by_asset.is_empty());
+    }
+
+    #[test]
+    fn unpriced_external_fee_is_visible_and_does_not_invent_wallet_value() {
+        let mut ledger = ledger_holding(&[("USDT", dec!(1000))]);
+        let buy = fill_with_fee(Side::Buy, dec!(100), dec!(1), dec!(0.01), "BNB");
+        ledger.apply_fill(&buy).unwrap();
+        ledger.observe_spot_price("BTCUSDT", buy.filled_at, dec!(100));
+        let pnl = &ledger.spot_pnl()["BTCUSDT"];
+        assert_eq!(pnl.external_fees_by_asset["BNB"], dec!(0.01));
+        assert_eq!(pnl.fee_at_execution, None);
+        assert_eq!(pnl.net_pnl, None);
+        assert!(!ledger.balances().contains_key("BNB"));
     }
 
     // ---- Fees: how a real exchange charges them -------------------------

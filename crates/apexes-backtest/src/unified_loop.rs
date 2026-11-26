@@ -348,6 +348,7 @@ pub async fn run_unified_event_loop(
                 match &event {
                     MarketEvent::Trade(trade) => {
                         price_history.record(&trade.symbol, trade.timestamp, trade.price);
+                        ledger.observe_spot_price(&trade.symbol, trade.timestamp, trade.price);
                         if let Some(instrument) = instruments_by_symbol.get(&trade.symbol)
                             && let Some(base) = &instrument.base_currency
                         {
@@ -847,13 +848,13 @@ pub async fn run_unified_event_loop(
                                 ));
                                 let realized: Decimal = ledger.realized_pnl().values().copied().sum();
                                 (
-                                    Some(tracker.summary_at(
-                                        equity,
-                                        realized,
-                                        gross_exposure,
-                                        max_abs_position,
-                                        &last_prices,
-                                    )),
+                                    Some({
+                                        let mut summary = tracker.summary_at(
+                                            equity, realized, gross_exposure, max_abs_position, &last_prices,
+                                        );
+                                        summary.spot_pnl = ledger.spot_pnl();
+                                        summary
+                                    }),
                                     tracker.equity_history(),
                                 )
                             }
@@ -975,6 +976,7 @@ pub async fn run_unified_event_loop(
             .collect(),
         equity_curve: overall_tracker.equity_curve().to_vec(),
         trades: all_fills,
+        spot_pnl: ledger.spot_pnl(),
     })
 }
 
