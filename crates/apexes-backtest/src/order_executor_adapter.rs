@@ -80,8 +80,7 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
             OrderType::Market => self.lock_engine().submit_market_order(intent, now),
             OrderType::Limit => self
                 .lock_engine()
-                .submit_limit_order(intent, now)
-                .map(|order| (order, Vec::new())),
+                .submit_executable_limit_order(intent, now),
             OrderType::Stop | OrderType::StopLimit => self
                 .lock_engine()
                 .submit_stop_order(intent, now)
@@ -461,6 +460,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crossing_limit_consumes_bounded_depth_and_rests_only_remainder() {
+        let at = Utc::now();
+        let mut engine = MatchingEngine::new(
+            CostModel {
+                fee_schedule: Box::new(FlatFeeSchedule {
+                    maker_bps: dec!(5),
+                    taker_bps: dec!(20),
+                }),
+                funding_rate_bps: None,
+            },
+            dec!(0),
+        );
+        engine.on_depth_update(&DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(10),
+            }],
+            asks: vec![
+                PriceLevel {
+                    price: dec!(101),
+                    quantity: dec!(2),
+                },
+                PriceLevel {
+                    price: dec!(102),
+                    quantity: dec!(3),
+                },
+                PriceLevel {
+                    price: dec!(103),
+                    quantity: dec!(10),
+                },
+            ],
+            sequence: None,
+            is_snapshot: true,
+            timestamp: at,
+        });
+        let executor = MatchingEngineOrderExecutor::new(Arc::new(Mutex::new(engine)));
+        let mut intent = market_intent(OrderType::Limit, Some(dec!(102)));
+        intent.quantity = dec!(6);
+        let (order, fills) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), at)
+            .await
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_quantity, dec!(5));
+        assert_eq!(
+            fills
+                .iter()
+                .map(|f| (f.price, f.quantity, f.fee))
+                .collect::<Vec<_>>(),
+            vec![
+                (dec!(101), dec!(2), dec!(0.404)),
+                (dec!(102), dec!(3), dec!(0.612))
+            ]
+        );
+        assert!(
+            fills
+                .iter()
+                .all(|f| f.order_id == order.id && f.filled_at == at)
+        );
+        assert_eq!(
+            executor.open_orders().await[&order.id].filled_quantity,
+            dec!(5)
+        );
+
+        let (second, fills) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), at)
+            .await
+            .unwrap();
+        assert_eq!(second.status, OrderStatus::New);
+        assert!(fills.is_empty(), "consumed depth must not be reused");
+        let later = at + chrono::Duration::milliseconds(1);
+        let fills = executor.on_market_event(&MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(102),
+            quantity: dec!(1),
+            side: Some(Side::Sell),
+            trade_id: None,
+            timestamp: later,
+        }));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].0, order.id);
+        assert_eq!(fills[0].1[0].quantity, dec!(1));
+        assert_eq!(fills[0].1[0].fee, dec!(0.051));
+        assert!(!executor.open_orders().await.contains_key(&order.id));
+        assert!(executor.open_orders().await.contains_key(&second.id));
+    }
+
+    #[tokio::test]
+    async fn crossing_sell_limit_fills_at_bid_and_is_terminal() {
+        let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+        let mut intent = market_intent(OrderType::Limit, Some(dec!(64980)));
+        intent.side = Side::Sell;
+        let (order, fills) = executor
+            .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.filled_quantity, dec!(1));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, order.id);
+        assert_eq!(fills[0].price, dec!(64990));
+        assert!(executor.open_orders().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crossing_limit_does_not_execute_against_future_depth() {
+        let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+        let (order, fills) = executor
+            .submit(
+                &market_intent(OrderType::Limit, Some(dec!(65010))),
+                &HashMap::new(),
+                &HashMap::new(),
+                Utc::now() - chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::New);
+        assert!(fills.is_empty());
+    }
+
+    #[tokio::test]
     async fn matching_engine_order_executor_submit_limit_order_returns_no_immediate_fills() {
         let executor = MatchingEngineOrderExecutor::new(engine_with_book());
         // A non-crossing Buy limit far below the best ask (65010).
@@ -512,11 +635,11 @@ mod tests {
     #[tokio::test]
     async fn matching_engine_order_executor_on_market_event_fills_resting_order() {
         let executor = MatchingEngineOrderExecutor::new(engine_with_book());
-        // A resting Buy limit at 65010 -- crossed by a trade at or below
+        // A resting Buy limit at 65000 -- crossed by a trade at or below
         // that price.
         let (order, immediate_fills) = executor
             .submit(
-                &market_intent(OrderType::Limit, Some(dec!(65010))),
+                &market_intent(OrderType::Limit, Some(dec!(65000))),
                 &HashMap::new(),
                 &HashMap::new(),
                 Utc::now(),
@@ -528,7 +651,7 @@ mod tests {
         let trade_event = MarketEvent::Trade(TradeEvent {
             symbol: "BTCUSDT".to_string(),
             venue: Venue::Binance,
-            price: dec!(65010),
+            price: dec!(65000),
             quantity: dec!(5),
             side: Some(Side::Sell),
             trade_id: None,
