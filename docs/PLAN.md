@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (session health qualification)_
+_Last updated: 2026-11-26 (spot position recovery qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management is locally qualified (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)). Next: F02.01 persistent spot position recovery. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery is locally qualified for bound, quiescent schemas (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)). Next: F02.02 authoritative fill reconciliation. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -128,6 +128,19 @@ disconnect, and tick-independent status/resume denial. No live database
 or real exchange orders were used. The initial managed policy requires
 operator reconciliation and restart after any halt; it does not persist
 an independent health latch across process restarts. Remote CI is pending.
+
+F02.01 local qualification (Rust 1.99.0, locked): full workspace build,
+fmt, Clippy with warnings denied, all 79 test binaries, and 30 doc-test
+suites passed. Executed 1,372 tests (121 OMS/EMS/live-trading including
+isolated PostgreSQL cases, 927 other core, 63 supervisor, 261 UI);
+zero failures, 44 remaining ignored external/manual tests. Eight new
+regressions verify restart inventory/basis, deduplication, wallet
+ownership, conflicting bindings, legacy refusal and incomplete history.
+The recovery path requires no working orders or relevant locked funds,
+a dedicated bound schema, and distinct base assets. Existing legacy
+history requires an audited migration, not automatic adoption; online
+reservation accounting and full fee attribution remain F02.05/F02.03.
+No live database or real exchange orders were used. Remote CI pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

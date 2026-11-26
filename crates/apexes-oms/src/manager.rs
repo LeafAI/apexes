@@ -96,6 +96,11 @@ impl OrderManager {
         })
     }
 
+    /// The bound store's persisted spot fills after startup reconciliation.
+    pub async fn spot_inventory_fills(&mut self) -> Result<Vec<Fill>, OmsError> {
+        self.store.spot_inventory_fills().await
+    }
+
     /// Sets the age threshold for warning about an unresolved submission.
     /// No age or negative lookup is proof of non-execution.
     pub fn with_unsent_order_grace(mut self, grace: std::time::Duration) -> Self {
@@ -211,6 +216,10 @@ impl OrderManager {
             return Err(OmsError::SubmissionUnresolved {
                 order_id: pending.id,
             });
+        }
+        if let Err(error) = self.store.verify_inventory_lease().await {
+            self.report_health_fault("live inventory lease lost");
+            return Err(error);
         }
         let now = Utc::now();
         let mut order = Order {
@@ -570,6 +579,11 @@ impl OrderManager {
     /// tracking.
     pub async fn reconcile(&mut self) -> Result<Vec<(OrderId, Vec<Fill>)>, OmsError> {
         let telemetry = apexes_telemetry::metrics();
+        if self.store.verify_inventory_lease().await.is_err() {
+            // Still reconcile/cancel existing orders; losing the ownership
+            // lease is not permission to leave them unattended.
+            self.report_health_fault("live inventory lease lost");
+        }
         let result = self.reconcile_inner().await;
         match &result {
             Ok(changes) => {

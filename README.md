@@ -83,7 +83,7 @@ Strategies are written either as Rust types implementing the `Strategy` trait or
 
 ## Status
 
-[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (103 rows; currently 48 done, 17 in progress, 26 planned, 11 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
+[`docs/FEATURES.md`](docs/FEATURES.md) is the authoritative, row-by-row feature table (103 rows; currently 49 done, 17 in progress, 25 planned, 11 not started, 1 deferred). [`docs/PLAN.md`](docs/PLAN.md) tracks what is being built now and next.
 
 **Implemented**
 - Binance Spot market data, ClickHouse historical storage, tick-level backtesting with matching simulation and cost models.

@@ -59,6 +59,9 @@ async fn account_balances_merges_spot_and_futures_wallets() {
         .await;
 
     let gateway = gateway_against(&mock_server).await;
+    let spot = gateway.spot_balances().await.unwrap();
+    assert_eq!(spot["BTC"].free, dec!(0.5));
+    assert_eq!(spot["BTC"].locked, dec!(0.1));
     let balances = gateway.account_balances().await.unwrap();
 
     // Spot USDT (1000, free+locked) + Futures USDT (500) = 1500.

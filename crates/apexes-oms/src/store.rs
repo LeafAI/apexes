@@ -44,6 +44,9 @@ impl SubmissionState {
 
 pub struct OrderStore {
     pool: PgPool,
+    // A detached connection owns the schema-scoped advisory lock for the
+    // lifetime of the managed order store, rather than returning it to a pool.
+    inventory_lease: Option<sqlx::PgConnection>,
 }
 
 impl OrderStore {
@@ -72,7 +75,125 @@ impl OrderStore {
         sqlx::query(FILLS_TABLE_DDL).execute(&pool).await?;
         sqlx::query(FILLS_ORDER_ID_INDEX_DDL).execute(&pool).await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            inventory_lease: None,
+        })
+    }
+
+    /// Bind a dedicated live schema to one stable credential/strategy and
+    /// instrument set. Never guess ownership of legacy unbound orders.
+    pub async fn bind_spot_inventory(&mut self, owner: &str) -> Result<(), OmsError> {
+        if self.inventory_lease.is_some() || owner.is_empty() {
+            return Err(OmsError::InvalidRow {
+                reason: "invalid inventory binding".into(),
+            });
+        }
+        let mut connection = self.pool.acquire().await?.detach();
+        let locked: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext(current_schema()), 20261126)")
+                .fetch_one(&mut connection)
+                .await?;
+        if !locked {
+            return Err(OmsError::InvalidRow {
+                reason: "another live engine owns this inventory schema".into(),
+            });
+        }
+        sqlx::query("CREATE TABLE IF NOT EXISTS spot_inventory_owner (singleton BOOLEAN PRIMARY KEY CHECK (singleton), owner TEXT NOT NULL)")
+            .execute(&mut connection).await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT owner FROM spot_inventory_owner WHERE singleton")
+                .fetch_optional(&mut connection)
+                .await?;
+        match existing {
+            Some(value) if value == owner => {}
+            Some(_) => return Err(OmsError::InvalidRow {
+                reason:
+                    "inventory schema belongs to a different credential, strategy or instrument set"
+                        .into(),
+            }),
+            None => {
+                let has_orders: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orders)")
+                    .fetch_one(&mut connection)
+                    .await?;
+                let has_parents: bool =
+                    sqlx::query_scalar("SELECT to_regclass('parent_orders') IS NOT NULL")
+                        .fetch_one(&mut connection)
+                        .await?;
+                let has_parent_rows = if has_parents {
+                    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM parent_orders)")
+                        .fetch_one(&mut connection)
+                        .await?
+                } else {
+                    false
+                };
+                if has_orders || has_parent_rows {
+                    return Err(OmsError::InvalidRow { reason: "legacy unbound inventory history requires audited migration; no automatic adoption".into() });
+                }
+                sqlx::query(
+                    "INSERT INTO spot_inventory_owner (singleton, owner) VALUES (TRUE, $1)",
+                )
+                .bind(owner)
+                .execute(&mut connection)
+                .await?;
+            }
+        }
+        self.inventory_lease = Some(connection);
+        Ok(())
+    }
+
+    /// A bound store must never silently reconnect its lease connection.
+    /// A lost lease latches the live session through the OMS caller.
+    pub(crate) async fn verify_inventory_lease(&mut self) -> Result<(), OmsError> {
+        if let Some(connection) = self.inventory_lease.as_mut() {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sqlx::query("SELECT 1").execute(connection),
+            )
+            .await;
+            if !matches!(result, Ok(Ok(_))) {
+                return Err(OmsError::QueryFailed {
+                    reason: "live inventory lease unavailable".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay source: the durable order/fill history, not account balances.
+    /// Validate the persisted fill quantities before returning a stable
+    /// ordering of the exchange fills. F02.02 adds ongoing reconciliation.
+    pub async fn spot_inventory_fills(&mut self) -> Result<Vec<Fill>, OmsError> {
+        let connection = self
+            .inventory_lease
+            .as_mut()
+            .ok_or_else(|| OmsError::InvalidRow {
+                reason: "inventory history is not bound to a live owner".into(),
+            })?;
+        let inconsistent: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM orders o LEFT JOIN
+              (SELECT order_id, SUM(quantity) AS quantity FROM fills GROUP BY order_id) f ON f.order_id = o.id
+              WHERE o.asset_class <> 'Spot' OR o.leverage IS NOT NULL
+              OR o.filled_quantity <> COALESCE(f.quantity, 0)
+              OR (o.status = 'Filled' AND o.filled_quantity <> o.quantity)
+              OR o.filled_quantity > o.quantity)"
+        ).fetch_one(&mut *connection).await?;
+        let mismatched: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM fills f JOIN orders o ON f.order_id = o.id
+              WHERE f.symbol <> o.symbol OR f.venue <> o.venue OR f.side <> o.side)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        if inconsistent || mismatched {
+            return Err(OmsError::InvalidRow {
+                reason: "durable spot order/fill history inconsistent; reconcile before startup"
+                    .into(),
+            });
+        }
+        let rows: Vec<FillRow> = sqlx::query_as(
+            "SELECT * FROM fills ORDER BY filled_at, venue, symbol, length(exchange_trade_id), exchange_trade_id, id"
+        ).fetch_all(&mut *connection).await?;
+        rows.into_iter().map(Fill::try_from).collect()
     }
 
     /// Inserts a new order, or updates it if `order.id` already exists
