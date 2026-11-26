@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use apexes_core::AssetClass;
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::config::BinanceGatewayConfig;
+use crate::error::BinanceApiError;
 use crate::signing::sign_query_string;
 
 /// Which Binance API family a request targets. Binance Spot and
@@ -42,6 +44,8 @@ impl From<AssetClass> for ApiFamily {
 /// [`BinanceRestClient::signed_request_idempotent`]): retrying an order
 /// `POST`/`DELETE` after an ambiguous failure could double-submit, so
 /// those surface the failure and let `OrderManager::reconcile` resolve it.
+/// An explicit HTTP 400 / Binance -1021 timestamp rejection instead
+/// permits one fresh synchronization and retry.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Extra attempts after the first for idempotent requests.
@@ -80,6 +84,39 @@ const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Upper bound for a whole request, so a stalled server cannot hang a caller.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CLOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_CLOCK_RTT: Duration = Duration::from_secs(1);
+const CLOCK_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// A server timestamp anchored to the midpoint of a monotonic RTT sample.
+/// Wall-clock corrections after sampling cannot move the signed clock.
+#[derive(Clone, Copy)]
+struct ClockSample {
+    server_ms: i64,
+    midpoint: Instant,
+    sampled_at: Instant,
+}
+
+impl ClockSample {
+    fn timestamp(self, now: Instant) -> i64 {
+        self.server_ms.saturating_add(
+            i64::try_from(now.saturating_duration_since(self.midpoint).as_millis())
+                .unwrap_or(i64::MAX),
+        )
+    }
+}
+
+#[derive(Default)]
+struct ClockState {
+    sample: Option<ClockSample>,
+    retry_after: Option<Instant>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTime {
+    server_time: i64,
+}
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -111,6 +148,8 @@ pub struct BinanceRestClient {
     retry: RetryConfig,
     /// Requests are held back until this instant (set by 429/418).
     blocked_until: Arc<Mutex<Option<Instant>>>,
+    spot_clock: Arc<tokio::sync::Mutex<ClockState>>,
+    futures_clock: Arc<tokio::sync::Mutex<ClockState>>,
 }
 
 impl BinanceRestClient {
@@ -120,6 +159,8 @@ impl BinanceRestClient {
             config,
             retry: RetryConfig::default(),
             blocked_until: Arc::new(Mutex::new(None)),
+            spot_clock: Arc::new(tokio::sync::Mutex::new(ClockState::default())),
+            futures_clock: Arc::new(tokio::sync::Mutex::new(ClockState::default())),
         }
     }
 
@@ -163,8 +204,7 @@ impl BinanceRestClient {
     /// (already URL-encoded key=value pairs joined by `&`, caller's
     /// responsibility), computes the HMAC signature over the full
     /// resulting string, and appends `&signature=<hex>`.
-    fn build_signed_query(&self, extra_params: &str) -> String {
-        let timestamp = Utc::now().timestamp_millis();
+    fn build_signed_query(&self, extra_params: &str, timestamp: i64) -> String {
         let base_query = if extra_params.is_empty() {
             format!(
                 "timestamp={timestamp}&recvWindow={}",
@@ -192,7 +232,8 @@ impl BinanceRestClient {
     /// per-call, since each endpoint's success shape differs.
     ///
     /// `GET` and `PUT` are retried per [`RetryConfig`]; `POST`/`DELETE`
-    /// are sent at most once.
+    /// are sent at most once except one retry after an explicit HTTP 400
+    /// Binance -1021 timestamp rejection (the request did not execute).
     pub async fn signed_request(
         &self,
         method: &str,
@@ -251,6 +292,117 @@ impl BinanceRestClient {
         )
     }
 
+    fn clock(&self, family: ApiFamily) -> &tokio::sync::Mutex<ClockState> {
+        match family {
+            ApiFamily::Spot => &self.spot_clock,
+            ApiFamily::Futures => &self.futures_clock,
+        }
+    }
+
+    /// Refresh once per family across all clones. This lock is only for
+    /// clock sampling, not the OMS or a general request lock.
+    pub(crate) async fn signed_timestamp(&self, family: ApiFamily) -> Result<i64, &'static str> {
+        if !(1..=60_000).contains(&self.config.recv_window_ms) {
+            return Err("invalid_recv_window");
+        }
+        let mut clock = self.clock(family).lock().await;
+        let now = Instant::now();
+        if let Some(sample) = clock.sample
+            && now.saturating_duration_since(sample.sampled_at) < CLOCK_REFRESH_INTERVAL
+        {
+            return Ok(sample.timestamp(now));
+        }
+        if self.gate_remaining().is_some() {
+            return Err("rate_limited");
+        }
+        if clock.retry_after.is_some_and(|until| now < until) {
+            return Err("time_refresh_cooldown");
+        }
+        match self.sample_clock(family).await {
+            Ok(sample) => {
+                clock.sample = Some(sample);
+                clock.retry_after = None;
+                Ok(sample.timestamp(Instant::now()))
+            }
+            Err(reason) => {
+                clock.sample = None;
+                clock.retry_after = Some(Instant::now() + CLOCK_FAILURE_COOLDOWN);
+                Err(reason)
+            }
+        }
+    }
+
+    async fn sample_clock(&self, family: ApiFamily) -> Result<ClockSample, &'static str> {
+        let path = match family {
+            ApiFamily::Spot => "/api/v3/time",
+            ApiFamily::Futures => "/fapi/v1/time",
+        };
+        let start = Instant::now();
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url(family)))
+            .timeout(MAX_CLOCK_RTT)
+            .send()
+            .await
+            .map_err(|_| "time_request_failed")?;
+        let status = response.status();
+        apexes_telemetry::metrics().count_rest_status(status.as_u16());
+        if status.as_u16() == 429 || status.as_u16() == 418 {
+            let wait = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(if status.as_u16() == 418 {
+                    DEFAULT_BAN
+                } else {
+                    DEFAULT_RATE_LIMIT_WAIT
+                });
+            self.set_gate(wait);
+            return Err("rate_limited");
+        }
+        if !status.is_success() {
+            return Err("time_http_error");
+        }
+        let time: ServerTime = response.json().await.map_err(|_| "invalid_time_response")?;
+        let end = Instant::now();
+        let rtt = end.saturating_duration_since(start);
+        let max_rtt = MAX_CLOCK_RTT.min(Duration::from_millis(self.config.recv_window_ms / 2));
+        if rtt > max_rtt || time.server_time <= 0 {
+            return Err("unreliable_time_sample");
+        }
+        let sample = ClockSample {
+            server_ms: time.server_time,
+            midpoint: start + rtt / 2,
+            sampled_at: end,
+        };
+        let timestamp = sample.timestamp(end);
+        tracing::info!(
+            ?family,
+            rtt_ms = rtt.as_millis() as u64,
+            offset_ms = timestamp.saturating_sub(Utc::now().timestamp_millis()),
+            "Binance server clock synchronized"
+        );
+        Ok(sample)
+    }
+
+    pub(crate) async fn invalidate_clock(&self, family: ApiFamily) {
+        self.clock(family).lock().await.sample = None;
+    }
+
+    fn timestamp_rejected(status: reqwest::StatusCode, body: &str) -> bool {
+        status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_str::<BinanceApiError>(body).is_ok_and(|e| e.code == -1021)
+    }
+
+    fn clock_unavailable_response(reason: &'static str) -> (reqwest::StatusCode, String) {
+        // No signed request was sent. Surface an explicit local rejection
+        // rather than making the OMS reconcile a nonexistent order.
+        (reqwest::StatusCode::BAD_REQUEST,
+            serde_json::json!({"code": -1021, "msg": format!("client clock unavailable: {reason}; signed request not sent")}).to_string())
+    }
+
     async fn request_with_policy(
         &self,
         method: &str,
@@ -260,6 +412,7 @@ impl BinanceRestClient {
         idempotent: bool,
     ) -> Result<(reqwest::StatusCode, String), String> {
         let mut attempt = 0u32;
+        let mut timestamp_retry_used = false;
         loop {
             if let Some(wait) = self.gate_remaining() {
                 if !idempotent || wait > self.retry.rate_limit_cap {
@@ -268,8 +421,45 @@ impl BinanceRestClient {
                 tokio::time::sleep(wait).await;
             }
 
-            match self.send_once(method, family, path, extra_params).await {
+            let timestamp = match self.signed_timestamp(family).await {
+                Ok(timestamp) => timestamp,
+                Err(reason) => {
+                    tracing::warn!(
+                        ?family,
+                        reason,
+                        "Binance signed request not sent: clock unavailable"
+                    );
+                    if let Some(wait) = self.gate_remaining() {
+                        return Ok(Self::rate_limited_response(wait));
+                    }
+                    return Ok(Self::clock_unavailable_response(reason));
+                }
+            };
+            // Another clone can have engaged the gate during sampling.
+            if let Some(wait) = self.gate_remaining() {
+                if !idempotent || wait > self.retry.rate_limit_cap {
+                    return Ok(Self::rate_limited_response(wait));
+                }
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            match self
+                .send_once(method, family, path, extra_params, timestamp)
+                .await
+            {
                 Ok((status, body, retry_after)) => {
+                    if Self::timestamp_rejected(status, &body) {
+                        self.invalidate_clock(family).await;
+                        if !timestamp_retry_used {
+                            timestamp_retry_used = true;
+                            tracing::warn!(
+                                ?family,
+                                path,
+                                "Binance rejected timestamp; refreshing clock and retrying once"
+                            );
+                            continue;
+                        }
+                    }
                     let limited =
                         status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 418;
                     if limited {
@@ -321,8 +511,9 @@ impl BinanceRestClient {
         family: ApiFamily,
         path: &str,
         extra_params: &str,
+        timestamp: i64,
     ) -> Result<(reqwest::StatusCode, String, Option<Duration>), String> {
-        let query = self.build_signed_query(extra_params);
+        let query = self.build_signed_query(extra_params, timestamp);
         let url = format!("{}{path}?{query}", self.base_url(family));
 
         let request = match method {
@@ -337,7 +528,7 @@ impl BinanceRestClient {
         let response = request
             .send()
             .await
-            .map_err(|error| format!("request failed: {error}"))?;
+            .map_err(|error| format!("request failed: {}", error.without_url()))?;
         let status = response.status();
         apexes_telemetry::metrics().count_rest_status(status.as_u16());
         let retry_after = response
@@ -349,7 +540,7 @@ impl BinanceRestClient {
         let body = response
             .text()
             .await
-            .map_err(|error| format!("failed to read response body: {error}"))?;
+            .map_err(|error| format!("failed to read response body: {}", error.without_url()))?;
         Ok((status, body, retry_after))
     }
 }
@@ -377,12 +568,34 @@ mod tests {
     }
 
     async fn received(server: &MockServer) -> usize {
-        server.received_requests().await.unwrap().len()
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| !r.url.path().ends_with("/time"))
+            .count()
+    }
+
+    async fn mount_clock(server: &MockServer) {
+        for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(time_path))
+                .respond_with(|_: &wiremock::Request| {
+                    wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                    )
+                })
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
     }
 
     #[tokio::test]
     async fn get_is_retried_on_server_error_until_success() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         Mock::given(method("GET"))
             .and(path("/x"))
             .respond_with(ResponseTemplate::new(503))
@@ -407,6 +620,7 @@ mod tests {
     #[tokio::test]
     async fn get_retry_is_bounded() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         Mock::given(path("/x"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -422,6 +636,7 @@ mod tests {
     #[tokio::test]
     async fn order_post_is_never_retried() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
@@ -437,6 +652,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_with_retry_after_is_waited_out_for_gets() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
             .up_to_n_times(1)
@@ -460,6 +676,7 @@ mod tests {
     #[tokio::test]
     async fn order_requests_fail_fast_while_gated_and_are_not_sent() {
         let server = MockServer::start().await;
+        mount_clock(&server).await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(418).insert_header("Retry-After", "120"))
             .mount(&server)
@@ -504,6 +721,14 @@ mod tests {
             max_delay: Duration::from_millis(10),
             rate_limit_cap: Duration::from_secs(1),
         });
+        // A prior successful synchronization: exercise the signed
+        // request's transport retry, not the preflight time endpoint.
+        let now = Instant::now();
+        c.spot_clock.lock().await.sample = Some(ClockSample {
+            server_ms: Utc::now().timestamp_millis(),
+            midpoint: now,
+            sampled_at: now,
+        });
         let started = std::time::Instant::now();
         assert!(
             c.signed_request("GET", ApiFamily::Spot, "/x", "")
@@ -512,5 +737,237 @@ mod tests {
         );
         // 2 backoffs of >= 5ms and >= 10ms happened.
         assert!(started.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[tokio::test]
+    async fn explicit_timestamp_rejection_refreshes_and_retries_the_same_order_once() {
+        let server = MockServer::start().await;
+        let old_time = 1_800_000_000_000i64;
+        let corrected_time = old_time + 10_000;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/time"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"serverTime": old_time})),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/time"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"serverTime": corrected_time})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/order"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1021, "msg": "outside recvWindow"})),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/order"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("accepted"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let (status, body) = c
+            .signed_request(
+                "POST",
+                ApiFamily::Spot,
+                "/order",
+                "symbol=ETHUSDT&newClientOrderId=same-id",
+            )
+            .await
+            .unwrap();
+        assert!(status.is_success());
+        assert_eq!(body, "accepted");
+        let requests = server.received_requests().await.unwrap();
+        let orders: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/order")
+            .collect();
+        assert_eq!(orders.len(), 2);
+        for (request, expected) in orders.iter().zip([old_time, corrected_time]) {
+            let query = request.url.query().unwrap();
+            let params: std::collections::HashMap<_, _> = request.url.query_pairs().collect();
+            let timestamp = params["timestamp"].parse::<i64>().unwrap();
+            assert!((expected..expected + 1000).contains(&timestamp));
+            assert_eq!(params["newClientOrderId"], "same-id");
+            let (unsigned, sig) = query.rsplit_once("&signature=").unwrap();
+            assert_eq!(sig, sign_query_string("s", unsigned));
+        }
+        for request in requests.iter().filter(|r| r.url.path().ends_with("/time")) {
+            assert!(!request.headers.contains_key("x-mbx-apikey"));
+            assert!(request.url.query().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamp_retries_are_bounded_and_ambiguous_responses_are_not_retried() {
+        for (code, expected) in [(400, 2), (503, 1)] {
+            let server = MockServer::start().await;
+            mount_clock(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/order"))
+                .respond_with(
+                    ResponseTemplate::new(code)
+                        .set_body_json(serde_json::json!({"code": -1021, "msg": "timestamp"})),
+                )
+                .expect(expected)
+                .mount(&server)
+                .await;
+            let (status, _) = client(&server)
+                .signed_request(
+                    "POST",
+                    ApiFamily::Spot,
+                    "/order",
+                    "newClientOrderId=same-id",
+                )
+                .await
+                .unwrap();
+            assert_eq!(status.as_u16(), code);
+            assert_eq!(received(&server).await, expected as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn time_samples_are_shared_across_clones_and_isolated_by_api_family() {
+        let server = MockServer::start().await;
+        for (time_path, stamp) in [
+            ("/api/v3/time", 1_800_000_000_000i64),
+            ("/fapi/v1/time", 1_800_000_010_000i64),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(time_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"serverTime": stamp})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let c = client(&server);
+        let clone = c.clone();
+        let (a, b) = tokio::join!(
+            c.signed_timestamp(ApiFamily::Spot),
+            clone.signed_timestamp(ApiFamily::Spot)
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert!((1_800_000_000_000..1_800_000_001_000).contains(&a));
+        assert!((a - 1000..a + 1000).contains(&b));
+        let future = c.signed_timestamp(ApiFamily::Futures).await.unwrap();
+        assert!((1_800_000_010_000..1_800_000_011_000).contains(&future));
+    }
+
+    #[tokio::test]
+    async fn expired_clock_is_refreshed_before_signing_again() {
+        let server = MockServer::start().await;
+        let c = client(&server);
+        let now = Instant::now();
+        c.spot_clock.lock().await.sample = Some(ClockSample {
+            server_ms: 1,
+            midpoint: now - CLOCK_REFRESH_INTERVAL,
+            sampled_at: now - CLOCK_REFRESH_INTERVAL,
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/v3/time"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"serverTime": 1_800_000_000_000i64})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(c.signed_timestamp(ApiFamily::Spot).await.unwrap() >= 1_800_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn missing_invalid_or_slow_time_preflight_never_sends_an_order() {
+        for template in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"serverTime": -1})),
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"serverTime": 1_800_000_000_000i64}))
+                .set_delay(Duration::from_millis(1200)),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/api/v3/time"))
+                .respond_with(template)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let (status, body) = client(&server)
+                .signed_request("POST", ApiFamily::Spot, "/order", "")
+                .await
+                .unwrap();
+            assert_eq!(status.as_u16(), 400);
+            assert!(body.contains("signed request not sent"));
+        }
+    }
+
+    #[tokio::test]
+    async fn time_endpoint_rate_limit_blocks_signed_requests_across_clones() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v3/time"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        for _ in 0..2 {
+            let (status, _) = c
+                .clone()
+                .signed_request("POST", ApiFamily::Spot, "/order", "")
+                .await
+                .unwrap();
+            assert_eq!(status.as_u16(), 429);
+        }
+    }
+    #[tokio::test]
+    async fn failed_time_preflight_is_throttled_across_clones() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v3/time"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        for _ in 0..3 {
+            let (status, body) = c
+                .clone()
+                .signed_request("POST", ApiFamily::Spot, "/order", "")
+                .await
+                .unwrap();
+            assert_eq!(status.as_u16(), 400);
+            assert!(body.contains("signed request not sent"));
+        }
     }
 }

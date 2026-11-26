@@ -20,9 +20,25 @@ async fn gateway_against(mock_server: &MockServer) -> BinanceExecutionGateway {
     })
 }
 
+async fn mount_clock(server: &MockServer) {
+    for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(time_path))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                )
+            })
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
 #[tokio::test]
 async fn account_balances_merges_spot_and_futures_wallets() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/api/v3/account"))
@@ -54,6 +70,7 @@ async fn account_balances_merges_spot_and_futures_wallets() {
 #[tokio::test]
 async fn account_positions_maps_futures_position_risk_response() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/fapi/v2/positionRisk"))
@@ -93,6 +110,7 @@ async fn account_positions_maps_futures_position_risk_response() {
 #[tokio::test]
 async fn internal_transfer_sends_correct_transfer_type() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/sapi/v1/asset/transfer"))
@@ -113,6 +131,7 @@ async fn internal_transfer_sends_correct_transfer_type() {
 #[tokio::test]
 async fn internal_transfer_surfaces_explicit_rejection() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/sapi/v1/asset/transfer"))
@@ -134,6 +153,7 @@ async fn internal_transfer_surfaces_explicit_rejection() {
 #[tokio::test]
 async fn deposit_history_maps_response_to_fund_movements() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/sapi/v1/capital/deposit/hisrec"))
@@ -162,6 +182,7 @@ async fn deposit_history_maps_response_to_fund_movements() {
 #[tokio::test]
 async fn withdrawal_history_maps_response_to_fund_movements() {
     let mock_server = MockServer::start().await;
+    mount_clock(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/sapi/v1/capital/withdraw/history"))

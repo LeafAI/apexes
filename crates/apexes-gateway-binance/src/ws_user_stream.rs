@@ -29,6 +29,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth::ParamSigner;
+use crate::rest::{ApiFamily, BinanceRestClient};
 use crate::user_data_stream::{StreamTimings, backoff_delay, parse_binance_status};
 
 pub type WsApiSocket =
@@ -118,39 +119,80 @@ fn check_subscribe_reply(reply: &Value) -> Result<(), String> {
 /// Connects and subscribes once. The returned socket is ready to deliver
 /// events.
 pub async fn connect_and_subscribe(config: &SpotStreamConfig) -> Result<WsApiSocket, String> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let (mut socket, _) = tokio_tungstenite::connect_async(config.url.as_str())
-            .await
-            .map_err(|error| format!("could not connect to {}: {error}", config.url))?;
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let request = subscribe_request(
-            config.signer.as_ref(),
-            config.recv_window_ms,
-            chrono::Utc::now().timestamp_millis(),
-            &request_id,
-        )?;
-        socket
-            .send(Message::Text(request.into()))
-            .await
-            .map_err(|error| format!("could not send the subscribe request: {error}"))?;
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let Ok(reply) = serde_json::from_str::<Value>(&text) else {
-                        continue;
-                    };
-                    if reply.get("id").and_then(Value::as_str) == Some(request_id.as_str()) {
-                        return check_subscribe_reply(&reply).map(|()| socket);
+    connect_and_subscribe_with_clock(config, None).await
+}
+
+// The gateway always provides its shared REST clock. Keep the public
+// low-level helper compatible for callers that supply their own local clock.
+pub(crate) async fn connect_and_subscribe_with_clock(
+    config: &SpotStreamConfig,
+    rest: Option<&BinanceRestClient>,
+) -> Result<WsApiSocket, String> {
+    let mut retried = false;
+    loop {
+        let mut rejected_timestamp = false;
+        let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            let (mut socket, _) = tokio_tungstenite::connect_async(config.url.as_str())
+                .await
+                .map_err(|error| format!("could not connect to {}: {error}", config.url))?;
+            let timestamp_ms = match rest {
+                Some(rest) => rest
+                    .signed_timestamp(ApiFamily::Spot)
+                    .await
+                    .map_err(|reason| format!("Spot subscription clock unavailable: {reason}"))?,
+                None => chrono::Utc::now().timestamp_millis(),
+            };
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let request = subscribe_request(
+                config.signer.as_ref(),
+                config.recv_window_ms,
+                timestamp_ms,
+                &request_id,
+            )?;
+            socket
+                .send(Message::Text(request.into()))
+                .await
+                .map_err(|error| format!("could not send the subscribe request: {error}"))?;
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(reply) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        if reply.get("id").and_then(Value::as_str) == Some(request_id.as_str()) {
+                            if reply.get("status").and_then(Value::as_i64) == Some(400)
+                                && reply
+                                    .get("error")
+                                    .and_then(|e| e.get("code"))
+                                    .and_then(Value::as_i64)
+                                    == Some(-1021)
+                                && let Some(rest) = rest
+                            {
+                                rest.invalidate_clock(ApiFamily::Spot).await;
+                                rejected_timestamp = true;
+                            }
+                            return check_subscribe_reply(&reply).map(|()| socket);
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        return Err(format!("socket error while subscribing: {error}"));
+                    }
+                    None => return Err("the connection closed while subscribing".to_string()),
                 }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(format!("socket error while subscribing: {error}")),
-                None => return Err("the connection closed while subscribing".to_string()),
             }
+        })
+        .await
+        .map_err(|_| format!("timed out after {HANDSHAKE_TIMEOUT:?} connecting and subscribing"))?;
+        if rejected_timestamp && !retried {
+            retried = true;
+            tracing::warn!(
+                "Spot subscription rejected timestamp; refreshing and reconnecting once"
+            );
+            continue;
         }
-    })
-    .await
-    .map_err(|_| format!("timed out after {HANDSHAKE_TIMEOUT:?} connecting and subscribing"))?
+        return result;
+    }
 }
 
 fn parse_execution_report(event: &Value) -> Option<ExchangeUpdate> {
@@ -198,13 +240,14 @@ pub(crate) async fn run_ws_stream(
     tx: mpsc::UnboundedSender<ExchangeUpdate>,
     resync: Arc<Notify>,
     timings: StreamTimings,
+    rest: Option<BinanceRestClient>,
 ) {
     let mut first = first;
     let mut failures = 0u32;
     loop {
         let mut socket = match first.take() {
             Some(socket) => socket,
-            None => match connect_and_subscribe(&config).await {
+            None => match connect_and_subscribe_with_clock(&config, rest.as_ref()).await {
                 Ok(socket) => socket,
                 Err(reason) => {
                     tracing::warn!(
@@ -586,6 +629,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_subscription_uses_synchronized_clock_and_retries_timestamp_rejection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let http = MockServer::start().await;
+        for (stamp, first) in [(1_800_000_000_000i64, true), (1_800_000_010_000i64, false)] {
+            let mock = Mock::given(method("GET"))
+                .and(path("/api/v3/time"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"serverTime": stamp})),
+                )
+                .expect(1);
+            if first {
+                mock.up_to_n_times(1).mount(&http).await;
+            } else {
+                mock.mount(&http).await;
+            }
+        }
+        let rest = BinanceRestClient::new(crate::config::BinanceGatewayConfig {
+            api_key: KEY.into(),
+            api_secret: SECRET.into(),
+            spot_base_url: http.uri(),
+            futures_base_url: http.uri(),
+            recv_window_ms: 5000,
+        });
+        let server = fake_ws_api(vec![
+            Behaviour::Reject(400, -1021),
+            Behaviour::Accept(vec![]),
+        ])
+        .await;
+        connect_and_subscribe_with_clock(&config(&server.url), Some(&rest))
+            .await
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, expected) in requests
+            .iter()
+            .zip([1_800_000_000_000i64, 1_800_000_010_000i64])
+        {
+            let params = &request["params"];
+            let timestamp = params["timestamp"].as_i64().unwrap();
+            assert!((expected..expected + 1000).contains(&timestamp));
+            let payload = format!("apiKey={KEY}&recvWindow=5000&timestamp={timestamp}");
+            assert_eq!(
+                params["signature"],
+                crate::signing::sign_query_string(SECRET, &payload)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_rejected_subscription_fails_startup_with_the_exchanges_reason() {
         let server = fake_ws_api(vec![Behaviour::Reject(401, -2015)]).await;
         let error = connect_and_subscribe(&config(&server.url))
@@ -627,6 +720,7 @@ mod tests {
             tx,
             Arc::clone(&resync),
             fast(),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), resync.notified())
@@ -660,6 +754,7 @@ mod tests {
             tx,
             Arc::clone(&resync),
             fast(),
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), resync.notified())
@@ -698,6 +793,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             fast(),
+            None,
         ));
         for _ in 0..100 {
             if server.connections.load(Ordering::SeqCst) >= 2 {
@@ -728,6 +824,7 @@ mod tests {
             tx,
             Arc::clone(&resync),
             fast(),
+            None,
         ));
         // first subscribe, then after two rejections a successful third
         tokio::time::timeout(Duration::from_secs(5), resync.notified())
@@ -756,6 +853,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             timings,
+            None,
         ));
         for _ in 0..100 {
             if server.connections.load(Ordering::SeqCst) >= 2 {
@@ -786,6 +884,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             fast(),
+            None,
         ));
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

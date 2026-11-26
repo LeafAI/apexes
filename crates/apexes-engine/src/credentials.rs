@@ -27,6 +27,8 @@ use apexes_gateway_binance::{BinanceExecutionGateway, BinanceNetwork};
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CredentialsError {
+    #[error("APEXES_BINANCE_RECV_WINDOW_MS must be an integer between 1 and 60000 milliseconds")]
+    InvalidRecvWindow,
     #[error(
         "no {network} credentials found for credentials_ref {credentials_ref:?}: environment \
          variable {missing_var} is not set"
@@ -78,8 +80,20 @@ pub fn resolve_binance_credentials(
     let api_key = fetch(&api_key_var)?;
     let api_secret = fetch(&api_secret_var)?;
 
-    Ok(BinanceExecutionGateway::for_network(
-        network, api_key, api_secret,
+    let recv_window_ms = match lookup("APEXES_BINANCE_RECV_WINDOW_MS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|v| (1..=60_000).contains(v))
+            .ok_or(CredentialsError::InvalidRecvWindow)?,
+        Err(std::env::VarError::NotPresent) => 5000,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(CredentialsError::InvalidRecvWindow),
+    };
+    Ok(BinanceExecutionGateway::for_network_with_recv_window(
+        network,
+        api_key,
+        api_secret,
+        recv_window_ms,
     ))
 }
 
@@ -173,5 +187,30 @@ mod tests {
     fn env_var_fragment_uppercases_and_replaces_hyphens() {
         assert_eq!(env_var_fragment("binance-main"), "BINANCE_MAIN");
         assert_eq!(env_var_fragment("simple"), "SIMPLE");
+    }
+    #[test]
+    fn receive_window_is_configurable_and_invalid_values_fail_startup() {
+        for (value, valid) in [
+            ("5000", true),
+            ("10000", true),
+            ("60000", true),
+            ("0", false),
+            ("60001", false),
+            ("not a number", false),
+        ] {
+            let vars = [
+                ("APEXES_CRED_BINANCE_MAIN_TESTNET_API_KEY", "test-key"),
+                ("APEXES_CRED_BINANCE_MAIN_TESTNET_API_SECRET", "test-secret"),
+                ("APEXES_BINANCE_RECV_WINDOW_MS", value),
+            ];
+            let lookup = fake_env(&vars);
+            match resolve_binance_credentials("binance-main", BinanceNetwork::Testnet, lookup) {
+                Ok(_) => assert!(valid),
+                Err(error) => {
+                    assert!(!valid);
+                    assert_eq!(error, CredentialsError::InvalidRecvWindow);
+                }
+            }
+        }
     }
 }
