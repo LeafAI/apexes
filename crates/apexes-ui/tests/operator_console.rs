@@ -252,6 +252,7 @@ fn identity(mode: &str, network: Option<&str>) -> apexes_backtest::SessionIdenti
         network: network.map(str::to_string),
         mode: mode.to_string(),
         strategy: "demo.drift".to_string(),
+        fee_label: None,
     }
 }
 

@@ -69,12 +69,13 @@ pub struct PaperTradingConfig {
 /// direct parameter (NOT a registry lookup) -- paper trading only ever
 /// needs one directly-supplied event bus.
 pub async fn run_paper_trading(
-    config: PaperTradingConfig,
+    mut config: PaperTradingConfig,
     registry: &Registry,
     bus: &MarketEventBus,
     strategy: impl Strategy,
     stop_signal: oneshot::Receiver<()>,
 ) -> Result<BacktestReport, ApexesError> {
+    let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let risk_checker = registry
         .try_one::<Arc<CompositeRiskChecker>>()
         .map_err(|error| ApexesError::InvalidBacktestConfig {
@@ -150,7 +151,7 @@ pub async fn run_paper_trading(
         symbol_rules: HashMap::new(),
     };
 
-    run_unified_event_loop(
+    let mut report = run_unified_event_loop(
         unified_loop_config,
         event_stream,
         clock,
@@ -162,7 +163,9 @@ pub async fn run_paper_trading(
         None,
         Some(config.latency_model),
     )
-    .await
+    .await?;
+    report.simulated_fees = Some(simulated_fees);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -323,6 +326,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.trades.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_taker_fee_changes_paper_equity_and_report() {
+        let bus = MarketEventBus::new(Box::new(MockMarketDataProvider {
+            events: sample_events(),
+        }));
+        let mut config = base_config();
+        config.cost_model = apexes_backtest::SimulatedFees::Flat {
+            maker_bps: dec!(5),
+            taker_bps: dec!(20),
+        }
+        .cost_model();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
+        let report = run_paper_trading(
+            config,
+            &Registry::new(),
+            &bus,
+            BuyOnceStrategy { bought: false },
+            rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].fee, dec!(0.2));
+        assert_eq!(report.equity_curve.last().unwrap().1, dec!(99999.8));
+        let fees = report.simulated_fees.unwrap();
+        assert_eq!(fees.rates_by_venue["Binance"].taker_bps, dec!(20));
+        assert_eq!(fees.label(), "Modeled fees");
     }
 
     #[tokio::test]

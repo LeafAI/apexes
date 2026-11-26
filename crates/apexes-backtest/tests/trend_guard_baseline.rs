@@ -154,6 +154,18 @@ fn trend_guard_round_trip_is_reproducible_and_cost_sensitive() {
     let free = replay(&prices, Decimal::ZERO);
     assert_eq!(economic_report(&paid), economic_report(&repeated));
     assert_eq!(paid.trades.len(), 2, "{:?}", paid.trades);
+    let fees = paid.simulated_fees.as_ref().unwrap();
+    assert_eq!(fees.label(), "Modeled fees");
+    assert_eq!(fees.rates_by_venue["Binance"].taker_bps, dec!(10));
+    assert_eq!(free.simulated_fees.as_ref().unwrap().label(), "ZERO FEES");
+    let mut legacy = serde_json::to_value(&paid).unwrap();
+    legacy.as_object_mut().unwrap().remove("simulated_fees");
+    assert!(
+        serde_json::from_value::<BacktestReport>(legacy)
+            .unwrap()
+            .simulated_fees
+            .is_none()
+    );
     let (buy, sell) = (&paid.trades[0], &paid.trades[1]);
     assert_eq!(buy.side, Side::Buy);
     assert_eq!(sell.side, Side::Sell);

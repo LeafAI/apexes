@@ -23,6 +23,9 @@ pub struct BacktestReport {
     /// Spot execution contribution by symbol, each in its own quote unit.
     #[serde(default)]
     pub spot_pnl: HashMap<String, crate::spot_accounting::SpotPnlSummary>,
+    /// None means fee assumptions are unrecorded, not zero.
+    #[serde(default)]
+    pub simulated_fees: Option<crate::SimulatedFeeReport>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

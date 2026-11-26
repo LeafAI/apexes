@@ -1,6 +1,9 @@
 use apexes_core::Venue;
+use apexes_core::{ApexesError, AssetClass, Instrument};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Whether a fill was the resting (maker) or aggressing (taker) side of a
 /// trade — determines which fee rate applies.
@@ -91,6 +94,126 @@ impl FeeSchedule for FlatFeeSchedule {
     }
 }
 
+/// Launch-time simulated fee policy. Legacy launch JSON defaults to
+/// explicit zero fees; live fills never use this schedule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SimulatedFees {
+    #[default]
+    Zero,
+    Flat {
+        maker_bps: Decimal,
+        taker_bps: Decimal,
+    },
+    BinanceSpotVip {
+        tier: u8,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeRates {
+    pub maker_bps: Decimal,
+    pub taker_bps: Decimal,
+}
+
+impl FeeRates {
+    fn valid(&self) -> bool {
+        (Decimal::ZERO..dec!(10000)).contains(&self.maker_bps)
+            && (Decimal::ZERO..dec!(10000)).contains(&self.taker_bps)
+    }
+}
+
+/// Frozen per-venue assumptions, rather than inferred from fills (a
+/// run with no fills may still have nonzero configured fees).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulatedFeeReport {
+    pub rates_by_venue: BTreeMap<String, FeeRates>,
+}
+
+impl SimulatedFeeReport {
+    pub fn label(&self) -> &'static str {
+        if self.rates_by_venue.is_empty() {
+            "Fees unknown"
+        } else if self
+            .rates_by_venue
+            .values()
+            .all(|r| r.maker_bps.is_zero() && r.taker_bps.is_zero())
+        {
+            "ZERO FEES"
+        } else {
+            "Modeled fees"
+        }
+    }
+}
+
+impl SimulatedFees {
+    pub fn validate(&self, instruments: &[Instrument]) -> Result<(), String> {
+        match self {
+            Self::Flat { maker_bps, taker_bps } if !(FeeRates { maker_bps:*maker_bps,taker_bps:*taker_bps }).valid() =>
+                Err("maker/taker fees must be in [0, 10000) bps".into()),
+            Self::BinanceSpotVip { tier } if *tier > 9 || instruments.iter().any(|i| i.venue != Venue::Binance || i.asset_class != AssetClass::Spot) =>
+                Err("Binance Spot VIP fee policy requires tier 0–9 and only Binance Spot instruments".into()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn cost_model(&self) -> CostModel {
+        let fee_schedule: Box<dyn FeeSchedule> = match *self {
+            Self::Zero => Box::new(FlatFeeSchedule {
+                maker_bps: Decimal::ZERO,
+                taker_bps: Decimal::ZERO,
+            }),
+            Self::Flat {
+                maker_bps,
+                taker_bps,
+            } => Box::new(FlatFeeSchedule {
+                maker_bps,
+                taker_bps,
+            }),
+            Self::BinanceSpotVip { tier } => Box::new(BinanceSpotVipFeeSchedule { tier }),
+        };
+        CostModel {
+            fee_schedule,
+            funding_rate_bps: None,
+        }
+    }
+}
+
+struct FrozenFeeSchedule(BTreeMap<String, FeeRates>);
+impl FeeSchedule for FrozenFeeSchedule {
+    fn maker_fee_bps(&self, venue: Venue) -> Decimal {
+        self.0
+            .get(&format!("{venue:?}"))
+            .map_or(Decimal::ZERO, |r| r.maker_bps)
+    }
+    fn taker_fee_bps(&self, venue: Venue) -> Decimal {
+        self.0
+            .get(&format!("{venue:?}"))
+            .map_or(Decimal::ZERO, |r| r.taker_bps)
+    }
+}
+
+struct FrozenWithFallback {
+    frozen: FrozenFeeSchedule,
+    fallback: Box<dyn FeeSchedule>,
+}
+impl FeeSchedule for FrozenWithFallback {
+    fn maker_fee_bps(&self, venue: Venue) -> Decimal {
+        if self.frozen.0.contains_key(&format!("{venue:?}")) {
+            self.frozen.maker_fee_bps(venue)
+        } else {
+            self.fallback.maker_fee_bps(venue)
+        }
+    }
+    fn taker_fee_bps(&self, venue: Venue) -> Decimal {
+        if self.frozen.0.contains_key(&format!("{venue:?}")) {
+            self.frozen.taker_fee_bps(venue)
+        } else {
+            self.fallback.taker_fee_bps(venue)
+        }
+    }
+}
+
 /// The backtest's cost model: fees per fill, plus a funding-rate field
 /// intended for open perpetual positions (NOT YET WIRED UP -- see
 /// `funding_rate_bps`). Market-impact/slippage is produced naturally by
@@ -111,6 +234,47 @@ pub struct CostModel {
 }
 
 impl CostModel {
+    /// Freeze rates for configured venues so report assumptions match
+    /// the matching engine, even for custom schedules. Unconfigured
+    /// venues retain the original policy (see simulation routing).
+    pub fn freeze_fees(
+        &mut self,
+        instruments: &[Instrument],
+    ) -> Result<SimulatedFeeReport, ApexesError> {
+        let mut rates_by_venue = BTreeMap::new();
+        for instrument in instruments {
+            let venue = instrument.venue;
+            let key = format!("{venue:?}");
+            if rates_by_venue.contains_key(&key) {
+                continue;
+            }
+            let rates = FeeRates {
+                maker_bps: self.fee_schedule.maker_fee_bps(venue),
+                taker_bps: self.fee_schedule.taker_fee_bps(venue),
+            };
+            if !rates.valid() {
+                return Err(ApexesError::InvalidBacktestConfig {
+                    reason: format!("invalid fee rates for {key}"),
+                });
+            }
+            rates_by_venue.insert(key, rates);
+        }
+        // Only configured venues are modeled; retain the original
+        // policy for legacy SOR routes outside the instrument set.
+        let report = SimulatedFeeReport { rates_by_venue };
+        self.fee_schedule = Box::new(FrozenWithFallback {
+            frozen: FrozenFeeSchedule(report.rates_by_venue.clone()),
+            fallback: std::mem::replace(
+                &mut self.fee_schedule,
+                Box::new(FlatFeeSchedule {
+                    maker_bps: Decimal::ZERO,
+                    taker_bps: Decimal::ZERO,
+                }),
+            ),
+        });
+        Ok(report)
+    }
+
     /// Computes the fee owed for a fill of `notional` value (price *
     /// quantity, already computed by the caller) at `venue`, given whether
     /// it was a maker or taker fill.

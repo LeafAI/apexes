@@ -163,6 +163,9 @@ pub struct SessionIdentity {
     pub network: Option<String>,
     pub mode: String,
     pub strategy: String,
+    /// Engine-provided execution fee classification, absent in older engines.
+    #[serde(default)]
+    pub fee_label: Option<String>,
 }
 
 /// Constructed by the caller (`apexes-engine`, a later task) BEFORE
