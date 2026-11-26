@@ -16,7 +16,7 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-26 (fee-aware Spot reservation qualification)_
+_Last updated: 2026-11-26 (EMS parent capital qualification)_
 
 ---
 
@@ -29,7 +29,7 @@ and [design](superpowers/specs/2026-11-25-apexes-quantitative-enhancement-design
 PR #11 passed all three CI jobs and PR #12 promoted the baseline to master.
 F00.02 adds structured decision diagnostics (see [design](superpowers/specs/2026-11-26-apexes-trading-diagnostics-design.md)); PR #13 merged to integration after green CI, and PR #14 promoted it to master with green CI.
 F01.01 adds exchange clock synchronization (see [design](superpowers/specs/2026-11-26-apexes-exchange-clock-design.md)); PR #15 merged to master after green CI.
-F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up passed CI and merged in PR #23. F02.04 protective exits (see [design](superpowers/specs/2026-11-26-apexes-protective-exits-design.md)) passed CI and merged in PR #24. F02.05 dynamic Spot rules and reservations passed CI and merged in PR #25 (see [design](superpowers/specs/2026-11-26-apexes-dynamic-spot-rules-design.md)). The durable reservation follow-up passed CI and merged in PR #26. Bounded market-buy execution passed CI and merged in PR #27. Fee-aware reservation follow-up is locally qualified; CI and remaining parent-level capital allocation are pending before F03.01 configurable costs. Feature statuses remain in FEATURES.md.
+F01.02 reliable submission (see [design](superpowers/specs/2026-11-26-apexes-reliable-submission-design.md)) passed CI and merged in PR #16. Corrected master 33e6be3 passed CI. F01.03 market-data recovery (see [design](superpowers/specs/2026-11-26-apexes-market-data-recovery-design.md)) passed CI and merged in PR #17. F01.04 EMS database decoupling (see [design](superpowers/specs/2026-11-26-apexes-ems-database-decoupling-design.md)) passed CI and merged in PR #18. F01.05 session health management (see [design](superpowers/specs/2026-11-26-apexes-session-health-design.md)) passed CI and merged in PR #19. F02.01 persistent spot position recovery (see [design](superpowers/specs/2026-11-26-apexes-spot-position-recovery-design.md)) passed CI and merged in PR #20. F02.02 authoritative fill reconciliation (see [design](superpowers/specs/2026-11-26-apexes-authoritative-fill-reconciliation-design.md)) passed CI and merged in PR #21. F02.03 spot fee and P&L attribution (see [design](superpowers/specs/2026-11-26-apexes-spot-fee-accounting-design.md)) passed CI and merged in PR #22. The durable conversion and lifetime journal follow-up passed CI and merged in PR #23. F02.04 protective exits (see [design](superpowers/specs/2026-11-26-apexes-protective-exits-design.md)) passed CI and merged in PR #24. F02.05 dynamic Spot rules and reservations passed CI and merged in PR #25 (see [design](superpowers/specs/2026-11-26-apexes-dynamic-spot-rules-design.md)). The durable reservation follow-up passed CI and merged in PR #26. Bounded market-buy execution passed CI and merged in PR #27. Fee-aware reservation follow-up passed CI and merged in PR #28. EMS parent-level capital allocation is locally qualified; CI and remaining execution/fee qualification review are pending before F03.01 configurable costs. Feature statuses remain in FEATURES.md.
 
 Baseline discovered a simulator defect: completed orders remained in
 open_orders and blocked all later strategy orders. The regression now checks
@@ -263,6 +263,26 @@ Fee rates are observed, not frozen by the exchange. Exact third-asset
 fee quantities and future rate changes are not guaranteed; discounts
 are never assumed in the budget. No real orders or live database
 used. Remote CI and parent-level capital allocation remain pending.
+
+F02.05 EMS parent capital follow-up (Rust 1.99.0, locked):
+workspace build, formatting, Clippy with warnings denied, 80 test
+binaries and 30 doc-test suites passed. 1,408 executed tests (140
+OMS/EMS/live-trading, 943 other core, 63 supervisor, 262 UI), zero
+failures; 44 external/manual tests remain ignored. Three new
+PostgreSQL regressions cover competing parent/direct orders, fee-rate
+budget exhaustion, durable child allocation, orphan locks, restart
+verification and actual EMS/OMS POV integration. Parent admission
+reserves the whole conformed quantity against fresh Spot evidence;
+children consume their own reservations and quantities atomically
+with pre-dispatch order records. Release waits for terminal scheduling,
+terminal children and the existing fill-acknowledgement gate.
+No budget recycling, flexible cross-parent sharing or native
+exchange-side parent reservation is provided. Admission is
+conservative (full parent must satisfy single-order filters); a crash
+between allocation and scheduling insert leaves an orphan lock for
+audited recovery. Exact external fee-token funding, real-service
+qualification and execution-model parity remain open. No real orders
+or live database used. Remote CI pending.
 
 ## Prior work — Binance Spot testnet MVP: built; remaining verification and polish
 

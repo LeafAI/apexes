@@ -465,8 +465,7 @@ can expire without filling. Principal is bounded by quantity times cap;
 the current undiscounted account commission rate replaces the fixed
 1% quote-fee headroom. Any above-cap fill or
 cumulative reservation breach is recorded and durably halts trading.
-No fallback to MARKET, stop-order/derivative extension or parent-level
-allocation is supplied.
+No fallback to MARKET or stop-order/derivative extension is supplied.
 
 Managed Spot preflight now reads signed account commission rates for
 the symbol. Missing or malformed evidence refuses submission. The
@@ -484,3 +483,20 @@ External fee-token quantities are not numerically reserved; discounts
 may fall back to received-asset charges. Rate changes, actual fee
 rounding and future conversion prices remain uncertain. Actual spend
 breaches still halt durably.
+
+Managed EMS parents now reserve a whole Spot budget before scheduling.
+The parent holds its spend, receipt and potential discount assets
+exclusively against competing parent and direct orders. The admission
+quantity must satisfy current single-order filters exactly. A child
+revalidates current rules, free funds, fees and risk, and consumes its
+reservation and submitted quantity from the durable parent budget in
+the same transaction as the child's pre-dispatch OMS record. The
+allocation is conservative: cancelled, rejected or partially filled
+children do not restore budget automatically. Completion still means
+all intended slices submitted, not all filled. Release is requested
+only after terminal scheduler status; working children retain the lock,
+and pending ledger acknowledgement continues to block submissions.
+Recovery verifies the scheduling journal against the allocation and
+linked durable orders. Missing evidence or unresolved dispatch stops
+recovery; a crash before parent insertion can leave an orphan lock
+that needs audited reconciliation. Do not clear it automatically.

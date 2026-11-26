@@ -99,6 +99,111 @@ fn twap_request() -> AlgoOrderRequest {
 
 #[tokio::test]
 #[ignore]
+async fn managed_pov_parent_reserves_before_dispatch_and_recovers_budget() {
+    use apexes_core::registry::Registry;
+    use apexes_ems::postgres::OrderManagerChildOrderSink;
+    use apexes_oms::{
+        ExecutionGateway, KillSwitch, MockExecutionGateway, OrderManager, OrderStore,
+    };
+    let fixture = TestSchema::new().await;
+    let registry = Registry::new();
+    let gateway = Arc::new(MockExecutionGateway::new());
+    registry
+        .register::<Arc<dyn ExecutionGateway>, ()>((), gateway.clone())
+        .unwrap();
+    let health = Arc::new(KillSwitch::managed());
+    let mut store = OrderStore::new(&fixture.url).await.unwrap();
+    store.bind_spot_inventory("managed-ems-test").await.unwrap();
+    let mut manager = OrderManager::new(store, &registry)
+        .await
+        .unwrap()
+        .with_kill_switch(health.clone());
+    manager.spot_inventory_fills().await.unwrap();
+    health.begin_reconciliation();
+    health.startup_ready();
+    let manager = Arc::new(TokioMutex::new(manager));
+    let sink = Arc::new(OrderManagerChildOrderSink::new(manager.clone()));
+    let ems = PostgresEms::new_with_kill_switch(
+        &fixture.url,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+        Some(health.clone()),
+    )
+    .await
+    .unwrap();
+    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    let mut other = pov_request();
+    other.symbol = "ETHUSDT".into();
+    assert!(matches!(
+        ems.submit_algo_order(other.clone()).await,
+        Err(EmsError::ParentAdmissionRejected { .. })
+    ));
+    assert!(!health.is_engaged());
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
+    let budget: rust_decimal::Decimal =
+        sqlx::query_scalar("SELECT budget FROM spot_parent_allocations WHERE id=$1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(budget, dec!(404));
+    ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
+        .await
+        .unwrap();
+    let child = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+                "SELECT child_order_id FROM parent_order_children WHERE parent_order_id=$1",
+            )
+            .bind(id.0)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some((child,)) = row {
+                break OrderId(child);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (allocated,linked):(rust_decimal::Decimal,uuid::Uuid)=sqlx::query_as("SELECT p.allocated_amount,o.parent_allocation_id FROM spot_parent_allocations p JOIN orders o ON o.parent_allocation_id=p.id WHERE o.id=$1")
+        .bind(child.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(allocated, dec!(101));
+    assert_eq!(linked, id.0);
+    manager.lock().await.cancel_order(child).await.unwrap();
+    drop(ems);
+    let ems = PostgresEms::new_with_kill_switch(
+        &fixture.url,
+        sink.clone(),
+        Arc::new(PriceAndFeeScorer),
+        HashMap::new(),
+        None,
+        Some(health.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ems.parent_order_status(id).await.unwrap(),
+        Some(ParentOrderStatus::Scheduling)
+    );
+    assert!(matches!(
+        ems.submit_algo_order(other.clone()).await,
+        Err(EmsError::ParentAdmissionRejected { .. })
+    ));
+    ems.cancel_parent_order(id).await.unwrap();
+    assert!(ems.submit_algo_order(other).await.is_ok());
+    drop(ems);
+    drop(sink);
+    drop(manager);
+    pool.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn twap_parent_order_persists_and_completes() {
     let fixture = TestSchema::new().await;
     let sink = Arc::new(RecordingSink::new());

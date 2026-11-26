@@ -272,14 +272,127 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, positions, balances, false)
+        self.submit_order_inner(intent, positions, balances, false, None)
             .await
     }
 
     /// EMS already persisted its dispatch quantity. Refuse rather than
     /// silently changing the quantity recorded by the parent scheduler.
     pub async fn submit_child_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true)
+        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, None)
+            .await
+    }
+
+    /// Reserve a complete parent budget before EMS persists/schedules it.
+    /// Full quantity must conform at admission; each child revalidates.
+    pub async fn reserve_ems_parent(
+        &mut self,
+        id: Uuid,
+        mut intent: OrderIntent,
+    ) -> Result<(), OmsError> {
+        if !self.store.inventory_bound() {
+            return Ok(());
+        }
+        if self
+            .kill_switch
+            .as_ref()
+            .is_some_and(|k| k.blocks_submissions())
+            || self
+                .fill_delivery
+                .as_ref()
+                .is_none_or(|d| d.dirty || d.failed)
+            || self.reservation_breached
+        {
+            return Err(OmsError::TradingHalted {
+                reason: "managed parent admission requires reconciled healthy inventory".into(),
+            });
+        }
+        self.store.verify_inventory_lease().await?;
+        if intent.routing != apexes_strategy::OrderRouting::Fixed {
+            return Err(OmsError::OrderRejected {
+                reason: "managed EMS requires fixed routing".into(),
+            });
+        }
+        let requested = intent.quantity;
+        let reservation = self
+            .validate_managed_spot_order(&mut intent)
+            .await?
+            .ok_or_else(|| OmsError::InvalidRow {
+                reason: "missing parent reservation".into(),
+            })?;
+        if requested != intent.quantity {
+            return Err(OmsError::OrderRejected {
+                reason: "parent quantity must conform to current trading rules".into(),
+            });
+        }
+        // A parent also locks its receipt asset, even against an existing
+        // direct order spending it. Recheck every potentially affected asset.
+        let assets = [
+            Some(reservation.spend_asset.as_str()),
+            Some(reservation.receipt_asset.as_str()),
+            reservation
+                .commission
+                .as_ref()
+                .and_then(|c| c.discount_asset.as_deref()),
+        ];
+        if self.spot_reservations.values().any(|r| {
+            [
+                Some(r.spend_asset.as_str()),
+                Some(r.receipt_asset.as_str()),
+                r.commission
+                    .as_ref()
+                    .and_then(|c| c.discount_asset.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|a| assets.contains(&Some(a)))
+        }) {
+            return Err(OmsError::OrderRejected {
+                reason: "working order conflicts with EMS parent assets".into(),
+            });
+        }
+        self.store
+            .check_parent_capital(None, &intent, &reservation)
+            .await?;
+        self.store
+            .reserve_parent_capital(id, &intent, &reservation)
+            .await
+    }
+
+    pub async fn verify_ems_parent(
+        &mut self,
+        id: Uuid,
+        symbol: &str,
+        side: Side,
+        total: Decimal,
+        submitted: Decimal,
+    ) -> Result<(), OmsError> {
+        if !self.store.inventory_bound() {
+            return Ok(());
+        }
+        self.store.verify_inventory_lease().await?;
+        self.store
+            .verify_parent_capital(id, symbol, side, total, submitted)
+            .await
+    }
+
+    /// A terminal scheduler may request release, but working child orders
+    /// retain the lock; the fill-delivery gate protects final proceeds.
+    pub async fn release_ems_parent(&mut self, id: Uuid) -> Result<(), OmsError> {
+        if !self.store.inventory_bound() {
+            return Ok(());
+        }
+        self.store.verify_inventory_lease().await?;
+        self.store.release_parent_capital(id).await
+    }
+
+    pub async fn submit_allocated_child(
+        &mut self,
+        parent: Uuid,
+        intent: OrderIntent,
+    ) -> Result<OrderId, OmsError> {
+        let parent = self.store.inventory_bound().then_some(parent);
+        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, parent)
             .await
     }
 
@@ -289,6 +402,7 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
         exact_quantity: bool,
+        parent: Option<Uuid>,
     ) -> Result<OrderId, OmsError> {
         if let Some(kill_switch) = &self.kill_switch
             && kill_switch.blocks_submissions()
@@ -336,6 +450,9 @@ impl OrderManager {
                 reason: "EMS child quantity must already conform to current exchange rules".into(),
             });
         }
+        if let Some(r) = &reservation {
+            self.store.check_parent_capital(parent, &intent, r).await?;
+        }
         let mut risk_intent = intent.clone();
         let mut risk_positions = positions.clone();
         if let Some(evidence) = &reservation {
@@ -375,7 +492,7 @@ impl OrderManager {
             return Err(OmsError::RiskCheckFailed { violations });
         }
 
-        let result = self.place_order(intent, false, reservation).await;
+        let result = self.place_order(intent, false, reservation, parent).await;
         if matches!(
             &result,
             Err(OmsError::QueryFailed { .. } | OmsError::SubmissionUnresolved { .. })
@@ -398,7 +515,7 @@ impl OrderManager {
     /// limit). Callers must only pass orders that reduce exposure.
     pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
-        self.place_order(intent, true, None).await
+        self.place_order(intent, true, None, None).await
     }
 
     /// Validate fresh rule/availability evidence and reserve the spend
@@ -614,6 +731,7 @@ impl OrderManager {
         intent: OrderIntent,
         flatten: bool,
         reservation: Option<SpotReservation>,
+        parent: Option<Uuid>,
     ) -> Result<OrderId, OmsError> {
         // Do not rely on strategies checking has_open_order: the OMS is
         // the final guard, including when a caller attempts a flatten.
@@ -656,7 +774,7 @@ impl OrderManager {
             updated_at: now,
         };
         self.store
-            .begin_submission(&order, reservation.as_ref())
+            .begin_submission(&order, reservation.as_ref(), parent)
             .await?;
         let order_id = order.id;
         // Retain the guard before awaiting network I/O. Cancellation or a
@@ -1166,6 +1284,11 @@ impl OrderManager {
             }
         }
         report
+    }
+
+    /// Durable lookup for background EMS reconciliation, including terminal children.
+    pub async fn persisted_order(&self, id: OrderId) -> Result<Option<Order>, OmsError> {
+        self.store.get_order(id).await
     }
 
     pub fn open_orders(&self) -> &HashMap<OrderId, Order> {

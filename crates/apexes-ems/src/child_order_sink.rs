@@ -42,6 +42,35 @@ pub struct ChildOrderIntent {
 
 #[async_trait]
 pub trait ChildOrderSink: Send + Sync {
+    /// Managed live sinks must reserve before scheduling. Simulation
+    /// and legacy sinks retain their previous behavior.
+    async fn reserve_parent(
+        &self,
+        _id: apexes_strategy::ParentOrderId,
+        _request: &crate::AlgoOrderRequest,
+    ) -> Result<(), EmsError> {
+        Ok(())
+    }
+    async fn verify_parent(
+        &self,
+        _id: apexes_strategy::ParentOrderId,
+        _symbol: &str,
+        _side: Side,
+        _total: Decimal,
+        _submitted: Decimal,
+    ) -> Result<(), EmsError> {
+        Ok(())
+    }
+    async fn release_parent(&self, _id: apexes_strategy::ParentOrderId) -> Result<(), EmsError> {
+        Ok(())
+    }
+    async fn submit_allocated_child(
+        &self,
+        _id: apexes_strategy::ParentOrderId,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError> {
+        self.submit_child_order(intent).await
+    }
     /// Submits `intent` for immediate execution, returning the
     /// resulting `OrderId` and any `Fill`s that happened synchronously
     /// as part of submission (e.g. a Market order against a live local
