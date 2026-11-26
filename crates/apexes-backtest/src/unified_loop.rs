@@ -254,6 +254,15 @@ pub async fn run_unified_event_loop(
     // push stream with a `reconcile()` interval timer), which
     // re-creating the stream every iteration would disturb.
     let mut supplemental_fill_stream = supplemental_fills.stream();
+    let mut arrivals = match latency_model {
+        Some(LatencyModel::EventTime(policy)) => {
+            policy
+                .validate()
+                .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
+            Some(crate::event_latency::ArrivalQueue::new(policy))
+        }
+        _ => None,
+    };
 
     loop {
         // Polled at the top of each iteration -- NOT as a
@@ -274,18 +283,19 @@ pub async fn run_unified_event_loop(
             event = market_events.next() => {
                 let Some(event) = event else { break };
 
+                let timestamp=if arrivals.is_some() { match &event { MarketEvent::Bar(bar)=>bar.close_time,_=>event_timestamp(&event) } } else {event_timestamp(&event)};
+                if arrivals.as_mut().is_some_and(|q|!q.observe(timestamp)){continue;}
                 if !recorded_initial_equity {
                     let initial_equity = ledger.equity(&last_prices)?;
-                    overall_tracker.record_equity_point(event_timestamp(&event), initial_equity);
+                    overall_tracker.record_equity_point(timestamp, initial_equity);
                     recorded_initial_equity = true;
                     // The exchange's prices from before the first event are
                     // real observations: the charts start from them.
                     for (symbol, price) in &config.initial_prices {
-                        price_history.record(symbol, event_timestamp(&event), *price);
+                        price_history.record(symbol, timestamp, *price);
                     }
                 }
 
-                let timestamp = event_timestamp(&event);
                 diagnostics.next_event();
                 clock.wait_for_next_event(timestamp).await;
 
@@ -583,15 +593,22 @@ pub async fn run_unified_event_loop(
                     }
                 }
 
+                // Process due arrivals before making a new decision. In legacy
+                // mode the first pass is empty.
+                for arriving in [true,false] {
+                let intents = if arriving {
+                    arrivals.as_mut().map_or_else(Vec::new,|q|q.due(timestamp))
+                } else {
                 // `open_orders` comes from the executor, fetched fresh --
                 // this loop no longer keeps its own map.
                 let open_orders = executor.open_orders().await;
+                let arrived_margin_status = arrivals.as_ref().map(|_| ledger.margin_status(&mark_prices, &config.margin_tiers));
                 let ctx = StrategyContext {
                     positions: ledger.positions(),
                     balances: ledger.balances(),
                     open_orders: &open_orders,
                     open_parent_orders: &open_parent_orders,
-                    margin_status: &margin_status,
+                    margin_status: arrived_margin_status.as_ref().unwrap_or(&margin_status),
                     now: timestamp,
                 };
                 let paused = control.as_ref().is_some_and(ControlHandle::is_paused);
@@ -607,8 +624,10 @@ pub async fn run_unified_event_loop(
                 };
 
                 diagnostics.decision(&event, timestamp, paused, intents.len());
+                intents
+                };
                 for intent in intents {
-                    let trace = diagnostics.intent(&intent, "strategy", timestamp);
+                    let trace = diagnostics.intent(&intent, if arriving {"strategy_arrival"} else {"strategy"}, timestamp);
                     // Make the order valid for its symbol (round the quantity
                     // down to the exchange's step, the price to its tick) before
                     // anything judges it: the risk checks must see the order
@@ -703,7 +722,18 @@ pub async fn run_unified_event_loop(
                     }
 
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
-                    if let Some(latency_model) = &latency_model {
+                    if let Some(queue)=&mut arrivals {
+                        if !arriving {
+                            match queue.schedule(timestamp,intent.clone()) {
+                                Ok(())=>trace.outcome("scheduled","event_latency"),
+                                Err(reason)=>{
+                                    trace.outcome("rules_rejected",reason);
+                                    if let Some(log)=&mut order_log {record_refusal(log,&intent,timestamp,reason);}
+                                }
+                            }
+                            continue;
+                        }
+                    } else if let Some(latency_model) = &latency_model {
                         latency_model.apply().await;
                     }
 
@@ -806,6 +836,7 @@ pub async fn run_unified_event_loop(
                     }
                 }
 
+                }
                 let equity = ledger.equity(&last_prices)?;
                 overall_tracker.record_equity_point(timestamp, equity);
                 // Bars carry no new price (equity only moves on trades) and are
@@ -1000,6 +1031,7 @@ pub async fn run_unified_event_loop(
         simulated_fees: None,
         simulated_execution: None,
         simulated_depth: None,
+        event_latency: arrivals.map(|q| q.finish()),
     })
 }
 

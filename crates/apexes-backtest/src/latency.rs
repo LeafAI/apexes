@@ -21,6 +21,8 @@ pub enum LatencyModel {
     /// soon as it passes any configured `PreTradeCheck`.
     None,
     Fixed(Duration),
+    /// Deterministic event-time arrival, scheduled by the unified loop.
+    EventTime(crate::EventLatencyPolicy),
     /// Uniformly distributed random delay in `[min, max]` (inclusive).
     Uniform {
         min: Duration,
@@ -35,7 +37,7 @@ impl LatencyModel {
     /// simulating real network jitter.
     pub fn sample(&self) -> Duration {
         match self {
-            LatencyModel::None => Duration::ZERO,
+            LatencyModel::None | LatencyModel::EventTime(_) => Duration::ZERO,
             LatencyModel::Fixed(duration) => *duration,
             LatencyModel::Uniform { min, max } => {
                 if min >= max {

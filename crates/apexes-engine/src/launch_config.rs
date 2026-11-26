@@ -163,6 +163,8 @@ pub struct LaunchConfig {
     pub simulated_execution: Option<apexes_backtest::SimulatedExecution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simulated_depth: Option<apexes_backtest::SimulatedDepthPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_latency: Option<apexes_backtest::EventLatencyPolicy>,
     /// `apexes-market-data-gateway`'s `/market` WS URL this engine
     /// subscribes to for live market data (backtest mode ignores this
     /// -- historical replay reads from `apexes-storage` instead).
@@ -180,6 +182,8 @@ pub enum LaunchConfigError {
     SimulatedExecution(String),
     #[error("invalid simulated depth: {0}")]
     SimulatedDepth(String),
+    #[error("invalid event latency: {0}")]
+    EventLatency(String),
     #[error("live sessions need at least one instrument")]
     NoInstruments,
     #[error(
@@ -225,6 +229,14 @@ impl LaunchConfig {
             policy
                 .validate()
                 .map_err(LaunchConfigError::SimulatedDepth)?;
+        }
+        if let Some(policy) = self.event_latency {
+            if matches!(self.mode, SessionMode::Live { .. }) {
+                return Err(LaunchConfigError::EventLatency(
+                    "live uses actual exchange latency".into(),
+                ));
+            }
+            policy.validate().map_err(LaunchConfigError::EventLatency)?;
         }
         let SessionMode::Live { risk_limits, .. } = &self.mode else {
             return Ok(());
@@ -365,6 +377,7 @@ mod tests {
             simulated_fees: None,
             simulated_execution: None,
             simulated_depth: None,
+            event_latency: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -401,6 +414,7 @@ mod tests {
             simulated_fees: None,
             simulated_execution: None,
             simulated_depth: None,
+            event_latency: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -430,6 +444,29 @@ mod tests {
             StrategyRef::DriftScript { .. }
         ));
         assert!(!config.instruments.is_empty());
+    }
+
+    #[test]
+    fn event_latency_validates_round_trips_and_live_refuses_it() {
+        use apexes_backtest::EventLatencyPolicy;
+        let mut config = sample_backtest_config();
+        let old: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(old.event_latency.is_none());
+        let policy = EventLatencyPolicy { delay_ms: 250 };
+        config.event_latency = Some(policy);
+        let roundtrip: LaunchConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.event_latency, Some(policy));
+        roundtrip.validate().unwrap();
+        config.event_latency = Some(EventLatencyPolicy { delay_ms: 0 });
+        assert!(config.validate().is_err());
+        let mut live = sample_live_config();
+        live.event_latency = Some(policy);
+        assert!(matches!(
+            live.validate(),
+            Err(LaunchConfigError::EventLatency(_))
+        ));
     }
 
     #[test]

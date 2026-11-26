@@ -103,6 +103,8 @@ pub async fn run_backtest(
 
     let execution = crate::SimulatedExecution::from_registry(registry, &config.instruments)?;
     let depth = crate::SimulatedDepthPolicy::from_registry(registry)?;
+    let latency =
+        crate::EventLatencyPolicy::from_registry(registry)?.map(crate::LatencyModel::EventTime);
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let events = market_data.events().await?;
     let event_stream = futures::stream::iter(events);
@@ -164,7 +166,7 @@ pub async fn run_backtest(
         ems,
         strategy,
         None,
-        None,
+        latency,
     )
     .await?;
     report.simulated_fees = Some(simulated_fees);

@@ -30,6 +30,8 @@ pub struct BacktestReport {
     pub simulated_execution: Option<crate::SimulatedExecution>,
     #[serde(default)]
     pub simulated_depth: Option<crate::SimulatedDepthPolicy>,
+    #[serde(default)]
+    pub event_latency: Option<crate::EventLatencyReport>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/
