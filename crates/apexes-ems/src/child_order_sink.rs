@@ -18,6 +18,11 @@ use rust_decimal::Decimal;
 
 use crate::error::EmsError;
 
+/// Simulation-only pre-commit check. Proposed fills have not consumed depth.
+/// A successful check may advance its private execution-account projection.
+pub type SimulatedChildCheck<'a> =
+    dyn FnMut(&apexes_strategy::OrderIntent, &[Fill]) -> Result<(), String> + Send + 'a;
+
 /// A single child order an `Ems` implementation wants submitted.
 /// Deliberately much narrower than `apexes_strategy::OrderIntent`
 /// (`OrderIntent` carries `execution_algo`/`routing`, which never apply
@@ -103,6 +108,16 @@ pub trait ChildOrderSink: Send + Sync {
     /// Called only by the causal in-memory scheduler.
     async fn advance_simulated_time(&self, _at: chrono::DateTime<chrono::Utc>) -> Vec<Fill> {
         Vec::new()
+    }
+
+    /// Simulation-only checked arrival path. Legacy sinks have no deferred
+    /// children and never use the callback.
+    async fn advance_simulated_time_checked(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+        _check: &mut SimulatedChildCheck<'_>,
+    ) -> Vec<Fill> {
+        self.advance_simulated_time(at).await
     }
 
     /// Cancels a previously-submitted child order, if still active.

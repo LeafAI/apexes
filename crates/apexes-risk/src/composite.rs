@@ -107,6 +107,36 @@ impl CompositeRiskChecker {
         }
     }
 
+    /// Recheck execution risk on an already admitted parent's child.
+    /// Do not charge another strategy-level daily allowance.
+    pub fn check_child(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        open_orders: &HashMap<OrderId, Order>,
+        now: DateTime<Utc>,
+    ) -> Result<(), Vec<RiskViolation>> {
+        let checks = self
+            .pre_trade_checks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let violations: Vec<_> = checks
+            .iter()
+            .filter_map(|check| {
+                check
+                    .check_child(intent, positions, balances, open_orders, now)
+                    .err()
+            })
+            .flatten()
+            .collect();
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
     /// Tells every pre-trade check that `intent` was accepted for execution,
     /// so stateful limits (orders and volume per day) can advance. Call once
     /// per accepted order, from the layer that owns the submission. See

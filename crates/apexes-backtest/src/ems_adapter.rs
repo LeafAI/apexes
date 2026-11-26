@@ -132,7 +132,15 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
     }
 
     async fn advance_simulated_time(&self, at: chrono::DateTime<Utc>) -> Vec<apexes_core::Fill> {
-        self.deliver_arrivals(at)
+        self.deliver_arrivals(at, None)
+    }
+
+    async fn advance_simulated_time_checked(
+        &self,
+        at: chrono::DateTime<Utc>,
+        check: &mut apexes_ems::SimulatedChildCheck<'_>,
+    ) -> Vec<apexes_core::Fill> {
+        self.deliver_arrivals(at, Some(check))
     }
 
     async fn cancel_child_order(&self, order_id: OrderId) -> Result<(), EmsError> {

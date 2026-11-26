@@ -48,6 +48,19 @@ impl PortfolioLedger {
         self
     }
 
+    /// Private execution projection for atomic arrival checks. Attribution
+    /// histories are not needed to validate balances or positions; the
+    /// authoritative ledger records them when accepted fills are delivered.
+    pub(crate) fn execution_snapshot(&self) -> Self {
+        Self {
+            instruments: self.instruments.clone(),
+            balances: self.balances.clone(),
+            positions: self.positions.clone(),
+            realized_pnl: self.realized_pnl.clone(),
+            spot_accounting: Default::default(),
+        }
+    }
+
     pub fn balances(&self) -> &HashMap<String, Decimal> {
         &self.balances
     }

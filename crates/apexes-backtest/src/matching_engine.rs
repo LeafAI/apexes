@@ -250,7 +250,7 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
-        self.submit_market_inner(intent, now, false)
+        self.submit_market_inner(intent, now, false, None)
     }
 
     pub(crate) fn submit_market_child(
@@ -258,7 +258,17 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
-        self.submit_market_inner(intent, now, true)
+        self.submit_market_inner(intent, now, true, None)
+    }
+
+    pub(crate) fn submit_market_child_checked(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+        order_id: OrderId,
+        check: &mut apexes_ems::SimulatedChildCheck<'_>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit_market_inner(intent, now, true, Some((order_id, check)))
     }
 
     fn submit_market_inner(
@@ -266,6 +276,7 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
         exact_quantity: bool,
+        check: Option<(OrderId, &mut apexes_ems::SimulatedChildCheck<'_>)>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
         if intent.order_type != OrderType::Market {
             return Err(ApexesError::OrderRejected {
@@ -311,7 +322,9 @@ impl MatchingEngine {
             }
         };
 
-        let order_id = OrderId(Uuid::new_v4());
+        let order_id = check
+            .as_ref()
+            .map_or_else(|| OrderId(Uuid::new_v4()), |(id, _)| *id);
         let mut remaining = intent.quantity;
         let mut fills = Vec::new();
 
@@ -340,8 +353,15 @@ impl MatchingEngine {
                 margin_mode: intent.margin_mode,
             });
 
-            book.consume(intent.side, level.price, fill_quantity);
             remaining -= fill_quantity;
+        }
+        // No depth is consumed until the complete proposed execution passes
+        // the independent arrival check. The engine lock covers both phases.
+        if let Some((_, check)) = check {
+            check(&intent, &fills).map_err(|reason| ApexesError::OrderRejected { reason })?;
+        }
+        for fill in &fills {
+            book.consume(intent.side, fill.price, fill.quantity);
         }
 
         if remaining > Decimal::ZERO && remaining < intent.quantity {

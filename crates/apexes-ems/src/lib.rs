@@ -23,7 +23,7 @@ pub mod in_memory;
 pub mod postgres;
 pub mod volume_curve_provider;
 
-pub use child_order_sink::{ChildOrderIntent, ChildOrderSink};
+pub use child_order_sink::{ChildOrderIntent, ChildOrderSink, SimulatedChildCheck};
 pub use ems::{AlgoOrderRequest, Ems};
 pub use error::EmsError;
 pub use in_memory::InMemoryEms;

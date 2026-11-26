@@ -100,7 +100,11 @@ impl MatchingEngineChildOrderSink {
         Ok((id, Vec::new()))
     }
 
-    pub(super) fn deliver_arrivals(&self, now: DateTime<Utc>) -> Vec<Fill> {
+    pub(super) fn deliver_arrivals(
+        &self,
+        now: DateTime<Utc>,
+        mut check: Option<&mut apexes_ems::SimulatedChildCheck<'_>>,
+    ) -> Vec<Fill> {
         let Some(arrivals) = &self.arrivals else {
             return Vec::new();
         };
@@ -119,11 +123,13 @@ impl MatchingEngineChildOrderSink {
                 break;
             };
             queue.report.arrived += 1;
-            let result = self
-                .engine
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .submit_market_child(&intent, now);
+            let result = {
+                let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+                match check.as_deref_mut() {
+                    Some(check) => engine.submit_market_child_checked(&intent, now, id, check),
+                    None => engine.submit_market_child(&intent, now),
+                }
+            };
             let mut orders = self.submitted.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(order) = orders.get_mut(&id) {
                 order.updated_at = now;
@@ -286,6 +292,44 @@ mod tests {
             (report.scheduled, report.arrived, report.expired_at_end),
             (2, 2, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn refused_child_does_not_consume_depth_or_hide_later_fills() {
+        let engine = engine();
+        let t = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        engine
+            .lock()
+            .unwrap()
+            .on_depth_update(&depth(t, dec!(100), dec!(2)));
+        let sink = MatchingEngineChildOrderSink::new(engine)
+            .with_event_latency(Some(EventLatencyPolicy { delay_ms: 500 }));
+        let (first, _) = sink.submit_child_order_at(child(dec!(2)), t).await.unwrap();
+        let (second, _) = sink.submit_child_order_at(child(dec!(2)), t).await.unwrap();
+        let mut seen = Vec::new();
+        let mut check = |_: &OrderIntent, fills: &[Fill]| {
+            seen.push(fills[0].order_id);
+            if fills[0].order_id == first {
+                Err("test rejection".into())
+            } else {
+                Ok(())
+            }
+        };
+        let fills = sink
+            .advance_simulated_time_checked(t + TimeDelta::milliseconds(500), &mut check)
+            .await;
+        assert_eq!(seen, vec![first, second]);
+        assert_eq!(fills.len(), 1);
+        assert_eq!((fills[0].order_id, fills[0].quantity), (second, dec!(2)));
+        assert_eq!(
+            sink.order_status(first).await.unwrap().unwrap().status,
+            OrderStatus::Rejected
+        );
+        assert_eq!(
+            sink.order_status(second).await.unwrap().unwrap().status,
+            OrderStatus::Filled
+        );
+        assert_eq!(sink.finish_child_latency().unwrap().rejected_at_arrival, 1);
     }
 
     #[tokio::test]

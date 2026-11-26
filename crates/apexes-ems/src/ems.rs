@@ -79,4 +79,14 @@ pub trait Ems: Send + Sync {
     /// per event, for every event, regardless of whether any parent
     /// orders are currently scheduling.
     async fn on_market_event(&self, event: &MarketEvent) -> Result<Vec<Fill>, EmsError>;
+
+    /// The simulation caller supplies an independent execution check for
+    /// arriving children. Live EMS keeps its existing order-manager path.
+    async fn on_market_event_checked(
+        &self,
+        event: &MarketEvent,
+        _check: &mut crate::SimulatedChildCheck<'_>,
+    ) -> Result<Vec<Fill>, EmsError> {
+        self.on_market_event(event).await
+    }
 }
