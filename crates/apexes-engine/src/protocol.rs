@@ -57,6 +57,13 @@ pub struct EngineStatus {
     pub halt_reason: Option<String>,
     /// A halt asked for positions to be closed.
     pub flatten_requested: bool,
+    /// Optional health fields for backward-compatible older clients/engines.
+    #[serde(default)]
+    pub health_state: Option<String>,
+    #[serde(default)]
+    pub health_reason: Option<String>,
+    #[serde(default)]
+    pub resume_blocked: bool,
 }
 
 #[cfg(test)]
@@ -127,6 +134,9 @@ mod tests {
             halted: true,
             halt_reason: Some("why".to_string()),
             flatten_requested: false,
+            health_state: None,
+            health_reason: None,
+            resume_blocked: false,
         });
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"type\":\"Status\""), "{json}");

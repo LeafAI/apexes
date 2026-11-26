@@ -231,6 +231,9 @@ mod tests {
             halted,
             halt_reason: halted.then(|| "why".to_string()),
             flatten_requested: false,
+            health_state: None,
+            health_reason: None,
+            resume_blocked: false,
         }
     }
 

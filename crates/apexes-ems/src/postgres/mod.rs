@@ -237,6 +237,9 @@ impl PostgresEms {
 
         let deps = self.scheduling_deps();
         let handle = tokio::spawn(async move {
+            if !deps.state.wait_startup_ready().await {
+                return;
+            }
             if deps
                 .run_scheduling_loop(parent_id, algo_spec)
                 .await
@@ -709,7 +712,7 @@ impl Ems for PostgresEms {
         &self,
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
-        if !self.state.allowed() {
+        if !self.state.trading_ready() {
             return Err(EmsError::SchedulingSuspended);
         }
         let result = self.submit_parent(request).await;
@@ -782,7 +785,7 @@ impl Ems for PostgresEms {
         // `OrderManagerChildOrderSink`, whose fills surface later via
         // `OrderManager::apply_exchange_update`/`reconcile()`, not
         // synchronously here).
-        if !self.state.allowed() {
+        if !self.state.trading_ready() {
             return Ok(Vec::new());
         }
         if let MarketEvent::Trade(trade) = event {

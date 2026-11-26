@@ -668,3 +668,70 @@ async fn a_late_joining_client_gets_the_current_snapshot_immediately() {
         }
     }
 }
+
+#[tokio::test]
+async fn managed_health_is_visible_without_ticks_and_resume_is_denied() {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<SessionCommand>();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(empty_snapshot());
+    let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+    let ks = std::sync::Arc::new(apexes_oms::KillSwitch::managed());
+    let app = apexes_engine::build_app_with_kill_switch(
+        command_tx,
+        snapshot_rx,
+        stop_tx,
+        Some(ks.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session/ws"))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_status(&mut ws).await.health_state.as_deref(),
+        Some("Initializing")
+    );
+    ks.begin_reconciliation();
+    assert_eq!(
+        next_status(&mut ws).await.health_state.as_deref(),
+        Some("Reconciling")
+    );
+    ks.startup_ready();
+    assert_eq!(
+        next_status(&mut ws).await.health_state.as_deref(),
+        Some("Running")
+    );
+    ks.fault("database unavailable");
+    let status = next_status(&mut ws).await;
+    assert_eq!(status.health_state.as_deref(), Some("Degraded"));
+    assert!(status.resume_blocked && status.halted);
+    ks.cancel_sweep_complete();
+    assert_eq!(
+        next_status(&mut ws).await.health_state.as_deref(),
+        Some("Halted")
+    );
+    ws.send(Message::Text(
+        serde_json::to_string(&SessionMessage::Command(SessionCommand::ResumeTrading))
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap()
+                && let SessionMessage::Error { message } = serde_json::from_str(&text).unwrap()
+            {
+                assert!(message.contains("reconciliation and restart"));
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ks.is_engaged());
+    assert!(command_rx.try_recv().is_err());
+    task.abort();
+}

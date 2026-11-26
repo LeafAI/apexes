@@ -194,11 +194,18 @@ fn health_body(state: &AppState) -> (bool, serde_json::Value) {
         .filter(|ks| ks.is_engaged())
         .map(|ks| ks.reason().unwrap_or_default());
     let halted = halt_reason.is_some();
+    let phase = state.kill_switch.as_ref().and_then(|ks| ks.phase());
+    let blocked = state
+        .kill_switch
+        .as_ref()
+        .is_some_and(|ks| ks.blocks_submissions());
     (
-        halted,
+        blocked,
         serde_json::json!({
-            "status": if halted { "halted" } else { "ok" },
+            "status": if halted { "halted" } else if blocked { "not_ready" } else { "ok" },
             "halt_reason": halt_reason,
+            "health_state": phase.map(|p| p.as_str()),
+            "health_reason": state.kill_switch.as_ref().and_then(|ks| ks.health_reason()),
         }),
     )
 }
@@ -211,7 +218,7 @@ async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, axum::Json(body))
 }
 
-/// Readiness: 503 while the kill switch is engaged.
+/// Readiness: 503 while managed startup is incomplete or trading is halted.
 async fn readyz_handler(State(state): State<AppState>) -> impl IntoResponse {
     let (halted, body) = health_body(&state);
     let code = if halted {
@@ -241,6 +248,11 @@ fn engine_status(identity: &Identity, kill_switch: Option<&KillSwitch>) -> Engin
         halted,
         halt_reason: kill_switch.filter(|_| halted).and_then(KillSwitch::reason),
         flatten_requested: kill_switch.is_some_and(KillSwitch::flatten_requested),
+        health_state: kill_switch
+            .and_then(KillSwitch::phase)
+            .map(|phase| phase.as_str().to_string()),
+        health_reason: kill_switch.and_then(KillSwitch::health_reason),
+        resume_blocked: kill_switch.is_some_and(|ks| ks.phase().is_some()),
     }
 }
 
@@ -447,7 +459,16 @@ async fn forward_command(
                     }
                     ks.engage(reason.clone());
                 }
-                (SessionCommand::ResumeTrading, Some(ks)) => ks.release(),
+                (SessionCommand::ResumeTrading, Some(ks)) => {
+                    if let Err(reason) = ks.try_release() {
+                        security.audit(
+                            actor,
+                            "command_denied",
+                            serde_json::json!({"command":"ResumeTrading","reason":reason}),
+                        );
+                        return Forwarded::Denied(reason.into());
+                    }
+                }
                 (SessionCommand::Halt { .. } | SessionCommand::ResumeTrading, None) => {
                     tracing::warn!(
                         "apexes-engine server: halt/resume received but no kill switch is configured (non-live session)"

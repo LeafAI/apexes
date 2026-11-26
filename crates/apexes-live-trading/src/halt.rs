@@ -29,6 +29,7 @@ pub struct ActivityClock {
     base: Instant,
     last_ms: AtomicU64,
     instruments: Mutex<HashMap<(Venue, String), Instant>>,
+    seen: Mutex<std::collections::HashSet<(Venue, String)>>,
 }
 
 impl ActivityClock {
@@ -37,6 +38,7 @@ impl ActivityClock {
             base: Instant::now(),
             last_ms: AtomicU64::new(0),
             instruments: Mutex::new(HashMap::new()),
+            seen: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -66,8 +68,21 @@ impl ActivityClock {
             && let Some(last) = entries.get_mut(&(event.venue(), event.symbol().to_string()))
         {
             *last = Instant::now();
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.insert((event.venue(), event.symbol().to_string()));
+            }
         }
         self.touch();
+    }
+
+    pub fn all_observed(&self) -> bool {
+        let Ok(instruments) = self.instruments.lock() else {
+            return false;
+        };
+        let Ok(seen) = self.seen.lock() else {
+            return false;
+        };
+        !instruments.is_empty() && instruments.keys().all(|key| seen.contains(key))
     }
 
     fn reset_grace(&self) {
@@ -146,6 +161,7 @@ pub fn spawn_cancel_all_task(
                     "kill switch: cancel-all pass"
                 );
                 if report.is_complete() {
+                    kill_switch.cancel_sweep_complete();
                     break;
                 }
                 tokio::time::sleep(CANCEL_RETRY_INTERVAL).await;
@@ -286,5 +302,42 @@ mod tests {
         }
         assert!(ks.is_engaged());
         assert!(ks.reason().unwrap().contains("ETHUSDT"));
+    }
+    #[test]
+    fn startup_requires_a_usable_event_for_every_configured_symbol() {
+        use apexes_core::{AssetClass, MarketType, TradeEvent};
+        use rust_decimal_macros::dec;
+        let instrument = |symbol: &str| {
+            Instrument::new(
+                symbol,
+                MarketType::Crypto,
+                Venue::Binance,
+                AssetClass::Spot,
+                None,
+                Some("USDT".into()),
+                dec!(0.01),
+                dec!(0.001),
+                dec!(1),
+            )
+            .unwrap()
+        };
+        let clock = ActivityClock::for_instruments(&[instrument("BTCUSDT"), instrument("ETHUSDT")]);
+        let trade = |symbol: &str| {
+            MarketEvent::Trade(TradeEvent {
+                symbol: symbol.into(),
+                venue: Venue::Binance,
+                price: dec!(100),
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: chrono::Utc::now(),
+            })
+        };
+        assert!(!clock.all_observed());
+        clock.observe(&trade("BTCUSDT"));
+        clock.observe(&trade("OTHER"));
+        assert!(!clock.all_observed());
+        clock.observe(&trade("ETHUSDT"));
+        assert!(clock.all_observed());
     }
 }

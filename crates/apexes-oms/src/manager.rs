@@ -141,14 +141,17 @@ impl OrderManager {
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
         if let Some(kill_switch) = &self.kill_switch
-            && kill_switch.is_engaged()
+            && kill_switch.blocks_submissions()
         {
             apexes_telemetry::metrics()
                 .orders_submitted
                 .with_label_values(&[apexes_telemetry::order_result::HALTED])
                 .inc();
             return Err(OmsError::TradingHalted {
-                reason: kill_switch.reason().unwrap_or_default(),
+                reason: kill_switch
+                    .reason()
+                    .or_else(|| kill_switch.health_reason())
+                    .unwrap_or_default(),
             });
         }
         if let Some(checker) = &self.risk_checker {
@@ -164,7 +167,20 @@ impl OrderManager {
             }
         }
 
-        self.place_order(intent).await
+        let result = self.place_order(intent, false).await;
+        if matches!(
+            &result,
+            Err(OmsError::QueryFailed { .. } | OmsError::SubmissionUnresolved { .. })
+        ) {
+            self.report_health_fault("OMS submission persistence or reconciliation failed");
+        }
+        result
+    }
+
+    pub fn report_health_fault(&self, reason: &'static str) {
+        if let Some(ks) = &self.kill_switch {
+            ks.fault(reason);
+        }
     }
 
     /// Submits a position-closing order for the kill switch's flatten
@@ -174,12 +190,16 @@ impl OrderManager {
     /// limit). Callers must only pass orders that reduce exposure.
     pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
-        self.place_order(intent).await
+        self.place_order(intent, true).await
     }
 
     /// Persists, then sends, one order. Shared tail of `submit_order` and
     /// `submit_flatten_order`; both paths enforce unresolved-submission safety.
-    async fn place_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
+    async fn place_order(
+        &mut self,
+        intent: OrderIntent,
+        flatten: bool,
+    ) -> Result<OrderId, OmsError> {
         // Do not rely on strategies checking has_open_order: the OMS is
         // the final guard, including when a caller attempts a flatten.
         if let Some(pending) = self.open_orders.values().find(|o| {
@@ -216,6 +236,22 @@ impl OrderManager {
         // Retain the guard before awaiting network I/O. Cancellation or a
         // failed acknowledgement write must not erase an in-flight order.
         self.open_orders.insert(order_id, order.clone());
+        if !flatten
+            && let Some(ks) = &self.kill_switch
+            && ks.blocks_submissions()
+        {
+            // No gateway call occurred: persist a definite local refusal.
+            order.status = OrderStatus::Rejected;
+            order.updated_at = Utc::now();
+            self.store.upsert_order(&order).await?;
+            self.open_orders.remove(&order_id);
+            return Err(OmsError::TradingHalted {
+                reason: ks
+                    .reason()
+                    .or_else(|| ks.health_reason())
+                    .unwrap_or_default(),
+            });
+        }
 
         let submit_started = std::time::Instant::now();
         let outcome = self.gateway.submit_order(&order).await;
@@ -246,6 +282,7 @@ impl OrderManager {
                 Err(OmsError::OrderRejected { reason })
             }
             GatewayOutcome::Uncertain { .. } => {
+                self.report_health_fault("OMS order submission outcome uncertain");
                 tracing::warn!(
                     order_id = ?order.id,
                     "order submission outcome uncertain; deferring to reconcile()"
@@ -355,6 +392,21 @@ impl OrderManager {
         exchange_order_id: Option<String>,
         status: OrderStatus,
     ) -> Result<Vec<Fill>, OmsError> {
+        let result = self
+            .apply_exchange_update_inner(client_order_id, exchange_order_id, status)
+            .await;
+        if result.is_err() {
+            self.report_health_fault("OMS exchange update persistence failed");
+        }
+        result
+    }
+
+    async fn apply_exchange_update_inner(
+        &mut self,
+        client_order_id: OrderId,
+        exchange_order_id: Option<String>,
+        status: OrderStatus,
+    ) -> Result<Vec<Fill>, OmsError> {
         let Some(previous_status) = self
             .open_orders
             .get(&client_order_id)
@@ -395,6 +447,7 @@ impl OrderManager {
         let mut new_fills = Vec::new();
         if status_changed && status_carries_fills(status) {
             if candidate.exchange_order_id.is_none() {
+                self.report_health_fault("OMS fill has no exchange order ID");
                 tracing::warn!(
                     order_id = ?client_order_id,
                     ?status,
@@ -435,6 +488,7 @@ impl OrderManager {
                     }
                 }
                 Err(reason) => {
+                    self.report_health_fault("OMS fill query failed");
                     // Do NOT advance the status without the fills (see
                     // above). The local order stays as it was, so the next
                     // reconcile pass sees the same transition and retries.
@@ -522,7 +576,17 @@ impl OrderManager {
                 telemetry.reconcile_runs.with_label_values(&["ok"]).inc();
                 telemetry.reconcile_changes.inc_by(changes.len() as u64);
             }
-            Err(_) => telemetry.reconcile_runs.with_label_values(&["error"]).inc(),
+            Err(_) => {
+                telemetry.reconcile_runs.with_label_values(&["error"]).inc();
+                self.report_health_fault("OMS reconciliation failed");
+            }
+        }
+        if self
+            .open_orders
+            .values()
+            .any(|o| o.exchange_order_id.is_none())
+        {
+            self.report_health_fault("OMS unresolved submission");
         }
         telemetry.open_orders.set(self.open_orders.len() as i64);
         result
@@ -558,6 +622,7 @@ impl OrderManager {
                 .get(&client_order_id)
                 .map(|order| order.status)
             else {
+                self.report_health_fault("OMS untracked exchange order");
                 tracing::error!(
                     order_id = ?client_order_id,
                     "reconcile: exchange reports an open order we have no local record of"
@@ -639,6 +704,7 @@ impl OrderManager {
                     }
                 }
                 Ok(None) => {
+                    self.report_health_fault("OMS open order missing at exchange");
                     tracing::error!(
                         order_id = ?client_order_id,
                         exchange_order_id,
@@ -646,6 +712,7 @@ impl OrderManager {
                     );
                 }
                 Err(reason) => {
+                    self.report_health_fault("OMS order status query failed");
                     tracing::warn!(
                         order_id = ?client_order_id,
                         reason,
@@ -1325,5 +1392,41 @@ mod tests {
                 .as_deref(),
             Some("EX-INTERRUPTED")
         );
+    }
+    #[tokio::test]
+    #[ignore]
+    async fn managed_oms_blocks_startup_and_latches_uncertain_submission() {
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let ks = Arc::new(KillSwitch::managed());
+        let mut manager = fresh_manager(gateway.clone())
+            .await
+            .with_kill_switch(ks.clone());
+        let positions = HashMap::new();
+        let balances = HashMap::new();
+        assert!(matches!(
+            manager
+                .submit_order(sample_intent(), &positions, &balances)
+                .await,
+            Err(OmsError::TradingHalted { .. })
+        ));
+        assert!(manager.open_orders().is_empty());
+        ks.begin_reconciliation();
+        ks.startup_ready();
+        gateway.program_next_submit_outcome(GatewayOutcome::Uncertain {
+            reason: "lost ack".into(),
+        });
+        let id = manager
+            .submit_order(sample_intent(), &positions, &balances)
+            .await
+            .unwrap();
+        assert!(manager.open_orders().contains_key(&id));
+        assert_eq!(ks.phase(), Some(crate::SessionPhase::Degraded));
+        assert!(ks.try_release().is_err());
+        let mut other = sample_intent();
+        other.symbol = "ETHUSDT".into();
+        assert!(matches!(
+            manager.submit_order(other, &positions, &balances).await,
+            Err(OmsError::TradingHalted { .. })
+        ));
     }
 }

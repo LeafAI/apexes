@@ -64,6 +64,9 @@ fn status(role: &str, halted: bool) -> EngineStatus {
         halted,
         halt_reason: halted.then(|| "operator console".to_string()),
         flatten_requested: false,
+        health_state: None,
+        health_reason: None,
+        resume_blocked: false,
     }
 }
 

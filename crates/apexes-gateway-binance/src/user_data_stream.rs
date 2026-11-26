@@ -196,6 +196,15 @@ pub async fn start_user_data_stream(
     spot: crate::ws_user_stream::SpotStreamConfig,
     with_futures: bool,
 ) -> Result<(UserDataStreamHandle, impl Stream<Item = ExchangeUpdate>), String> {
+    start_user_data_stream_guarded(rest, spot, with_futures, None).await
+}
+
+pub(crate) async fn start_user_data_stream_guarded(
+    rest: BinanceRestClient,
+    spot: crate::ws_user_stream::SpotStreamConfig,
+    with_futures: bool,
+    health: Option<Arc<apexes_oms::KillSwitch>>,
+) -> Result<(UserDataStreamHandle, impl Stream<Item = ExchangeUpdate>), String> {
     let (tx, rx) = mpsc::unbounded_channel();
     let resync = Arc::new(Notify::new());
 
@@ -211,6 +220,7 @@ pub async fn start_user_data_stream(
         Arc::clone(&resync),
         StreamTimings::default(),
         Some(rest.clone()),
+        health.clone(),
     ));
     let futures = with_futures.then(|| {
         tokio::spawn(run_stream_task(
@@ -220,6 +230,7 @@ pub async fn start_user_data_stream(
             tx,
             Arc::clone(&resync),
             StreamTimings::default(),
+            health,
         ))
     });
 
@@ -262,12 +273,16 @@ async fn run_stream_task(
     tx: mpsc::UnboundedSender<ExchangeUpdate>,
     resync: Arc<Notify>,
     timings: StreamTimings,
+    health: Option<Arc<apexes_oms::KillSwitch>>,
 ) {
     let mut failures = 0u32;
     loop {
         let listen_key = match obtain_listen_key(&rest, family).await {
             Ok(key) => key,
             Err(reason) => {
+                if let Some(ks) = &health {
+                    ks.fault("exchange user-data connection unavailable");
+                }
                 tracing::warn!(reason, ?family, "failed to obtain listenKey; will retry");
                 tokio::time::sleep(backoff_delay(&timings, failures)).await;
                 failures = failures.saturating_add(1);
@@ -352,6 +367,9 @@ async fn run_stream_task(
             .stream_connected
             .with_label_values(&[family_label])
             .set(0.0);
+        if let Some(ks) = &health {
+            ks.fault("exchange user-data stream disconnected");
+        }
         tokio::time::sleep(backoff_delay(&timings, 0)).await;
     }
 }
@@ -662,6 +680,7 @@ mod tests {
             tx,
             Arc::clone(&resync),
             fast_timings(),
+            None,
         ));
 
         // First connection: resync + update 1.
@@ -716,6 +735,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             timings,
+            None,
         ));
 
         for _ in 0..100 {
@@ -747,6 +767,7 @@ mod tests {
             tx,
             Arc::new(Notify::new()),
             timings,
+            None,
         ));
         for _ in 0..100 {
             if connections.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
