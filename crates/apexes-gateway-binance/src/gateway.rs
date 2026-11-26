@@ -76,13 +76,24 @@ impl BinanceExecutionGateway {
     /// Futures endpoint is ever contacted (the Futures base URL is left
     /// empty so an accidental Futures call fails loudly).
     pub fn for_network(network: BinanceNetwork, api_key: String, api_secret: String) -> Self {
+        Self::for_network_with_recv_window(network, api_key, api_secret, 5000)
+    }
+
+    /// Same Spot-only network routing with an explicit receive window.
+    /// Signed requests refuse invalid windows (outside 1..=60,000 ms).
+    pub fn for_network_with_recv_window(
+        network: BinanceNetwork,
+        api_key: String,
+        api_secret: String,
+        recv_window_ms: u64,
+    ) -> Self {
         let endpoints = network.endpoints();
         let mut gateway = Self::new(BinanceGatewayConfig {
             api_key,
             api_secret,
             spot_base_url: endpoints.spot_rest.to_string(),
             futures_base_url: String::new(),
-            recv_window_ms: 5000,
+            recv_window_ms,
         })
         .spot_only();
         gateway.spot_ws_api = endpoints.spot_ws_api.to_string();

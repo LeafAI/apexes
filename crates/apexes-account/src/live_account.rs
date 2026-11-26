@@ -243,9 +243,25 @@ mod tests {
             .await;
     }
 
+    async fn mount_clock(server: &MockServer) {
+        for time_path in ["/api/v3/time", "/fapi/v1/time"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(time_path))
+                .respond_with(|_: &wiremock::Request| {
+                    wiremock::ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"serverTime": chrono::Utc::now().timestamp_millis()}),
+                    )
+                })
+                .with_priority(1)
+                .mount(server)
+                .await;
+        }
+    }
+
     #[tokio::test]
     async fn refresh_populates_balances_from_the_gateway() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/v3/account"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -275,6 +291,7 @@ mod tests {
     #[tokio::test]
     async fn balances_before_first_refresh_are_empty() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         mount_empty_balances_and_positions(&mock_server).await;
         let gateway = gateway_against(&mock_server).await;
         let live_account = LiveAccount::new(gateway);
@@ -285,6 +302,7 @@ mod tests {
     #[tokio::test]
     async fn deposit_history_forwards_to_the_gateway() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/sapi/v1/capital/deposit/hisrec"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
@@ -303,6 +321,7 @@ mod tests {
     #[tokio::test]
     async fn internal_transfer_forwards_to_the_gateway() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         Mock::given(method("POST"))
             .and(path("/sapi/v1/asset/transfer"))
             .respond_with(
@@ -328,6 +347,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_against_exchange_reports_discrepancy_beyond_tolerance() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         // Local cache will be empty (no refresh() called); exchange
         // reports a real USDT balance -- a large discrepancy.
         Mock::given(method("GET"))
@@ -366,6 +386,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_against_exchange_reports_nothing_within_tolerance() {
         let mock_server = MockServer::start().await;
+        mount_clock(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/v3/account"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
