@@ -153,6 +153,13 @@ pub struct BinanceRestClient {
 }
 
 impl BinanceRestClient {
+    /// Non-reversible identifier for binding a local inventory database to
+    /// the REST credential. Never log this value or send it to clients.
+    pub(crate) fn credential_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(self.config.api_key.as_bytes()))
+    }
+
     pub fn new(config: BinanceGatewayConfig) -> Self {
         Self {
             http: build_http_client(),

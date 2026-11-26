@@ -20,7 +20,7 @@ pub mod ws_user_stream;
 pub use apexes_core::binance_network::{BinanceEndpoints, BinanceNetwork, ParseNetworkError};
 pub use config::BinanceGatewayConfig;
 pub use error::BinanceApiError;
-pub use gateway::BinanceExecutionGateway;
+pub use gateway::{BinanceExecutionGateway, SpotBalance};
 pub use rest::{ApiFamily, BinanceRestClient};
 pub use user_data_stream::UserDataStreamHandle;
 pub use ws_user_stream::SpotStreamConfig;

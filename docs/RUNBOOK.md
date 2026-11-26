@@ -347,3 +347,23 @@ startup recovery; the health latch itself is not persisted across
 processes. Pause and Resume of strategy evaluation remain independent.
 The existing explicit flatten procedure is unchanged; never infer a
 safe flatten quantity from an unresolved order outcome.
+
+### Persistent spot position recovery (F02.01)
+
+The live engine restores strategy-owned spot quantity and weighted average
+entry price from durable order/fill history. Account balances are fetched
+separately; historical fills are not applied to wallet balances twice.
+Use one dedicated PostgreSQL schema per credential, network, strategy
+and configured instrument set. The owner binding is independent of the
+ephemeral session ID. A second managed engine using the same schema is
+refused; loss of the ownership lease halts new ordinary trading.
+
+For initial recovery, reconcile and explicitly resolve any working orders
+or relevant locked funds before starting. Do not interpret wallet holdings
+as strategy inventory. Missing inventory, incomplete history, unowned
+sales or conflicting ownership refuse startup. A pre-existing unbound
+database requires audited migration from exchange history; do not delete
+orders/fills or blindly set the owner marker. Credential changes and
+instrument-set changes also require review. Automatic legacy adoption,
+continuous reservations and account-wide coordination are not implemented
+in this iteration. Existing data is preserved.

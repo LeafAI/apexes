@@ -95,6 +95,8 @@ enum EngineError {
     BindSessionWs(std::io::Error),
     #[error("live startup recovery failed: {0}")]
     Recovery(#[from] apexes_live_trading::RecoveryError),
+    #[error("spot inventory recovery failed: {0}")]
+    SpotRecovery(#[from] apexes_live_trading::SpotRecoveryError),
     #[error(
         "live sessions require control tokens and an audit log: set APEXES_CONTROL_TOKEN and/or APEXES_CONTROL_TOKENS (and APEXES_AUDIT_LOG, or provide a writable $HOME)"
     )]
@@ -855,7 +857,25 @@ async fn run_live_mode(
         )),
     )?;
 
-    let order_store = OrderStore::new(&ems_postgres_url).await?;
+    // Bind the dedicated database before reconciling any old client IDs
+    // against the exchange. Session IDs are ephemeral; strategy reference,
+    // credential fingerprint, network and instrument identity are stable.
+    let mut scope: Vec<_> = launch_config
+        .instruments
+        .iter()
+        .map(|i| (&i.symbol, &i.base_currency, &i.quote_currency))
+        .collect();
+    scope.sort();
+    let owner = serde_json::json!({
+        "version": 1,
+        "network": network.to_string(),
+        "credential": binance_gateway.credential_fingerprint(),
+        "strategy": &launch_config.strategy_ref,
+        "instruments": scope,
+    })
+    .to_string();
+    let mut order_store = OrderStore::new(&ems_postgres_url).await?;
+    order_store.bind_spot_inventory(&owner).await?;
     let mut order_manager = OrderManager::new(order_store, registry)
         .await
         .map_err(EngineError::from)?
@@ -871,23 +891,49 @@ async fn run_live_mode(
         );
     }
     kill_switch.begin_reconciliation();
+    let mut wallet = HashMap::new();
     let recovered = apexes_live_trading::recover_live_state(
         &mut order_manager,
-        &[
-            apexes_core::AssetClass::Spot,
-            apexes_core::AssetClass::Perpetual,
-        ],
+        &[apexes_core::AssetClass::Spot],
         async {
+            wallet = binance_gateway
+                .spot_balances()
+                .await?
+                .into_iter()
+                .map(|(asset, balance)| {
+                    (
+                        asset,
+                        apexes_live_trading::SpotWalletBalance {
+                            free: balance.free,
+                            locked: balance.locked,
+                        },
+                    )
+                })
+                .collect();
             Ok(apexes_live_trading::ExchangeSnapshot {
-                balances: binance_gateway.account_balances().await?,
-                positions: binance_gateway.account_positions().await?,
+                balances: wallet
+                    .iter()
+                    .map(|(asset, balance)| (asset.clone(), balance.free + balance.locked))
+                    .collect(),
+                positions: HashMap::new(),
             })
         },
     )
     .await?;
-
-    // Recovery succeeded: local and exchange state agree and the ledger is
-    // seeded. Only now does this session count as started.
+    let fills = order_manager.spot_inventory_fills().await?;
+    let recovered_positions = apexes_live_trading::recover_spot_positions(
+        &launch_config.instruments,
+        &fills,
+        &wallet,
+        !order_manager.open_orders().is_empty(),
+    )?;
+    tracing::info!(
+        positions = recovered_positions.len(),
+        fills = fills.len(),
+        "strategy-owned spot inventory recovered from durable fills"
+    );
+    // Keep account wallet balances and strategy positions distinct;
+    // replayed executions must not be credited to the wallet again.
     let (session_balances, ignored_assets) =
         session_balances(recovered.snapshot.balances, &launch_config.instruments);
     if ignored_assets > 0 {
@@ -910,7 +956,7 @@ async fn run_live_mode(
     let config = LiveTradingConfig {
         instruments: launch_config.instruments.clone(),
         initial_balances: session_balances,
-        initial_positions: recovered.snapshot.positions,
+        initial_positions: recovered_positions,
         cost_model: default_cost_model(),
         margin_tiers: launch_config.margin_tiers.clone(),
         market_condition_config: launch_config.market_condition_config.clone(),

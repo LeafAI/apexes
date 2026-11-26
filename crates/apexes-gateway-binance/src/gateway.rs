@@ -393,7 +393,50 @@ impl BinanceExecutionGateway {
     }
 }
 
+/// An exchange Spot wallet balance, retaining the reservation distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpotBalance {
+    pub free: Decimal,
+    pub locked: Decimal,
+}
+
 impl BinanceExecutionGateway {
+    /// Local persistence binding only; the API key itself never leaves
+    /// the gateway through this interface.
+    pub fn credential_fingerprint(&self) -> String {
+        self.rest.credential_fingerprint()
+    }
+
+    pub async fn spot_balances(&self) -> Result<HashMap<String, SpotBalance>, String> {
+        let (status, body) = self
+            .rest
+            .signed_request("GET", ApiFamily::Spot, "/api/v3/account", "")
+            .await?;
+        if !status.is_success() {
+            return Err(format!("spot balances: HTTP {status}"));
+        }
+        let spot: SpotAccountResponse =
+            serde_json::from_str(&body).map_err(|_| "invalid spot balance response".to_string())?;
+        let mut balances = HashMap::new();
+        for entry in spot.balances {
+            if entry.free < Decimal::ZERO
+                || entry.locked < Decimal::ZERO
+                || balances
+                    .insert(
+                        entry.asset,
+                        SpotBalance {
+                            free: entry.free,
+                            locked: entry.locked,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err("invalid or duplicate spot wallet balance".into());
+            }
+        }
+        Ok(balances)
+    }
+
     /// Queries real Spot (`GET /api/v3/account`) and USDS-M Futures
     /// (`GET /fapi/v2/balance`) balances, merging both wallets into a
     /// single asset-symbol -> total-quantity map (matching
@@ -405,18 +448,8 @@ impl BinanceExecutionGateway {
     pub async fn account_balances(&self) -> Result<HashMap<String, Decimal>, String> {
         let mut totals: HashMap<String, Decimal> = HashMap::new();
 
-        let (status, body) = self
-            .rest
-            .signed_request("GET", ApiFamily::Spot, "/api/v3/account", "")
-            .await?;
-        if !status.is_success() {
-            return Err(format!("account_balances (spot): HTTP {status}: {body}"));
-        }
-        let spot: SpotAccountResponse = serde_json::from_str(&body).map_err(|error| {
-            format!("account_balances (spot): parse error: {error}; body={body}")
-        })?;
-        for entry in spot.balances {
-            *totals.entry(entry.asset).or_insert(Decimal::ZERO) += entry.free + entry.locked;
+        for (asset, entry) in self.spot_balances().await? {
+            totals.insert(asset, entry.free + entry.locked);
         }
 
         if self.spot_only {
