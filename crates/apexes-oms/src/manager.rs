@@ -60,8 +60,7 @@ pub struct OrderManager {
     risk_checker: Option<Arc<CompositeRiskChecker>>,
     open_orders: HashMap<OrderId, Order>,
     kill_switch: Option<Arc<KillSwitch>>,
-    /// How long an order with no exchange id may be reported unknown by
-    /// the exchange before `reconcile` concludes it never arrived there.
+    /// Age threshold for an unresolved-submission warning, not an expiry.
     unsent_order_grace: std::time::Duration,
 }
 
@@ -97,10 +96,8 @@ impl OrderManager {
         })
     }
 
-    /// Sets how old an order with no exchange id must be before an
-    /// exchange "no such order" answer is trusted to mean it was never
-    /// sent (a crash between persisting and submitting). Younger orders
-    /// are left alone: their submit may still be in flight.
+    /// Sets the age threshold for warning about an unresolved submission.
+    /// No age or negative lookup is proof of non-execution.
     pub fn with_unsent_order_grace(mut self, grace: std::time::Duration) -> Self {
         self.unsent_order_grace = grace;
         self
@@ -181,8 +178,20 @@ impl OrderManager {
     }
 
     /// Persists, then sends, one order. Shared tail of `submit_order` and
-    /// `submit_flatten_order`; applies no gating of its own.
+    /// `submit_flatten_order`; both paths enforce unresolved-submission safety.
     async fn place_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
+        // Do not rely on strategies checking has_open_order: the OMS is
+        // the final guard, including when a caller attempts a flatten.
+        if let Some(pending) = self.open_orders.values().find(|o| {
+            o.exchange_order_id.is_none()
+                && o.symbol == intent.symbol
+                && o.venue == intent.venue
+                && o.asset_class == intent.asset_class
+        }) {
+            return Err(OmsError::SubmissionUnresolved {
+                order_id: pending.id,
+            });
+        }
         let now = Utc::now();
         let mut order = Order {
             id: OrderId(Uuid::new_v4()),
@@ -202,7 +211,11 @@ impl OrderManager {
             created_at: now,
             updated_at: now,
         };
-        self.store.upsert_order(&order).await?;
+        self.store.begin_submission(&order).await?;
+        let order_id = order.id;
+        // Retain the guard before awaiting network I/O. Cancellation or a
+        // failed acknowledgement write must not erase an in-flight order.
+        self.open_orders.insert(order_id, order.clone());
 
         let submit_started = std::time::Instant::now();
         let outcome = self.gateway.submit_order(&order).await;
@@ -229,15 +242,18 @@ impl OrderManager {
                 order.status = OrderStatus::Rejected;
                 order.updated_at = Utc::now();
                 self.store.upsert_order(&order).await?;
+                self.open_orders.remove(&order_id);
                 Err(OmsError::OrderRejected { reason })
             }
-            GatewayOutcome::Uncertain { reason } => {
+            GatewayOutcome::Uncertain { .. } => {
                 tracing::warn!(
                     order_id = ?order.id,
-                    reason,
                     "order submission outcome uncertain; deferring to reconcile()"
                 );
-                let order_id = order.id;
+                order.updated_at = Utc::now();
+                // If this write fails, the durable Submitting marker and
+                // the in-memory unknown-ID guard remain in place.
+                self.store.upsert_order(&order).await?;
                 self.open_orders.insert(order_id, order);
                 Ok(order_id)
             }
@@ -590,26 +606,21 @@ impl OrderManager {
                         results.push((client_order_id, new_fills));
                     }
                     Ok(None) => {
+                        self.store.upsert_order(&order_snapshot).await?;
                         let age = Utc::now() - order_snapshot.created_at;
                         let grace = chrono::Duration::from_std(self.unsent_order_grace)
                             .unwrap_or(chrono::Duration::MAX);
                         if age >= grace {
-                            tracing::error!(
+                            tracing::warn!(
                                 order_id = ?client_order_id,
                                 ?age,
-                                "reconcile: exchange has no record of this order and it is older than the grace period; it never reached the exchange. Marking Rejected"
+                                "reconcile: client ID not found; submission remains unresolved, manual review may be required"
                             );
-                            let mut order = self.open_orders.remove(&client_order_id).unwrap();
-                            order.status = OrderStatus::Rejected;
-                            order.updated_at = Utc::now();
-                            self.store.upsert_order(&order).await?;
-                            results.push((client_order_id, Vec::new()));
                         }
                     }
-                    Err(reason) => {
+                    Err(_) => {
                         tracing::warn!(
                             order_id = ?client_order_id,
-                            reason,
                             "reconcile: cannot resolve order with no exchange_order_id (client-id lookup failed/unsupported); will retry"
                         );
                     }
@@ -1216,5 +1227,103 @@ mod tests {
         assert_eq!(changed[0].1.len(), 1);
         assert_eq!(changed[0].1[0].leverage, Some(dec!(10)));
         assert_eq!(changed[0].1[0].margin_mode, Some(MarginMode::Isolated));
+    }
+
+    /// Simulates acceptance at the exchange followed by a lost acknowledgement
+    /// and a cancelled caller future. No new exchange request is needed to recover.
+    struct InterruptedGateway {
+        exchange: MockExecutionGateway,
+        dispatched: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionGateway for InterruptedGateway {
+        async fn submit_order(&self, order: &Order) -> GatewayOutcome {
+            self.exchange.force_register_exchange_order(
+                order.id,
+                "EX-INTERRUPTED",
+                OrderStatus::New,
+                order.asset_class,
+            );
+            self.dispatched.notify_one();
+            std::future::pending().await
+        }
+
+        async fn cancel_order(&self, order: &Order) -> GatewayOutcome {
+            self.exchange.cancel_order(order).await
+        }
+
+        async fn query_order_status(&self, order: &Order) -> Result<Option<OrderStatus>, String> {
+            self.exchange.query_order_status(order).await
+        }
+
+        async fn query_order_by_client_id(
+            &self,
+            order: &Order,
+        ) -> Result<Option<(String, OrderStatus)>, String> {
+            self.exchange.query_order_by_client_id(order).await
+        }
+
+        async fn query_all_open_orders(
+            &self,
+            asset_class: AssetClass,
+        ) -> Result<Vec<(OrderId, Option<String>, OrderStatus)>, String> {
+            self.exchange.query_all_open_orders(asset_class).await
+        }
+
+        async fn query_fills_for_order(
+            &self,
+            order: &Order,
+        ) -> Result<Vec<crate::ExchangeFill>, String> {
+            self.exchange.query_fills_for_order(order).await
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn interrupted_submission_retains_durable_client_id_and_in_memory_guard() {
+        use crate::SubmissionState;
+        let gateway = Arc::new(InterruptedGateway {
+            exchange: MockExecutionGateway::new(),
+            dispatched: tokio::sync::Notify::new(),
+        });
+        let mut manager = fresh_manager(gateway.clone()).await;
+        let positions = HashMap::new();
+        let balances = HashMap::new();
+        {
+            let submit = manager.submit_order(sample_intent(), &positions, &balances);
+            tokio::pin!(submit);
+            tokio::select! {
+                _ = gateway.dispatched.notified() => {}
+                result = &mut submit => panic!("unexpected completion: {result:?}"),
+            }
+        }
+        let order_id = *manager.open_orders().keys().next().unwrap();
+        let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        assert_eq!(
+            store.get_submission_state(order_id).await.unwrap(),
+            Some(SubmissionState::Submitting)
+        );
+        assert!(matches!(
+            manager.submit_order(sample_intent(), &positions, &balances).await,
+            Err(OmsError::SubmissionUnresolved { order_id: blocked }) if blocked == order_id
+        ));
+        drop(manager);
+        let registry = registry_with_gateway(gateway);
+        let mut recovered =
+            OrderManager::new(OrderStore::new(POSTGRES_URL).await.unwrap(), &registry)
+                .await
+                .unwrap();
+        recovered.reconcile().await.unwrap();
+        assert_eq!(
+            store.get_submission_state(order_id).await.unwrap(),
+            Some(SubmissionState::Accepted)
+        );
+        assert_eq!(
+            recovered.open_orders()[&order_id]
+                .exchange_order_id
+                .as_deref(),
+            Some("EX-INTERRUPTED")
+        );
     }
 }

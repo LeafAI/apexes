@@ -278,3 +278,21 @@ using the same client order ID. A timeout or ambiguous response is not
 permission to retry an order. Reconcile it before taking further action.
 The clock layer does not guarantee recovery when network delays exceed
 the receive window, and does not replace the session health controls.
+
+### Reliable order submission (F01.02)
+
+The OMS persists the client UUID and submission state before sending an
+order. Inspect the existing order ID, exchange order ID and submission
+state when investigating an interrupted or timed-out submission.
+Submitting and Uncertain orders without a known exchange ID block further
+orders (including flatten attempts) for that venue/asset class/symbol.
+Reconciliation looks up the original client ID; it never issues a
+replacement submission. A negative lookup does not release the guard,
+regardless of how old the order is.
+
+If an unresolved order persists, investigate the exchange's order/fill
+history and account balances before attempting manual recovery. Do not
+blindly delete the record, mark it rejected, or resubmit. A prior version
+may already have marked a lost-acknowledgement order rejected; the migration
+does not infer its actual exchange outcome. Account-wide risk and
+operator-assisted recovery are later enhancements.

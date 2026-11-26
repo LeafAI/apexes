@@ -87,10 +87,10 @@ pub trait ExecutionGateway: Send + Sync {
     /// `Uncertain` or whose acknowledgement was lost in a crash, so its
     /// exchange id was never recorded. Returns `(exchange_order_id,
     /// status)` if the exchange knows the order, `Ok(None)` ONLY if the
-    /// exchange definitively has no such order, `Err` if that cannot be
-    /// determined. The default is `Err`: gateways that cannot do this
-    /// lookup must not let `OrderManager` conclude an order never
-    /// reached the exchange.
+    /// exchange reports no such order, `Err` if that cannot be
+    /// determined. A negative lookup is not proof that an ambiguous
+    /// submission never executed; the OMS must retain its guard.
+    /// The default is `Err` for gateways without this lookup.
     async fn query_order_by_client_id(
         &self,
         _order: &Order,
