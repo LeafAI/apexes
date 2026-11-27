@@ -152,6 +152,7 @@ impl IdentityPolicy {
         &self,
         definition: &DatasetDefinition,
         events: &'a [MarketEvent],
+        observation_order: bool,
     ) -> Result<Scan<'a>, String> {
         declared_keys(definition)?;
         if self.schema_version != 1
@@ -185,13 +186,18 @@ impl IdentityPolicy {
         let mut previous = None;
         for event in events {
             let at = event_timestamp(event);
-            if previous.is_some_and(|t| at < t)
+            let order_time = if observation_order {
+                crate::market_data_source::observation_timestamp(event)
+            } else {
+                at
+            };
+            if previous.is_some_and(|t| order_time < t)
                 || at.date_naive() < definition.start_day
                 || at.date_naive() >= definition.end_day_exclusive
             {
                 return Err("raw events regress in time or exceed dataset range".into());
             }
-            previous = Some(at);
+            previous = Some(order_time);
             let stream = DatasetStream {
                 venue: event.venue(),
                 symbol: event.symbol().into(),
@@ -242,7 +248,16 @@ impl IdentityPolicy {
         definition: &DatasetDefinition,
         events: &[MarketEvent],
     ) -> Result<(), String> {
-        let scan = self.scan(definition, events)?;
+        self.verify_unique_ordered(definition, events, false)
+    }
+
+    pub(crate) fn verify_unique_ordered(
+        &self,
+        definition: &DatasetDefinition,
+        events: &[MarketEvent],
+        observation_order: bool,
+    ) -> Result<(), String> {
+        let scan = self.scan(definition, events, observation_order)?;
         if scan.retained.len() != events.len() {
             return Err("normalized dataset contains duplicate source identities".into());
         }
@@ -258,7 +273,7 @@ pub fn normalize_dataset(
     policy: IdentityPolicy,
     events: &[MarketEvent],
 ) -> Result<NormalizedDataset, String> {
-    let scan = policy.scan(&definition, events)?;
+    let scan = policy.scan(&definition, events, false)?;
     let retained: Vec<_> = scan.retained.into_iter().cloned().collect();
     let mut manifest = seal_dataset(definition, &retained)?;
     manifest.identity_policy = Some(policy.clone());

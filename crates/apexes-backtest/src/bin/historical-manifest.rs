@@ -1,5 +1,8 @@
 //! Local, read-only historical export sealing and verification.
-use apexes_backtest::historical_dataset::{DatasetDefinition, DatasetManifest, seal_dataset};
+use apexes_backtest::historical_dataset::{
+    DatasetDefinition, DatasetManifest, migrate_observation_dataset, seal_dataset,
+    seal_observation_dataset,
+};
 use apexes_core::MarketEvent;
 use std::{
     io::{self, BufReader, Read, Write},
@@ -79,9 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && (args[0] == "verify-coverage"
                 || args[0] == "normalize"
                 || args[0] == "verify-ranges"
-                || args[0] == "build-ranges"))
+                || args[0] == "build-ranges"
+                || args[0] == "migrate-observation"))
     {
-        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl> | verify-collector-replay <qualified.json> <instrument.json> | fingerprint-replay <backtest-report.json>".into());
+        return Err("usage: historical-manifest seal <definition.json> <events.json> | seal-observation <definition.json> <ordered-events.json> | migrate-observation <v1-manifest.json> <v1-events.json> <new-version> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl> | verify-collector-replay <qualified.json> <instrument.json> | fingerprint-replay <backtest-report.json>".into());
     }
     if args[0] == "reconcile-collector" && args.len() == 3 {
         let journal = std::fs::read_to_string(Path::new(&args[1]))?;
@@ -103,6 +107,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut out,
                 &seal_dataset(definition, &events).map_err(io::Error::other)?,
             )?;
+        }
+        Some("seal-observation") => {
+            let definition: DatasetDefinition = read(Path::new(&args[1]))?;
+            let manifest =
+                seal_observation_dataset(definition, &events).map_err(io::Error::other)?;
+            serde_json::to_writer_pretty(&mut out, &manifest)?;
+        }
+        Some("migrate-observation") if args.len() == 4 => {
+            let manifest: DatasetManifest = read(Path::new(&args[1]))?;
+            let new_version = args[3].to_str().ok_or("new version must be UTF-8")?;
+            let export = migrate_observation_dataset(&manifest, &events, new_version)
+                .map_err(io::Error::other)?;
+            serde_json::to_writer_pretty(&mut out, &export)?;
         }
         Some("verify") => {
             let manifest: DatasetManifest = read(Path::new(&args[1]))?;

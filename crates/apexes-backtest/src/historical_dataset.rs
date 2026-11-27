@@ -2,7 +2,7 @@
 //! coverage. Sealing an export fingerprints its contents; it does not
 //! certify completeness of the upstream exchange feed.
 
-use crate::market_data_source::event_timestamp;
+use crate::market_data_source::{event_timestamp, observation_timestamp};
 use apexes_core::{Instrument, MarketEvent, Venue};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 const SCHEMA: u32 = 1;
+pub const OBSERVATION_SCHEMA: u32 = 2;
 const MAX_PARTITIONS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -156,13 +157,46 @@ pub fn seal_dataset(
     definition: DatasetDefinition,
     events: &[MarketEvent],
 ) -> Result<DatasetManifest, String> {
+    seal_ordered(definition, events, SCHEMA)
+}
+
+/// Seal an explicitly observation-ordered sequence; never sort or deduplicate.
+pub fn seal_observation_dataset(
+    definition: DatasetDefinition,
+    events: &[MarketEvent],
+) -> Result<DatasetManifest, String> {
+    seal_ordered(definition, events, OBSERVATION_SCHEMA)
+}
+
+fn seal_ordered(
+    definition: DatasetDefinition,
+    events: &[MarketEvent],
+    schema: u32,
+) -> Result<DatasetManifest, String> {
     let keys = declared_keys(&definition)?;
+    if schema == OBSERVATION_SCHEMA {
+        if definition
+            .source_id
+            .starts_with(crate::collector_receipts::SOURCE_PREFIX)
+        {
+            return Err("raw collector manifests retain schema 1".into());
+        }
+        crate::replay_identity::validate_observation_order(events, true)?;
+    }
     let mut partitions: HashMap<_, EvidenceBuilder> = keys
         .iter()
         .cloned()
         .map(|key| (key, EvidenceBuilder::default()))
         .collect();
     let mut replay = EvidenceBuilder::default();
+    if schema == OBSERVATION_SCHEMA {
+        replay.digest.update(b"apexes-observation-replay-v2\0");
+    }
+    let end = definition
+        .end_day_exclusive
+        .and_hms_opt(0, 0, 0)
+        .ok_or("invalid end date")?
+        .and_utc();
     let mut previous = None;
     let mut identified_trades = HashSet::new();
     for event in events {
@@ -170,10 +204,19 @@ pub fn seal_dataset(
             depth.validate_source_range()?;
         }
         let timestamp = event_timestamp(event);
-        if previous.is_some_and(|at| timestamp < at) {
+        let order_time = if schema == OBSERVATION_SCHEMA {
+            let observed = observation_timestamp(event);
+            if observed > end {
+                return Err("observation outside declared replay horizon".into());
+            }
+            observed
+        } else {
+            timestamp
+        };
+        if previous.is_some_and(|at| order_time < at) {
             return Err("historical events regress in time".into());
         }
-        previous = Some(timestamp);
+        previous = Some(order_time);
         let stream = DatasetStream {
             venue: event.venue(),
             symbol: event.symbol().into(),
@@ -213,7 +256,7 @@ pub fn seal_dataset(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(DatasetManifest {
-        schema_version: SCHEMA,
+        schema_version: schema,
         definition,
         partitions,
         replay_sha256: replay.finish().1,
@@ -258,7 +301,9 @@ impl DatasetManifest {
     }
 
     pub fn verify(&self, events: &[MarketEvent]) -> Result<VerifiedDataset, String> {
-        if self.schema_version != SCHEMA || !valid_hash(&self.replay_sha256) {
+        if !matches!(self.schema_version, SCHEMA | OBSERVATION_SCHEMA)
+            || !valid_hash(&self.replay_sha256)
+        {
             return Err("unsupported manifest schema or invalid replay digest".into());
         }
         let keys = declared_keys(&self.definition)?;
@@ -275,9 +320,13 @@ impl DatasetManifest {
                 return Err("invalid digest or duplicate partition".into());
             }
         }
-        let actual = seal_dataset(self.definition.clone(), events)?;
+        let actual = seal_ordered(self.definition.clone(), events, self.schema_version)?;
         if let Some(policy) = &self.identity_policy {
-            policy.verify_unique(&self.definition, events)?;
+            policy.verify_unique_ordered(
+                &self.definition,
+                events,
+                self.schema_version == OBSERVATION_SCHEMA,
+            )?;
         }
         for partition in &actual.partitions {
             let key = (partition.stream.clone(), partition.day);
@@ -307,4 +356,44 @@ impl DatasetManifest {
             collector_receipts: None,
         })
     }
+}
+
+/// Explicit migration result; provenance fields are caller-visible evidence
+/// of this operation, not independently attested source metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationExport {
+    pub source_version: String,
+    pub source_replay_sha256: String,
+    pub manifest: DatasetManifest,
+    pub events: Vec<MarketEvent>,
+}
+
+/// Verify before deriving the new order. Equal observation-time ties keep
+/// their original occurrence order; no event is added or removed.
+pub fn migrate_observation_dataset(
+    source: &DatasetManifest,
+    events: &[MarketEvent],
+    new_version: &str,
+) -> Result<ObservationExport, String> {
+    if source.schema_version != SCHEMA
+        || new_version.trim().is_empty()
+        || new_version == source.definition.version
+    {
+        return Err("migration requires schema 1 and a distinct nonempty dataset version".into());
+    }
+    source.verify(events)?;
+    let mut ordered = events.to_vec();
+    ordered.sort_by_key(observation_timestamp);
+    let mut definition = source.definition.clone();
+    definition.version = new_version.to_owned();
+    let mut manifest = seal_observation_dataset(definition, &ordered)?;
+    manifest.identity_policy = source.identity_policy.clone();
+    manifest.verify(&ordered)?;
+    Ok(ObservationExport {
+        source_version: source.definition.version.clone(),
+        source_replay_sha256: source.replay_sha256.clone(),
+        manifest,
+        events: ordered,
+    })
 }

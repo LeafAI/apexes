@@ -66,7 +66,7 @@ pub(crate) fn validate_observation_order(
                             .into(),
                     );
                 }
-                if bar.close_time < bar.open_time {
+                if bar.close_time <= bar.open_time {
                     return Err(format!("invalid bar interval at event {index}"));
                 }
                 bar.close_time
