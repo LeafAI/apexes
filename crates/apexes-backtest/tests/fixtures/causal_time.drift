@@ -1,0 +1,13 @@
+function on_market_event(event, ctx) {
+    if (event.type != "bar") { return []; }
+    if (!ctx.time.accept_closed_bar()) { return []; }
+    if (!ctx.time.try_cooldown("entry", 4000)) { return []; }
+    return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "buy",
+        order_type: "market",
+        quantity: 1,
+    }];
+}

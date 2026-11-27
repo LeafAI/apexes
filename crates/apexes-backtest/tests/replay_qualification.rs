@@ -882,3 +882,62 @@ async fn resting_limit_and_ems_closing_fills_keep_distinct_origins() {
     );
     assert_eq!(metrics.open_quantity, Decimal::ZERO);
 }
+
+#[test]
+fn drift_closed_bar_decisions_are_causal_and_trade_rate_independent() {
+    use apexes_strategy::drift_dsl::DriftScriptStrategy;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/causal_time.drift");
+    for causal in [false, true] {
+        for dense in [false, true] {
+            let mut events = vec![
+                depth(0, 1, dec!(100)),
+                trade(0, dec!(100), "open"),
+                bar(1000),
+                bar(1000),
+                tick(2500),
+                bar(3000),
+                tick(4500),
+                bar(5000),
+                tick(6500),
+            ];
+            if dense {
+                for ms in [2600, 2700, 2800, 4600, 4700, 4800] {
+                    events.push(trade(ms, dec!(100), "extra"));
+                }
+            }
+            let registry = Registry::new();
+            if causal {
+                registry
+                    .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+                    .unwrap();
+            }
+            let strategy = DriftScriptStrategy::from_file(&script).unwrap();
+            let report = futures::executor::block_on(run_backtest(
+                configuration(AssetClass::Spot, None),
+                &registry,
+                InMemoryMarketDataSource::new(events),
+                strategy,
+            ))
+            .unwrap();
+            if causal {
+                assert_eq!(report.trades.len(), 2);
+                assert_eq!(
+                    report
+                        .trades
+                        .iter()
+                        .map(|f| f.filled_at)
+                        .collect::<Vec<_>>(),
+                    vec![at(2500), at(6500)]
+                );
+            } else {
+                assert!(
+                    report.trades.is_empty(),
+                    "legacy open-time bars must not authorize decisions"
+                );
+            }
+        }
+    }
+}
