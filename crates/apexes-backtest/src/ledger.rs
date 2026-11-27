@@ -237,7 +237,7 @@ impl PortfolioLedger {
         // an immutable borrow of self.positions while later mutably
         // crediting self.balances.
         let mut settlements = Vec::new();
-        for (symbol, position) in &self.positions {
+        for (symbol, position) in crate::stable_order::entries(&self.positions) {
             if position.leverage.is_none() || position.quantity.is_zero() {
                 continue;
             }
@@ -530,7 +530,7 @@ impl PortfolioLedger {
     /// and non-zero).
     pub fn equity(&self, mark_prices: &HashMap<String, Decimal>) -> Result<Decimal, ApexesError> {
         let mut total = Decimal::ZERO;
-        for (asset, balance) in &self.balances {
+        for (asset, balance) in crate::stable_order::entries(&self.balances) {
             if balance.is_zero() {
                 continue;
             }
@@ -574,7 +574,7 @@ impl PortfolioLedger {
         // requirement total, needed before we can compute any
         // individual cross position's margin_ratio.
         let mut cross_maintenance_total = Decimal::ZERO;
-        for (symbol, position) in &self.positions {
+        for (symbol, position) in crate::stable_order::entries(&self.positions) {
             if position.leverage.is_none() || position.quantity.is_zero() {
                 continue;
             }
@@ -594,7 +594,7 @@ impl PortfolioLedger {
             Some(account_equity / cross_maintenance_total)
         };
 
-        for (symbol, position) in &self.positions {
+        for (symbol, position) in crate::stable_order::entries(&self.positions) {
             if position.leverage.is_none() || position.quantity.is_zero() {
                 continue;
             }
@@ -748,13 +748,16 @@ impl PortfolioLedger {
         mark_prices: &HashMap<String, Decimal>,
         margin_tiers: &HashMap<String, MarginTierTable>,
     ) -> Vec<String> {
-        self.margin_status(mark_prices, margin_tiers)
+        let mut symbols: Vec<_> = self
+            .margin_status(mark_prices, margin_tiers)
             .into_iter()
             .filter_map(|(symbol, status)| {
                 let ratio = status.margin_ratio?;
                 (ratio <= Decimal::ONE).then_some(symbol)
             })
-            .collect()
+            .collect();
+        symbols.sort_unstable();
+        symbols
     }
 
     /// Returns every `(symbol, side, quantity)` a caller should submit
@@ -775,8 +778,8 @@ impl PortfolioLedger {
         reduce_fractions: &HashMap<String, Decimal>,
         include_spot: bool,
     ) -> Vec<(String, Side, Decimal)> {
-        self.positions
-            .iter()
+        crate::stable_order::entries(&self.positions)
+            .into_iter()
             .filter_map(|(symbol, position)| {
                 if position.quantity.is_zero() {
                     return None;
@@ -2382,5 +2385,60 @@ mod tests {
 
         let orders = ledger.check_de_risking(&HashMap::new(), false);
         assert!(orders.is_empty());
+    }
+    #[test]
+    fn de_risking_is_symbol_ordered_for_long_and_short_positions() {
+        let btc = btc_usdt();
+        let mut eth = btc.clone();
+        eth.symbol = "ETHUSDT".into();
+        eth.base_currency = Some("ETH".into());
+        let fractions = HashMap::from([
+            ("ETHUSDT".into(), dec!(0.25)),
+            ("BTCUSDT".into(), dec!(0.5)),
+        ]);
+        for reversed in [false, true] {
+            let mut ledger = PortfolioLedger::new(
+                HashMap::from([
+                    ("BTCUSDT".into(), btc.clone()),
+                    ("ETHUSDT".into(), eth.clone()),
+                ]),
+                HashMap::from([("USDT".into(), dec!(10000))]),
+            );
+            let long =
+                leveraged_fill_for_symbol("BTCUSDT", Side::Buy, dec!(100), dec!(2), dec!(10));
+            let short =
+                leveraged_fill_for_symbol("ETHUSDT", Side::Sell, dec!(100), dec!(4), dec!(10));
+            let fills = if reversed {
+                [short, long]
+            } else {
+                [long, short]
+            };
+            for fill in fills {
+                ledger.apply_fill(&fill).unwrap();
+            }
+            assert_eq!(
+                ledger.check_de_risking(&fractions, false),
+                vec![
+                    ("BTCUSDT".into(), Side::Sell, dec!(1)),
+                    ("ETHUSDT".into(), Side::Buy, dec!(1))
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn equity_uses_stable_asset_order_even_when_decimal_addition_rounds() {
+        // The large term forces rounding of the tiny term; cancellation
+        // makes the order observable, not just a test of commutative integers.
+        let a = dec!(10000000000000000000000000000);
+        let b = dec!(0.1);
+        let c = -a;
+        let ordered = (a + b) + c;
+        assert_ne!(ordered, (a + c) + b);
+        for _ in 0..32 {
+            let balances = HashMap::from([("C".into(), c), ("A".into(), a), ("B".into(), b)]);
+            let ledger = PortfolioLedger::new(HashMap::new(), balances);
+            assert_eq!(ledger.equity(&HashMap::new()).unwrap(), ordered);
+        }
     }
 }

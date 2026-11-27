@@ -91,3 +91,5 @@ pub use order_log::{OrderLog, OrderRecord};
 pub use performance::{PerformanceSummary, PerformanceTracker};
 pub use report::BacktestReport;
 pub use runner::{BacktestConfig, run_backtest};
+
+mod stable_order;
