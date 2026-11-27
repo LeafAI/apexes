@@ -181,7 +181,10 @@ pub async fn collect(
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let capture = raw_depth_capture::capture(symbol, exchange, tx);
     let consumer = consume(rx, stop, &mut journal, symbol, |batch| async move {
-        store.write_batch(&batch).await.map_err(|e| e.to_string())
+        store
+            .write_batch(&batch)
+            .await
+            .map_err(|_| "raw depth insert failed; outcome may be ambiguous".into())
     });
     let (capture_result, consumer_result) = tokio::join!(capture, consumer);
     let result = capture_result.and(consumer_result);
