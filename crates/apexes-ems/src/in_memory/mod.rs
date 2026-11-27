@@ -776,7 +776,14 @@ impl Ems for InMemoryEms {
 
         let candidates = [AssetClass::Spot, AssetClass::Perpetual];
         let market_state = self.build_market_state(&candidates, &request.symbol);
-        let allocations =
+        let allocations = if self.causal && request.leverage.is_some() {
+            vec![state::VenueAllocation {
+                asset_class: AssetClass::Perpetual,
+                quantity: request.quantity,
+                submitted_quantity: Decimal::ZERO,
+                current_resting_child: None,
+            }]
+        } else {
             match routing::resolve_allocations(&request, self.scorer.as_ref(), &market_state) {
                 Ok(allocations) => allocations,
                 Err(error) => {
@@ -784,7 +791,8 @@ impl Ems for InMemoryEms {
                         .fail_parent_order(parent_id, request, error.to_string())
                         .await;
                 }
-            };
+            }
+        };
 
         // Matched on a clone so the failure paths below can move
         // `request` into `fail_parent_order` while the match is still

@@ -88,6 +88,9 @@ struct ParentCapital {
     symbol: String,
     venue: Venue,
     side: apexes_core::Side,
+    asset_class: apexes_core::AssetClass,
+    leverage: Option<Decimal>,
+    margin_mode: Option<apexes_core::MarginMode>,
     remaining: Decimal,
 }
 
@@ -174,6 +177,9 @@ impl ArrivalQueue {
                 symbol: intent.symbol.clone(),
                 venue: intent.venue,
                 side: intent.side,
+                asset_class: intent.asset_class,
+                leverage: intent.leverage,
+                margin_mode: intent.margin_mode,
                 remaining: intent.quantity,
             },
         );
@@ -195,6 +201,54 @@ impl ArrivalQueue {
             )
         });
         self.report.parent_capital_released += (before - self.parents.len()) as u64;
+    }
+
+    pub fn check_direct(
+        &self,
+        hold: Option<&CapitalHold>,
+        quantity: Decimal,
+        remaining: Decimal,
+        before: &HashMap<String, Decimal>,
+        after: &HashMap<String, Decimal>,
+    ) -> Result<(), String> {
+        if quantity <= Decimal::ZERO || remaining < Decimal::ZERO || remaining > quantity {
+            return Err("invalid direct reservation quantity".into());
+        }
+        if let Some(hold) = hold
+            && remaining > Decimal::ZERO
+        {
+            let amount = hold
+                .amount
+                .checked_mul(remaining)
+                .and_then(|n| n.checked_div(quantity))
+                .ok_or("direct reservation arithmetic overflow")?;
+            if !self.check_capital(
+                &CapitalHold {
+                    asset: hold.asset.clone(),
+                    amount,
+                },
+                after,
+            ) {
+                return Err("insufficient capital for working remainder".into());
+            }
+        }
+        for asset in self
+            .holds
+            .values()
+            .map(|h| &h.asset)
+            .chain(self.parents.values().map(|p| &p.hold.asset))
+            .chain(self.resting.values().map(|r| &r.hold.asset))
+        {
+            let old = before.get(asset).copied().unwrap_or_default();
+            let new = after.get(asset).copied().unwrap_or_default();
+            let reserved = self
+                .reserved(asset, None)
+                .ok_or("capital reservation arithmetic overflow")?;
+            if new < old && new < reserved {
+                return Err("direct fill would consume another order's reservation".into());
+            }
+        }
+        Ok(())
     }
 
     pub fn reserve_resting(&mut self, order: &Order, mut hold: CapitalHold) -> Result<(), String> {
@@ -321,6 +375,9 @@ impl ArrivalQueue {
             if p.symbol != intent.symbol
                 || p.venue != intent.venue
                 || p.side != intent.side
+                || p.asset_class != intent.asset_class
+                || p.leverage != intent.leverage
+                || p.margin_mode != intent.margin_mode
                 || intent.quantity <= Decimal::ZERO
                 || intent.quantity > p.remaining
             {
@@ -346,11 +403,12 @@ impl ArrivalQueue {
             ))
         } else {
             if parent.is_some()
-                && intent.asset_class == apexes_core::AssetClass::Spot
-                && intent.leverage.is_none()
-                && intent.margin_mode.is_none()
+                && matches!(
+                    intent.asset_class,
+                    apexes_core::AssetClass::Spot | apexes_core::AssetClass::Perpetual
+                )
             {
-                return Err("missing Spot parent capital reservation".into());
+                return Err("missing parent capital reservation".into());
             }
             None
         };

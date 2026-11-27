@@ -100,7 +100,11 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         let intent = OrderIntent {
             symbol: request.symbol.clone(),
             venue: request.venue,
-            asset_class: apexes_core::AssetClass::Spot,
+            asset_class: if self.arrivals.is_some() && request.leverage.is_some() {
+                apexes_core::AssetClass::Perpetual
+            } else {
+                apexes_core::AssetClass::Spot
+            },
             side: request.side,
             order_type: OrderType::Market,
             quantity: request.quantity,

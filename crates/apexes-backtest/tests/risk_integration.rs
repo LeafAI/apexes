@@ -998,3 +998,279 @@ async fn resting_remainder_reservation_released_at_replay_end() {
         (1, 0, 1)
     );
 }
+
+struct LeveragedOnce {
+    sent: bool,
+    side: apexes_core::Side,
+    order_type: apexes_core::OrderType,
+    leverage: rust_decimal::Decimal,
+    algo: bool,
+    compete: bool,
+}
+
+impl Strategy for LeveragedOnce {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if self.sent
+            || (self.compete && !matches!(event, MarketEvent::Depth(d) if d.symbol == "ETHUSDT"))
+        {
+            return vec![];
+        }
+        self.sent = true;
+        let mut intent = BuyOnceStrategy { has_bought: false }
+            .on_market_event(event, ctx)
+            .remove(0);
+        intent.asset_class = AssetClass::Perpetual;
+        intent.side = self.side;
+        intent.leverage = Some(self.leverage);
+        intent.margin_mode = Some(apexes_core::MarginMode::Isolated);
+        intent.order_type = self.order_type;
+        if self.order_type == apexes_core::OrderType::Limit {
+            intent.price = Some(dec!(10));
+        }
+        if self.algo {
+            intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                duration: std::time::Duration::from_millis(100),
+                slices: 1,
+            });
+        }
+        let mut intents = vec![intent];
+        if self.compete {
+            let mut spot = BuyOnceStrategy { has_bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            spot.symbol = "ETHUSDT".into();
+            intents.push(spot);
+        }
+        intents
+    }
+}
+
+fn leveraged_fixture(
+    balance: rust_decimal::Decimal,
+    arrival_bid: rust_decimal::Decimal,
+) -> (BacktestConfig, Vec<MarketEvent>) {
+    let (mut config, mut events) = shared_quote_fixture(balance, dec!(10));
+    config.instruments[0].asset_class = AssetClass::Perpetual;
+    for event in &mut events {
+        if let MarketEvent::Depth(d) = event
+            && d.symbol == "BTCUSDT"
+        {
+            d.asks[0].price = dec!(10);
+            d.bids = vec![PriceLevel {
+                price: if d.sequence == Some(2) {
+                    arrival_bid
+                } else {
+                    dec!(9)
+                },
+                quantity: dec!(100),
+            }];
+        }
+    }
+    (config, events)
+}
+
+#[tokio::test]
+async fn leveraged_buy_reserves_margin_instead_of_full_notional() {
+    let (config, events) = leveraged_fixture(dec!(5), dec!(9));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        LeveragedOnce {
+            sent: false,
+            side: apexes_core::Side::Buy,
+            order_type: apexes_core::OrderType::Market,
+            leverage: dec!(2),
+            algo: false,
+            compete: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].leverage, Some(dec!(2)));
+    assert_eq!(report.trades[0].price, dec!(10));
+}
+
+#[tokio::test]
+async fn leveraged_short_and_spot_buy_share_quote_reservations() {
+    let (config, events) = leveraged_fixture(dec!(10), dec!(9));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        LeveragedOnce {
+            sent: false,
+            side: apexes_core::Side::Sell,
+            order_type: apexes_core::OrderType::Market,
+            leverage: dec!(2),
+            algo: false,
+            compete: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "BTCUSDT");
+    assert_eq!(report.trades[0].side, apexes_core::Side::Sell);
+    let latency = report.event_latency.unwrap();
+    assert_eq!((latency.scheduled, latency.capital_refused), (1, 1));
+}
+
+#[tokio::test]
+async fn crossing_leveraged_sell_is_rejected_if_actual_margin_exceeds_limit_estimate() {
+    let (config, events) = leveraged_fixture(dec!(6), dec!(20));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        LeveragedOnce {
+            sent: false,
+            side: apexes_core::Side::Sell,
+            order_type: apexes_core::OrderType::Limit,
+            leverage: dec!(2),
+            algo: false,
+            compete: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    assert_eq!(report.event_latency.unwrap().resting_capital_reserved, 0);
+}
+
+#[tokio::test]
+async fn leveraged_parent_keeps_margin_until_child_arrival() {
+    let (config, mut events) = leveraged_fixture(dec!(10), dec!(9));
+    let MarketEvent::Depth(first) = events[0].clone() else {
+        unreachable!()
+    };
+    for (offset, seq) in [(600, 3), (1100, 4)] {
+        let mut d = first.clone();
+        d.timestamp += chrono::Duration::milliseconds(offset);
+        d.sequence = Some(seq);
+        events.push(MarketEvent::Depth(d));
+    }
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        LeveragedOnce {
+            sent: false,
+            side: apexes_core::Side::Sell,
+            order_type: apexes_core::OrderType::Market,
+            leverage: dec!(2),
+            algo: true,
+            compete: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].leverage, Some(dec!(2)));
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.parent_capital_reserved,
+            latency.parent_capital_released
+        ),
+        (1, 1)
+    );
+    assert_eq!(latency.child_orders.unwrap().arrived, 1);
+}
+
+#[tokio::test]
+async fn leveraged_reservation_refuses_invalid_leverage_and_unfunded_fees() {
+    for (leverage, balance) in [(dec!(0), dec!(100)), (dec!(2), dec!(5))] {
+        let (mut config, events) = leveraged_fixture(balance, dec!(9));
+        config.cost_model.fee_schedule = Box::new(FlatFeeSchedule {
+            maker_bps: dec!(0),
+            taker_bps: dec!(10),
+        });
+        let registry = child_risk_registry(Default::default());
+        let report = run_backtest(
+            config,
+            &registry,
+            InMemoryMarketDataSource::new(events),
+            LeveragedOnce {
+                sent: false,
+                side: apexes_core::Side::Buy,
+                order_type: apexes_core::OrderType::Market,
+                leverage,
+                algo: false,
+                compete: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.trades.is_empty());
+        assert_eq!(report.event_latency.unwrap().capital_refused, 1);
+    }
+}
+
+#[tokio::test]
+async fn leveraged_resting_sell_reserves_margin_until_terminal_fill() {
+    let (mut config, mut events) = leveraged_fixture(dec!(6), dec!(9));
+    // All observed prices must remain compatible with the passive sell.
+    config.cost_model.fee_schedule = Box::new(FlatFeeSchedule {
+        maker_bps: dec!(10),
+        taker_bps: dec!(20),
+    });
+    let MarketEvent::Depth(first) = events[0].clone() else {
+        unreachable!()
+    };
+    events.push(MarketEvent::Trade(TradeEvent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        price: dec!(10),
+        quantity: dec!(0.5),
+        side: Some(apexes_core::Side::Buy),
+        trade_id: None,
+        timestamp: first.timestamp + chrono::Duration::milliseconds(600),
+    }));
+    events.push(MarketEvent::Trade(TradeEvent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        price: dec!(10),
+        quantity: dec!(0.5),
+        side: Some(apexes_core::Side::Buy),
+        trade_id: None,
+        timestamp: first.timestamp + chrono::Duration::milliseconds(700),
+    }));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        LeveragedOnce {
+            sent: false,
+            side: apexes_core::Side::Sell,
+            order_type: apexes_core::OrderType::Limit,
+            leverage: dec!(2),
+            algo: false,
+            compete: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    assert!(
+        report
+            .trades
+            .iter()
+            .all(|f| f.quantity == dec!(0.5) && f.leverage == Some(dec!(2)))
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.resting_capital_reserved,
+            latency.resting_capital_released,
+            latency.resting_capital_refused
+        ),
+        (1, 1, 0)
+    );
+}

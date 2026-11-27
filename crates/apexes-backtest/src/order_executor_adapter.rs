@@ -97,6 +97,34 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         Ok((order, fills))
     }
 
+    async fn submit_simulated_checked(
+        &self,
+        intent: &OrderIntent,
+        _positions: &HashMap<String, Position>,
+        _balances: &HashMap<String, Decimal>,
+        now: DateTime<Utc>,
+        check: &mut apexes_strategy::order_executor::SimulatedDirectCheck<'_>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        let (order, fills) = self
+            .lock_engine()
+            .submit_direct_checked(intent, now, check)?;
+        if matches!(
+            order.status,
+            OrderStatus::New | OrderStatus::PartiallyFilled
+        ) {
+            self.lock_open_orders().insert(order.id, order.clone());
+        }
+        Ok((order, fills))
+    }
+
+    fn simulated_margin_budget(
+        &self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        self.lock_engine().simulated_margin_budget(intent, now)
+    }
+
     fn simulated_buy_budget(
         &self,
         intent: &OrderIntent,
