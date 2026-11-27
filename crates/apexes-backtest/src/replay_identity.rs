@@ -48,6 +48,41 @@ impl MatchingIds {
     }
 }
 
+/// A sealed input must also be ordered by causal observation time.
+/// A bar is available at its close, not its open. Legacy replay uses
+/// the open timestamp without event-time latency, so refuse that
+/// combination for the opt-in identity policy.
+pub(crate) fn validate_observation_order(
+    events: &[apexes_core::MarketEvent],
+    event_time: bool,
+) -> Result<(), String> {
+    let mut previous = None;
+    for (index, event) in events.iter().enumerate() {
+        let at = match event {
+            apexes_core::MarketEvent::Bar(bar) => {
+                if !event_time {
+                    return Err(
+                        "deterministic replay with bars requires explicit event-time latency"
+                            .into(),
+                    );
+                }
+                if bar.close_time < bar.open_time {
+                    return Err(format!("invalid bar interval at event {index}"));
+                }
+                bar.close_time
+            }
+            _ => crate::market_data_source::event_timestamp(event),
+        };
+        if previous.is_some_and(|last| at < last) {
+            return Err(format!(
+                "causal observation time regressed at event {index}; sealed input order cannot be changed"
+            ));
+        }
+        previous = Some(at);
+    }
+    Ok(())
+}
+
 /// Canonical comparison of a serialized report, not proof that all
 /// inputs or externally supplied strategy decisions were identical.
 pub fn canonical_report_sha256(

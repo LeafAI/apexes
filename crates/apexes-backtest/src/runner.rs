@@ -226,6 +226,11 @@ pub async fn run_backtest(
         });
     }
 
+    if replay_identity.is_some() {
+        crate::replay_identity::validate_observation_order(&events, latency.is_some())
+            .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
+    }
+
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
 
