@@ -73,6 +73,9 @@ pub struct DatasetManifest {
     pub partitions: Vec<PartitionEvidence>,
     /// Hash over the entire ordered input, including inter-stream tie order.
     pub replay_sha256: String,
+    /// Explicit identity contract for normalized datasets; legacy manifests omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_policy: Option<crate::source_identity::IdentityPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,13 +91,13 @@ pub struct VerifiedDataset {
 }
 
 #[derive(Default)]
-struct EvidenceBuilder {
+pub(crate) struct EvidenceBuilder {
     count: u64,
     digest: Sha256,
 }
 
 impl EvidenceBuilder {
-    fn add(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn add(&mut self, bytes: &[u8]) -> Result<(), String> {
         let len = u64::try_from(bytes.len()).map_err(|_| "event size overflow")?;
         self.count = self.count.checked_add(1).ok_or("event count overflow")?;
         self.digest.update(len.to_be_bytes());
@@ -102,14 +105,14 @@ impl EvidenceBuilder {
         Ok(())
     }
 
-    fn finish(self) -> (u64, String) {
+    pub(crate) fn finish(self) -> (u64, String) {
         (self.count, format!("{:x}", self.digest.finalize()))
     }
 }
 
 type PartitionKey = (DatasetStream, NaiveDate);
 
-fn declared_keys(def: &DatasetDefinition) -> Result<Vec<PartitionKey>, String> {
+pub(crate) fn declared_keys(def: &DatasetDefinition) -> Result<Vec<PartitionKey>, String> {
     if [&def.dataset_id, &def.version, &def.source_id]
         .iter()
         .any(|s| s.trim().is_empty())
@@ -207,6 +210,7 @@ pub fn seal_dataset(
         definition,
         partitions,
         replay_sha256: replay.finish().1,
+        identity_policy: None,
     })
 }
 
@@ -265,6 +269,9 @@ impl DatasetManifest {
             }
         }
         let actual = seal_dataset(self.definition.clone(), events)?;
+        if let Some(policy) = &self.identity_policy {
+            policy.verify_unique(&self.definition, events)?;
+        }
         for partition in &actual.partitions {
             let key = (partition.stream.clone(), partition.day);
             let Some(prior) = expected.get(&key) else {

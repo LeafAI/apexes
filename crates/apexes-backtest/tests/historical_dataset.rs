@@ -647,3 +647,328 @@ fn cli_verifies_coverage_and_rejects_failed_receipts() {
     assert!(output.stdout.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+use apexes_backtest::source_identity::{
+    IdentityContract, IdentityPolicy, StreamIdentity, normalize_dataset,
+};
+
+fn identity_policy(d: &DatasetDefinition, contracts: &[IdentityContract]) -> IdentityPolicy {
+    assert_eq!(d.streams.len(), contracts.len());
+    IdentityPolicy {
+        schema_version: 1,
+        source_id: d.source_id.clone(),
+        streams: d
+            .streams
+            .iter()
+            .cloned()
+            .zip(contracts.iter().copied())
+            .map(|(stream, contract)| StreamIdentity { stream, contract })
+            .collect(),
+    }
+}
+
+#[test]
+fn identified_retransmission_removed_but_anonymous_quote_repeats_preserved() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    let input = vec![
+        trade(1, Some("a")),
+        tick(1),
+        trade(1, Some("a")),
+        tick(1),
+        trade(3, Some("b")),
+    ];
+    let result = normalize_dataset(d.clone(), p.clone(), &input).unwrap();
+    assert_eq!(
+        result.events,
+        vec![
+            input[0].clone(),
+            input[1].clone(),
+            input[3].clone(),
+            input[4].clone()
+        ]
+    );
+    assert_eq!(
+        result.deduplication.streams[0].identical_duplicates_removed,
+        1
+    );
+    assert_eq!(result.deduplication.streams[1].unidentified_retained, 2);
+    assert_ne!(
+        result.deduplication.input_sha256,
+        result.deduplication.output_sha256
+    );
+    assert_eq!(result.manifest.identity_policy, Some(p.clone()));
+    assert_eq!(
+        result.manifest.verify(&result.events).unwrap().event_count,
+        4
+    );
+    let twice = normalize_dataset(d, p, &result.events).unwrap();
+    assert_eq!(twice.events, result.events);
+    assert_eq!(twice.manifest, result.manifest);
+    assert_eq!(
+        twice.deduplication.input_sha256,
+        twice.deduplication.output_sha256
+    );
+}
+
+#[test]
+fn conflicting_trade_payload_and_missing_explicit_id_fail_closed() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    let mut conflicting = trade(1, Some("a"));
+    if let MarketEvent::Trade(t) = &mut conflicting {
+        t.quantity = dec!(2);
+    }
+    assert!(
+        normalize_dataset(d.clone(), p.clone(), &[trade(1, Some("a")), conflicting])
+            .unwrap_err()
+            .contains("conflicting payload")
+    );
+    assert!(
+        normalize_dataset(d, p, &[trade(1, None)])
+            .unwrap_err()
+            .contains("missing opaque")
+    );
+}
+
+#[test]
+fn numeric_trade_alias_is_conflict_and_opaque_ids_stay_distinct() {
+    let d = definition();
+    let input = vec![trade(1, Some("01")), trade(1, Some("1"))];
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::NumericTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    assert!(
+        normalize_dataset(d.clone(), p.clone(), &input)
+            .unwrap_err()
+            .contains("conflicting payload")
+    );
+    assert!(normalize_dataset(d.clone(), p, &[trade(1, Some("not numeric"))]).is_err());
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    assert_eq!(normalize_dataset(d, p, &input).unwrap().events.len(), 2);
+}
+
+#[test]
+fn depth_increment_duplicates_removed_without_discarding_snapshots_or_invalidations() {
+    let mut d = definition();
+    d.streams.truncate(1);
+    d.streams[0].kind = StreamKind::Depth;
+    let p = identity_policy(&d, &[IdentityContract::DepthIncrementSequence]);
+    let depth = |snapshot, sequence| {
+        MarketEvent::Depth(apexes_core::DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![apexes_core::PriceLevel {
+                price: dec!(99),
+                quantity: dec!(1),
+            }],
+            asks: vec![apexes_core::PriceLevel {
+                price: dec!(101),
+                quantity: dec!(1),
+            }],
+            sequence,
+            is_snapshot: snapshot,
+            timestamp: day(1).and_hms_opt(0, 0, 1).unwrap().and_utc(),
+        })
+    };
+    let mut invalidation = depth(true, None);
+    if let MarketEvent::Depth(x) = &mut invalidation {
+        x.bids.clear();
+        x.asks.clear();
+    }
+    let increment = depth(false, Some(9));
+    let snapshot = depth(true, Some(9));
+    let input = vec![
+        snapshot.clone(),
+        increment.clone(),
+        increment.clone(),
+        snapshot,
+        invalidation.clone(),
+        invalidation,
+    ];
+    let result = normalize_dataset(d.clone(), p.clone(), &input).unwrap();
+    assert_eq!(result.events.len(), 5);
+    assert_eq!(result.deduplication.streams[0].unidentified_retained, 4);
+    assert_eq!(
+        result.deduplication.streams[0].identical_duplicates_removed,
+        1
+    );
+    assert!(normalize_dataset(d, p, &[depth(false, None)]).is_err());
+}
+
+#[test]
+fn final_bars_are_keyed_by_interval_and_open_time_and_conflicts_refused() {
+    let mut d = definition();
+    d.streams.truncate(1);
+    d.streams[0].kind = StreamKind::Bar;
+    let p = identity_policy(&d, &[IdentityContract::FinalBar]);
+    let start = day(1).and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let bar = |interval, minutes| {
+        MarketEvent::Bar(apexes_core::Bar {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(5),
+            interval,
+            open_time: start,
+            close_time: start + chrono::TimeDelta::minutes(minutes),
+        })
+    };
+    let one = bar(apexes_core::BarInterval::OneMinute, 1);
+    let five = bar(apexes_core::BarInterval::FiveMinutes, 5);
+    let result = normalize_dataset(
+        d.clone(),
+        p.clone(),
+        &[one.clone(), five.clone(), one.clone()],
+    )
+    .unwrap();
+    assert_eq!(result.events, vec![one.clone(), five]);
+    let mut changed = one.clone();
+    if let MarketEvent::Bar(b) = &mut changed {
+        b.volume = dec!(6);
+    }
+    assert!(normalize_dataset(d, p, &[one, changed]).is_err());
+}
+
+#[test]
+fn timestamp_identity_requires_explicit_contract_and_refuses_conflicts() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::UniqueTimestamp,
+        ],
+    );
+    let input = vec![tick(1), tick(1)];
+    let result = normalize_dataset(d.clone(), p.clone(), &input).unwrap();
+    assert_eq!(result.events.len(), 1);
+    let mut changed = tick(1);
+    if let MarketEvent::Tick(t) = &mut changed {
+        t.bid_size = dec!(2);
+    }
+    assert!(normalize_dataset(d, p, &[tick(1), changed]).is_err());
+}
+
+#[test]
+fn source_identity_policy_rejects_bad_scope_and_contract() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    let mut bad = p.clone();
+    bad.source_id = "other".into();
+    assert!(normalize_dataset(d.clone(), bad, &[]).is_err());
+    let mut bad = p.clone();
+    bad.streams[0].contract = IdentityContract::FinalBar;
+    assert!(normalize_dataset(d.clone(), bad, &[]).is_err());
+    let mut bad = p.clone();
+    bad.streams[1] = bad.streams[0].clone();
+    assert!(normalize_dataset(d.clone(), bad, &[]).is_err());
+    assert!(
+        normalize_dataset(
+            d.clone(),
+            p.clone(),
+            &[trade(3, Some("b")), trade(1, Some("a"))]
+        )
+        .is_err()
+    );
+    assert!(normalize_dataset(d, p, &[trade(4, Some("a"))]).is_err());
+}
+
+#[test]
+fn manifest_policy_refuses_duplicate_identities_even_if_content_hash_matches() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::UniqueTimestamp,
+        ],
+    );
+    let events = vec![tick(1), tick(1)];
+    let mut manifest = seal_dataset(d, &events).unwrap();
+    manifest.identity_policy = Some(p);
+    assert!(
+        manifest
+            .verify(&events)
+            .unwrap_err()
+            .contains("duplicate source identities")
+    );
+}
+
+#[test]
+fn cli_normalizes_without_mutating_input_and_refuses_conflicts() {
+    let d = definition();
+    let p = identity_policy(
+        &d,
+        &[
+            IdentityContract::OpaqueTradeId,
+            IdentityContract::Unavailable,
+        ],
+    );
+    let dir = std::env::temp_dir().join(format!("apexes-dedup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let def_path = dir.join("definition.json");
+    let events_path = dir.join("events.json");
+    let policy_path = dir.join("policy.json");
+    std::fs::write(&def_path, serde_json::to_vec(&d).unwrap()).unwrap();
+    std::fs::write(&policy_path, serde_json::to_vec(&p).unwrap()).unwrap();
+    let input = vec![trade(1, Some("a")), trade(1, Some("a"))];
+    let raw = serde_json::to_vec(&input).unwrap();
+    std::fs::write(&events_path, &raw).unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+            .arg("normalize")
+            .arg(&def_path)
+            .arg(&events_path)
+            .arg(&policy_path)
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::to_value(normalize_dataset(d, p, &input).unwrap()).unwrap()
+    );
+    assert_eq!(std::fs::read(&events_path).unwrap(), raw);
+    std::fs::write(&events_path, serde_json::to_vec(&[trade(1, None)]).unwrap()).unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
