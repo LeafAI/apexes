@@ -1753,4 +1753,139 @@ mod collector_reconciliation {
         assert!(!run().status.success());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    fn reconnect_fixture() -> (
+        String,
+        Vec<RawDepthBatch>,
+        Vec<MarketEvent>,
+        DatasetDefinition,
+    ) {
+        let (journal, _, mut events, def) = fixture();
+        let mut snapshot = events[0].clone();
+        if let MarketEvent::Depth(d) = &mut snapshot {
+            d.sequence = Some(200);
+            d.timestamp += chrono::Duration::seconds(1);
+        }
+        let mut increment = events[1].clone();
+        if let MarketEvent::Depth(d) = &mut increment {
+            d.sequence = Some(203);
+            d.source_range = Some(DepthSourceRange {
+                first: 201,
+                last: 203,
+                previous_final: None,
+            });
+            d.timestamp += chrono::Duration::seconds(1);
+        }
+        events.extend([snapshot, increment]);
+        let batches = vec![
+            RawDepthBatch::new(RUN, 0, &events[..2]).unwrap(),
+            RawDepthBatch::new(RUN, 1, &events[2..4]).unwrap(),
+            RawDepthBatch::new(RUN, 2, &events[4..]).unwrap(),
+        ];
+        let mut records = vec![journal.lines().next().unwrap().to_owned()];
+        for (i, batch) in batches.iter().enumerate() {
+            records.push(json!({"kind":"intent","batch_index":i,"expected_count":batch.events().unwrap().len(),"payload_sha256":format!("{:x}",Sha256::digest(batch.events_json.as_bytes())), "invalidations":usize::from(i==1)}).to_string());
+            records.push(json!({"kind":"commit","batch_index":i}).to_string());
+        }
+        records.push(
+            json!({"kind":"terminal","stopped":true,"reason":null,"committed_batches":3})
+                .to_string(),
+        );
+        (records.join("\n") + "\n", batches, events, def)
+    }
+
+    #[tokio::test]
+    async fn reconnect_segments_are_bound_to_receipts_across_batches_and_enable_strict_replay() {
+        use apexes_backtest::{DepthSequence, SimulatedDepthPolicy};
+        let (journal, batches, events, def) = reconnect_fixture();
+        let report = reconcile(&journal, &batches).unwrap().report;
+        let segments = report.segmentation.as_ref().unwrap();
+        assert_eq!(segments.segments.len(), 2);
+        assert_eq!(
+            (
+                segments.segments[0].start_index,
+                segments.segments[0].end_index_exclusive
+            ),
+            (0, 2)
+        );
+        assert_eq!(
+            (
+                segments.segments[1].start_index,
+                segments.segments[1].end_index_exclusive
+            ),
+            (3, 5)
+        );
+        assert_eq!(segments.gaps[0].first_invalidation_index, 2);
+        assert_eq!(segments.gaps[0].end_index_exclusive, 3);
+        assert!(!report.upstream_completeness_verified);
+        let reg = registry(seal_dataset(def, &events).unwrap());
+        reg.register::<CollectorEvidence, ()>((), CollectorEvidence { journal })
+            .unwrap();
+        reg.register::<SimulatedDepthPolicy, ()>(
+            (),
+            SimulatedDepthPolicy {
+                max_age_ms: 500,
+                sequence: DepthSequence::Contiguous,
+            },
+        )
+        .unwrap();
+        let result = run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events),
+            CountEvents(Arc::new(AtomicUsize::new(0))),
+        )
+        .await
+        .unwrap();
+        let policy = result.simulated_depth.unwrap();
+        assert_eq!(policy.sequence, DepthSequence::VerifiedRanges);
+        assert_eq!(policy.max_age_ms, 500);
+        assert_eq!(
+            result
+                .historical_dataset
+                .unwrap()
+                .collector_receipts
+                .unwrap(),
+            report
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_only_capture_is_diagnostic_not_replay_qualified() {
+        let (journal, _, events, def) = fixture();
+        let events = vec![events[2].clone()];
+        let batch = RawDepthBatch::new(RUN, 0, &events).unwrap();
+        let journal = format!(
+            "{}\n{}\n{}\n{}\n",
+            journal.lines().next().unwrap(),
+            json!({"kind":"intent","batch_index":0,"expected_count":1,"payload_sha256":format!("{:x}",Sha256::digest(batch.events_json.as_bytes())), "invalidations":1}),
+            json!({"kind":"commit","batch_index":0}),
+            json!({"kind":"terminal","stopped":true,"reason":null,"committed_batches":1})
+        );
+        assert!(
+            reconcile(&journal, &[batch])
+                .unwrap()
+                .report
+                .segmentation
+                .unwrap()
+                .segments
+                .is_empty()
+        );
+        let reg = registry(seal_dataset(def, &events).unwrap());
+        reg.register::<CollectorEvidence, ()>((), CollectorEvidence { journal })
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        assert!(
+            run_backtest(
+                config(),
+                &reg,
+                InMemoryMarketDataSource::new(events),
+                CountEvents(count.clone())
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no synchronized capture segment")
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 }
