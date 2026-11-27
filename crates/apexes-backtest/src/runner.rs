@@ -102,7 +102,7 @@ pub async fn run_backtest(
         })?;
 
     let execution = crate::SimulatedExecution::from_registry(registry, &config.instruments)?;
-    let depth = crate::SimulatedDepthPolicy::from_registry(registry)?;
+    let mut depth = crate::SimulatedDepthPolicy::from_registry(registry)?;
     let latency =
         crate::EventLatencyPolicy::from_registry(registry)?.map(crate::LatencyModel::EventTime);
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
@@ -142,6 +142,35 @@ pub async fn run_backtest(
                     reason: format!("historical source coverage failed: {reason}"),
                 })?,
         );
+    }
+
+    if let Some(ranges) = registry
+        .try_one::<crate::depth_ranges::DepthRangeEvidence>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?
+    {
+        let verified =
+            historical_dataset
+                .as_mut()
+                .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                    reason: "depth range evidence requires a verified dataset manifest".into(),
+                })?;
+        verified.depth_ranges = Some(
+            ranges
+                .verify_receipts(&verified.manifest, &events)
+                .map_err(|reason| ApexesError::InvalidBacktestConfig {
+                    reason: format!("historical depth range verification failed: {reason}"),
+                })?,
+        );
+        // Retain the configured freshness bound; only replace the
+        // unit-increment assumption after the exact input has passed
+        // range verification. Snapshot-only remains snapshot-only.
+        if let Some(policy) = &mut depth
+            && policy.sequence == crate::DepthSequence::Contiguous
+        {
+            policy.sequence = crate::DepthSequence::VerifiedRanges;
+        }
     }
 
     let event_stream = futures::stream::iter(events);

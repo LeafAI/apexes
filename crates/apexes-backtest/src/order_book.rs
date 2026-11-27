@@ -117,7 +117,9 @@ impl ReplayOrderBook {
             }
             match (self.sequence, update.sequence) {
                 (Some(old), Some(new)) if new < old => return false,
-                (Some(old), Some(new)) if old.checked_add(1) == Some(new) => {}
+                (Some(old), Some(new))
+                    if old.checked_add(1) == Some(new)
+                        || (policy.sequence == DepthSequence::VerifiedRanges && new > old) => {}
                 _ => {
                     self.invalidate(update.timestamp);
                     return true;
@@ -126,7 +128,7 @@ impl ReplayOrderBook {
         }
         if !valid_levels(&update.bids)
             || !valid_levels(&update.asks)
-            || (policy.sequence == DepthSequence::Contiguous && update.sequence.is_none())
+            || (policy.sequence != DepthSequence::SnapshotOnly && update.sequence.is_none())
         {
             self.invalidate(update.timestamp);
             return true;

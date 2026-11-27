@@ -38,6 +38,7 @@ pub mod order_book;
 pub mod cost_model;
 
 pub mod depth_policy;
+pub mod depth_ranges;
 pub mod execution_policy;
 pub use depth_policy::{DepthSequence, SimulatedDepthPolicy};
 pub mod event_latency;
