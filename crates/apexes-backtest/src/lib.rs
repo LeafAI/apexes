@@ -16,6 +16,7 @@
 pub mod error;
 
 pub mod collector_receipts;
+pub mod collector_replay;
 pub mod collector_segments;
 pub mod control;
 mod diagnostics;

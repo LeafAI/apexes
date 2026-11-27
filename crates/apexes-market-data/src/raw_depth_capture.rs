@@ -224,7 +224,11 @@ fn endpoints(symbol: &str, exchange: BinanceExchangeKind) -> Result<Endpoints, S
     }
     let spot = BinanceNetwork::Mainnet.endpoints();
     let (ws, rest, path) = match exchange {
-        BinanceExchangeKind::Spot => (spot.spot_market_ws, spot.spot_rest, "/api/v3/depth"),
+        BinanceExchangeKind::Spot => (
+            BinanceNetwork::Mainnet.spot_public_capture_ws(),
+            spot.spot_rest,
+            "/api/v3/depth",
+        ),
         BinanceExchangeKind::Perpetual => (
             "wss://fstream.binance.com/ws",
             "https://fapi.binance.com",
@@ -575,7 +579,7 @@ mod tests {
         let futures = endpoints("BTCUSDT", BinanceExchangeKind::Perpetual).unwrap();
         assert!(
             spot.websocket
-                .contains("stream.binance.com:9443/ws/btcusdt@depth@100ms")
+                .contains("stream.binance.com:443/ws/btcusdt@depth@100ms")
         );
         assert!(spot.snapshot.contains("/api/v3/depth?symbol=BTCUSDT"));
         assert!(

@@ -1964,4 +1964,86 @@ mod collector_reconciliation {
                 .contains("noncanonical")
         );
     }
+    #[tokio::test]
+    async fn qualified_bundle_smoke_replays_every_event_and_checks_report() {
+        use apexes_backtest::collector_receipts::qualify_export;
+        use apexes_backtest::collector_replay::verify_capture_replay;
+        let (journal, batches, events, _) = reconnect_fixture();
+        let bundle = qualify_export(&journal, &batches).unwrap();
+        let expected = bundle.dataset.clone();
+        let instrument = config().instruments.remove(0);
+        let report = verify_capture_replay(bundle, instrument).await.unwrap();
+        assert_eq!(report.dataset, expected);
+        assert_eq!(report.events_observed, events.len());
+        assert_eq!(report.fills, 0);
+        assert_eq!(
+            report.simulated_depth.sequence,
+            apexes_backtest::DepthSequence::VerifiedRanges
+        );
+        assert!(!report.independently_attested);
+    }
+
+    #[tokio::test]
+    async fn smoke_replay_refuses_tampered_bundle_and_wrong_market() {
+        use apexes_backtest::collector_receipts::qualify_export;
+        use apexes_backtest::collector_replay::verify_capture_replay;
+        let (journal, batches, _, _) = reconnect_fixture();
+        let instrument = config().instruments.remove(0);
+        let mut bundle = qualify_export(&journal, &batches).unwrap();
+        bundle.events.swap(0, 4);
+        assert!(
+            verify_capture_replay(bundle, instrument.clone())
+                .await
+                .is_err()
+        );
+        let mut bundle = qualify_export(&journal, &batches).unwrap();
+        bundle.dataset.event_count += 1;
+        assert!(
+            verify_capture_replay(bundle, instrument.clone())
+                .await
+                .is_err()
+        );
+        let bundle = qualify_export(&journal, &batches).unwrap();
+        let mut wrong = instrument;
+        wrong.asset_class = AssetClass::Perpetual;
+        assert!(verify_capture_replay(bundle, wrong).await.is_err());
+    }
+
+    #[test]
+    fn smoke_replay_cli_round_trip_and_no_success_for_tampered_receipt() {
+        use apexes_backtest::collector_receipts::qualify_export;
+        let (journal, batches, _, _) = reconnect_fixture();
+        let mut bundle = qualify_export(&journal, &batches).unwrap();
+        let instrument = config().instruments.remove(0);
+        let dir =
+            std::env::temp_dir().join(format!("apexes-replay-smoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let bp = dir.join("bundle.json");
+        let ip = dir.join("instrument.json");
+        std::fs::write(&bp, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        std::fs::write(&ip, serde_json::to_vec(&instrument).unwrap()).unwrap();
+        let run = || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+                .arg("verify-collector-replay")
+                .arg(&bp)
+                .arg(&ip)
+                .output()
+                .unwrap()
+        };
+        let result = run();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["events_observed"], 5);
+        assert_eq!(report["fills"], 0);
+        bundle.journal.pop();
+        std::fs::write(&bp, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        let result = run();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

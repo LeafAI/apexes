@@ -306,7 +306,8 @@ pub fn reconcile(raw: &str, batches: &[RawDepthBatch]) -> Result<ReconciledCaptu
 /// An export containing the original journal, exactly ordered events and
 /// a manifest sealed only after receipt reconciliation. It is not
 /// an upstream exchange attestation or a full-day coverage claim.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualifiedCapture {
     /// Where the rows were obtained, not an attestation of exchange completeness.
     pub qualification_method: QualificationMethod,
@@ -315,7 +316,7 @@ pub struct QualifiedCapture {
     pub events: Vec<MarketEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationMethod {
     CompleteExportSupplied,

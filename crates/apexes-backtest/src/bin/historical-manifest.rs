@@ -37,6 +37,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(out)?;
         return Ok(());
     }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "verify-collector-replay")
+    {
+        if args.len() != 3 {
+            return Err("usage: historical-manifest verify-collector-replay <qualified.json> <instrument.json>".into());
+        }
+        let bundle = read(Path::new(&args[1]))?;
+        let instrument = read(Path::new(&args[2]))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime
+            .block_on(apexes_backtest::collector_replay::verify_capture_replay(
+                bundle, instrument,
+            ))
+            .map_err(io::Error::other)?;
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &result)?;
+        writeln!(out)?;
+        return Ok(());
+    }
     if args.len() != 3
         && !(args.len() == 4
             && (args[0] == "verify-coverage"
@@ -44,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || args[0] == "verify-ranges"
                 || args[0] == "build-ranges"))
     {
-        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl>".into());
+        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl> | verify-collector-replay <qualified.json> <instrument.json>".into());
     }
     if args[0] == "reconcile-collector" && args.len() == 3 {
         let journal = std::fs::read_to_string(Path::new(&args[1]))?;
