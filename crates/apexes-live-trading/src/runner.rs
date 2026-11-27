@@ -323,7 +323,14 @@ pub async fn run_live_trading(
     // use (live trading never simulates fees itself; real fees arrive
     // embedded in the exchange's own fill data).
     let funding_rate_bps = config.cost_model.funding_rate_bps;
-    let clock = BacktestClock::new(ReplaySpeed::AsFastAsPossible);
+    let clock = match registry
+        .try_one::<apexes_backtest::clock::LiveObservationPolicy>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for LiveObservationPolicy failed: {error}"),
+        })? {
+        Some(policy) => BacktestClock::live_observations(policy),
+        None => BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+    };
 
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
