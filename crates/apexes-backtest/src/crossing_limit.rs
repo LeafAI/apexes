@@ -47,7 +47,7 @@ impl MatchingEngine {
                 }
                 let quantity = (order.quantity - order.filled_quantity).min(level.quantity);
                 fills.push(Fill {
-                    id: FillId(Uuid::new_v4()),
+                    id: self.ids.fill(),
                     order_id: order.id,
                     symbol: order.symbol.clone(),
                     venue: order.venue,

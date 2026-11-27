@@ -37,6 +37,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(out)?;
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "fingerprint-replay") {
+        if args.len() != 2 {
+            return Err(
+                "usage: historical-manifest fingerprint-replay <backtest-report.json>".into(),
+            );
+        }
+        let report = read(Path::new(&args[1]))?;
+        let mut out = io::stdout().lock();
+        writeln!(
+            out,
+            "{}",
+            apexes_backtest::replay_identity::canonical_report_sha256(&report)?
+        )?;
+        return Ok(());
+    }
     if args
         .first()
         .is_some_and(|arg| arg == "verify-collector-replay")
@@ -66,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || args[0] == "verify-ranges"
                 || args[0] == "build-ranges"))
     {
-        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl> | verify-collector-replay <qualified.json> <instrument.json>".into());
+        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json> | reconcile-collector <journal.jsonl> <batches.json> | qualify-collector <journal.jsonl> | verify-collector-replay <qualified.json> <instrument.json> | fingerprint-replay <backtest-report.json>".into());
     }
     if args[0] == "reconcile-collector" && args.len() == 3 {
         let journal = std::fs::read_to_string(Path::new(&args[1]))?;

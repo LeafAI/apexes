@@ -1,14 +1,13 @@
 use crate::cost_model::{CostModel, FillLiquidity};
 use crate::order_book::ReplayOrderBook;
+use crate::replay_identity::{MatchingIds, ReplayIdentityPolicy};
 use apexes_core::{
-    ApexesError, DepthUpdate, Fill, FillId, Order, OrderId, OrderStatus, OrderType, PriceLevel,
-    Side, Venue,
+    ApexesError, DepthUpdate, Fill, Order, OrderId, OrderStatus, OrderType, PriceLevel, Side, Venue,
 };
 use apexes_strategy::OrderIntent;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 #[path = "crossing_limit.rs"]
 mod crossing_limit;
@@ -82,6 +81,7 @@ pub fn walk_book(levels: &[PriceLevel], quantity: Decimal) -> Option<BookWalkRes
 /// state is used only to seed the INITIAL `external_ahead_remaining`
 /// threshold at submission time via `submit_limit_order`.
 pub struct MatchingEngine {
+    ids: MatchingIds,
     books: HashMap<(Venue, String), ReplayOrderBook>,
     event_time: Option<DateTime<Utc>>,
     execution: crate::SimulatedExecution,
@@ -140,6 +140,7 @@ impl MatchingEngine {
             "queue_position_factor should be in [0.0, 1.0], got {queue_position_factor}"
         );
         Self {
+            ids: MatchingIds::default(),
             books: HashMap::new(),
             event_time: None,
             execution: crate::SimulatedExecution::default(),
@@ -150,6 +151,15 @@ impl MatchingEngine {
             resting_orders: HashMap::new(),
             pending_triggers: HashMap::new(),
         }
+    }
+
+    pub(crate) fn with_replay_identity(mut self, policy: Option<ReplayIdentityPolicy>) -> Self {
+        self.ids = MatchingIds::new(policy);
+        self
+    }
+
+    pub(crate) fn next_order_id(&mut self) -> OrderId {
+        self.ids.order()
     }
 
     pub fn with_execution(mut self, execution: crate::SimulatedExecution) -> Self {
@@ -405,7 +415,7 @@ impl MatchingEngine {
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
         match intent.order_type {
             OrderType::Market => {
-                let id = OrderId(Uuid::new_v4());
+                let id = self.ids.order();
                 let mut guard =
                     |_: Option<apexes_strategy::ParentOrderId>, _: &OrderIntent, fills: &[Fill]| {
                         check(fills, Decimal::ZERO)
@@ -545,7 +555,7 @@ impl MatchingEngine {
 
         let order_id = check
             .as_ref()
-            .map_or_else(|| OrderId(Uuid::new_v4()), |(id, _, _)| *id);
+            .map_or_else(|| self.ids.order(), |(id, _, _)| *id);
         let mut remaining = intent.quantity;
         let mut fills = Vec::new();
 
@@ -560,7 +570,7 @@ impl MatchingEngine {
                 .fee_for_fill(intent.venue, FillLiquidity::Taker, notional);
 
             fills.push(Fill {
-                id: FillId(Uuid::new_v4()),
+                id: self.ids.fill(),
                 order_id,
                 symbol: intent.symbol.clone(),
                 venue: intent.venue,
@@ -677,7 +687,7 @@ impl MatchingEngine {
             });
         }
         let order = Order {
-            id: OrderId(Uuid::new_v4()),
+            id: self.ids.order(),
             exchange_order_id: None,
             symbol: intent.symbol.clone(),
             venue: intent.venue,
@@ -787,7 +797,7 @@ impl MatchingEngine {
             });
         }
 
-        let order_id = OrderId(Uuid::new_v4());
+        let order_id = self.ids.order();
         let order = Order {
             id: order_id,
             exchange_order_id: None,
@@ -882,6 +892,7 @@ impl MatchingEngine {
                 trade,
                 now,
                 &self.cost_model,
+                &mut self.ids,
                 &mut check,
             ));
         }

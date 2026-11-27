@@ -209,6 +209,23 @@ pub async fn run_backtest(
         }
     }
 
+    let replay_identity = registry
+        .try_one::<crate::replay_identity::ReplayIdentityPolicy>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?;
+    if replay_identity.is_some()
+        && (historical_dataset.is_none()
+            || config.control.is_some()
+            || config.speed != ReplaySpeed::AsFastAsPossible)
+    {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason:
+                "replay identity requires a verified manifest, no external control and fast replay"
+                    .into(),
+        });
+    }
+
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
 
@@ -229,7 +246,8 @@ pub async fn run_backtest(
     let matching_engine = Arc::new(Mutex::new(
         MatchingEngine::new(config.cost_model, config.queue_position_factor)
             .with_execution(execution.clone())
-            .with_depth_policy(depth),
+            .with_depth_policy(depth)
+            .with_replay_identity(replay_identity),
     ));
     let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(Arc::clone(
         &matching_engine,
@@ -279,6 +297,7 @@ pub async fn run_backtest(
     )
     .await?;
     report.historical_dataset = historical_dataset;
+    report.replay_identity = replay_identity;
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
     report.simulated_depth = depth;
@@ -442,5 +461,149 @@ mod tests {
         // symbol-keyed mark prices the held BTC fell back to price 1.0,
         // giving 9,900 + 1 = 9,901.
         assert_ne!(final_equity, dec!(9901));
+    }
+    #[tokio::test]
+    async fn replay_identity_repeats_fills_and_canonical_report() {
+        use crate::historical_dataset::{
+            DatasetDefinition, DatasetStream, StreamKind, seal_dataset,
+        };
+        use crate::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
+        use apexes_core::MarketEvent;
+        use uuid::Uuid;
+
+        let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        // Equal timestamps must preserve the sealed snapshot-before-trade order.
+        let events = vec![
+            MarketEvent::Depth(DepthUpdate {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                bids: vec![PriceLevel {
+                    price: dec!(99),
+                    quantity: dec!(10),
+                }],
+                asks: vec![
+                    PriceLevel {
+                        price: dec!(100),
+                        quantity: dec!(0.5),
+                    },
+                    PriceLevel {
+                        price: dec!(101),
+                        quantity: dec!(0.5),
+                    },
+                ],
+                sequence: None,
+                source_range: None,
+                is_snapshot: true,
+                timestamp: at,
+            }),
+            MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(100),
+                quantity: dec!(1),
+                side: Some(Side::Buy),
+                trade_id: Some("1".into()),
+                timestamp: at,
+            }),
+        ];
+        let definition = DatasetDefinition {
+            dataset_id: "deterministic-replay-fixture".into(),
+            version: "v1".into(),
+            source_id: "synthetic".into(),
+            start_day: at.date_naive(),
+            end_day_exclusive: at.date_naive().succ_opt().unwrap(),
+            streams: [StreamKind::Depth, StreamKind::Trade]
+                .into_iter()
+                .map(|kind| DatasetStream {
+                    venue: Venue::Binance,
+                    symbol: "BTCUSDT".into(),
+                    kind,
+                })
+                .collect(),
+        };
+        let manifest = seal_dataset(definition, &events).unwrap();
+        let config = || BacktestConfig {
+            instruments: vec![btcusdt_instrument()],
+            date_range: at.date_naive()..at.date_naive().succ_opt().unwrap(),
+            initial_balances: HashMap::from([("USDT".into(), dec!(10000))]),
+            cost_model: zero_cost_model(),
+            speed: ReplaySpeed::AsFastAsPossible,
+            queue_position_factor: dec!(0.5),
+            risk_free_return: Decimal::ZERO,
+            margin_tiers: HashMap::new(),
+            market_condition_config: None,
+            control: None,
+        };
+        let policy = ReplayIdentityPolicy {
+            namespace: Uuid::from_u128(42),
+        };
+        let registry = Registry::new();
+        registry.register::<_, ()>((), manifest.clone()).unwrap();
+        registry.register::<_, ()>((), policy).unwrap();
+        let mut expected = None;
+        for _ in 0..10 {
+            let report = run_backtest(
+                config(),
+                &registry,
+                InMemoryMarketDataSource::new(events.clone()),
+                BuyOnceStrategy { bought: false },
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.replay_identity, Some(policy));
+            assert_eq!(report.trades.len(), 2);
+            assert_eq!(report.trades[0].order_id, report.trades[1].order_id);
+            assert_ne!(report.trades[0].id, report.trades[1].id);
+            assert_eq!(report.trades[0].price, dec!(100));
+            assert_eq!(report.trades[1].price, dec!(101));
+            let hash = canonical_report_sha256(&report).unwrap();
+            if let Some(previous) = &expected {
+                assert_eq!(&hash, previous);
+            }
+            expected = Some(hash);
+        }
+        let absent = Registry::new();
+        absent.register::<_, ()>((), policy).unwrap();
+        assert!(
+            run_backtest(
+                config(),
+                &absent,
+                InMemoryMarketDataSource::new(events.clone()),
+                BuyOnceStrategy { bought: false }
+            )
+            .await
+            .is_err()
+        );
+        let mut bad = config();
+        bad.speed = ReplaySpeed::RealTime;
+        assert!(
+            run_backtest(
+                bad,
+                &registry,
+                InMemoryMarketDataSource::new(events.clone()),
+                BuyOnceStrategy { bought: false }
+            )
+            .await
+            .is_err()
+        );
+        let legacy = Registry::new();
+        legacy.register::<_, ()>((), manifest).unwrap();
+        let report = run_backtest(
+            config(),
+            &legacy,
+            InMemoryMarketDataSource::new(events),
+            BuyOnceStrategy { bought: false },
+        )
+        .await
+        .unwrap();
+        assert!(report.replay_identity.is_none());
+        assert_eq!(report.trades[0].id.0.get_version_num(), 4);
+        assert!(
+            !serde_json::to_value(&report)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("replay_identity")
+        );
     }
 }

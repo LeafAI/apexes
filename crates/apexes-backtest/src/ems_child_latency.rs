@@ -80,7 +80,11 @@ impl MatchingEngineChildOrderSink {
             queue.report.refused += 1;
             return Err(refusal("child arrival timestamp overflow"));
         };
-        let id = OrderId(uuid::Uuid::new_v4());
+        let id = self
+            .engine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_order_id();
         let order = Order {
             id,
             exchange_order_id: None,

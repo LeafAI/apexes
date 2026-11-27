@@ -35,6 +35,9 @@ pub struct BacktestReport {
     /// Verified identity of the loaded replay input, not upstream completeness.
     #[serde(default)]
     pub historical_dataset: Option<crate::historical_dataset::VerifiedDataset>,
+    /// Opt-in matching ID policy, not a full reproducibility attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_identity: Option<crate::replay_identity::ReplayIdentityPolicy>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/
