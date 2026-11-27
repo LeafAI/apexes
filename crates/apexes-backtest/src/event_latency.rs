@@ -61,6 +61,20 @@ pub struct EventLatencyReport {
     #[serde(default)]
     pub resting_capital_refused: u64,
 
+    /// Emergency cancellation and admission suppression evidence.
+    #[serde(default)]
+    pub emergency_events: u64,
+    #[serde(default)]
+    pub emergency_transit_cancelled: u64,
+    #[serde(default)]
+    pub emergency_resting_cancelled: u64,
+    #[serde(default)]
+    pub emergency_parents_cancelled: u64,
+    #[serde(default)]
+    pub emergency_cancel_failures: u64,
+    #[serde(default)]
+    pub emergency_intents_refused: u64,
+
     /// Separate EMS child transit accounting; None for legacy reports.
     #[serde(default)]
     pub child_orders: Option<ChildLatencyReport>,
@@ -132,6 +146,12 @@ impl ArrivalQueue {
                 resting_capital_released: 0,
                 resting_capital_released_at_end: 0,
                 resting_capital_refused: 0,
+                emergency_events: 0,
+                emergency_transit_cancelled: 0,
+                emergency_resting_cancelled: 0,
+                emergency_parents_cancelled: 0,
+                emergency_cancel_failures: 0,
+                emergency_intents_refused: 0,
                 child_orders: None,
             },
             watermark: None,
@@ -480,6 +500,15 @@ impl ArrivalQueue {
         self.report.scheduled += 1;
         Ok(())
     }
+    pub fn cancel_transit_for_emergency(&mut self) -> Vec<OrderIntent> {
+        let intents: Vec<_> = self.pending.drain(..).map(|(_, intent)| intent).collect();
+        for intent in &intents {
+            self.release(intent);
+        }
+        self.report.emergency_transit_cancelled += intents.len() as u64;
+        intents
+    }
+
     pub fn due(&mut self, at: DateTime<Utc>) -> Vec<OrderIntent> {
         let mut due = Vec::new();
         while self

@@ -137,6 +137,14 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         self.process_event(event, None)
     }
 
+    fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {
+        let mut engine = self.lock_engine();
+        let ids = engine.cancel_all_working();
+        let mut open = self.lock_open_orders();
+        open.clear();
+        Ok(ids)
+    }
+
     fn on_market_event_checked(
         &self,
         event: &MarketEvent,

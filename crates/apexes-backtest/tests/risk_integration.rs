@@ -1274,3 +1274,184 @@ async fn leveraged_resting_sell_reserves_margin_until_terminal_fill() {
         (1, 1, 0)
     );
 }
+
+/// Admit a long, an EMS parent, a resting order, and a pending direct
+/// order in successive events. The emergency arrives exactly when the
+/// first EMS child would otherwise execute.
+struct EmergencyCompetition {
+    start: chrono::DateTime<Utc>,
+}
+
+impl Strategy for EmergencyCompetition {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        let offset = (ctx.now - self.start).num_milliseconds();
+        if !matches!(offset, 0 | 500 | 1000 | 1500 | 1600) {
+            return vec![];
+        }
+        let mut intent = BuyOnceStrategy { has_bought: false }
+            .on_market_event(event, ctx)
+            .remove(0);
+        intent.asset_class = AssetClass::Perpetual;
+        intent.leverage = Some(dec!(10));
+        intent.margin_mode = Some(apexes_core::MarginMode::Isolated);
+        match offset {
+            500 => {
+                intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                    duration: std::time::Duration::from_secs(1),
+                    slices: 1,
+                })
+            }
+            1000 => {
+                intent.order_type = apexes_core::OrderType::Limit;
+                intent.price = Some(dec!(95));
+            }
+            _ => {}
+        }
+        vec![intent]
+    }
+}
+
+fn emergency_competition_fixture(
+    jump: bool,
+) -> (BacktestConfig, Vec<MarketEvent>, chrono::DateTime<Utc>) {
+    let (mut config, _) = leveraged_fixture(dec!(1000), dec!(99));
+    let MarketEvent::Depth(mut depth) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    let start = depth.timestamp;
+    depth.asks[0].price = dec!(100);
+    depth.bids = vec![PriceLevel {
+        price: dec!(99),
+        quantity: dec!(100),
+    }];
+    let mut events = Vec::new();
+    for (seq, offset) in [0, 500, 1000, 1100, 1500].into_iter().enumerate() {
+        let mut next = depth.clone();
+        next.timestamp = start + chrono::Duration::milliseconds(offset);
+        next.sequence = Some(seq as u64 + 1);
+        events.push(MarketEvent::Depth(next));
+        if jump && offset == 0 {
+            // Establish the prior price before the extreme print.
+            events.push(MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(100),
+                quantity: dec!(1),
+                side: Some(apexes_core::Side::Sell),
+                trade_id: None,
+                timestamp: start + chrono::Duration::milliseconds(1),
+            }));
+        }
+    }
+    if jump {
+        config.market_condition_config = Some(apexes_risk::MarketConditionConfig {
+            volatility_threshold: dec!(1000000),
+            jump_threshold_pct: dec!(0.1),
+            sensitivity: dec!(1),
+            volatility_window: 20,
+            price_source: apexes_risk::PriceSource::Trade,
+            account_equity_volatility_threshold: None,
+            include_spot: true,
+        });
+        // The same trade would have matched the resting buy at 95.
+        events.push(MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(70),
+            quantity: dec!(10),
+            side: Some(apexes_core::Side::Sell),
+            trade_id: None,
+            timestamp: start + chrono::Duration::milliseconds(1600),
+        }));
+    } else {
+        config.margin_tiers.insert(
+            "BTCUSDT".into(),
+            apexes_strategy::MarginTierTable {
+                tiers: vec![apexes_strategy::MarginTier {
+                    notional_floor: dec!(0),
+                    max_leverage: dec!(20),
+                    maintenance_margin_rate: dec!(0.005),
+                    maintenance_amount: dec!(0),
+                }],
+            },
+        );
+        events.push(MarketEvent::MarkPrice(apexes_core::MarkPriceUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            mark_price: dec!(89),
+            timestamp: start + chrono::Duration::milliseconds(1600),
+        }));
+    }
+    events.push(MarketEvent::Trade(TradeEvent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        price: dec!(95),
+        quantity: dec!(10),
+        side: Some(apexes_core::Side::Sell),
+        trade_id: None,
+        timestamp: start + chrono::Duration::milliseconds(2100),
+    }));
+    (config, events, start)
+}
+
+async fn assert_emergency_preempts_competing_orders(jump: bool) {
+    let (config, events, start) = emergency_competition_fixture(jump);
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        EmergencyCompetition { start },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2, "{:?}", report.trades);
+    assert_eq!(report.trades[0].side, apexes_core::Side::Buy);
+    assert_eq!(report.trades[1].side, apexes_core::Side::Sell);
+    assert_eq!(report.trades[1].quantity, dec!(1));
+    assert_eq!(
+        report.trades[1].filled_at,
+        start + chrono::Duration::milliseconds(1600)
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.emergency_events,
+            latency.emergency_transit_cancelled,
+            latency.emergency_resting_cancelled,
+            latency.emergency_parents_cancelled,
+            latency.emergency_intents_refused,
+            latency.emergency_cancel_failures
+        ),
+        (1, 1, 1, 1, 1, 0)
+    );
+    assert_eq!(
+        (
+            latency.parent_capital_released,
+            latency.resting_capital_released,
+            latency.capital_released_at_end,
+            latency.parent_capital_released_at_end,
+            latency.resting_capital_released_at_end
+        ),
+        (1, 1, 0, 0, 0)
+    );
+    let children = latency.child_orders.unwrap();
+    assert_eq!(
+        (
+            children.scheduled,
+            children.arrived,
+            children.cancelled_before_arrival
+        ),
+        (1, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn margin_liquidation_preempts_due_child_resting_and_transit_orders() {
+    assert_emergency_preempts_competing_orders(false).await;
+}
+
+#[tokio::test]
+async fn extreme_trade_preempts_maker_fill_and_due_child() {
+    assert_emergency_preempts_competing_orders(true).await;
+}

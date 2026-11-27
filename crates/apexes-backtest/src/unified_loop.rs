@@ -340,6 +340,36 @@ pub async fn run_unified_event_loop(
                     _ => {}
                 }
 
+                let mut emergency_event = false;
+                if let Some(queue) = &mut arrivals {
+                    // Settle the boundary against positions held entering
+                    // this observed event, not orders that will arrive on it.
+                    let boundary = last_funding_boundary(timestamp);
+                    if last_funding_settlement != Some(boundary) {
+                        ledger.apply_funding_payments(&mark_prices, &funding_cost_model)?;
+                        last_funding_settlement = Some(boundary);
+                    }
+                    // Sample current marked equity once before matching.
+                    // Execution-induced changes become visible next event.
+                    if let Some((_, _, monitor)) = &market_condition_monitor {
+                        let equity = ledger.equity(&mark_prices).unwrap_or(Decimal::ZERO);
+                        if let Err(violations) = monitor.on_equity_update(equity) {
+                            tracing::warn!(?violations, "account-wide market condition violation");
+                        }
+                    }
+                    let margin_breach = liquidation_policy.should_auto_execute(LiquidationReason::MarginBreach)
+                        && !ledger.check_liquidations(&mark_prices, &config.margin_tiers).is_empty();
+                    let extreme = liquidation_policy.should_auto_execute(LiquidationReason::ExtremeMarketCondition)
+                        && market_condition_monitor.as_ref().is_some_and(|(_, _, monitor)| {
+                            let symbols: Vec<_> = ledger.positions().keys().cloned().collect();
+                            !ledger.check_de_risking(&monitor.reduce_fractions(&symbols), market_condition_include_spot).is_empty()
+                        });
+                    if margin_breach || extreme {
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                        emergency_event = true;
+                    }
+                }
+
                 // Let the execution backend's own resting-order book react
                 // to this event (backtest/paper: the `MatchingEngine`'s
                 // depth-snapshot ingestion and resting-order matching; live
@@ -352,6 +382,9 @@ pub async fn run_unified_event_loop(
                     let mut check = |id, fills: &[Fill], terminal| {
                         let mut candidate = projected.execution_snapshot();
                         let result = (|| {
+                            if emergency_event {
+                                return Err("emergency preempts resting execution".into());
+                            }
                             for fill in fills {
                                 candidate.apply_fill(fill).map_err(|error| error.to_string())?;
                             }
@@ -402,6 +435,9 @@ pub async fn run_unified_event_loop(
                     let open_orders = executor.open_orders().await;
                     let mut projected = ledger.execution_snapshot();
                     let mut check = |parent: Option<ParentOrderId>, intent: &apexes_strategy::OrderIntent, fills: &[Fill]| {
+                        if emergency_event {
+                            return Err("emergency preempts child execution".into());
+                        }
                         let priced = apexes_strategy::OrderIntent {
                             // Conservative notional valuation across the proposed
                             // execution, not a stale last-trade reference.
@@ -552,6 +588,10 @@ pub async fn run_unified_event_loop(
                         leverage: position.leverage,
                         margin_mode: position.margin_mode,
                     };
+                    if !emergency_event && let Some(queue) = &mut arrivals {
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                        emergency_event = true;
+                    }
                     let trace = diagnostics.intent(&liquidation_intent, "liquidation", timestamp);
                     match executor
                         .submit(&liquidation_intent, ledger.positions(), ledger.balances(), timestamp)
@@ -586,9 +626,11 @@ pub async fn run_unified_event_loop(
                 // trading defaults to monitor-only, gated on its own
                 // `auto_derisk_live` flag).
                 if let Some((_, _, read_handle)) = &market_condition_monitor {
-                    let equity_for_volatility = ledger.equity(&mark_prices).unwrap_or(Decimal::ZERO);
-                    if let Err(violations) = read_handle.on_equity_update(equity_for_volatility) {
-                        tracing::warn!(?violations, "account-wide market condition violation");
+                    if arrivals.is_none() {
+                        let equity_for_volatility = ledger.equity(&mark_prices).unwrap_or(Decimal::ZERO);
+                        if let Err(violations) = read_handle.on_equity_update(equity_for_volatility) {
+                            tracing::warn!(?violations, "account-wide market condition violation");
+                        }
                     }
 
                     let open_symbols: Vec<String> = ledger.positions().keys().cloned().collect();
@@ -639,6 +681,10 @@ pub async fn run_unified_event_loop(
                             leverage: position.leverage,
                             margin_mode: position.margin_mode,
                         };
+                        if !emergency_event && let Some(queue) = &mut arrivals {
+                            preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                            emergency_event = true;
+                        }
                         let trace = diagnostics.intent(&de_risk_intent, "derisk", timestamp);
                         match executor
                             .submit(&de_risk_intent, ledger.positions(), ledger.balances(), timestamp)
@@ -704,6 +750,14 @@ pub async fn run_unified_event_loop(
                         queue.release(&intent);
                     }
                     let trace = diagnostics.intent(&intent, if arriving {"strategy_arrival"} else {"strategy"}, timestamp);
+                    if emergency_event && let Some(queue) = &mut arrivals {
+                        queue.report.emergency_intents_refused += 1;
+                        trace.outcome("rules_rejected", "emergency_preemption");
+                        if let Some(log) = &mut order_log {
+                            record_refusal(log, &intent, timestamp, "emergency exit preempts strategy orders");
+                        }
+                        continue;
+                    }
                     // Make the order valid for its symbol (round the quantity
                     // down to the exchange's step, the price to its tick) before
                     // anything judges it: the risk checks must see the order
@@ -1514,6 +1568,47 @@ fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
 /// spec) -- new parent orders are added to the map at the point
 /// `submit_algo_order` succeeds (see the call site above), not
 /// discovered here.
+/// Event-time simulation only: emergency reduction takes precedence over
+/// all ordinary order reservations, including orders on other symbols
+/// sharing the same wallet. Release only confirmed cancellations.
+async fn preempt_simulated_orders(
+    queue: &mut crate::event_latency::ArrivalQueue,
+    executor: &dyn OrderExecutor,
+    ems: &dyn Ems,
+    parents: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+) {
+    queue.report.emergency_events += 1;
+    queue.cancel_transit_for_emergency();
+    match executor.cancel_simulated_working() {
+        Ok(ids) => {
+            queue.report.emergency_resting_cancelled += ids.len() as u64;
+            queue.reconcile_resting(&executor.open_orders().await);
+        }
+        Err(error) => {
+            queue.report.emergency_cancel_failures += 1;
+            tracing::error!(%error, "simulated emergency working-order cancellation failed");
+        }
+    }
+    let ids: Vec<_> = parents
+        .iter()
+        .filter(|(_, status)| **status == ParentOrderStatus::Scheduling)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        match ems.cancel_parent_order(id).await {
+            Ok(()) => {
+                parents.insert(id, ParentOrderStatus::Cancelled);
+                queue.report.emergency_parents_cancelled += 1;
+            }
+            Err(error) => {
+                queue.report.emergency_cancel_failures += 1;
+                tracing::error!(parent_id = %id.0, %error, "simulated emergency parent cancellation failed");
+            }
+        }
+    }
+    queue.reconcile_parents(parents);
+}
+
 async fn refresh_open_parent_orders(
     ems: &dyn Ems,
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,

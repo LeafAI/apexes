@@ -87,6 +87,14 @@ pub trait OrderExecutor: Send + Sync {
         })
     }
 
+    /// Cancel all local simulated working orders before emergency execution.
+    /// Never dispatches a live cancellation by default.
+    fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {
+        Err(ApexesError::OrderRejected {
+            reason: "simulated cancellation unavailable".into(),
+        })
+    }
+
     fn on_market_event_checked(
         &self,
         event: &MarketEvent,
