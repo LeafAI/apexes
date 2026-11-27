@@ -103,6 +103,69 @@ impl RawDepthStore {
     }
 }
 
+/// Read-only access to a closed capture run. Never creates tables,
+/// writes batches, filters duplicates, or truncates to the receipt count.
+pub struct RawDepthReader {
+    client: Client,
+}
+
+impl RawDepthReader {
+    pub fn new(url: &str) -> Self {
+        Self {
+            client: Client::default()
+                .with_url(url)
+                .with_setting("readonly", "1")
+                .with_setting("max_execution_time", "60")
+                .with_setting("max_result_bytes", "268435456")
+                .with_setting("result_overflow_mode", "throw"),
+        }
+    }
+
+    /// Read all rows in one ordered query, including unexpected indexes.
+    /// The extra row detects surplus records without trusting the journal
+    /// as a WHERE filter. Refuse oversize results rather than returning a
+    /// prefix. Only use on stopped, immutable runs.
+    pub async fn read_run(
+        &self,
+        run_id: &str,
+        expected_batches: usize,
+    ) -> Result<Vec<RawDepthBatch>, StorageError> {
+        if expected_batches > 100_000 {
+            return Err(StorageError::QueryFailed {
+                reason: "raw capture exceeds qualification batch limit".into(),
+            });
+        }
+        let mut cursor = self.client.query(
+            "SELECT run_id, batch_index, events_json FROM raw_depth_batches WHERE run_id = ? ORDER BY batch_index LIMIT ?"
+        ).bind(run_id).bind((expected_batches + 1) as u64).fetch::<RawDepthBatch>()?;
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = cursor.next().await? {
+            bytes = bytes
+                .checked_add(row.events_json.len())
+                .filter(|n| *n <= 256 * 1024 * 1024)
+                .ok_or_else(|| StorageError::QueryFailed {
+                    reason: "raw capture exceeds qualification byte limit".into(),
+                })?;
+            if rows.len() == expected_batches
+                || row.run_id != run_id
+                || row.batch_index != rows.len() as u64
+            {
+                return Err(StorageError::QueryFailed {
+                    reason: "unexpected, duplicate or missing raw capture batch index".into(),
+                });
+            }
+            rows.push(row);
+        }
+        if rows.len() != expected_batches {
+            return Err(StorageError::QueryFailed {
+                reason: "missing raw capture batches".into(),
+            });
+        }
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1888,4 +1888,80 @@ mod collector_reconciliation {
         );
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
+    #[tokio::test]
+    async fn qualification_derives_scope_and_replays_original_receipt_bound_input() {
+        use apexes_backtest::collector_receipts::{QualificationMethod, qualify_export};
+        let (journal, batches, events, def) = reconnect_fixture();
+        let qualified = qualify_export(&journal, &batches).unwrap();
+        assert_eq!(
+            qualified.qualification_method,
+            QualificationMethod::CompleteExportSupplied
+        );
+        assert_eq!(qualified.journal, journal);
+        assert_eq!(qualified.events, events);
+        let manifest = &qualified.dataset.manifest;
+        assert_eq!(manifest.definition.source_id, def.source_id);
+        assert_eq!(manifest.definition.start_day, day(1));
+        assert_eq!(manifest.definition.end_day_exclusive, day(2));
+        assert!(!qualified.dataset.upstream_completeness_verified);
+        assert!(qualified.dataset.source_coverage.is_none());
+        assert_eq!(
+            qualified
+                .dataset
+                .collector_receipts
+                .as_ref()
+                .unwrap()
+                .segmentation
+                .as_ref()
+                .unwrap()
+                .gaps
+                .len(),
+            1
+        );
+        let reg = registry(manifest.clone());
+        reg.register::<CollectorEvidence, ()>((), CollectorEvidence { journal })
+            .unwrap();
+        let mut cfg = config();
+        cfg.date_range = day(1)..day(2);
+        let report = run_backtest(
+            cfg,
+            &reg,
+            InMemoryMarketDataSource::new(qualified.events),
+            CountEvents(Arc::new(AtomicUsize::new(0))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.historical_dataset.unwrap(), qualified.dataset);
+    }
+
+    #[test]
+    fn qualification_rejects_partial_export_and_unqualified_empty_run() {
+        use apexes_backtest::collector_receipts::qualify_export;
+        let (journal, batches, _, _) = reconnect_fixture();
+        assert!(qualify_export(&journal, &batches[..2]).is_err());
+        let empty = format!(
+            "{}\n{}\n",
+            journal.lines().next().unwrap(),
+            json!({"kind":"terminal","stopped":true,"reason":null,"committed_batches":0})
+        );
+        assert!(
+            qualify_export(&empty, &[])
+                .unwrap_err()
+                .contains("no synchronized")
+        );
+    }
+    #[test]
+    fn qualification_refuses_matching_receipt_for_noncanonical_replay_payload() {
+        use apexes_backtest::collector_receipts::qualify_export;
+        let (journal, mut batches, _, _) = reconnect_fixture();
+        let old_hash = format!("{:x}", Sha256::digest(batches[0].events_json.as_bytes()));
+        batches[0].events_json.push(' ');
+        let hash = format!("{:x}", Sha256::digest(batches[0].events_json.as_bytes()));
+        let journal = journal.replace(&old_hash, &hash);
+        assert!(
+            qualify_export(&journal, &batches)
+                .unwrap_err()
+                .contains("noncanonical")
+        );
+    }
 }
