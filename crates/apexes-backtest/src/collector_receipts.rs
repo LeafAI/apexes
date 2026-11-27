@@ -1,9 +1,12 @@
 //! F03.03: independently reconcile durable capture receipts and bind
 //! the exact captured sequence to replay. Not an exchange attestation.
 use crate::collector_segments::{CaptureSegmentation, Segmenter};
-use crate::historical_dataset::{DatasetManifest, DatasetStream, StreamKind};
+use crate::historical_dataset::{
+    DatasetDefinition, DatasetManifest, DatasetStream, StreamKind, VerifiedDataset, seal_dataset,
+};
+use crate::market_data_source::event_timestamp;
 use apexes_core::{AssetClass, Instrument, MarketEvent, Venue};
-use apexes_storage::raw_depth_store::RawDepthBatch;
+use apexes_storage::raw_depth_store::{RawDepthBatch, RawDepthReader};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,7 +14,7 @@ use uuid::Uuid;
 
 pub const SOURCE_PREFIX: &str = "binance-raw:";
 const MAX_BATCHES: usize = 100_000;
-const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_EVENTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +237,12 @@ impl<'a> Verifier<'a> {
             ));
         }
         let events = row.events().map_err(|e| e.to_string())?;
+        // Schema-v1 collector payloads are the canonical serialization.
+        // Reject a matching receipt for a representation that replay
+        // cannot reproduce from decoded events (including unknown fields).
+        if serde_json::to_string(&events).map_err(|e| e.to_string())? != row.events_json {
+            return Err(format!("batch {index}: noncanonical collector payload"));
+        }
         if events.len() != intent.count {
             return Err(format!("batch {index}: event count mismatch"));
         }
@@ -291,6 +300,82 @@ pub fn reconcile(raw: &str, batches: &[RawDepthBatch]) -> Result<ReconciledCaptu
     Ok(ReconciledCapture {
         report: verifier.finish(raw)?,
         events,
+    })
+}
+
+/// An export containing the original journal, exactly ordered events and
+/// a manifest sealed only after receipt reconciliation. It is not
+/// an upstream exchange attestation or a full-day coverage claim.
+#[derive(Debug, Serialize)]
+pub struct QualifiedCapture {
+    /// Where the rows were obtained, not an attestation of exchange completeness.
+    pub qualification_method: QualificationMethod,
+    pub journal: String,
+    pub dataset: VerifiedDataset,
+    pub events: Vec<MarketEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationMethod {
+    CompleteExportSupplied,
+    DirectClickHouseRead,
+}
+
+pub async fn qualify_recorded_run(
+    raw: &str,
+    reader: &RawDepthReader,
+) -> Result<QualifiedCapture, String> {
+    let journal = Journal::parse(raw)?;
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        reader.read_run(&journal.run_id, journal.intents.len()),
+    )
+    .await
+    .map_err(|_| "raw capture qualification query timed out")?
+    .map_err(|e| e.to_string())?;
+    let mut qualified = qualify_export(raw, &rows)?;
+    qualified.qualification_method = QualificationMethod::DirectClickHouseRead;
+    Ok(qualified)
+}
+
+/// Qualify a supplied complete export against the original journal and
+/// derive the dataset scope from its observations, never caller labels.
+pub fn qualify_export(raw: &str, rows: &[RawDepthBatch]) -> Result<QualifiedCapture, String> {
+    let capture = reconcile(raw, rows)?;
+    if capture
+        .report
+        .segmentation
+        .as_ref()
+        .is_none_or(|s| s.segments.is_empty())
+    {
+        return Err("no synchronized capture segment for qualification".into());
+    }
+    let first = capture.events.first().ok_or("empty capture")?;
+    let last = capture.events.last().ok_or("empty capture")?;
+    let definition = DatasetDefinition {
+        dataset_id: format!("binance-raw-{}", capture.report.run_id),
+        version: "v1".into(),
+        source_id: capture.report.source_id.clone(),
+        start_day: event_timestamp(first).date_naive(),
+        end_day_exclusive: event_timestamp(last)
+            .date_naive()
+            .succ_opt()
+            .ok_or("capture date overflow")?,
+        streams: vec![DatasetStream {
+            venue: Venue::Binance,
+            symbol: capture.report.symbol.clone(),
+            kind: StreamKind::Depth,
+        }],
+    };
+    let manifest = seal_dataset(definition, &capture.events)?;
+    let mut dataset = manifest.verify(&capture.events)?;
+    dataset.collector_receipts = Some(capture.report);
+    Ok(QualifiedCapture {
+        qualification_method: QualificationMethod::CompleteExportSupplied,
+        journal: raw.into(),
+        dataset,
+        events: capture.events,
     })
 }
 

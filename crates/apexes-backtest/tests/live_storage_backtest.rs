@@ -123,3 +123,112 @@ async fn backtest_reads_real_data_from_clickhouse_via_storage_market_data_source
         "with no orders, equity must stay flat at the initial balance"
     );
 }
+
+/// CI uses a disposable ClickHouse service and a unique synthetic run ID.
+/// No exchange access, no deletion or filtering of surplus rows.
+#[tokio::test]
+#[ignore]
+async fn qualifies_complete_raw_capture_and_rejects_unreceipted_rows() {
+    use apexes_backtest::collector_receipts::{QualificationMethod, qualify_recorded_run};
+    use apexes_core::{DepthSourceRange, DepthUpdate, PriceLevel};
+    use apexes_storage::raw_depth_store::{RawDepthBatch, RawDepthReader, RawDepthStore};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let writer = RawDepthStore::new(CLICKHOUSE_URL).await.unwrap();
+    let reader = RawDepthReader::new(CLICKHOUSE_URL);
+    let run = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let snap = DepthUpdate {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        bids: vec![PriceLevel {
+            price: dec!(99),
+            quantity: dec!(1),
+        }],
+        asks: vec![PriceLevel {
+            price: dec!(101),
+            quantity: dec!(1),
+        }],
+        sequence: Some(100),
+        source_range: None,
+        is_snapshot: true,
+        timestamp: now,
+    };
+    let delta = DepthUpdate {
+        sequence: Some(103),
+        source_range: Some(DepthSourceRange {
+            first: 101,
+            last: 103,
+            previous_final: None,
+        }),
+        is_snapshot: false,
+        ..snap.clone()
+    };
+    let events = vec![MarketEvent::Depth(snap), MarketEvent::Depth(delta)];
+    let first = RawDepthBatch::new(&run, 0, &events[..1]).unwrap();
+    let second = RawDepthBatch::new(&run, 1, &events[1..]).unwrap();
+    let mut lines = vec![
+        json!({"kind":"header","schema_version":1,"run_id":run,"symbol":"BTCUSDT","market":"spot","started_at":now}),
+    ];
+    for (i, row) in [&first, &second].into_iter().enumerate() {
+        lines.push(json!({"kind":"intent","batch_index":i,"expected_count":1,"payload_sha256":format!("{:x}",Sha256::digest(row.events_json.as_bytes())),"invalidations":0}));
+        lines.push(json!({"kind":"commit","batch_index":i}));
+    }
+    lines.push(json!({"kind":"terminal","stopped":true,"reason":null,"committed_batches":2}));
+    let journal = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert!(qualify_recorded_run(&journal, &reader).await.is_err());
+    writer.write_batch(&second).await.unwrap();
+    assert!(qualify_recorded_run(&journal, &reader).await.is_err());
+    writer.write_batch(&first).await.unwrap();
+    // An unrelated run cannot contaminate this query.
+    let other = RawDepthBatch::new(&uuid::Uuid::new_v4().to_string(), 0, &events).unwrap();
+    writer.write_batch(&other).await.unwrap();
+    let qualified = qualify_recorded_run(&journal, &reader).await.unwrap();
+    assert_eq!(
+        qualified.qualification_method,
+        QualificationMethod::DirectClickHouseRead
+    );
+    assert_eq!(qualified.events, events);
+    assert!(!qualified.dataset.upstream_completeness_verified);
+    let dir = std::env::temp_dir().join(format!("apexes-qualified-{run}"));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("journal.jsonl");
+    std::fs::write(&path, &journal).unwrap();
+    let run_cli = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+            .arg("qualify-collector")
+            .arg(&path)
+            .env("APEXES_CAPTURE_CLICKHOUSE_URL", CLICKHOUSE_URL)
+            .output()
+            .unwrap()
+    };
+    let output = run_cli();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual, serde_json::to_value(&qualified).unwrap());
+    // A high unexpected index must be visible even though it exceeds
+    // the claimed committed count.
+    writer
+        .write_batch(&RawDepthBatch::new(&run, 999, &events).unwrap())
+        .await
+        .unwrap();
+    assert!(qualify_recorded_run(&journal, &reader).await.is_err());
+    let output = run_cli();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+    // A separate run proves that duplicate identities cannot be hidden.
+    let duplicate_run = uuid::Uuid::new_v4().to_string();
+    let duplicate = RawDepthBatch::new(&duplicate_run, 0, &events).unwrap();
+    writer.write_batch(&duplicate).await.unwrap();
+    writer.write_batch(&duplicate).await.unwrap();
+    assert!(reader.read_run(&duplicate_run, 1).await.is_err());
+}
