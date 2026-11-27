@@ -29,6 +29,7 @@ pub struct DriftScriptStrategy {
     interpreter: Interpreter,
     on_market_event_fn: DriftValue,
     params: Arc<ParamStore>,
+    symbol_state: super::symbol_state::ScriptState,
 }
 
 impl DriftScriptStrategy {
@@ -94,6 +95,7 @@ impl DriftScriptStrategy {
             interpreter,
             on_market_event_fn,
             params,
+            symbol_state: Default::default(),
         })
     }
 }
@@ -104,12 +106,14 @@ impl Strategy for DriftScriptStrategy {
         event: &apexes_core::MarketEvent,
         ctx: &StrategyContext,
     ) -> Vec<OrderIntent> {
-        let ctx_value = build_ctx_drift_value(
+        let mut ctx_value = build_ctx_drift_value(
             ctx.positions.clone(),
             ctx.balances.clone(),
             ctx.open_orders.clone(),
             ctx.now,
         );
+        let state = self.symbol_state.begin(event);
+        state.attach(&mut ctx_value);
         let event_value = market_event_to_drift_value(event);
 
         let handle = tokio::runtime::Handle::current();
@@ -118,18 +122,26 @@ impl Strategy for DriftScriptStrategy {
             vec![event_value, ctx_value],
         ));
 
-        match call_result {
+        let result = match call_result {
             Ok(value) => match order_intents_from_drift_value(value) {
-                Ok(intents) => intents,
+                Ok(intents) => Some(intents),
                 Err(msg) => {
                     tracing::error!("on_market_event returned an invalid value: {msg}");
-                    vec![]
+                    None
                 }
             },
             Err(e) => {
                 tracing::error!("on_market_event script error: {e}");
-                vec![]
+                None
             }
+        };
+        if self.symbol_state.finish(event, state, result.is_some()) {
+            result.unwrap_or_default()
+        } else {
+            if result.is_some() {
+                tracing::error!(symbol = event.symbol(), venue = ?event.venue(), "symbol state operation rejected; discarding callback writes and intents");
+            }
+            vec![]
         }
     }
 

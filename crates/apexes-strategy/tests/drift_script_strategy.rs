@@ -496,3 +496,60 @@ fn set_param_on_unknown_name_still_succeeds() {
         assert_eq!(params.get("never_declared_by_the_script"), Some(&dec!(7)));
     });
 }
+
+#[test]
+fn symbol_state_isolates_interleaved_windows_and_rolls_back_failed_callbacks() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("symbol_state.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now,
+        };
+        let mut step = |symbol: &str, venue: Venue, price: Decimal| {
+            let MarketEvent::Trade(mut trade) = sample_trade_event() else {
+                panic!("trade fixture")
+            };
+            trade.symbol = symbol.into();
+            trade.venue = venue;
+            trade.price = price;
+            strategy.on_market_event(&MarketEvent::Trade(trade), &ctx)
+        };
+        for (symbol, venue, price) in [
+            ("BTCUSDT", Venue::Binance, dec!(10)),
+            ("ETHUSDT", Venue::Binance, dec!(100)),
+            ("BTCUSDT", Venue::Okx, dec!(1000)),
+            ("BTCUSDT", Venue::Binance, dec!(20)),
+            ("ETHUSDT", Venue::Binance, dec!(200)),
+            ("BTCUSDT", Venue::Okx, dec!(2000)),
+            ("BTCUSDT", Venue::Binance, dec!(999)),
+            ("BTCUSDT", Venue::Binance, dec!(998)),
+        ] {
+            assert!(step(symbol, venue, price).is_empty());
+        }
+        for (symbol, venue, price, expected) in [
+            ("BTCUSDT", Venue::Binance, dec!(30), dec!(20)),
+            ("ETHUSDT", Venue::Binance, dec!(300), dec!(200)),
+            ("BTCUSDT", Venue::Okx, dec!(3000), dec!(2000)),
+            ("BTCUSDT", Venue::Binance, dec!(40), dec!(30)),
+        ] {
+            let intents = step(symbol, venue, price);
+            assert_eq!(intents.len(), 1, "{symbol} {venue:?}");
+            assert_eq!(intents[0].symbol, symbol);
+            assert_eq!(intents[0].venue, venue);
+            assert_eq!(intents[0].quantity, expected);
+        }
+        let mut second =
+            DriftScriptStrategy::from_file(&fixture_path("symbol_state.drift")).unwrap();
+        assert!(
+            second
+                .on_market_event(&sample_trade_event(), &ctx)
+                .is_empty()
+        );
+    });
+}
