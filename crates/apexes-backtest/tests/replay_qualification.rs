@@ -361,13 +361,40 @@ async fn mixed_perpetual_replay_repeats_funding_and_fees() {
         assert_eq!(summary.losses, 1);
         assert_eq!(summary.profit_factor, Some(Decimal::ZERO));
         assert_eq!(summary.open_quantity, Decimal::ZERO);
+        use apexes_backtest::funding_attribution::{FundingPriceSource, SymbolFunding};
+        let funding = report.funding.as_ref().unwrap();
+        assert_eq!(funding.rate_bps, Some(dec!(10)));
+        assert_eq!(funding.observed_settlement_passes, 2);
+        assert_eq!(funding.settlements.len(), 1);
+        let settlement = &funding.settlements[0];
+        assert_eq!(settlement.boundary, at(10000));
+        assert_eq!(settlement.observed_at, at(10000));
+        assert_eq!(settlement.movement.symbol, SYMBOL);
+        assert_eq!(settlement.movement.position_quantity, dec!(1));
+        assert_eq!(settlement.movement.price_source, FundingPriceSource::Mark);
+        assert_eq!(settlement.movement.notional, dec!(100));
+        assert_eq!(settlement.movement.balance_delta, dec!(-0.1));
+        let SymbolFunding::Available(totals) = &funding.per_symbol[SYMBOL] else {
+            panic!("missing funding totals")
+        };
+        assert_eq!(totals.quote_currency, "USDT");
+        assert_eq!(totals.income, Decimal::ZERO);
+        assert_eq!(totals.expenses, dec!(0.1));
+        assert_eq!(totals.net_funding, dec!(-0.1));
+        assert_eq!(totals.net_realized_plus_funding, Some(dec!(-1.299)));
+        assert_eq!(
+            report.overall.total_pnl,
+            totals.net_realized_plus_funding.unwrap()
+        );
+
         let mut legacy = serde_json::to_value(&report).unwrap();
         legacy
             .as_object_mut()
             .unwrap()
             .remove("execution_performance");
+        legacy.as_object_mut().unwrap().remove("funding");
         let legacy: BacktestReport = serde_json::from_value(legacy).unwrap();
-        assert!(legacy.execution_performance.is_none());
+        assert!(legacy.execution_performance.is_none() && legacy.funding.is_none());
 
         let hash = canonical_report_sha256(&report).unwrap();
         if let Some(previous) = &expected {
@@ -376,6 +403,10 @@ async fn mixed_perpetual_replay_repeats_funding_and_fees() {
         expected = Some(hash);
     }
     let no_funding = perpetual_run(None).await;
+    let disabled = no_funding.funding.as_ref().unwrap();
+    assert_eq!(disabled.rate_bps, None);
+    assert_eq!(disabled.observed_settlement_passes, 0);
+    assert!(disabled.settlements.is_empty() && disabled.per_symbol.is_empty());
     assert_eq!(no_funding.equity_curve.last().unwrap().1, dec!(9998.801));
     assert_ne!(
         Some(canonical_report_sha256(&no_funding).unwrap()),
@@ -609,4 +640,80 @@ async fn benchmark_requires_sealed_input_and_first_observed_trade() {
     assert!(
         matches!(report.benchmark,Some(BenchmarkEvidence::Unavailable{reason,..}) if reason.contains("verified"))
     );
+}
+
+#[tokio::test]
+async fn funding_attribution_preserves_gap_and_boundary_order_in_both_modes() {
+    use apexes_backtest::funding_attribution::{FundingPriceSource, SymbolFunding};
+    let gap = 28_820_000; // First observation after both 08:00 and 16:00.
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(0, dec!(100), "open"),
+        depth(500, 2, dec!(100)),
+        tick(1000),
+        mark(gap),
+        depth(gap + 1000, 3, dec!(100)),
+        trade(gap + 1000, dec!(99), "close"),
+        tick(gap + 1500),
+    ];
+    // Use a manifest whose streams actually exist; no bars in this fixture.
+    for causal in [false, true] {
+        let r = Registry::new();
+        let manifest = seal_dataset(
+            DatasetDefinition {
+                dataset_id: "funding-gap".into(),
+                version: "v1".into(),
+                source_id: "synthetic".into(),
+                start_day: at(0).date_naive(),
+                end_day_exclusive: at(0).date_naive().succ_opt().unwrap(),
+                streams: [
+                    StreamKind::Trade,
+                    StreamKind::Depth,
+                    StreamKind::Tick,
+                    StreamKind::MarkPrice,
+                ]
+                .into_iter()
+                .map(|kind| DatasetStream {
+                    symbol: SYMBOL.into(),
+                    venue: Venue::Binance,
+                    kind,
+                })
+                .collect(),
+            },
+            &events,
+        )
+        .unwrap();
+        r.register::<_, ()>((), manifest).unwrap();
+        if causal {
+            r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+                .unwrap();
+        }
+        let report = run_backtest(
+            configuration(AssetClass::Perpetual, Some(dec!(-10))),
+            &r,
+            InMemoryMarketDataSource::new(events.clone()),
+            Perpetual,
+        )
+        .await
+        .unwrap();
+        let funding = report.funding.as_ref().unwrap();
+        assert_eq!(funding.observed_settlement_passes, 2);
+        assert_eq!(
+            funding.settlements.len(),
+            1,
+            "do not invent missed boundary settlements"
+        );
+        let settlement = &funding.settlements[0];
+        assert_eq!(settlement.boundary, at(28_810_000));
+        assert_eq!(settlement.observed_at, at(gap));
+        assert_eq!(settlement.movement.price_source, FundingPriceSource::Mark);
+        assert_eq!(settlement.movement.balance_delta, dec!(0.1));
+        let SymbolFunding::Available(totals) = &funding.per_symbol[SYMBOL] else {
+            panic!("expected funding totals")
+        };
+        assert_eq!(totals.income, dec!(0.1));
+        assert_eq!(totals.expenses, Decimal::ZERO);
+        assert_eq!(totals.net_realized_plus_funding, Some(dec!(-1.099)));
+        assert_eq!(report.overall.total_pnl, dec!(-1.099));
+    }
 }

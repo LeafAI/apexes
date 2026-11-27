@@ -6,7 +6,7 @@ use crate::order_executor_adapter::{
     BacktestLiquidationPolicy, MatchingEngineOrderExecutor, NeverFillSupplementalFillSource,
 };
 use crate::report::BacktestReport;
-use crate::unified_loop::{UnifiedLoopConfig, run_unified_event_loop};
+use crate::unified_loop::{UnifiedLoopConfig, run_unified_event_loop_with_funding};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
 use apexes_ems::Ems;
@@ -63,7 +63,7 @@ pub struct BacktestConfig {
 /// portfolio state via a `PortfolioLedger`, and producing a
 /// `BacktestReport` with overall + per-symbol + per-venue performance
 /// summaries (design spec §8). Internally delegates to the shared
-/// `crate::unified_loop::run_unified_event_loop` core (see that module's
+/// `crate::unified_loop::run_unified_event_loop_with_funding` core (see that module's
 /// docs) -- this function's job is to adapt
 /// `HistoricalMarketDataSource`'s pre-loaded `Vec<MarketEvent>` into the
 /// `Stream` the shared core expects, to build the backtest-flavored
@@ -299,7 +299,7 @@ pub async fn run_backtest(
         symbol_rules: HashMap::new(),
     };
 
-    let mut report = run_unified_event_loop(
+    let mut report = run_unified_event_loop_with_funding(
         unified_loop_config,
         event_stream,
         clock,
@@ -310,12 +310,18 @@ pub async fn run_backtest(
         strategy,
         None,
         latency,
+        Some(crate::funding_attribution::FundingReport::new(
+            funding_rate_bps,
+        )),
     )
     .await?;
     report.execution_performance = Some(crate::execution_performance::evaluate(
         &performance_instruments,
         &report.trades,
     ));
+    if let (Some(funding), Some(execution)) = (&mut report.funding, &report.execution_performance) {
+        funding.reconcile(execution);
+    }
     report.drawdown_duration = Some(crate::drawdown_duration::evaluate(&report.equity_curve));
     report.benchmark = benchmark.map(|(policy, reference)| policy.finish(reference, &report));
     report.historical_dataset = historical_dataset;

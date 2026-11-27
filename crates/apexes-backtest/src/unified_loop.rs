@@ -163,6 +163,35 @@ pub struct UnifiedLoopConfig {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_unified_event_loop(
     config: UnifiedLoopConfig,
+    market_events: impl Stream<Item = MarketEvent> + Unpin,
+    clock: BacktestClock,
+    executor: Arc<dyn OrderExecutor>,
+    liquidation_policy: Arc<dyn LiquidationPolicy>,
+    supplemental_fills: impl SupplementalFillSource,
+    ems: Arc<dyn Ems>,
+    strategy: impl Strategy,
+    stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
+    latency_model: Option<LatencyModel>,
+) -> Result<BacktestReport, ApexesError> {
+    run_unified_event_loop_with_funding(
+        config,
+        market_events,
+        clock,
+        executor,
+        liquidation_policy,
+        supplemental_fills,
+        ems,
+        strategy,
+        stop_signal,
+        latency_model,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_unified_event_loop_with_funding(
+    config: UnifiedLoopConfig,
     mut market_events: impl Stream<Item = MarketEvent> + Unpin,
     mut clock: BacktestClock,
     executor: Arc<dyn OrderExecutor>,
@@ -172,6 +201,7 @@ pub async fn run_unified_event_loop(
     mut strategy: impl Strategy,
     mut stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
     latency_model: Option<LatencyModel>,
+    mut funding_report: Option<crate::funding_attribution::FundingReport>,
 ) -> Result<BacktestReport, ApexesError> {
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
@@ -346,7 +376,7 @@ pub async fn run_unified_event_loop(
                     // this observed event, not orders that will arrive on it.
                     let boundary = last_funding_boundary(timestamp);
                     if last_funding_settlement != Some(boundary) {
-                        ledger.apply_funding_payments(&mark_prices, &funding_cost_model)?;
+                        crate::funding_attribution::settle(&mut ledger, &mark_prices, &funding_cost_model, boundary, timestamp, funding_report.as_mut())?;
                         last_funding_settlement = Some(boundary);
                     }
                     // Sample current marked equity once before matching.
@@ -526,7 +556,7 @@ pub async fn run_unified_event_loop(
                 // one new boundary.
                 let current_funding_boundary = last_funding_boundary(timestamp);
                 if last_funding_settlement != Some(current_funding_boundary) {
-                    ledger.apply_funding_payments(&mark_prices, &funding_cost_model)?;
+                    crate::funding_attribution::settle(&mut ledger, &mark_prices, &funding_cost_model, current_funding_boundary, timestamp, funding_report.as_mut())?;
                     last_funding_settlement = Some(current_funding_boundary);
                 }
 
@@ -1197,6 +1227,7 @@ pub async fn run_unified_event_loop(
         execution_performance: None,
         drawdown_duration: None,
         benchmark: None,
+        funding: funding_report,
     })
 }
 
