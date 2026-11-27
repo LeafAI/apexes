@@ -273,3 +273,186 @@ async fn run_backtest_with_empty_margin_tiers_never_liquidates() {
         "empty margin_tiers must be a silent no-op: only the opening fill"
     );
 }
+
+#[tokio::test]
+async fn simultaneous_cross_liquidations_reproduce_execution_and_report() {
+    use apexes_backtest::historical_dataset::{
+        DatasetDefinition, DatasetStream, StreamKind, seal_dataset,
+    };
+    use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
+    struct Both(bool);
+    impl Strategy for Both {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if self.0 || !matches!(event, MarketEvent::Trade(_)) {
+                return vec![];
+            }
+            self.0 = true;
+            let mut btc = LeveragedBuyOnce { bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            btc.margin_mode = Some(MarginMode::Cross);
+            let mut eth = btc.clone();
+            eth.symbol = "ETHUSDT".into();
+            // Reverse alphabetical admission: liquidation order is independent.
+            vec![eth, btc]
+        }
+    }
+    let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let events = vec![
+        MarketEvent::Depth(DepthUpdate {
+            symbol: "ETHUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(10),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(100),
+                quantity: dec!(10),
+            }],
+            sequence: None,
+            source_range: None,
+            is_snapshot: true,
+            timestamp: at,
+        }),
+        MarketEvent::Depth(DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(10),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(100),
+                quantity: dec!(10),
+            }],
+            sequence: None,
+            source_range: None,
+            is_snapshot: true,
+            timestamp: at,
+        }),
+        MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(100),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: at + chrono::Duration::seconds(1),
+        }),
+        MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "ETHUSDT".into(),
+            venue: Venue::Binance,
+            mark_price: dec!(100),
+            timestamp: at + chrono::Duration::seconds(2),
+        }),
+        MarketEvent::MarkPrice(MarkPriceUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            mark_price: dec!(100),
+            timestamp: at + chrono::Duration::seconds(3),
+        }),
+    ];
+    let start = at.date_naive();
+    let end = start.succ_opt().unwrap();
+    let streams = vec![
+        ("BTCUSDT", StreamKind::Depth),
+        ("ETHUSDT", StreamKind::Depth),
+        ("BTCUSDT", StreamKind::Trade),
+        ("BTCUSDT", StreamKind::MarkPrice),
+        ("ETHUSDT", StreamKind::MarkPrice),
+    ]
+    .into_iter()
+    .map(|(symbol, kind)| DatasetStream {
+        symbol: symbol.into(),
+        venue: Venue::Binance,
+        kind,
+    })
+    .collect();
+    let manifest = seal_dataset(
+        DatasetDefinition {
+            dataset_id: "cross-liquidation".into(),
+            version: "v1".into(),
+            source_id: "synthetic".into(),
+            start_day: start,
+            end_day_exclusive: end,
+            streams,
+        },
+        &events,
+    )
+    .unwrap();
+    let registry = apexes_core::registry::Registry::new();
+    registry.register::<_, ()>((), manifest).unwrap();
+    registry
+        .register::<_, ()>(
+            (),
+            ReplayIdentityPolicy {
+                namespace: uuid::Uuid::from_u128(63),
+            },
+        )
+        .unwrap();
+    let mut expected = None;
+    for run in 0..10 {
+        let btc = btcusdt_perpetual_instrument();
+        let mut eth = btc.clone();
+        eth.symbol = "ETHUSDT".into();
+        eth.base_currency = Some("ETH".into());
+        let instruments = if run % 2 == 0 {
+            vec![btc, eth]
+        } else {
+            vec![eth, btc]
+        };
+        let config = BacktestConfig {
+            instruments,
+            date_range: start..end,
+            initial_balances: HashMap::from([("USDT".into(), dec!(20.5))]),
+            cost_model: CostModel {
+                fee_schedule: Box::new(FlatFeeSchedule {
+                    maker_bps: dec!(0),
+                    taker_bps: dec!(0),
+                }),
+                funding_rate_bps: None,
+            },
+            speed: ReplaySpeed::AsFastAsPossible,
+            queue_position_factor: dec!(0),
+            risk_free_return: dec!(0),
+            margin_tiers: HashMap::from([
+                ("ETHUSDT".into(), single_tier_table()),
+                ("BTCUSDT".into(), single_tier_table()),
+            ]),
+            market_condition_config: None,
+            control: None,
+        };
+        let report = run_backtest(
+            config,
+            &registry,
+            InMemoryMarketDataSource::new(events.clone()),
+            Both(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report
+                .trades
+                .iter()
+                .map(|f| (f.symbol.as_str(), f.side))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ETHUSDT", Side::Buy),
+                ("BTCUSDT", Side::Buy),
+                ("BTCUSDT", Side::Sell),
+                ("ETHUSDT", Side::Sell)
+            ]
+        );
+        assert_eq!(report.equity_curve.last().unwrap().1, dec!(18.5));
+        let hash = canonical_report_sha256(&report).unwrap();
+        if let Some(previous) = &expected {
+            assert_eq!(&hash, previous);
+        }
+        expected = Some(hash);
+    }
+}

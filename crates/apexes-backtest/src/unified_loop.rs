@@ -1057,7 +1057,7 @@ pub async fn run_unified_event_loop(
                                     &last_prices,
                                     &instruments_by_symbol,
                                 ));
-                                let realized: Decimal = ledger.realized_pnl().values().copied().sum();
+                                let realized: Decimal = crate::stable_order::entries(ledger.realized_pnl()).into_iter().map(|(_, value)| *value).sum();
                                 (
                                     Some({
                                         let mut summary = tracker.summary_at(
@@ -1439,7 +1439,7 @@ fn exposure_inputs(
 ) -> (Decimal, Decimal) {
     let mut gross = Decimal::ZERO;
     let mut largest = Decimal::ZERO;
-    for position in positions.values() {
+    for (_, position) in crate::stable_order::entries(positions) {
         let quantity = position.quantity.abs();
         if quantity.is_zero() {
             continue;
@@ -1634,7 +1634,8 @@ async fn refresh_open_parent_orders(
     ems: &dyn Ems,
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
 ) {
-    let ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
+    let mut ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
+    ids.sort_unstable_by_key(|id| id.0);
     for id in ids {
         match ems.parent_order_status(id).await {
             Ok(Some(status)) => {
