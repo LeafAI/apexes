@@ -88,6 +88,8 @@ pub struct VerifiedDataset {
     pub upstream_completeness_verified: bool,
     #[serde(default)]
     pub source_coverage: Option<crate::source_coverage::CoverageReport>,
+    #[serde(default)]
+    pub depth_ranges: Option<crate::depth_ranges::DepthRangeReport>,
 }
 
 #[derive(Default)]
@@ -296,6 +298,7 @@ impl DatasetManifest {
                 .count(),
             upstream_completeness_verified: false,
             source_coverage: None,
+            depth_ranges: None,
         })
     }
 }

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum DepthSequence {
     SnapshotOnly,
     Contiguous,
+    /// Historical runner only, after verifying the entire sealed range evidence.
+    VerifiedRanges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +36,11 @@ impl SimulatedDepthPolicy {
                     reason: e.to_string(),
                 })?;
         if let Some(p) = policy {
+            if p.sequence == DepthSequence::VerifiedRanges {
+                return Err(ApexesError::InvalidBacktestConfig {
+                    reason: "verified_ranges is selected by historical replay after range verification, not by registry policy".into(),
+                });
+            }
             p.validate()
                 .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
         }

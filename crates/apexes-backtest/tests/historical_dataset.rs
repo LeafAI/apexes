@@ -972,3 +972,397 @@ fn cli_normalizes_without_mutating_input_and_refuses_conflicts() {
     assert!(output.stdout.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+use apexes_backtest::depth_ranges::{
+    DepthRange, DepthRangeEvidence, DepthStreamRanges, RangeContract,
+};
+
+fn range_fixture(
+    contract: RangeContract,
+) -> (DatasetManifest, Vec<MarketEvent>, DepthRangeEvidence) {
+    let mut d = definition();
+    d.streams[0].kind = StreamKind::Depth;
+    let depth = |seq, snapshot, ms| {
+        MarketEvent::Depth(apexes_core::DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![apexes_core::PriceLevel {
+                price: dec!(99),
+                quantity: dec!(2),
+            }],
+            asks: vec![apexes_core::PriceLevel {
+                price: dec!(101),
+                quantity: dec!(2),
+            }],
+            sequence: Some(seq),
+            is_snapshot: snapshot,
+            timestamp: day(1).and_hms_opt(0, 0, 0).unwrap().and_utc()
+                + chrono::TimeDelta::milliseconds(ms),
+        })
+    };
+    let events = vec![
+        depth(100, true, 0),
+        depth(103, false, 500),
+        tick(1),
+        depth(110, false, 1500),
+    ];
+    let manifest = seal_dataset(d, &events).unwrap();
+    let (first, second) = match contract {
+        RangeContract::InclusiveNext => ((99, None), (104, None)),
+        RangeContract::PreviousFinal => ((99, Some(98)), (108, Some(103))),
+    };
+    let ranges = DepthRangeEvidence {
+        schema_version: 1,
+        dataset_id: manifest.definition.dataset_id.clone(),
+        dataset_version: manifest.definition.version.clone(),
+        source_id: manifest.definition.source_id.clone(),
+        replay_sha256: manifest.replay_sha256.clone(),
+        streams: vec![DepthStreamRanges {
+            stream: manifest.definition.streams[0].clone(),
+            contract,
+            increments: vec![
+                DepthRange {
+                    event_index: 1,
+                    first: first.0,
+                    last: 103,
+                    previous_final: first.1,
+                },
+                DepthRange {
+                    event_index: 3,
+                    first: second.0,
+                    last: 110,
+                    previous_final: second.1,
+                },
+            ],
+        }],
+    };
+    (manifest, events, ranges)
+}
+
+#[test]
+fn ranges_accept_overlapping_and_batched_updates_with_explicit_contracts() {
+    for contract in [RangeContract::InclusiveNext, RangeContract::PreviousFinal] {
+        let (manifest, events, ranges) = range_fixture(contract);
+        let verified = ranges.verify_dataset(&manifest, &events).unwrap();
+        let report = verified.depth_ranges.unwrap();
+        assert_eq!(
+            (
+                report.streams_verified,
+                report.snapshots_verified,
+                report.increments_verified
+            ),
+            (1, 1, 2)
+        );
+        assert!(!report.independently_attested);
+        assert!(!verified.upstream_completeness_verified);
+        assert_eq!(report.evidence, ranges);
+    }
+}
+
+#[test]
+fn ranges_refuse_initial_bridge_gap_and_later_gap() {
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::InclusiveNext);
+    ranges.streams[0].increments[0].first = 102;
+    assert!(
+        ranges
+            .verify_dataset(&manifest, &events)
+            .unwrap_err()
+            .contains("range gap")
+    );
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::InclusiveNext);
+    ranges.streams[0].increments[1].first = 105;
+    assert!(
+        ranges
+            .verify_dataset(&manifest, &events)
+            .unwrap_err()
+            .contains("range gap")
+    );
+}
+
+#[test]
+fn previous_final_requires_initial_bridge_and_exact_previous_link() {
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::PreviousFinal);
+    ranges.streams[0].increments[0].first = 101;
+    assert!(
+        ranges
+            .verify_dataset(&manifest, &events)
+            .unwrap_err()
+            .contains("bridge snapshot")
+    );
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::PreviousFinal);
+    ranges.streams[0].increments[1].previous_final = Some(102);
+    assert!(
+        ranges
+            .verify_dataset(&manifest, &events)
+            .unwrap_err()
+            .contains("link mismatch")
+    );
+    ranges.streams[0].increments[1].previous_final = None;
+    assert!(
+        ranges
+            .verify_dataset(&manifest, &events)
+            .unwrap_err()
+            .contains("missing previous-final")
+    );
+}
+
+#[test]
+fn ranges_require_exact_event_binding_and_complete_metadata() {
+    let (manifest, events, ranges) = range_fixture(RangeContract::InclusiveNext);
+    let mut bad = ranges.clone();
+    bad.streams[0].increments[1].event_index = 2;
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+    let mut bad = ranges.clone();
+    bad.streams[0].increments[0].last = 102;
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+    let mut bad = ranges.clone();
+    bad.streams[0].increments.pop();
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+    let mut bad = ranges.clone();
+    let extra = bad.streams[0].increments[0].clone();
+    bad.streams[0].increments.push(extra);
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+    let mut bad = ranges.clone();
+    bad.replay_sha256 = "0".repeat(64);
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+    let mut bad = ranges;
+    bad.streams.clear();
+    assert!(bad.verify_dataset(&manifest, &events).is_err());
+}
+
+#[test]
+fn ranges_refuse_snapshot_jumps_and_invalidation_even_with_resealed_input() {
+    let (manifest, mut events, mut ranges) = range_fixture(RangeContract::InclusiveNext);
+    if let MarketEvent::Depth(d) = &mut events[3] {
+        d.is_snapshot = true;
+    }
+    let m = seal_dataset(manifest.definition.clone(), &events).unwrap();
+    ranges.replay_sha256 = m.replay_sha256.clone();
+    ranges.streams[0].increments.pop();
+    assert!(
+        ranges
+            .verify_dataset(&m, &events)
+            .unwrap_err()
+            .contains("snapshot jumps")
+    );
+    if let MarketEvent::Depth(d) = &mut events[3] {
+        d.sequence = None;
+        d.bids.clear();
+        d.asks.clear();
+    }
+    let m = seal_dataset(manifest.definition, &events).unwrap();
+    ranges.replay_sha256 = m.replay_sha256.clone();
+    assert!(
+        ranges
+            .verify_dataset(&m, &events)
+            .unwrap_err()
+            .contains("invalidation")
+    );
+}
+
+#[test]
+fn repeated_same_id_snapshot_cannot_reset_previous_final_chain() {
+    let (manifest, mut events, mut ranges) = range_fixture(RangeContract::PreviousFinal);
+    let mut snap = events[1].clone();
+    if let MarketEvent::Depth(d) = &mut snap {
+        d.is_snapshot = true;
+    }
+    events.insert(2, snap);
+    let m = seal_dataset(manifest.definition, &events).unwrap();
+    ranges.replay_sha256 = m.replay_sha256.clone();
+    ranges.streams[0].increments[1].event_index = 4;
+    assert!(ranges.verify_dataset(&m, &events).is_ok());
+    ranges.streams[0].increments[1].first = 102;
+    ranges.streams[0].increments[1].previous_final = Some(102);
+    assert!(
+        ranges
+            .verify_dataset(&m, &events)
+            .unwrap_err()
+            .contains("link mismatch")
+    );
+}
+
+struct BuyOnTick;
+impl Strategy for BuyOnTick {
+    fn on_market_event(&mut self, event: &MarketEvent, _: &StrategyContext) -> Vec<OrderIntent> {
+        if !matches!(event, MarketEvent::Tick(_)) {
+            return vec![];
+        }
+        vec![OrderIntent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
+            side: Side::Buy,
+            order_type: apexes_core::OrderType::Market,
+            quantity: dec!(1),
+            price: None,
+            stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: None,
+            margin_mode: None,
+        }]
+    }
+}
+
+#[tokio::test]
+async fn verified_ranges_enable_strict_replay_without_weakening_freshness() {
+    use apexes_backtest::{DepthSequence, SimulatedDepthPolicy};
+    let (manifest, events, ranges) = range_fixture(RangeContract::InclusiveNext);
+    let reg = registry(manifest.clone());
+    reg.register::<DepthRangeEvidence, ()>((), ranges.clone())
+        .unwrap();
+    reg.register::<SimulatedDepthPolicy, ()>(
+        (),
+        SimulatedDepthPolicy {
+            max_age_ms: 1000,
+            sequence: DepthSequence::Contiguous,
+        },
+    )
+    .unwrap();
+    let report = run_backtest(
+        config(),
+        &reg,
+        InMemoryMarketDataSource::new(events.clone()),
+        BuyOnTick,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].price, dec!(101));
+    assert_eq!(
+        report.simulated_depth.unwrap().sequence,
+        DepthSequence::VerifiedRanges
+    );
+    assert!(report.historical_dataset.unwrap().depth_ranges.is_some());
+    let reg = registry(manifest.clone());
+    reg.register::<SimulatedDepthPolicy, ()>(
+        (),
+        SimulatedDepthPolicy {
+            max_age_ms: 1000,
+            sequence: DepthSequence::Contiguous,
+        },
+    )
+    .unwrap();
+    let report = run_backtest(
+        config(),
+        &reg,
+        InMemoryMarketDataSource::new(events.clone()),
+        BuyOnTick,
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let reg = registry(manifest);
+    reg.register::<DepthRangeEvidence, ()>((), ranges).unwrap();
+    reg.register::<SimulatedDepthPolicy, ()>(
+        (),
+        SimulatedDepthPolicy {
+            max_age_ms: 100,
+            sequence: DepthSequence::Contiguous,
+        },
+    )
+    .unwrap();
+    let report = run_backtest(
+        config(),
+        &reg,
+        InMemoryMarketDataSource::new(events),
+        BuyOnTick,
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+}
+
+#[tokio::test]
+async fn range_verification_failure_or_direct_mode_selection_prevents_strategy_execution() {
+    use apexes_backtest::{DepthSequence, SimulatedDepthPolicy};
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::InclusiveNext);
+    ranges.streams[0].increments[1].first = 105;
+    let count = Arc::new(AtomicUsize::new(0));
+    let reg = registry(manifest.clone());
+    reg.register::<DepthRangeEvidence, ()>((), ranges.clone())
+        .unwrap();
+    assert!(
+        run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events.clone()),
+            CountEvents(count.clone())
+        )
+        .await
+        .is_err()
+    );
+    let reg = apexes_core::registry::Registry::new();
+    reg.register::<DepthRangeEvidence, ()>((), ranges).unwrap();
+    assert!(
+        run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events.clone()),
+            CountEvents(count.clone())
+        )
+        .await
+        .is_err()
+    );
+    let reg = registry(manifest);
+    reg.register::<SimulatedDepthPolicy, ()>(
+        (),
+        SimulatedDepthPolicy {
+            max_age_ms: 1000,
+            sequence: DepthSequence::VerifiedRanges,
+        },
+    )
+    .unwrap();
+    assert!(
+        run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events),
+            CountEvents(count.clone())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn cli_verifies_range_evidence_without_modifying_input() {
+    let (manifest, events, mut ranges) = range_fixture(RangeContract::InclusiveNext);
+    let dir = std::env::temp_dir().join(format!("apexes-ranges-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let mp = dir.join("manifest.json");
+    let ep = dir.join("events.json");
+    let rp = dir.join("ranges.json");
+    let raw = serde_json::to_vec(&events).unwrap();
+    std::fs::write(&mp, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::write(&ep, &raw).unwrap();
+    std::fs::write(&rp, serde_json::to_vec(&ranges).unwrap()).unwrap();
+    let verify = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+            .arg("verify-ranges")
+            .arg(&mp)
+            .arg(&ep)
+            .arg(&rp)
+            .output()
+            .unwrap()
+    };
+    let output = verify();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::to_value(ranges.verify_dataset(&manifest, &events).unwrap()).unwrap()
+    );
+    ranges.streams[0].increments[1].first = 105;
+    std::fs::write(&rp, serde_json::to_vec(&ranges).unwrap()).unwrap();
+    let output = verify();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(ep).unwrap(), raw);
+    std::fs::remove_dir_all(dir).unwrap();
+}
