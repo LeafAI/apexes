@@ -41,6 +41,10 @@ pub struct BacktestReport {
     /// Historical closing-fill metrics, not legacy equity-point statistics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_performance: Option<crate::execution_performance::ExecutionPerformance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawdown_duration: Option<crate::drawdown_duration::DrawdownEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<crate::benchmark::BenchmarkEvidence>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/
