@@ -49,6 +49,7 @@ pub mod spot_accounting;
 
 // Populated in Tasks 8-11 (walk_book, MatchingEngine core, limit orders, Stop/StopLimit).
 pub mod matching_engine;
+pub mod queue_calibration;
 
 // Populated in Task 12.
 pub mod clock;

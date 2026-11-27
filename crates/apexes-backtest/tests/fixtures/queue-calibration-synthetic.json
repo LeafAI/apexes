@@ -1,0 +1,176 @@
+{
+  "dataset_id": "synthetic-isolated-maker",
+  "dataset_version": "1",
+  "market_source": "synthetic depth/trade fixtures",
+  "order_fill_source": "synthetic maker labels",
+  "evidence": "synthetic",
+  "venue": "Binance",
+  "symbol": "BTCUSDT",
+  "holdout_start": "2026-01-01T00:00:25Z",
+  "max_snapshot_age_ms": 100,
+  "factors": [
+    "0",
+    "0.25",
+    "0.5",
+    "0.75",
+    "1"
+  ],
+  "observations": [
+    {
+      "order_id": "order-1",
+      "accepted_at": "2026-01-01T00:00:10Z",
+      "observed_until": "2026-01-01T00:00:13Z",
+      "side": "Buy",
+      "limit_price": "100",
+      "quantity": "4",
+      "observed_filled": "2",
+      "snapshot": {
+        "symbol": "BTCUSDT",
+        "venue": "Binance",
+        "bids": [
+          {
+            "price": "100",
+            "quantity": "8"
+          }
+        ],
+        "asks": [
+          {
+            "price": "101",
+            "quantity": "8"
+          }
+        ],
+        "sequence": 1,
+        "is_snapshot": true,
+        "timestamp": "2026-01-01T00:00:09.950000Z"
+      },
+      "trades": [
+        {
+          "symbol": "BTCUSDT",
+          "venue": "Binance",
+          "price": "100",
+          "quantity": "6",
+          "side": "Sell",
+          "trade_id": "trade-1",
+          "timestamp": "2026-01-01T00:00:11Z"
+        }
+      ]
+    },
+    {
+      "order_id": "order-2",
+      "accepted_at": "2026-01-01T00:00:20Z",
+      "observed_until": "2026-01-01T00:00:23Z",
+      "side": "Sell",
+      "limit_price": "101",
+      "quantity": "4",
+      "observed_filled": "1",
+      "snapshot": {
+        "symbol": "BTCUSDT",
+        "venue": "Binance",
+        "bids": [
+          {
+            "price": "100",
+            "quantity": "8"
+          }
+        ],
+        "asks": [
+          {
+            "price": "101",
+            "quantity": "8"
+          }
+        ],
+        "sequence": 2,
+        "is_snapshot": true,
+        "timestamp": "2026-01-01T00:00:19.950000Z"
+      },
+      "trades": [
+        {
+          "symbol": "BTCUSDT",
+          "venue": "Binance",
+          "price": "101",
+          "quantity": "5",
+          "side": "Buy",
+          "trade_id": "trade-2",
+          "timestamp": "2026-01-01T00:00:21Z"
+        }
+      ]
+    },
+    {
+      "order_id": "order-3",
+      "accepted_at": "2026-01-01T00:00:30Z",
+      "observed_until": "2026-01-01T00:00:33Z",
+      "side": "Sell",
+      "limit_price": "101",
+      "quantity": "4",
+      "observed_filled": "3",
+      "snapshot": {
+        "symbol": "BTCUSDT",
+        "venue": "Binance",
+        "bids": [
+          {
+            "price": "100",
+            "quantity": "8"
+          }
+        ],
+        "asks": [
+          {
+            "price": "101",
+            "quantity": "8"
+          }
+        ],
+        "sequence": 3,
+        "is_snapshot": true,
+        "timestamp": "2026-01-01T00:00:29.950000Z"
+      },
+      "trades": [
+        {
+          "symbol": "BTCUSDT",
+          "venue": "Binance",
+          "price": "101",
+          "quantity": "7",
+          "side": "Buy",
+          "trade_id": "trade-3",
+          "timestamp": "2026-01-01T00:00:31Z"
+        }
+      ]
+    },
+    {
+      "order_id": "order-4",
+      "accepted_at": "2026-01-01T00:00:40Z",
+      "observed_until": "2026-01-01T00:00:43Z",
+      "side": "Buy",
+      "limit_price": "100",
+      "quantity": "4",
+      "observed_filled": "0",
+      "snapshot": {
+        "symbol": "BTCUSDT",
+        "venue": "Binance",
+        "bids": [
+          {
+            "price": "100",
+            "quantity": "8"
+          }
+        ],
+        "asks": [
+          {
+            "price": "101",
+            "quantity": "8"
+          }
+        ],
+        "sequence": 4,
+        "is_snapshot": true,
+        "timestamp": "2026-01-01T00:00:39.950000Z"
+      },
+      "trades": [
+        {
+          "symbol": "BTCUSDT",
+          "venue": "Binance",
+          "price": "100",
+          "quantity": "3",
+          "side": "Sell",
+          "trade_id": "trade-4",
+          "timestamp": "2026-01-01T00:00:41Z"
+        }
+      ]
+    }
+  ]
+}
