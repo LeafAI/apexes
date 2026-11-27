@@ -38,6 +38,14 @@ impl InMemoryMarketDataSource {
         events.sort_by_key(event_timestamp);
         Self { events }
     }
+
+    /// Preserve the exact observation-ordered export, including equal-time
+    /// ties. Never repair the order of a sealed sequence.
+    pub fn from_observation_ordered(events: Vec<MarketEvent>) -> Result<Self, ApexesError> {
+        crate::replay_identity::validate_observation_order(&events, true)
+            .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
+        Ok(Self { events })
+    }
 }
 
 impl HistoricalMarketDataSource for InMemoryMarketDataSource {
@@ -112,6 +120,15 @@ pub(crate) fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::U
         MarketEvent::Bar(bar) => bar.open_time,
         MarketEvent::Trade(trade) => trade.timestamp,
         MarketEvent::MarkPrice(mark_price) => mark_price.timestamp,
+    }
+}
+
+/// Earliest causal historical observation time. This is not an attested
+/// live arrival time; the historical bar model exposes OHLC at close.
+pub(crate) fn observation_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
+    match event {
+        MarketEvent::Bar(bar) => bar.close_time,
+        _ => event_timestamp(event),
     }
 }
 

@@ -239,6 +239,13 @@ impl SourceCoverage {
         events: &[MarketEvent],
     ) -> Result<CoverageReport, String> {
         let d = &manifest.definition;
+        if manifest.schema_version == crate::historical_dataset::OBSERVATION_SCHEMA
+            && d.streams.iter().any(|s| s.kind == StreamKind::Bar)
+        {
+            return Err(
+                "schema 2 bar coverage requires an interval-specific receipt contract".into(),
+            );
+        }
         if self.schema_version != 1
             || self.dataset_id != d.dataset_id
             || self.dataset_version != d.version

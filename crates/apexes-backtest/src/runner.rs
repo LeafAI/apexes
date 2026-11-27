@@ -226,7 +226,15 @@ pub async fn run_backtest(
         });
     }
 
-    if replay_identity.is_some() {
+    let observation_manifest = manifest
+        .as_ref()
+        .is_some_and(|m| m.schema_version == crate::historical_dataset::OBSERVATION_SCHEMA);
+    if observation_manifest && latency.is_none() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "schema 2 observation manifest requires explicit event-time latency".into(),
+        });
+    }
+    if replay_identity.is_some() || observation_manifest {
         crate::replay_identity::validate_observation_order(&events, latency.is_some())
             .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
     }

@@ -941,3 +941,135 @@ fn drift_closed_bar_decisions_are_causal_and_trade_rate_independent() {
         }
     }
 }
+
+#[test]
+fn observation_manifest_replays_overlapping_bars_at_close_without_reordering_sealed_input() {
+    use apexes_backtest::historical_dataset::{OBSERVATION_SCHEMA, migrate_observation_dataset};
+    use apexes_strategy::drift_dsl::DriftScriptStrategy;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/causal_time.drift");
+    let mut wide = bar(10000);
+    if let MarketEvent::Bar(b) = &mut wide {
+        b.interval = BarInterval::OneMinute;
+        b.close_time = at(70000);
+    }
+    // Source order is bar-open order, with interleaved trade and depth.
+    let original = vec![
+        depth(0, 1, dec!(100)),
+        trade(0, dec!(100), "start"),
+        wide.clone(),
+        bar(11000),
+        trade(12000, dec!(100), "tie1"),
+        tick(12000),
+        tick(12500),
+        bar(13000),
+        tick(14500),
+        depth(70000, 2, dec!(100)),
+        tick(70500),
+    ];
+    let definition = DatasetDefinition {
+        dataset_id: "overlapping-bars".into(),
+        version: "v1".into(),
+        source_id: "synthetic".into(),
+        start_day: at(0).date_naive(),
+        end_day_exclusive: at(0).date_naive().succ_opt().unwrap(),
+        streams: [
+            StreamKind::Depth,
+            StreamKind::Trade,
+            StreamKind::Bar,
+            StreamKind::Tick,
+        ]
+        .into_iter()
+        .map(|kind| DatasetStream {
+            symbol: SYMBOL.into(),
+            venue: Venue::Binance,
+            kind,
+        })
+        .collect(),
+    };
+    let v1 = seal_dataset(definition, &original).unwrap();
+    let export = migrate_observation_dataset(&v1, &original, "v2").unwrap();
+    assert_eq!(export.manifest.schema_version, OBSERVATION_SCHEMA);
+    assert_eq!(export.source_replay_sha256, v1.replay_sha256);
+    assert_eq!(export.events.len(), original.len());
+    assert_eq!(export.events[2..5], original[3..6]);
+    assert_eq!(export.events[8], wide);
+    assert!(v1.verify(&export.events).is_err());
+    assert!(v1.verify(&original).is_ok());
+    let mut expected = None;
+    for _ in 0..10 {
+        let registry = Registry::new();
+        registry
+            .register::<_, ()>((), export.manifest.clone())
+            .unwrap();
+        registry
+            .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        registry
+            .register::<_, ()>(
+                (),
+                ReplayIdentityPolicy {
+                    namespace: uuid::Uuid::from_u128(72),
+                },
+            )
+            .unwrap();
+        let report = futures::executor::block_on(run_backtest(
+            configuration(AssetClass::Spot, None),
+            &registry,
+            InMemoryMarketDataSource::from_observation_ordered(export.events.clone()).unwrap(),
+            DriftScriptStrategy::from_file(&script).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            report
+                .trades
+                .iter()
+                .map(|f| f.filled_at)
+                .collect::<Vec<_>>(),
+            vec![at(12500), at(70500)]
+        );
+        assert_eq!(report.event_latency.as_ref().unwrap().regressing_events, 0);
+        assert_eq!(
+            report.historical_dataset.as_ref().unwrap().manifest,
+            export.manifest
+        );
+        let hash = canonical_report_sha256(&report).unwrap();
+        if let Some(prior) = &expected {
+            assert_eq!(&hash, prior);
+        }
+        expected = Some(hash);
+    }
+    let registry = Registry::new();
+    registry
+        .register::<_, ()>((), export.manifest.clone())
+        .unwrap();
+    let error = futures::executor::block_on(run_backtest(
+        configuration(AssetClass::Spot, None),
+        &registry,
+        InMemoryMarketDataSource::from_observation_ordered(export.events.clone()).unwrap(),
+        DriftScriptStrategy::from_file(&script).unwrap(),
+    ))
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires explicit event-time latency")
+    );
+    registry
+        .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    let error = futures::executor::block_on(run_backtest(
+        configuration(AssetClass::Spot, None),
+        &registry,
+        InMemoryMarketDataSource::new(export.events),
+        DriftScriptStrategy::from_file(&script).unwrap(),
+    ))
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("historical dataset verification failed")
+    );
+}
