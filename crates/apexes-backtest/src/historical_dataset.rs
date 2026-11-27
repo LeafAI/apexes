@@ -1,0 +1,291 @@
+//! F03.02/F03.03 — Versioned replay input identity and explicit UTC-day
+//! coverage. Sealing an export fingerprints its contents; it does not
+//! certify completeness of the upstream exchange feed.
+
+use crate::market_data_source::event_timestamp;
+use apexes_core::{Instrument, MarketEvent, Venue};
+use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+const SCHEMA: u32 = 1;
+const MAX_PARTITIONS: usize = 100_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    Trade,
+    Tick,
+    Depth,
+    Bar,
+    MarkPrice,
+}
+
+impl StreamKind {
+    fn of(event: &MarketEvent) -> Self {
+        match event {
+            MarketEvent::Trade(_) => Self::Trade,
+            MarketEvent::Tick(_) => Self::Tick,
+            MarketEvent::Depth(_) => Self::Depth,
+            MarketEvent::Bar(_) => Self::Bar,
+            MarketEvent::MarkPrice(_) => Self::MarkPrice,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetStream {
+    pub venue: Venue,
+    pub symbol: String,
+    pub kind: StreamKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetDefinition {
+    pub dataset_id: String,
+    pub version: String,
+    /// Non-secret source/export identifier; caller-declared, not attested.
+    pub source_id: String,
+    pub start_day: NaiveDate,
+    pub end_day_exclusive: NaiveDate,
+    pub streams: Vec<DatasetStream>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionEvidence {
+    pub stream: DatasetStream,
+    pub day: NaiveDate,
+    pub event_count: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetManifest {
+    pub schema_version: u32,
+    pub definition: DatasetDefinition,
+    /// One entry for every declared stream/day, including empty days.
+    pub partitions: Vec<PartitionEvidence>,
+    /// Hash over the entire ordered input, including inter-stream tie order.
+    pub replay_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedDataset {
+    pub manifest: DatasetManifest,
+    pub event_count: u64,
+    pub empty_partitions: usize,
+    /// Integrity against supplied manifest only; no independent upstream
+    /// attestation is implemented in this version.
+    pub upstream_completeness_verified: bool,
+}
+
+#[derive(Default)]
+struct EvidenceBuilder {
+    count: u64,
+    digest: Sha256,
+}
+
+impl EvidenceBuilder {
+    fn add(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let len = u64::try_from(bytes.len()).map_err(|_| "event size overflow")?;
+        self.count = self.count.checked_add(1).ok_or("event count overflow")?;
+        self.digest.update(len.to_be_bytes());
+        self.digest.update(bytes);
+        Ok(())
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.count, format!("{:x}", self.digest.finalize()))
+    }
+}
+
+type PartitionKey = (DatasetStream, NaiveDate);
+
+fn declared_keys(def: &DatasetDefinition) -> Result<Vec<PartitionKey>, String> {
+    if [&def.dataset_id, &def.version, &def.source_id]
+        .iter()
+        .any(|s| s.trim().is_empty())
+        || def.streams.is_empty()
+        || def.start_day >= def.end_day_exclusive
+    {
+        return Err("nonempty identity, streams and positive date range required".into());
+    }
+    let mut seen = HashSet::new();
+    for stream in &def.streams {
+        if stream.symbol.trim().is_empty() || !seen.insert(stream) {
+            return Err("empty or duplicate dataset stream".into());
+        }
+    }
+    let days = usize::try_from((def.end_day_exclusive - def.start_day).num_days())
+        .map_err(|_| "invalid dataset day range")?;
+    let size = days
+        .checked_mul(def.streams.len())
+        .filter(|n| *n <= MAX_PARTITIONS)
+        .ok_or("dataset exceeds partition limit")?;
+    let mut keys = Vec::with_capacity(size);
+    for stream in &def.streams {
+        let mut day = def.start_day;
+        while day < def.end_day_exclusive {
+            keys.push((stream.clone(), day));
+            day = day.succ_opt().ok_or("date overflow")?;
+        }
+    }
+    Ok(keys)
+}
+
+/// Fingerprint the exact serialized event sequence, with a big-endian
+/// u64 byte length before each event to unambiguously frame the digest.
+/// Schema v1 uses serde_json's MarketEvent serialization; changing that
+/// representation requires resealing under a new schema.
+pub fn seal_dataset(
+    definition: DatasetDefinition,
+    events: &[MarketEvent],
+) -> Result<DatasetManifest, String> {
+    let keys = declared_keys(&definition)?;
+    let mut partitions: HashMap<_, EvidenceBuilder> = keys
+        .iter()
+        .cloned()
+        .map(|key| (key, EvidenceBuilder::default()))
+        .collect();
+    let mut replay = EvidenceBuilder::default();
+    let mut previous = None;
+    let mut identified_trades = HashSet::new();
+    for event in events {
+        let timestamp = event_timestamp(event);
+        if previous.is_some_and(|at| timestamp < at) {
+            return Err("historical events regress in time".into());
+        }
+        previous = Some(timestamp);
+        let stream = DatasetStream {
+            venue: event.venue(),
+            symbol: event.symbol().into(),
+            kind: StreamKind::of(event),
+        };
+        let key = (stream, timestamp.date_naive());
+        let partition = partitions
+            .get_mut(&key)
+            .ok_or_else(|| format!("event outside declared stream/day: {key:?}"))?;
+        // A known trade ID is unique within the declared source's venue
+        // and symbol. Do not silently discard duplicates or guess IDs
+        // for trades without one.
+        if let MarketEvent::Trade(t) = event
+            && let Some(id) = &t.trade_id
+            && (id.trim().is_empty()
+                || !identified_trades.insert((t.venue, t.symbol.as_str(), id.as_str())))
+        {
+            return Err("empty or duplicate identified trade".into());
+        }
+        let bytes = serde_json::to_vec(event).map_err(|e| format!("serialize event: {e}"))?;
+        partition.add(&bytes)?;
+        replay.add(&bytes)?;
+    }
+    let partitions = keys
+        .into_iter()
+        .map(|key| {
+            let builder = partitions
+                .remove(&key)
+                .ok_or("internal missing partition")?;
+            let (event_count, sha256) = builder.finish();
+            Ok(PartitionEvidence {
+                stream: key.0,
+                day: key.1,
+                event_count,
+                sha256,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(DatasetManifest {
+        schema_version: SCHEMA,
+        definition,
+        partitions,
+        replay_sha256: replay.finish().1,
+    })
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl DatasetManifest {
+    /// Require the declared market universe and date range to match the
+    /// actual backtest configuration. Asset class cannot be inferred from
+    /// MarketEvent; ambiguous same-venue/symbol instruments are refused.
+    pub fn verify_scope(
+        &self,
+        instruments: &[Instrument],
+        range: &Range<NaiveDate>,
+    ) -> Result<(), String> {
+        let declared: HashSet<_> = self
+            .definition
+            .streams
+            .iter()
+            .map(|s| (s.venue, s.symbol.as_str()))
+            .collect();
+        let configured: HashSet<_> = instruments
+            .iter()
+            .map(|i| (i.venue, i.symbol.as_str()))
+            .collect();
+        if configured.len() != instruments.len()
+            || declared != configured
+            || self.definition.start_day != range.start
+            || self.definition.end_day_exclusive != range.end
+        {
+            return Err("dataset scope differs from backtest instruments or date range".into());
+        }
+        Ok(())
+    }
+
+    pub fn verify(&self, events: &[MarketEvent]) -> Result<VerifiedDataset, String> {
+        if self.schema_version != SCHEMA || !valid_hash(&self.replay_sha256) {
+            return Err("unsupported manifest schema or invalid replay digest".into());
+        }
+        let keys = declared_keys(&self.definition)?;
+        if self.partitions.len() != keys.len() {
+            return Err("missing or excess stream/day partition".into());
+        }
+        let mut expected = HashMap::new();
+        for partition in &self.partitions {
+            if !valid_hash(&partition.sha256)
+                || expected
+                    .insert((partition.stream.clone(), partition.day), partition)
+                    .is_some()
+            {
+                return Err("invalid digest or duplicate partition".into());
+            }
+        }
+        let actual = seal_dataset(self.definition.clone(), events)?;
+        for partition in &actual.partitions {
+            let key = (partition.stream.clone(), partition.day);
+            let Some(prior) = expected.get(&key) else {
+                return Err(format!("missing stream/day partition: {key:?}"));
+            };
+            if *prior != partition {
+                return Err(format!(
+                    "historical partition count or digest mismatch: {key:?}"
+                ));
+            }
+        }
+        if actual.replay_sha256 != self.replay_sha256 {
+            return Err("ordered replay digest mismatch".into());
+        }
+        Ok(VerifiedDataset {
+            manifest: self.clone(),
+            event_count: u64::try_from(events.len()).map_err(|_| "event count overflow")?,
+            empty_partitions: actual
+                .partitions
+                .iter()
+                .filter(|p| p.event_count == 0)
+                .count(),
+            upstream_completeness_verified: false,
+        })
+    }
+}

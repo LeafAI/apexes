@@ -105,7 +105,7 @@ impl HistoricalMarketDataSource for StorageMarketDataSource {
 /// Extracts the timestamp used for chronological ordering from any
 /// `MarketEvent` variant (Bar uses `open_time`, all others use
 /// `timestamp`).
-fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
     match event {
         MarketEvent::Tick(tick) => tick.timestamp,
         MarketEvent::Depth(depth) => depth.timestamp,

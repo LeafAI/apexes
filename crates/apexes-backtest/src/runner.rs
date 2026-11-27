@@ -107,6 +107,22 @@ pub async fn run_backtest(
         crate::EventLatencyPolicy::from_registry(registry)?.map(crate::LatencyModel::EventTime);
     let simulated_fees = config.cost_model.freeze_fees(&config.instruments)?;
     let events = market_data.events().await?;
+    let manifest = registry
+        .try_one::<crate::historical_dataset::DatasetManifest>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: format!("registry lookup for DatasetManifest failed: {error}"),
+        })?;
+    let historical_dataset = manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest.verify_scope(&config.instruments, &config.date_range)?;
+            manifest.verify(&events)
+        })
+        .transpose()
+        .map_err(|reason| ApexesError::InvalidBacktestConfig {
+            reason: format!("historical dataset verification failed: {reason}"),
+        })?;
+
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
 
@@ -176,6 +192,7 @@ pub async fn run_backtest(
         latency,
     )
     .await?;
+    report.historical_dataset = historical_dataset;
     report.simulated_fees = Some(simulated_fees);
     report.simulated_execution = Some(execution);
     report.simulated_depth = depth;
