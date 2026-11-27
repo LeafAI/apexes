@@ -239,7 +239,25 @@ pub async fn run_backtest(
             .map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
     }
 
-    let benchmark = crate::benchmark::BenchmarkPolicy::from_registry(registry)?.map(|policy| {
+    let benchmark_policy = crate::benchmark::BenchmarkPolicy::from_registry(registry)?;
+    let portfolio_policy =
+        crate::portfolio_benchmark::PortfolioBenchmarkPolicy::from_registry(registry)?;
+    if benchmark_policy.is_some() && portfolio_policy.is_some() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "single-instrument and portfolio benchmark policies are mutually exclusive"
+                .into(),
+        });
+    }
+    let portfolio_benchmark = portfolio_policy.map(|policy| {
+        let reference = policy.prepare(
+            &config,
+            &events,
+            historical_dataset.is_some(),
+            latency.is_some(),
+        );
+        (policy, reference)
+    });
+    let benchmark = benchmark_policy.map(|policy| {
         let reference = policy.prepare(
             &config,
             &events,
@@ -340,6 +358,8 @@ pub async fn run_backtest(
     }
     report.drawdown_duration = Some(crate::drawdown_duration::evaluate(&report.equity_curve));
     report.benchmark = benchmark.map(|(policy, reference)| policy.finish(reference, &report));
+    report.portfolio_benchmark =
+        portfolio_benchmark.map(|(policy, reference)| policy.finish(reference, &report));
     report.historical_dataset = historical_dataset;
     report.replay_identity = replay_identity;
     report.simulated_fees = Some(simulated_fees);
