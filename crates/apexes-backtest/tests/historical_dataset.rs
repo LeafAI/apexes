@@ -2047,3 +2047,45 @@ mod collector_reconciliation {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[tokio::test]
+async fn fingerprint_cli_matches_library_and_preserves_ordered_arrays() {
+    use apexes_backtest::replay_identity::canonical_report_sha256;
+    let manifest = seal_dataset(definition(), &events()).unwrap();
+    let report = run_backtest(
+        config(),
+        &registry(manifest),
+        InMemoryMarketDataSource::new(events()),
+        CountEvents(Arc::new(AtomicUsize::new(0))),
+    )
+    .await
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "apexes-report-fingerprint-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("report.json");
+    let expected = canonical_report_sha256(&report).unwrap();
+    let cli = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+            .arg("fingerprint-replay")
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+    std::fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    let result = cli();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), expected);
+    let mut changed = report;
+    changed.equity_curve.push(changed.equity_curve[0]);
+    assert_ne!(canonical_report_sha256(&changed).unwrap(), expected);
+    std::fs::write(&path, b"{}").unwrap();
+    assert!(!cli().status.success());
+    std::fs::remove_dir_all(dir).unwrap();
+}

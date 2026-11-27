@@ -65,6 +65,7 @@ pub mod clock;
 pub mod performance;
 
 // Populated in Task 14.
+pub mod replay_identity;
 pub mod report;
 pub mod runner;
 

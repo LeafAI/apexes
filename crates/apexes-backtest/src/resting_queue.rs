@@ -17,6 +17,7 @@ impl RestingOrder {
         quantity: Decimal,
         now: DateTime<Utc>,
         cost: &CostModel,
+        ids: &mut MatchingIds,
     ) -> Option<Fill> {
         let price = self.order.price?;
         if quantity <= Decimal::ZERO {
@@ -31,7 +32,7 @@ impl RestingOrder {
             OrderStatus::PartiallyFilled
         };
         Some(Fill {
-            id: FillId(Uuid::new_v4()),
+            id: ids.fill(),
             order_id: self.order_id,
             symbol: self.order.symbol.clone(),
             venue: self.order.venue,
@@ -89,6 +90,7 @@ impl MatchingEngine {
         trade: &TradeEvent,
         now: DateTime<Utc>,
         cost_model: &CostModel,
+        ids: &mut MatchingIds,
         check: &mut Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
         if trade.quantity <= Decimal::ZERO || trade.price <= Decimal::ZERO || trade.timestamp > now
@@ -116,7 +118,7 @@ impl MatchingEngine {
         {
             let quantity = budget.allocate(order);
             let mut candidate = order.clone();
-            if let Some(fill) = candidate.maker_fill(quantity, now, cost_model) {
+            if let Some(fill) = candidate.maker_fill(quantity, now, cost_model, ids) {
                 if let Some(check) = check.as_deref_mut()
                     && let Err(reason) = check(
                         order.order_id,
