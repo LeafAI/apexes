@@ -1233,6 +1233,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         execution_performance: None,
         drawdown_duration: None,
         benchmark: None,
+        portfolio_benchmark: None,
         funding: funding_report,
     })
 }
