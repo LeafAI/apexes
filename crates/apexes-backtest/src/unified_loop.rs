@@ -760,6 +760,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 let market = apexes_strategy::InstrumentContext::for_event(&event, &config.instruments, &config.symbol_rules);
                 let ctx = StrategyContext {
                     market,
+                    costs: market.and_then(|m| executor.cost_observation(m.instrument())).filter(|costs| market.is_some_and(|m| costs.matches(&event, m.instrument()))),
                     book: market.and_then(|_| executor.book_observation(&event, timestamp)).filter(|book| book.matches_at(&event, timestamp)),
                     positions: ledger.positions(),
                     balances: ledger.balances(),
@@ -1233,6 +1234,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         execution_performance: None,
         drawdown_duration: None,
         benchmark: None,
+        portfolio_benchmark: None,
         funding: funding_report,
     })
 }
