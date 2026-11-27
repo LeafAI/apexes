@@ -1194,6 +1194,7 @@ pub async fn run_unified_event_loop(
         event_latency: arrivals.map(|q| q.finish()),
         historical_dataset: None,
         replay_identity: None,
+        execution_performance: None,
     })
 }
 

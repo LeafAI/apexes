@@ -38,6 +38,9 @@ pub struct BacktestReport {
     /// Opt-in matching ID policy, not a full reproducibility attestation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_identity: Option<crate::replay_identity::ReplayIdentityPolicy>,
+    /// Historical closing-fill metrics, not legacy equity-point statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_performance: Option<crate::execution_performance::ExecutionPerformance>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

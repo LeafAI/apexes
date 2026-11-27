@@ -93,3 +93,5 @@ pub use report::BacktestReport;
 pub use runner::{BacktestConfig, run_backtest};
 
 mod stable_order;
+
+pub mod execution_performance;

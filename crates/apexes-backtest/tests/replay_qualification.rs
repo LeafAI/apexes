@@ -348,6 +348,27 @@ async fn mixed_perpetual_replay_repeats_funding_and_fees() {
         assert_eq!(report.trades[0].fee, dec!(0.1));
         assert_eq!(report.trades[1].fee, dec!(0.099));
         assert_eq!(report.equity_curve.last().unwrap().1, dec!(9998.701));
+        use apexes_backtest::execution_performance::SymbolExecutionPerformance;
+        let execution = report.execution_performance.as_ref().unwrap();
+        let SymbolExecutionPerformance::Available(summary) = &execution.per_symbol[SYMBOL] else {
+            panic!("expected realized metrics");
+        };
+        assert_eq!(summary.gross_realized, dec!(-1));
+        assert_eq!(summary.net_realized, dec!(-1.199));
+        assert_eq!(summary.fees_paid, dec!(0.199));
+        assert_eq!(summary.turnover, dec!(199));
+        assert_eq!(summary.expectancy_per_close, Some(dec!(-1.199)));
+        assert_eq!(summary.losses, 1);
+        assert_eq!(summary.profit_factor, Some(Decimal::ZERO));
+        assert_eq!(summary.open_quantity, Decimal::ZERO);
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_performance");
+        let legacy: BacktestReport = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.execution_performance.is_none());
+
         let hash = canonical_report_sha256(&report).unwrap();
         if let Some(previous) = &expected {
             assert_eq!(&hash, previous);
