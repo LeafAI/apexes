@@ -95,3 +95,6 @@ pub use runner::{BacktestConfig, run_backtest};
 mod stable_order;
 
 pub mod execution_performance;
+
+pub mod benchmark;
+pub mod drawdown_duration;

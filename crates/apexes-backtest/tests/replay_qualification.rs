@@ -429,3 +429,184 @@ async fn deterministic_bar_replay_rejects_future_data_and_regressing_observation
             .contains("bars requires explicit event-time latency")
     );
 }
+
+#[tokio::test]
+async fn benchmark_and_drawdown_use_observed_horizon_and_reject_stale_references() {
+    use apexes_backtest::{
+        benchmark::{BenchmarkEvidence, BenchmarkPolicy},
+        drawdown_duration::DrawdownEvidence,
+    };
+    struct OneBuy;
+    impl Strategy for OneBuy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if matches!(event, MarketEvent::Trade(t) if t.trade_id.as_deref()==Some("open")) {
+                vec![intent(AssetClass::Spot, Side::Buy, dec!(1), None)]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let events = vec![
+        trade(0, dec!(100), "baseline"),
+        depth(100, 1, dec!(100)),
+        trade(100, dec!(100), "open"),
+        depth(600, 2, dec!(100)),
+        trade(1000, dec!(80), "low"),
+        trade(2000, dec!(120), "high"),
+        trade(3000, dec!(90), "last"),
+        bar(3000),
+        mark(4000),
+        tick(4500),
+    ];
+    let mut digest = None;
+    for _ in 0..10 {
+        let r = registry(&events, "benchmark");
+        r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        r.register::<_, ()>(
+            (),
+            BenchmarkPolicy {
+                symbol: SYMBOL.into(),
+                max_end_age_ms: 1500,
+            },
+        )
+        .unwrap();
+        let report = run_backtest(
+            configuration(AssetClass::Spot, None),
+            &r,
+            InMemoryMarketDataSource::new(events.clone()),
+            OneBuy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        let Some(BenchmarkEvidence::Available { comparison, .. }) = &report.benchmark else {
+            panic!("{:?}", report.benchmark)
+        };
+        assert_eq!(comparison.quote_currency, "USDT");
+        assert_eq!(comparison.start_at, at(0));
+        assert_eq!(comparison.end_at, at(4500));
+        assert_eq!(comparison.last_reference_at, at(3000));
+        assert_eq!(comparison.final_equity, dec!(9989.9));
+        assert_eq!(comparison.strategy_return, dec!(-0.00101));
+        assert_eq!(comparison.cash_return, Decimal::ZERO);
+        assert_eq!(comparison.buy_hold_return, dec!(-0.1));
+        assert_eq!(comparison.excess_vs_buy_hold, dec!(0.09899));
+        let Some(DrawdownEvidence::Available(d)) = &report.drawdown_duration else {
+            panic!("missing drawdown")
+        };
+        assert_eq!(d.completed_episodes, 1);
+        assert_eq!(d.longest_completed_ms, Some(1900));
+        assert_eq!(d.longest_observed_ms, 2500);
+        assert_eq!(d.current.as_ref().unwrap().observed_duration_ms, 2500);
+        assert_eq!(d.current.as_ref().unwrap().trough_equity, dec!(9989.9));
+        let hash = canonical_report_sha256(&report).unwrap();
+        if let Some(previous) = &digest {
+            assert_eq!(&hash, previous);
+        }
+        digest = Some(hash);
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        legacy.as_object_mut().unwrap().remove("benchmark");
+        legacy.as_object_mut().unwrap().remove("drawdown_duration");
+        let old: BacktestReport = serde_json::from_value(legacy).unwrap();
+        assert!(old.benchmark.is_none() && old.drawdown_duration.is_none());
+    }
+    let r = registry(&events, "benchmark-stale");
+    r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    r.register::<_, ()>(
+        (),
+        BenchmarkPolicy {
+            symbol: SYMBOL.into(),
+            max_end_age_ms: 1499,
+        },
+    )
+    .unwrap();
+    let report = run_backtest(
+        configuration(AssetClass::Spot, None),
+        &r,
+        InMemoryMarketDataSource::new(events.clone()),
+        OneBuy,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.benchmark,Some(BenchmarkEvidence::Unavailable{reason,..}) if reason.contains("stale"))
+    );
+    assert_eq!(report.trades.len(), 1);
+    let r = registry(&events, "benchmark-inventory");
+    r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    r.register::<_, ()>(
+        (),
+        BenchmarkPolicy {
+            symbol: SYMBOL.into(),
+            max_end_age_ms: 1500,
+        },
+    )
+    .unwrap();
+    let mut config = configuration(AssetClass::Spot, None);
+    config.initial_balances.insert("BTC".into(), dec!(1));
+    let report = run_backtest(config, &r, InMemoryMarketDataSource::new(events), OneBuy)
+        .await
+        .unwrap();
+    assert!(
+        matches!(report.benchmark,Some(BenchmarkEvidence::Unavailable{reason,..}) if reason.contains("cash-only"))
+    );
+}
+
+#[tokio::test]
+async fn benchmark_requires_sealed_input_and_first_observed_trade() {
+    use apexes_backtest::benchmark::{BenchmarkEvidence, BenchmarkPolicy};
+    struct Idle;
+    impl Strategy for Idle {
+        fn on_market_event(&mut self, _: &MarketEvent, _: &StrategyContext) -> Vec<OrderIntent> {
+            vec![]
+        }
+    }
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(100, dec!(100), "first"),
+        tick(200),
+        bar(300),
+        mark(1300),
+    ];
+    let policy = BenchmarkPolicy {
+        symbol: SYMBOL.into(),
+        max_end_age_ms: 2000,
+    };
+    let r = registry(&events, "benchmark-no-first-trade");
+    r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    r.register::<_, ()>((), policy.clone()).unwrap();
+    let report = run_backtest(
+        configuration(AssetClass::Spot, None),
+        &r,
+        InMemoryMarketDataSource::new(events.clone()),
+        Idle,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.benchmark,Some(BenchmarkEvidence::Unavailable{reason,..}) if reason.contains("first-event"))
+    );
+    let r = Registry::new();
+    r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    r.register::<_, ()>((), policy).unwrap();
+    let report = run_backtest(
+        configuration(AssetClass::Spot, None),
+        &r,
+        InMemoryMarketDataSource::new(events),
+        Idle,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.benchmark,Some(BenchmarkEvidence::Unavailable{reason,..}) if reason.contains("verified"))
+    );
+}

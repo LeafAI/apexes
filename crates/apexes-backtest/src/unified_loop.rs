@@ -1195,6 +1195,8 @@ pub async fn run_unified_event_loop(
         historical_dataset: None,
         replay_identity: None,
         execution_performance: None,
+        drawdown_duration: None,
+        benchmark: None,
     })
 }
 
