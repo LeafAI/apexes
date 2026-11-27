@@ -14,3 +14,5 @@ pub use strategy::DriftScriptStrategy;
 mod symbol_state;
 
 mod scoped_indicators;
+
+mod context_market;

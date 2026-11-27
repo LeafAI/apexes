@@ -1,5 +1,5 @@
 //! `ctx.*` native-function bindings exposed to Drift Script strategy
-//! scripts: `get_position`, `get_balance`, `now`, `has_open_order`. Built
+//! scripts: `get_position`, `get_balance`, `ledger_balance`, `now`, `has_open_order`. Built
 //! fresh on every `DriftScriptStrategy::on_market_event` call from owned
 //! clones of the current `StrategyContext`'s borrowed maps, since
 //! `DriftValue::NativeFunction` requires `'static` closures while
@@ -36,6 +36,11 @@ pub fn build_ctx_drift_value(
         "get_position".to_string(),
         DriftValue::NativeFunction(get_position_fn(positions)),
     );
+    let balances = Arc::new(balances);
+    obj.insert(
+        "ledger_balance".to_string(),
+        DriftValue::NativeFunction(ledger_balance_fn(Arc::clone(&balances))),
+    );
     obj.insert(
         "get_balance".to_string(),
         DriftValue::NativeFunction(get_balance_fn(balances)),
@@ -69,15 +74,31 @@ fn get_position_fn(positions: HashMap<String, Position>) -> NativeFn {
     })
 }
 
-fn get_balance_fn(balances: HashMap<String, Decimal>) -> NativeFn {
+fn get_balance_fn(balances: Arc<HashMap<String, Decimal>>) -> NativeFn {
     Arc::new(move |args| {
-        let balances = balances.clone();
+        let balances = Arc::clone(&balances);
         Box::pin(async move {
             let Some(asset) = first_string_arg(&args) else {
                 return DriftValue::Undefined;
             };
             let value = balances.get(&asset).copied().unwrap_or(Decimal::ZERO);
             DriftValue::Number(value.try_into().unwrap_or(0.0))
+        })
+    })
+}
+
+/// New explicit lookup: missing entry is null, not zero.
+fn ledger_balance_fn(balances: Arc<HashMap<String, Decimal>>) -> NativeFn {
+    Arc::new(move |args| {
+        let balances = Arc::clone(&balances);
+        Box::pin(async move {
+            let [DriftValue::String(asset)] = args.as_slice() else {
+                return DriftValue::Undefined;
+            };
+            balances
+                .get(asset.as_str())
+                .and_then(|v| f64::try_from(*v).ok())
+                .map_or(DriftValue::Null, DriftValue::Number)
         })
     })
 }
@@ -143,8 +164,30 @@ mod tests {
     }
 
     #[test]
+    fn ledger_balance_has_explicit_missing_and_exact_argument_contract() {
+        let balances = Arc::new(HashMap::from([
+            ("BTC".into(), Decimal::ZERO),
+            ("USDT".into(), dec!(100)),
+        ]));
+        let f = ledger_balance_fn(Arc::clone(&balances));
+        let asset = |s: &str| DriftValue::String(Arc::new(s.to_owned()));
+        assert!(matches!(call(&f,vec![asset("BTC")]),DriftValue::Number(n) if n==0.0));
+        assert!(matches!(call(&f,vec![asset("USDT")]),DriftValue::Number(n) if n==100.0));
+        assert!(matches!(call(&f, vec![asset("missing")]), DriftValue::Null));
+        assert!(matches!(call(&f, vec![]), DriftValue::Undefined));
+        assert!(matches!(
+            call(&f, vec![DriftValue::Number(1.0)]),
+            DriftValue::Undefined
+        ));
+        assert!(matches!(
+            call(&f, vec![asset("BTC"), asset("USDT")]),
+            DriftValue::Undefined
+        ));
+    }
+
+    #[test]
     fn get_balance_returns_zero_when_absent() {
-        let f = get_balance_fn(HashMap::new());
+        let f = get_balance_fn(Arc::new(HashMap::new()));
         let result = call(&f, vec![DriftValue::String(Arc::new("USDT".to_string()))]);
         assert!(matches!(result, DriftValue::Number(n) if n == 0.0));
     }
@@ -153,7 +196,7 @@ mod tests {
     fn get_balance_returns_existing_balance() {
         let mut balances = HashMap::new();
         balances.insert("USDT".to_string(), dec!(10000));
-        let f = get_balance_fn(balances);
+        let f = get_balance_fn(Arc::new(balances));
         let result = call(&f, vec![DriftValue::String(Arc::new("USDT".to_string()))]);
         assert!(matches!(result, DriftValue::Number(n) if n == 10000.0));
     }

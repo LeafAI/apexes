@@ -57,6 +57,7 @@ fn always_buy_returns_one_buy_intent() {
             DriftScriptStrategy::from_file(&fixture_path("always_buy.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -82,6 +83,7 @@ fn uses_math_binding_computes_average_and_buys() {
             DriftScriptStrategy::from_file(&fixture_path("uses_math.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -118,6 +120,7 @@ fn uses_ctx_position_skips_when_already_long() {
         let balances = HashMap::new();
         let open_orders = HashMap::new();
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -144,6 +147,7 @@ fn uses_ctx_position_buys_when_flat_and_no_open_orders() {
             DriftScriptStrategy::from_file(&fixture_path("uses_ctx_position.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -187,6 +191,7 @@ fn runtime_error_script_returns_empty_vec_not_panic() {
             DriftScriptStrategy::from_file(&fixture_path("runtime_panic.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -212,6 +217,7 @@ fn uses_indicators_sma_stays_flat_during_warmup_then_buys() {
             DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -276,6 +282,7 @@ fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
             DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -307,6 +314,7 @@ fn uses_signals_produces_no_order_during_indicator_warmup() {
             DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -341,6 +349,7 @@ fn uses_signals_produces_rebalance_order_once_warm() {
             DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -408,6 +417,7 @@ fn top_level_param_call_does_not_hot_reload() {
             DriftScriptStrategy::from_file(&fixture_path("top_level_param.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -444,6 +454,7 @@ fn inside_on_market_event_param_call_does_hot_reload() {
             DriftScriptStrategy::from_file(&fixture_path("hot_reloadable_param.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -504,6 +515,7 @@ fn symbol_state_isolates_interleaved_windows_and_rolls_back_failed_callbacks() {
             DriftScriptStrategy::from_file(&fixture_path("symbol_state.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -561,6 +573,7 @@ fn scoped_native_indicators_isolate_warmup_and_rollback() {
             DriftScriptStrategy::from_file(&fixture_path("scoped_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -613,6 +626,7 @@ fn scoped_sma_migration_preserves_single_symbol_strategy_decisions() {
             DriftScriptStrategy::from_file(&fixture_path("uses_scoped_sma.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -653,6 +667,7 @@ fn time_gates_isolate_instruments_and_rollback_failed_grants() {
             trade.price = price;
             trade.timestamp = now;
             let ctx = StrategyContext {
+                market: None,
                 positions: &positions,
                 balances: &balances,
                 open_orders: &open_orders,
@@ -677,5 +692,77 @@ fn time_gates_isolate_instruments_and_rollback_failed_grants() {
         assert_eq!(step("BTCUSDT", Venue::Okx, 1500, dec!(1)), 1);
         assert_eq!(step("BTCUSDT", Venue::Binance, 900, dec!(1)), 0);
         assert_eq!(step("BTCUSDT", Venue::Binance, 2000, dec!(1)), 1);
+    });
+}
+
+#[test]
+fn market_context_uses_unique_event_instrument_and_distinguishes_missing_balances() {
+    use apexes_core::{AssetClass, Instrument, MarketType, SymbolRules};
+    use apexes_strategy::InstrumentContext;
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("market_context.drift")).unwrap();
+        let event = sample_trade_event();
+        let instrument = Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("BTC".into()),
+            Some("USDT".into()),
+            dec!(0.01),
+            dec!(0.001),
+            dec!(1),
+        )
+        .unwrap();
+        let rules = HashMap::from([(
+            "BTCUSDT".into(),
+            SymbolRules {
+                quantity_step: dec!(0.01),
+                min_quantity: dec!(0.02),
+                max_quantity: dec!(10),
+                price_tick: dec!(0.05),
+                min_notional: dec!(5),
+            },
+        )]);
+        let balances = HashMap::from([("BTC".into(), dec!(0)), ("USDT".into(), dec!(100))]);
+        let single = [instrument.clone()];
+        let mut ctx = StrategyContext {
+            market: InstrumentContext::for_event(&event, &single, &rules),
+            positions: &HashMap::new(),
+            balances: &balances,
+            open_orders: &HashMap::new(),
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now: Utc::now(),
+        };
+        assert_eq!(ctx.ledger_balance("BTC"), Some(Decimal::ZERO));
+        assert_eq!(ctx.ledger_balance("missing"), None);
+        let intents = strategy.on_market_event(&event, &ctx);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].quantity, dec!(0.02));
+        let empty_rules = HashMap::new();
+        ctx.market = InstrumentContext::for_event(&event, &single, &empty_rules);
+        assert!(ctx.market.unwrap().rules().is_none());
+        assert!(strategy.on_market_event(&event, &ctx).is_empty());
+        let mut other = instrument;
+        other.asset_class = AssetClass::Perpetual;
+        let ambiguous = [single[0].clone(), other];
+        assert!(InstrumentContext::for_event(&event, &ambiguous, &rules).is_none());
+        ctx.market = None;
+        assert!(strategy.on_market_event(&event, &ctx).is_empty());
+        ctx.market = InstrumentContext::for_event(&event, &single, &rules);
+        let MarketEvent::Trade(mut wrong) = event.clone() else {
+            panic!("trade fixture")
+        };
+        wrong.venue = Venue::Okx;
+        let wrong = MarketEvent::Trade(wrong);
+        assert!(InstrumentContext::for_event(&wrong, &single, &rules).is_none());
+        // Even a caller accidentally reusing another venue's context cannot
+        // expose those rules to a Drift callback for this event.
+        assert!(strategy.on_market_event(&wrong, &ctx).is_empty());
+        let absent = HashMap::from([("USDT".into(), dec!(100))]);
+        ctx.balances = &absent;
+        assert!(strategy.on_market_event(&event, &ctx).is_empty());
     });
 }

@@ -56,6 +56,7 @@ fn step(
         );
     }
     let ctx = StrategyContext {
+        market: None,
         positions: &positions,
         balances: &HashMap::new(),
         open_orders: &HashMap::new(),

@@ -29,3 +29,6 @@ pub use venue_scorer::{PriceAndFeeScorer, VenueMarketState, VenueScorer};
 pub mod symbol_state;
 
 pub mod event_time;
+
+pub mod context_market;
+pub use context_market::InstrumentContext;
