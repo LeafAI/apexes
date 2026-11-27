@@ -21,6 +21,7 @@ pub mod evaluation;
 pub mod historical_dataset;
 pub mod history;
 pub mod order_log;
+pub mod source_coverage;
 
 pub mod ems_adapter;
 

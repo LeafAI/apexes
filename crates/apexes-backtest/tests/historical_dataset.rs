@@ -336,3 +336,314 @@ fn cli_seals_and_verifies_local_export_without_modifying_it() {
     assert_eq!(std::fs::read(events_path).unwrap(), original);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+use apexes_backtest::source_coverage::{
+    CollectionWindow, SequenceContract, SequenceRange, SourceCoverage, StreamCoverage,
+};
+
+fn receipt(stream: &str, n: u32, count: u64, range: Option<(u64, u64)>) -> CollectionWindow {
+    CollectionWindow {
+        receipt_id: format!("{stream}-{n}"),
+        start: day(n).and_hms_opt(0, 0, 0).unwrap().and_utc(),
+        end_exclusive: day(n + 1).and_hms_opt(0, 0, 0).unwrap().and_utc(),
+        complete: true,
+        expected_count: count,
+        sequence_range: range.map(|(first, last)| SequenceRange { first, last }),
+    }
+}
+
+fn coverage_fixture() -> (DatasetManifest, Vec<MarketEvent>, SourceCoverage) {
+    let events = vec![trade(1, Some("100")), tick(1), trade(3, Some("101"))];
+    let manifest = seal_dataset(definition(), &events).unwrap();
+    let d = &manifest.definition;
+    let coverage = SourceCoverage {
+        schema_version: 1,
+        dataset_id: d.dataset_id.clone(),
+        dataset_version: d.version.clone(),
+        source_id: d.source_id.clone(),
+        replay_sha256: manifest.replay_sha256.clone(),
+        streams: vec![
+            StreamCoverage {
+                stream: d.streams[0].clone(),
+                sequence_contract: SequenceContract::ContiguousTradeId,
+                windows: vec![
+                    receipt("trade", 1, 1, Some((100, 100))),
+                    receipt("trade", 2, 0, None),
+                    receipt("trade", 3, 1, Some((101, 101))),
+                ],
+            },
+            StreamCoverage {
+                stream: d.streams[1].clone(),
+                sequence_contract: SequenceContract::Unavailable,
+                windows: vec![
+                    receipt("tick", 1, 1, None),
+                    receipt("tick", 2, 0, None),
+                    receipt("tick", 3, 0, None),
+                ],
+            },
+        ],
+    };
+    (manifest, events, coverage)
+}
+
+#[test]
+fn explicit_empty_windows_and_contiguous_ids_across_days_are_reconciled() {
+    let (manifest, events, coverage) = coverage_fixture();
+    let verified = coverage.verify_dataset(&manifest, &events).unwrap();
+    let report = verified.source_coverage.unwrap();
+    assert_eq!(
+        (
+            report.windows_verified,
+            report.empty_windows,
+            report.sequence_checked_streams,
+            report.sequence_unavailable_streams
+        ),
+        (6, 3, 1, 1)
+    );
+    assert!(!report.independently_attested);
+    assert!(!verified.upstream_completeness_verified);
+    assert_eq!(report.evidence, coverage);
+}
+
+#[test]
+fn missing_failed_overlapping_and_duplicate_receipts_are_refused() {
+    let (manifest, events, coverage) = coverage_fixture();
+    let mut c = coverage.clone();
+    c.streams[0].windows.remove(1);
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage.clone();
+    c.streams[0].windows[1].complete = false;
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage.clone();
+    c.streams[0].windows[1].start -= chrono::TimeDelta::seconds(1);
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage.clone();
+    c.streams[1].windows[0].receipt_id = c.streams[0].windows[0].receipt_id.clone();
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage;
+    c.streams[0].windows.pop();
+    assert!(c.verify(&manifest, &events).is_err());
+}
+
+#[test]
+fn collection_counts_detect_omission_even_when_resealed_manifest_matches() {
+    let (_, mut events, mut coverage) = coverage_fixture();
+    events.pop();
+    let manifest = seal_dataset(definition(), &events).unwrap();
+    coverage.replay_sha256 = manifest.replay_sha256.clone();
+    assert!(
+        coverage
+            .verify(&manifest, &events)
+            .unwrap_err()
+            .contains("count mismatch")
+    );
+    coverage.streams[0].windows[2].expected_count = 0;
+    coverage.streams[0].windows[2].sequence_range = None;
+    assert!(coverage.verify(&manifest, &events).is_ok()); // claims cannot authenticate themselves
+}
+
+#[test]
+fn rejects_sequence_gaps_between_windows_and_within_window() {
+    let (manifest, events, coverage) = coverage_fixture();
+    let mut c = coverage.clone();
+    c.streams[0].windows[2].sequence_range = Some(SequenceRange {
+        first: 102,
+        last: 102,
+    });
+    assert!(
+        c.verify(&manifest, &events)
+            .unwrap_err()
+            .contains("gap or overlap")
+    );
+    let (_, mut events, mut c) = coverage_fixture();
+    events.insert(1, trade(1, Some("102")));
+    let manifest = seal_dataset(definition(), &events).unwrap();
+    c.replay_sha256 = manifest.replay_sha256.clone();
+    c.streams[0].windows[0].expected_count = 2;
+    c.streams[0].windows[0].sequence_range = Some(SequenceRange {
+        first: 100,
+        last: 101,
+    });
+    c.streams[0].windows[2].sequence_range = Some(SequenceRange {
+        first: 102,
+        last: 102,
+    });
+    // The source receipts expect 100,101,102; the sealed tape contains 100,102,101.
+    assert!(
+        c.verify(&manifest, &events)
+            .unwrap_err()
+            .contains("sequence mismatch")
+    );
+}
+
+#[test]
+fn refuses_wrong_identity_missing_stream_and_invalid_sequence_contract() {
+    let (manifest, events, coverage) = coverage_fixture();
+    let mut c = coverage.clone();
+    c.dataset_version = "v2".into();
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage.clone();
+    c.streams.pop();
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage.clone();
+    c.streams[0].sequence_contract = SequenceContract::ContiguousDepthUpdate;
+    assert!(c.verify(&manifest, &events).is_err());
+    let mut c = coverage;
+    c.streams[0].windows[0].sequence_range = Some(SequenceRange {
+        first: 0,
+        last: u64::MAX,
+    });
+    assert!(c.verify(&manifest, &events).is_err());
+}
+
+#[test]
+fn depth_sequence_contract_refuses_invalidation_and_missing_sequence() {
+    let mut d = definition();
+    d.streams.truncate(1);
+    d.streams[0].kind = StreamKind::Depth;
+    let depth = |sequence| {
+        MarketEvent::Depth(apexes_core::DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![apexes_core::PriceLevel {
+                price: dec!(99),
+                quantity: dec!(1),
+            }],
+            asks: vec![apexes_core::PriceLevel {
+                price: dec!(101),
+                quantity: dec!(1),
+            }],
+            sequence,
+            is_snapshot: true,
+            timestamp: day(1).and_hms_opt(0, 0, 1).unwrap().and_utc(),
+        })
+    };
+    let mut events = vec![depth(Some(10))];
+    let m = seal_dataset(d.clone(), &events).unwrap();
+    let mut c = SourceCoverage {
+        schema_version: 1,
+        dataset_id: d.dataset_id.clone(),
+        dataset_version: d.version.clone(),
+        source_id: d.source_id.clone(),
+        replay_sha256: m.replay_sha256.clone(),
+        streams: vec![StreamCoverage {
+            stream: d.streams[0].clone(),
+            sequence_contract: SequenceContract::ContiguousDepthUpdate,
+            windows: vec![
+                receipt("depth", 1, 1, Some((10, 10))),
+                receipt("depth", 2, 0, None),
+                receipt("depth", 3, 0, None),
+            ],
+        }],
+    };
+    assert!(c.verify(&m, &events).is_ok());
+    events[0] = depth(None);
+    let m = seal_dataset(d.clone(), &events).unwrap();
+    c.replay_sha256 = m.replay_sha256.clone();
+    assert!(
+        c.verify(&m, &events)
+            .unwrap_err()
+            .contains("missing depth sequence")
+    );
+    if let MarketEvent::Depth(update) = &mut events[0] {
+        update.bids.clear();
+        update.asks.clear();
+    }
+    let m = seal_dataset(d, &events).unwrap();
+    c.replay_sha256 = m.replay_sha256.clone();
+    assert!(c.verify(&m, &events).unwrap_err().contains("invalidation"));
+}
+
+#[tokio::test]
+async fn coverage_is_enforced_before_strategy_and_recorded_on_success() {
+    let (manifest, events, coverage) = coverage_fixture();
+    let count = Arc::new(AtomicUsize::new(0));
+    let reg = registry(manifest.clone());
+    reg.register::<SourceCoverage, ()>((), coverage.clone())
+        .unwrap();
+    let report = run_backtest(
+        config(),
+        &reg,
+        InMemoryMarketDataSource::new(events.clone()),
+        CountEvents(count.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report
+            .historical_dataset
+            .unwrap()
+            .source_coverage
+            .unwrap()
+            .evidence,
+        coverage
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 3);
+    count.store(0, Ordering::Relaxed);
+    let mut c = coverage.clone();
+    c.streams[0].windows[1].complete = false;
+    let reg = registry(manifest);
+    reg.register::<SourceCoverage, ()>((), c).unwrap();
+    assert!(
+        run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events.clone()),
+            CountEvents(count.clone())
+        )
+        .await
+        .is_err()
+    );
+    let reg = apexes_core::registry::Registry::new();
+    reg.register::<SourceCoverage, ()>((), coverage).unwrap();
+    assert!(
+        run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events),
+            CountEvents(count.clone())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn cli_verifies_coverage_and_rejects_failed_receipts() {
+    let (manifest, events, mut coverage) = coverage_fixture();
+    let dir = std::env::temp_dir().join(format!("apexes-coverage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let manifest_path = dir.join("manifest.json");
+    let events_path = dir.join("events.json");
+    let coverage_path = dir.join("coverage.json");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::write(&events_path, serde_json::to_vec(&events).unwrap()).unwrap();
+    std::fs::write(&coverage_path, serde_json::to_vec(&coverage).unwrap()).unwrap();
+    let verify = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+            .arg("verify-coverage")
+            .arg(&manifest_path)
+            .arg(&events_path)
+            .arg(&coverage_path)
+            .output()
+            .unwrap()
+    };
+    let output = verify();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::to_value(coverage.verify_dataset(&manifest, &events).unwrap()).unwrap()
+    );
+    coverage.streams[0].windows[1].complete = false;
+    std::fs::write(&coverage_path, serde_json::to_vec(&coverage).unwrap()).unwrap();
+    let output = verify();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}

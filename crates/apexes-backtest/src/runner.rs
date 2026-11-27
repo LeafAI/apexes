@@ -112,7 +112,7 @@ pub async fn run_backtest(
         .map_err(|error| ApexesError::InvalidBacktestConfig {
             reason: format!("registry lookup for DatasetManifest failed: {error}"),
         })?;
-    let historical_dataset = manifest
+    let mut historical_dataset = manifest
         .as_ref()
         .map(|manifest| {
             manifest.verify_scope(&config.instruments, &config.date_range)?;
@@ -122,6 +122,27 @@ pub async fn run_backtest(
         .map_err(|reason| ApexesError::InvalidBacktestConfig {
             reason: format!("historical dataset verification failed: {reason}"),
         })?;
+
+    if let Some(coverage) = registry
+        .try_one::<crate::source_coverage::SourceCoverage>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?
+    {
+        let verified =
+            historical_dataset
+                .as_mut()
+                .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                    reason: "source coverage requires a verified dataset manifest".into(),
+                })?;
+        verified.source_coverage = Some(
+            coverage
+                .verify_receipts(&verified.manifest, &events)
+                .map_err(|reason| ApexesError::InvalidBacktestConfig {
+                    reason: format!("historical source coverage failed: {reason}"),
+                })?,
+        );
+    }
 
     let event_stream = futures::stream::iter(events);
     let clock = BacktestClock::new(config.speed);
