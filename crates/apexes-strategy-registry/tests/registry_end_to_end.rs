@@ -65,6 +65,7 @@ fn sample_events() -> Vec<MarketEvent> {
             quantity: dec!(1000),
         }],
         sequence: Some(1),
+        source_range: None,
         is_snapshot: true,
         timestamp: t0,
     });

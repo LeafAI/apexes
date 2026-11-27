@@ -1147,6 +1147,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             sequence: None,
+            source_range: None,
             is_snapshot: true,
             timestamp: now,
         })

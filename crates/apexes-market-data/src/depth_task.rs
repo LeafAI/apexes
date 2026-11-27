@@ -159,6 +159,7 @@ fn invalidate_book(symbol: &str) -> MarketEvent {
         bids: Vec::new(),
         asks: Vec::new(),
         sequence: None,
+        source_range: None,
         is_snapshot: true,
         timestamp: chrono::Utc::now(),
     })

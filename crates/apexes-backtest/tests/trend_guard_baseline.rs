@@ -41,6 +41,7 @@ fn fixture(prices: &[Decimal]) -> Vec<MarketEvent> {
                 quantity: dec!(10),
             }],
             sequence: Some(i as u64 + 1),
+            source_range: None,
             is_snapshot: true,
             timestamp,
         }));

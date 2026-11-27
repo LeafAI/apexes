@@ -66,6 +66,8 @@ impl BookCache {
             .map(|book| {
                 let mut snapshot = book.latest.clone();
                 snapshot.is_snapshot = true;
+                // A synthesized snapshot is not the original delta.
+                snapshot.source_range = None;
                 snapshot.bids = book
                     .bids
                     .iter()
@@ -96,6 +98,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             venue: Venue::Binance,
             sequence: Some(seq),
+            source_range: None,
             timestamp: chrono::Utc::now(),
             is_snapshot: snapshot,
             bids,
@@ -118,11 +121,16 @@ mod tests {
             true,
             vec![level(dec!(100), dec!(1)), level(dec!(99), dec!(3))]
         )));
-        let update = depth(
+        let mut update = depth(
             15,
             false,
             vec![level(dec!(100), dec!(0)), level(dec!(101), dec!(2))],
         );
+        update.source_range = Some(apexes_core::DepthSourceRange {
+            first: 11,
+            last: 15,
+            previous_final: None,
+        });
         assert!(cache.apply(&update));
         assert!(!cache.apply(&depth(12, false, vec![level(dec!(100), dec!(9))])));
         let snapshots = cache.snapshots();
@@ -131,6 +139,7 @@ mod tests {
         };
         assert!(snapshot.is_snapshot);
         assert_eq!(snapshot.sequence, Some(15));
+        assert_eq!(snapshot.source_range, None);
         assert_eq!(snapshot.timestamp, update.timestamp);
         assert_eq!(
             snapshot.bids,

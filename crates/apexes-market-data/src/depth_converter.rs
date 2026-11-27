@@ -17,6 +17,7 @@ fn convert_book(symbol: &str, venue: Venue, book: &OrderBook, is_snapshot: bool)
         bids: book.bids().levels().iter().map(convert_level).collect(),
         asks: book.asks().levels().iter().map(convert_level).collect(),
         sequence: Some(book.sequence()),
+        source_range: None,
         is_snapshot,
         timestamp: book.time_engine().unwrap_or_else(Utc::now),
     }

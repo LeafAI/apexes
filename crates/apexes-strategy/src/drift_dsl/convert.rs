@@ -95,6 +95,7 @@ pub fn market_event_to_drift_value(event: &MarketEvent) -> DriftValue {
             bids,
             asks,
             sequence,
+            source_range: _,
             is_snapshot,
             timestamp,
         }) => {
@@ -487,6 +488,7 @@ mod tests {
                 quantity: dec!(2),
             }],
             sequence: Some(42),
+            source_range: None,
             is_snapshot: true,
             timestamp: Utc::now(),
         });

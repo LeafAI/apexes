@@ -259,6 +259,7 @@ mod tests {
                     quantity: dec!(1000),
                 }],
                 sequence: Some(1),
+                source_range: None,
                 is_snapshot: true,
                 timestamp: t0,
             }),

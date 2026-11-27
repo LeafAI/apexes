@@ -240,6 +240,7 @@ mod tests {
             bids: vec![],
             asks: vec![PriceLevel { price, quantity }],
             sequence: None,
+            source_range: None,
             is_snapshot: true,
             timestamp: at,
         }

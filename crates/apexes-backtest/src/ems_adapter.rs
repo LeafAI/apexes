@@ -210,6 +210,7 @@ mod tests {
                 quantity: dec!(10),
             }],
             sequence: None,
+            source_range: None,
             is_snapshot: true,
             timestamp: Utc::now(),
         });
@@ -264,6 +265,7 @@ mod tests {
                     quantity: dec!(10),
                 }],
                 sequence: Some(2),
+                source_range: None,
                 is_snapshot: true,
                 timestamp: at,
             });
@@ -451,6 +453,7 @@ mod tests {
                     quantity: dec!(10),
                 }],
                 sequence: None,
+                source_range: None,
                 is_snapshot: false,
                 timestamp: Utc::now(),
             }),

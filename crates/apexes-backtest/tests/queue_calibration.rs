@@ -37,6 +37,7 @@ fn observation(index: i64, side: Side, volume: Decimal, filled: Decimal) -> Queu
                 quantity: dec!(8),
             }],
             sequence: Some(index as u64),
+            source_range: None,
             is_snapshot: true,
             timestamp: accepted_at - TimeDelta::milliseconds(50),
         },
