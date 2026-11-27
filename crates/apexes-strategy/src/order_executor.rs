@@ -97,6 +97,15 @@ pub trait OrderExecutor: Send + Sync {
         None
     }
 
+    /// Read-only modeled fee assumptions. Unfrozen schedules, unknown
+    /// routes and live execution do not imply any known fee rate.
+    fn cost_observation(
+        &self,
+        _instrument: &apexes_core::Instrument,
+    ) -> Option<crate::CostObservation> {
+        None
+    }
+
     /// Cancel all local simulated working orders before emergency execution.
     /// Never dispatches a live cancellation by default.
     fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {

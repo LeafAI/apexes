@@ -119,6 +119,8 @@ pub struct StrategyContext<'a> {
     pub market: Option<crate::InstrumentContext<'a>>,
     /// Validated remaining simulated book at this callback, if available.
     pub book: Option<crate::BookObservation>,
+    /// Frozen simulated fee assumptions for the event instrument.
+    pub costs: Option<crate::CostObservation>,
 }
 
 impl StrategyContext<'_> {
@@ -315,6 +317,7 @@ mod tests {
         let open_orders = HashMap::new();
         let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
+            costs: None,
             book: None,
             market: None,
             positions: &positions,
@@ -362,6 +365,7 @@ mod tests {
         let now = Utc::now();
 
         let ctx = StrategyContext {
+            costs: None,
             book: None,
             market: None,
             positions: &positions,

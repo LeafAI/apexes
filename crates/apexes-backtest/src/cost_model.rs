@@ -17,6 +17,10 @@ pub enum FillLiquidity {
 pub trait FeeSchedule: Send + Sync {
     fn maker_fee_bps(&self, venue: Venue) -> Decimal;
     fn taker_fee_bps(&self, venue: Venue) -> Decimal;
+    /// Only a session-frozen schedule may expose a deterministic quote.
+    fn frozen_rates(&self, _venue: Venue) -> Option<FeeRates> {
+        None
+    }
 }
 
 /// Binance Spot's real VIP tier fee table (VIP0/Regular..VIP9), standard
@@ -198,6 +202,10 @@ struct FrozenWithFallback {
     fallback: Box<dyn FeeSchedule>,
 }
 impl FeeSchedule for FrozenWithFallback {
+    fn frozen_rates(&self, venue: Venue) -> Option<FeeRates> {
+        self.frozen.0.get(&format!("{venue:?}")).cloned()
+    }
+
     fn maker_fee_bps(&self, venue: Venue) -> Decimal {
         if self.frozen.0.contains_key(&format!("{venue:?}")) {
             self.frozen.maker_fee_bps(venue)
@@ -391,5 +399,43 @@ mod tests {
         };
         // 100,000 notional * 0.01% = 10
         assert_eq!(cost_model.funding_payment(dec!(100000)), Some(dec!(10)));
+    }
+}
+
+#[cfg(test)]
+mod frozen_context_tests {
+    use super::*;
+    use apexes_core::MarketType;
+
+    #[test]
+    fn frozen_context_has_no_unconfigured_venue_or_unfrozen_fallback_quote() {
+        let mut model = SimulatedFees::Flat {
+            maker_bps: dec!(5),
+            taker_bps: dec!(10),
+        }
+        .cost_model();
+        assert!(model.fee_schedule.frozen_rates(Venue::Binance).is_none());
+        let instrument = Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("BTC".into()),
+            Some("USDT".into()),
+            dec!(0.01),
+            dec!(0.001),
+            Decimal::ONE,
+        )
+        .unwrap();
+        let report = model.freeze_fees(&[instrument]).unwrap();
+        assert_eq!(
+            model.fee_schedule.frozen_rates(Venue::Binance),
+            report.rates_by_venue.get("Binance").cloned()
+        );
+        assert!(model.fee_schedule.frozen_rates(Venue::Okx).is_none());
+        assert_eq!(
+            model.fee_for_fill(Venue::Okx, FillLiquidity::Taker, dec!(100)),
+            dec!(0.1)
+        );
     }
 }
