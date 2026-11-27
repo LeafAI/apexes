@@ -142,6 +142,13 @@ pub async fn run_backtest(
                     reason: format!("collector receipt verification failed: {reason}"),
                 })?,
         );
+        // Receipt-bound segmentation verifies each native range chain and
+        // preserves every invalidation. Only upgrade an explicit policy.
+        if let Some(policy) = &mut depth
+            && policy.sequence == crate::DepthSequence::Contiguous
+        {
+            policy.sequence = crate::DepthSequence::VerifiedRanges;
+        }
     } else if manifest.as_ref().is_some_and(|m| {
         m.definition
             .source_id

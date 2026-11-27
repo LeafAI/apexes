@@ -1,5 +1,6 @@
 //! F03.03: independently reconcile durable capture receipts and bind
 //! the exact captured sequence to replay. Not an exchange attestation.
+use crate::collector_segments::{CaptureSegmentation, Segmenter};
 use crate::historical_dataset::{DatasetManifest, DatasetStream, StreamKind};
 use apexes_core::{AssetClass, Instrument, MarketEvent, Venue};
 use apexes_storage::raw_depth_store::RawDepthBatch;
@@ -176,6 +177,8 @@ pub struct CollectorReport {
     pub committed_batches: usize,
     pub event_count: usize,
     pub invalidations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segmentation: Option<CaptureSegmentation>,
     pub independently_attested: bool,
     pub upstream_completeness_verified: bool,
 }
@@ -198,6 +201,7 @@ struct Verifier<'a> {
     previous: Option<DateTime<Utc>>,
     count: usize,
     invalidations: usize,
+    segmenter: Segmenter,
 }
 
 impl<'a> Verifier<'a> {
@@ -207,6 +211,7 @@ impl<'a> Verifier<'a> {
             previous: None,
             count: 0,
             invalidations: 0,
+            segmenter: Segmenter::new(journal.market),
         }
     }
 
@@ -233,7 +238,7 @@ impl<'a> Verifier<'a> {
             return Err(format!("batch {index}: event count mismatch"));
         }
         let mut invalidations = 0;
-        for event in &events {
+        for (offset, event) in events.iter().enumerate() {
             let MarketEvent::Depth(d) = event else {
                 return Err("non-depth event in capture".into());
             };
@@ -243,6 +248,7 @@ impl<'a> Verifier<'a> {
             {
                 return Err(format!("batch {index}: stream mismatch or time regression"));
             }
+            self.segmenter.observe(self.count + offset, d)?;
             self.previous = Some(d.timestamp);
             invalidations += usize::from(d.is_invalidation());
         }
@@ -254,8 +260,8 @@ impl<'a> Verifier<'a> {
         Ok(events)
     }
 
-    fn finish(self, raw: &str) -> CollectorReport {
-        CollectorReport {
+    fn finish(self, raw: &str) -> Result<CollectorReport, String> {
+        Ok(CollectorReport {
             source_id: self.journal.source_id(),
             run_id: self.journal.run_id.clone(),
             symbol: self.journal.symbol.clone(),
@@ -265,9 +271,10 @@ impl<'a> Verifier<'a> {
             committed_batches: self.journal.intents.len(),
             event_count: self.count,
             invalidations: self.invalidations,
+            segmentation: Some(self.segmenter.finish()?),
             independently_attested: false,
             upstream_completeness_verified: false,
-        }
+        })
     }
 }
 
@@ -282,7 +289,7 @@ pub fn reconcile(raw: &str, batches: &[RawDepthBatch]) -> Result<ReconciledCaptu
         events.extend(verifier.verify_batch(index, row)?);
     }
     Ok(ReconciledCapture {
-        report: verifier.finish(raw),
+        report: verifier.finish(raw)?,
         events,
     })
 }
@@ -326,6 +333,14 @@ impl CollectorEvidence {
         if !remaining.is_empty() {
             return Err("unexpected extra replay events".into());
         }
-        Ok(verifier.finish(&self.journal))
+        let report = verifier.finish(&self.journal)?;
+        if report
+            .segmentation
+            .as_ref()
+            .is_none_or(|s| s.segments.is_empty())
+        {
+            return Err("no synchronized capture segment for replay".into());
+        }
+        Ok(report)
     }
 }
