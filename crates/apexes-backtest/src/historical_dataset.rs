@@ -24,7 +24,7 @@ pub enum StreamKind {
 }
 
 impl StreamKind {
-    fn of(event: &MarketEvent) -> Self {
+    pub(crate) fn of(event: &MarketEvent) -> Self {
         match event {
             MarketEvent::Trade(_) => Self::Trade,
             MarketEvent::Tick(_) => Self::Tick,
@@ -83,6 +83,8 @@ pub struct VerifiedDataset {
     /// Integrity against supplied manifest only; no independent upstream
     /// attestation is implemented in this version.
     pub upstream_completeness_verified: bool,
+    #[serde(default)]
+    pub source_coverage: Option<crate::source_coverage::CoverageReport>,
 }
 
 #[derive(Default)]
@@ -286,6 +288,7 @@ impl DatasetManifest {
                 .filter(|p| p.event_count == 0)
                 .count(),
             upstream_completeness_verified: false,
+            source_coverage: None,
         })
     }
 }
