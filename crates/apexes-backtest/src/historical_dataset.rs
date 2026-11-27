@@ -90,6 +90,8 @@ pub struct VerifiedDataset {
     pub source_coverage: Option<crate::source_coverage::CoverageReport>,
     #[serde(default)]
     pub depth_ranges: Option<crate::depth_ranges::DepthRangeReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_receipts: Option<crate::collector_receipts::CollectorReport>,
 }
 
 #[derive(Default)]
@@ -302,6 +304,7 @@ impl DatasetManifest {
             upstream_completeness_verified: false,
             source_coverage: None,
             depth_ranges: None,
+            collector_receipts: None,
         })
     }
 }

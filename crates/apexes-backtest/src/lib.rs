@@ -15,6 +15,7 @@
 
 pub mod error;
 
+pub mod collector_receipts;
 pub mod control;
 mod diagnostics;
 pub mod evaluation;

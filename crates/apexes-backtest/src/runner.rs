@@ -123,6 +123,35 @@ pub async fn run_backtest(
             reason: format!("historical dataset verification failed: {reason}"),
         })?;
 
+    let collector = registry
+        .try_one::<crate::collector_receipts::CollectorEvidence>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?;
+    if let Some(evidence) = collector {
+        let verified =
+            historical_dataset
+                .as_mut()
+                .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                    reason: "collector receipts require a verified dataset manifest".into(),
+                })?;
+        verified.collector_receipts = Some(
+            evidence
+                .verify_replay(&verified.manifest, &events, &config.instruments)
+                .map_err(|reason| ApexesError::InvalidBacktestConfig {
+                    reason: format!("collector receipt verification failed: {reason}"),
+                })?,
+        );
+    } else if manifest.as_ref().is_some_and(|m| {
+        m.definition
+            .source_id
+            .starts_with(crate::collector_receipts::SOURCE_PREFIX)
+    }) {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "raw collector manifest requires original receipts".into(),
+        });
+    }
+
     if let Some(coverage) = registry
         .try_one::<crate::source_coverage::SourceCoverage>()
         .map_err(|error| ApexesError::InvalidBacktestConfig {

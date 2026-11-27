@@ -1498,3 +1498,259 @@ fn cli_builds_native_range_evidence() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+mod collector_reconciliation {
+    use super::*;
+    use apexes_backtest::collector_receipts::{CollectorEvidence, reconcile};
+    use apexes_core::{DepthSourceRange, DepthUpdate, PriceLevel};
+    use apexes_storage::raw_depth_store::RawDepthBatch;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    const RUN: &str = "03a4e561-ea6c-4aaa-94ad-fbf1ee472c3f";
+
+    fn fixture() -> (
+        String,
+        Vec<RawDepthBatch>,
+        Vec<MarketEvent>,
+        DatasetDefinition,
+    ) {
+        let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap();
+        let snapshot = DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(1),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(101),
+                quantity: dec!(1),
+            }],
+            sequence: Some(100),
+            source_range: None,
+            is_snapshot: true,
+            timestamp: at,
+        };
+        let mut delta = snapshot.clone();
+        delta.is_snapshot = false;
+        delta.sequence = Some(103);
+        delta.source_range = Some(DepthSourceRange {
+            first: 101,
+            last: 103,
+            previous_final: None,
+        });
+        let mut invalidation = snapshot.clone();
+        invalidation.sequence = None;
+        invalidation.bids.clear();
+        invalidation.asks.clear();
+        let events = vec![
+            MarketEvent::Depth(snapshot),
+            MarketEvent::Depth(delta),
+            MarketEvent::Depth(invalidation),
+        ];
+        let batches = vec![
+            RawDepthBatch::new(RUN, 0, &events[..2]).unwrap(),
+            RawDepthBatch::new(RUN, 1, &events[2..]).unwrap(),
+        ];
+        let mut lines = vec![
+            json!({"kind":"header", "schema_version":1,"run_id":RUN,"symbol":"BTCUSDT","market":"spot","started_at":at}),
+        ];
+        for (i, batch) in batches.iter().enumerate() {
+            lines.push(json!({"kind":"intent","batch_index":i,"expected_count":if i==0 {2}else{1},"payload_sha256":format!("{:x}",Sha256::digest(batch.events_json.as_bytes())), "invalidations":i}));
+            lines.push(json!({"kind":"commit","batch_index":i}));
+        }
+        lines.push(json!({"kind":"terminal","stopped":true,"reason":null,"committed_batches":2}));
+        let journal = lines.iter().map(|v| format!("{v}\n")).collect::<String>();
+        let mut def = definition();
+        def.source_id = format!("binance-raw:spot:{RUN}");
+        def.streams = vec![DatasetStream {
+            venue: Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: StreamKind::Depth,
+        }];
+        (journal, batches, events, def)
+    }
+
+    #[test]
+    fn exact_batches_reconcile_with_explicit_invalidation_and_no_attestation() {
+        let (journal, batches, events, def) = fixture();
+        let result = reconcile(&journal, &batches).unwrap();
+        assert_eq!(result.events, events);
+        assert_eq!(result.report.source_id, def.source_id);
+        assert_eq!(result.report.committed_batches, 2);
+        assert_eq!(result.report.event_count, 3);
+        assert_eq!(result.report.invalidations, 1);
+        assert!(!result.report.independently_attested);
+        assert!(!result.report.upstream_completeness_verified);
+        assert_eq!(
+            result.report.journal_sha256,
+            format!("{:x}", Sha256::digest(journal.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_extra_reordered_and_tampered_batches() {
+        let (journal, batches, _, _) = fixture();
+        assert!(reconcile(&journal, &batches[..1]).is_err());
+        assert!(reconcile(&journal, &[batches[0].clone(), batches[0].clone()]).is_err());
+        assert!(reconcile(&journal, &[batches[1].clone(), batches[0].clone()]).is_err());
+        let mut extra = batches.clone();
+        extra.push(batches[1].clone());
+        assert!(reconcile(&journal, &extra).is_err());
+        let mut changed = batches.clone();
+        changed[0].events_json.push(' ');
+        assert!(reconcile(&journal, &changed).is_err());
+        let mut changed = batches.clone();
+        changed[0].run_id = "other".into();
+        assert!(reconcile(&journal, &changed).is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_failed_malformed_and_nonconsecutive_journals() {
+        let (journal, batches, _, _) = fixture();
+        let lines: Vec<_> = journal.lines().collect();
+        for index in 0..lines.len() {
+            let missing = lines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, s)| format!("{s}\n"))
+                .collect::<String>();
+            assert!(reconcile(&missing, &batches).is_err());
+        }
+        for altered in [
+            journal.trim_end().to_string(),
+            journal.replace("\"stopped\":true", "\"stopped\":false"),
+            journal.replace("\"committed_batches\":2", "\"committed_batches\":3"),
+            journal.replace("\"expected_count\":2", "\"expected_count\":65"),
+            journal.replace("\"invalidations\":1", "\"invalidations\":0"),
+            journal.replace("\"expected_count\":2", "\"expected_count\":1"),
+            journal.replace("\"batch_index\":1", "\"batch_index\":2"),
+            format!("{journal}{}\n", lines[5]),
+            journal.replace("\"schema_version\":1", "\"schema_version\":2"),
+        ] {
+            assert!(reconcile(&altered, &batches).is_err(), "{altered}");
+        }
+    }
+
+    #[test]
+    fn rejects_stream_and_clock_mismatch_even_with_matching_hash() {
+        let (journal, batches, events, _) = fixture();
+        for foreign in [true, false] {
+            let mut e = events[2].clone();
+            if let MarketEvent::Depth(d) = &mut e {
+                if foreign {
+                    d.symbol = "ETHUSDT".into();
+                } else {
+                    d.timestamp -= chrono::Duration::seconds(1);
+                }
+            }
+            let replacement = RawDepthBatch::new(RUN, 1, &[e]).unwrap();
+            let new_journal = journal.replace(
+                &format!("{:x}", Sha256::digest(batches[1].events_json.as_bytes())),
+                &format!("{:x}", Sha256::digest(replacement.events_json.as_bytes())),
+            );
+            assert!(reconcile(&new_journal, &[batches[0].clone(), replacement]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_refuses_missing_receipts_resealed_omission_and_wrong_market() {
+        let (journal, _, events, def) = fixture();
+        let manifest = seal_dataset(def.clone(), &events).unwrap();
+        let evidence = CollectorEvidence { journal };
+        let count = Arc::new(AtomicUsize::new(0));
+        let reg = registry(manifest.clone());
+        let result = run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events.clone()),
+            CountEvents(count.clone()),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires original receipts")
+        );
+        let omitted = events[..2].to_vec();
+        let reg = registry(seal_dataset(def, &omitted).unwrap());
+        reg.register::<CollectorEvidence, ()>((), evidence.clone())
+            .unwrap();
+        assert!(
+            run_backtest(
+                config(),
+                &reg,
+                InMemoryMarketDataSource::new(omitted),
+                CountEvents(count.clone())
+            )
+            .await
+            .is_err()
+        );
+        let reg = registry(manifest.clone());
+        reg.register::<CollectorEvidence, ()>((), evidence.clone())
+            .unwrap();
+        let mut wrong = config();
+        wrong.instruments[0].asset_class = AssetClass::Perpetual;
+        assert!(
+            run_backtest(
+                wrong,
+                &reg,
+                InMemoryMarketDataSource::new(events.clone()),
+                CountEvents(count.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let report = run_backtest(
+            config(),
+            &reg,
+            InMemoryMarketDataSource::new(events),
+            CountEvents(count.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report
+                .historical_dataset
+                .unwrap()
+                .collector_receipts
+                .unwrap()
+                .event_count,
+            3
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn cli_reconciles_batches_and_rejects_truncated_export() {
+        let (journal, batches, _, _) = fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "apexes-collector-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let j = dir.join("journal.jsonl");
+        let b = dir.join("batches.json");
+        std::fs::write(&j, journal).unwrap();
+        std::fs::write(&b, serde_json::to_vec(&batches).unwrap()).unwrap();
+        let run = || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+                .arg("reconcile-collector")
+                .arg(&j)
+                .arg(&b)
+                .output()
+                .unwrap()
+        };
+        let result = run();
+        assert!(result.status.success(), "{:?}", result);
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["report"]["event_count"], 3);
+        std::fs::write(&b, serde_json::to_vec(&batches[..1]).unwrap()).unwrap();
+        assert!(!run().status.success());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
