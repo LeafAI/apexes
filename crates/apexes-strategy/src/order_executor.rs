@@ -27,6 +27,9 @@ use crate::{OrderIntent, Position};
 pub type SimulatedRestingCheck<'a> =
     dyn FnMut(OrderId, &[Fill], bool) -> Result<(), String> + Send + 'a;
 
+/// Simulation-only direct execution guard; quantity is the working remainder.
+pub type SimulatedDirectCheck<'a> = dyn FnMut(&[Fill], Decimal) -> Result<(), String> + Send + 'a;
+
 #[async_trait]
 pub trait OrderExecutor: Send + Sync {
     /// Submits `intent`, returning the accepted `Order` plus any fills
@@ -50,6 +53,27 @@ pub trait OrderExecutor: Send + Sync {
         balances: &HashMap<String, Decimal>,
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError>;
+
+    async fn submit_simulated_checked(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        now: DateTime<Utc>,
+        _check: &mut SimulatedDirectCheck<'_>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit(intent, positions, balances, now).await
+    }
+
+    fn simulated_margin_budget(
+        &self,
+        _intent: &OrderIntent,
+        _now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        Err(ApexesError::OrderRejected {
+            reason: "simulated margin budget unavailable".into(),
+        })
+    }
 
     /// Read-only simulated Spot buy budget, including modeled execution fees.
     /// Live executors do not participate in event-time capital reservation.

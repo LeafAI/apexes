@@ -306,6 +306,121 @@ impl MatchingEngine {
         Self::budget_with_fee(intent.quantity, price, rate)
     }
 
+    /// Conservative full-size opening margin plus fees, independent of side.
+    pub(crate) fn simulated_margin_budget(
+        &self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        let reject = |reason: &str| ApexesError::OrderRejected {
+            reason: reason.into(),
+        };
+        let leverage = intent
+            .leverage
+            .filter(|l| *l >= Decimal::ONE)
+            .ok_or_else(|| reject("leveraged reservation requires leverage >= 1"))?;
+        if intent.asset_class != apexes_core::AssetClass::Perpetual
+            || intent.quantity <= Decimal::ZERO
+        {
+            return Err(reject(
+                "unsupported leveraged reservation instrument or quantity",
+            ));
+        }
+        self.execution.validate_intent(intent)?;
+        let taker = self.cost_model.fee_schedule.taker_fee_bps(intent.venue);
+        let (price, rate) = if intent.order_type == OrderType::Market {
+            self.require_depth(intent, now)?;
+            let book = self
+                .books
+                .get(&(intent.venue, intent.symbol.clone()))
+                .filter(|book| book.is_causal_at(now))
+                .ok_or_else(|| reject("missing causal margin reservation depth"))?;
+            let levels = match intent.side {
+                Side::Buy => book.asks(),
+                Side::Sell => book.bids(),
+            };
+            let mut remaining = intent.quantity;
+            let mut worst = None;
+            for level in levels {
+                if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+                    return Err(reject("invalid margin reservation depth"));
+                }
+                worst = Some(worst.map_or(level.price, |p: Decimal| p.max(level.price)));
+                remaining -= remaining.min(level.quantity);
+                if remaining.is_zero() {
+                    break;
+                }
+            }
+            (
+                worst.ok_or_else(|| reject("missing executable margin reservation depth"))?,
+                taker,
+            )
+        } else {
+            let price = match intent.order_type {
+                OrderType::Limit | OrderType::StopLimit => intent.price,
+                OrderType::Stop => intent.stop_price,
+                _ => None,
+            }
+            .filter(|p| *p > Decimal::ZERO)
+            .ok_or_else(|| reject("missing positive margin reservation price"))?;
+            (
+                price,
+                taker.max(self.cost_model.fee_schedule.maker_fee_bps(intent.venue)),
+            )
+        };
+        if rate < Decimal::ZERO || rate >= Decimal::from(10000) {
+            return Err(reject("invalid margin reservation fee rate"));
+        }
+        intent
+            .quantity
+            .checked_mul(price)
+            .and_then(|notional| {
+                let margin = notional.checked_div(leverage)?;
+                let fee = notional
+                    .checked_mul(rate)?
+                    .checked_div(Decimal::from(10000))?;
+                margin.checked_add(fee)
+            })
+            .filter(|n| *n > Decimal::ZERO)
+            .ok_or_else(|| reject("invalid or overflowing margin reservation"))
+    }
+
+    pub(crate) fn submit_direct_checked(
+        &mut self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+        check: &mut apexes_strategy::order_executor::SimulatedDirectCheck<'_>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        match intent.order_type {
+            OrderType::Market => {
+                let id = OrderId(Uuid::new_v4());
+                let mut guard =
+                    |_: Option<apexes_strategy::ParentOrderId>, _: &OrderIntent, fills: &[Fill]| {
+                        check(fills, Decimal::ZERO)
+                    };
+                self.submit_market_inner(intent, now, false, Some((id, None, &mut guard)))
+            }
+            OrderType::Limit => {
+                let order = self.prepare_limit_order(intent, now)?;
+                let mut guard = |_: OrderId, fills: &[Fill], terminal: bool| {
+                    let remaining = if terminal {
+                        Decimal::ZERO
+                    } else {
+                        intent.quantity - fills.iter().map(|f| f.quantity).sum::<Decimal>()
+                    };
+                    check(fills, remaining)
+                };
+                self.execute_prepared_limit_checked(order, now, &mut Some(&mut guard))
+            }
+            OrderType::Stop | OrderType::StopLimit => {
+                check(&[], intent.quantity)
+                    .map_err(|reason| ApexesError::OrderRejected { reason })?;
+                self.submit_stop_order(intent, now)
+                    .map(|order| (order, Vec::new()))
+            }
+        }
+    }
+
     fn budget_with_fee(
         quantity: Decimal,
         price: Decimal,

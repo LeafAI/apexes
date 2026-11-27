@@ -66,10 +66,12 @@ impl MatchingEngine {
                 });
                 order.filled_quantity += quantity;
             }
-            if let Some(check) = check.as_deref_mut() {
-                check(order.id, &fills, order.filled_quantity == order.quantity)
-                    .map_err(|reason| ApexesError::OrderRejected { reason })?;
-            }
+        }
+        if let Some(check) = check.as_deref_mut() {
+            check(order.id, &fills, order.filled_quantity == order.quantity)
+                .map_err(|reason| ApexesError::OrderRejected { reason })?;
+        }
+        if let Some(book) = self.books.get_mut(&(order.venue, order.symbol.clone())) {
             for fill in &fills {
                 book.consume(order.side, fill.price, fill.quantity);
             }

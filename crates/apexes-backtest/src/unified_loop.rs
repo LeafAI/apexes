@@ -800,7 +800,7 @@ pub async fn run_unified_event_loop(
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
                     let mut admitted_hold = None;
                     if let Some(queue)=&mut arrivals {
-                        let hold = match spot_intent_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
+                        let hold = match intent_capital_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
                             Ok(hold) if hold.as_ref().is_none_or(|hold| queue.check_capital(hold, ledger.balances())) => hold,
                             result => {
                                 queue.capital_refused(!arriving);
@@ -865,10 +865,19 @@ pub async fn run_unified_event_loop(
                     // immediately -- an empty fill vec is normal (a
                     // resting limit order in backtest; every live
                     // submission).
-                    match executor
-                        .submit(&intent, ledger.positions(), ledger.balances(), timestamp)
-                        .await
-                    {
+                    let submission = if let Some(queue) = &arrivals {
+                        let mut check = |fills: &[Fill], remaining| {
+                            let mut candidate = ledger.execution_snapshot();
+                            for fill in fills {
+                                candidate.apply_fill(fill).map_err(|error| error.to_string())?;
+                            }
+                            queue.check_direct(admitted_hold.as_ref(), intent.quantity, remaining, ledger.balances(), candidate.balances())
+                        };
+                        executor.submit_simulated_checked(&intent, ledger.positions(), ledger.balances(), timestamp, &mut check).await
+                    } else {
+                        executor.submit(&intent, ledger.positions(), ledger.balances(), timestamp).await
+                    };
+                    match submission {
                         Ok((order, fills)) => {
                             trace.accepted(&order);
                             if let (Some(queue), Some(hold)) = (&mut arrivals, admitted_hold)
@@ -1130,39 +1139,58 @@ pub async fn run_unified_event_loop(
     })
 }
 
-/// Reserve Spot intent spend assets while in transit, then transfer the
-/// remaining amount to a working direct order or admitted EMS parent.
-fn spot_intent_hold(
+/// Reserve spend assets for Spot or linear perpetual intents in transit.
+fn intent_capital_hold(
     intent: &apexes_strategy::OrderIntent,
     instruments: &HashMap<String, Instrument>,
     executor: &dyn OrderExecutor,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<crate::event_latency::CapitalHold>, String> {
     use apexes_core::{AssetClass, Side};
-    if intent.asset_class == AssetClass::Spot
-        && intent.execution_algo.is_some()
-        && intent.order_type != OrderType::Market
-    {
-        return Err("simulated Spot parent requires a market intent".into());
-    }
-    if intent.asset_class != AssetClass::Spot
-        || intent.leverage.is_some()
-        || intent.margin_mode.is_some()
-    {
+    let leveraged = intent.asset_class == AssetClass::Perpetual;
+    if !matches!(intent.asset_class, AssetClass::Spot | AssetClass::Perpetual) {
+        if intent.leverage.is_some() || intent.margin_mode.is_some() {
+            return Err("unsupported leveraged reservation asset class".into());
+        }
         return Ok(None);
+    }
+    if leveraged {
+        if intent.leverage.is_none_or(|l| l < Decimal::ONE) {
+            return Err("perpetual reservation requires leverage >= 1".into());
+        }
+    } else if intent.leverage.is_some() || intent.margin_mode.is_some() {
+        return Err("Spot reservation does not support leverage or margin mode".into());
+    }
+    if intent.execution_algo.is_some()
+        && (intent.order_type != OrderType::Market
+            || intent.routing != apexes_strategy::OrderRouting::Fixed)
+    {
+        return Err("simulated parent requires fixed-route market intent".into());
     }
     let instrument = instruments
         .get(&intent.symbol)
         .filter(|i| i.venue == intent.venue && i.asset_class == intent.asset_class)
         .ok_or("unknown reservation instrument")?;
-    let (asset, amount) = match intent.side {
-        Side::Buy => (
+    if leveraged && instrument.multiplier != Decimal::ONE {
+        return Err("leveraged reservation requires unit contract multiplier".into());
+    }
+    let (asset, amount) = if leveraged {
+        (
             instrument.quote_currency.as_ref(),
             executor
-                .simulated_buy_budget(intent, now)
+                .simulated_margin_budget(intent, now)
                 .map_err(|e| e.to_string())?,
-        ),
-        Side::Sell => (instrument.base_currency.as_ref(), intent.quantity),
+        )
+    } else {
+        match intent.side {
+            Side::Buy => (
+                instrument.quote_currency.as_ref(),
+                executor
+                    .simulated_buy_budget(intent, now)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Side::Sell => (instrument.base_currency.as_ref(), intent.quantity),
+        }
     };
     let asset = asset
         .filter(|asset| !asset.is_empty())

@@ -214,6 +214,26 @@ mod tests {
     }
 
     #[test]
+    fn rejected_direct_crossing_does_not_consume_depth() {
+        let mut e = engine(dec!(0));
+        let at = Utc::now();
+        snapshot(&mut e, at, dec!(10), 1);
+        let mut order = intent(Side::Sell, dec!(90), dec!(10));
+        order.asset_class = AssetClass::Perpetual;
+        order.leverage = Some(dec!(2));
+        let mut guard = |_: &[Fill], _: Decimal| Err("unfunded margin".into());
+        assert!(e.submit_direct_checked(&order, at, &mut guard).is_err());
+        let mut accept = |fills: &[Fill], remaining: Decimal| {
+            assert_eq!(remaining, Decimal::ZERO);
+            assert_eq!(fills[0].quantity, dec!(10));
+            Ok(())
+        };
+        let (order, fills) = e.submit_direct_checked(&order, at, &mut accept).unwrap();
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(fills[0].price, dec!(100));
+    }
+
+    #[test]
     fn rejected_maker_does_not_consume_other_orders_print_budget() {
         let mut e = engine(dec!(0));
         let at = Utc::now();
