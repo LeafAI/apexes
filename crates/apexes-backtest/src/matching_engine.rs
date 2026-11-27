@@ -231,6 +231,21 @@ impl MatchingEngine {
     pub fn event_time(&self) -> Option<DateTime<Utc>> {
         self.event_time
     }
+    pub(crate) fn cancel_all_working(&mut self) -> Vec<OrderId> {
+        let mut ids: Vec<_> = self
+            .resting_orders
+            .drain()
+            .flat_map(|(_, orders)| orders.into_iter().map(|o| o.order_id))
+            .collect();
+        ids.extend(
+            self.pending_triggers
+                .drain()
+                .flat_map(|(_, orders)| orders.into_iter().map(|o| o.order_id)),
+        );
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
     pub fn is_working(&self, id: OrderId) -> bool {
         self.resting_orders
             .values()
