@@ -189,6 +189,48 @@ impl ReplayOrderBook {
                 .is_some_and(|at| at <= now && now - at <= policy.max_age())
     }
 
+    /// Read the exact same strict book and remaining liquidity used by
+    /// execution, without consuming or modifying a price level.
+    pub(crate) fn observation(
+        &self,
+        event: &apexes_core::MarketEvent,
+        now: DateTime<Utc>,
+        policy: SimulatedDepthPolicy,
+    ) -> Option<apexes_strategy::BookObservation> {
+        use apexes_strategy::{BookIntegrity, BookObservation};
+        if !self.fresh_at(now, policy) {
+            return None;
+        }
+        let integrity = match policy.sequence {
+            DepthSequence::SnapshotOnly => BookIntegrity::SnapshotOnly,
+            DepthSequence::Contiguous => BookIntegrity::Contiguous,
+            DepthSequence::VerifiedRanges => BookIntegrity::VerifiedRanges,
+        };
+        Some(BookObservation {
+            symbol: event.symbol().to_owned(),
+            venue: event.venue(),
+            observed_at: self.observed_at?,
+            decision_at: now,
+            max_age_ms: policy.max_age_ms,
+            integrity,
+            sequence: self.sequence,
+            best_bid: self
+                .inner
+                .bids()
+                .levels()
+                .iter()
+                .filter_map(|l| available(l, &self.consumed_bids))
+                .max_by_key(|l| l.price),
+            best_ask: self
+                .inner
+                .asks()
+                .levels()
+                .iter()
+                .filter_map(|l| available(l, &self.consumed_asks))
+                .min_by_key(|l| l.price),
+        })
+    }
+
     /// Current bids, sorted best (highest price) first.
     pub fn bids(&self) -> Vec<PriceLevel> {
         self.inner
@@ -280,6 +322,65 @@ mod tests {
             max_age_ms: 1000,
             sequence: DepthSequence::Contiguous,
         }
+    }
+
+    #[test]
+    fn observation_is_causal_read_only_and_reports_empty_sides_without_fabricating_prices() {
+        use apexes_core::MarketEvent;
+        use apexes_strategy::BookIntegrity;
+        let policy = strict_policy();
+        let mut book = ReplayOrderBook::new();
+        let snap = snapshot(
+            vec![PriceLevel {
+                price: dec!(99),
+                quantity: dec!(2),
+            }],
+            vec![
+                PriceLevel {
+                    price: dec!(101),
+                    quantity: dec!(1),
+                },
+                PriceLevel {
+                    price: dec!(102),
+                    quantity: dec!(3),
+                },
+            ],
+        );
+        let at = snap.timestamp;
+        let event = MarketEvent::Depth(snap.clone());
+        assert!(book.observation(&event, at, policy).is_none());
+        book.apply_strict(&snap, policy);
+        assert!(
+            book.observation(&event, at - chrono::TimeDelta::nanoseconds(1), policy)
+                .is_none()
+        );
+        let first = book.observation(&event, at, policy).unwrap();
+        assert_eq!(first.integrity, BookIntegrity::Contiguous);
+        assert_eq!(first.spread(), Some(dec!(2)));
+        assert_eq!(first.best_ask.unwrap().quantity, dec!(1));
+        assert_eq!(book.observation(&event, at, policy).unwrap(), first);
+        book.consume(Side::Buy, dec!(101), dec!(1));
+        let next = book
+            .observation(&event, at + policy.max_age(), policy)
+            .unwrap();
+        assert_eq!(next.best_ask.unwrap().price, dec!(102));
+        assert_eq!(next.spread(), Some(dec!(3)));
+        assert_eq!(next.age_ms(), 1000);
+        assert!(!first.matches_at(&event, next.decision_at));
+        assert!(
+            book.observation(
+                &event,
+                next.decision_at + chrono::TimeDelta::nanoseconds(1),
+                policy
+            )
+            .is_none()
+        );
+        book.consume(Side::Buy, dec!(102), dec!(3));
+        let empty = book.observation(&event, next.decision_at, policy).unwrap();
+        assert!(empty.best_ask.is_none());
+        assert!(empty.spread().is_none());
+        assert_eq!(empty.best_bid.unwrap().quantity, dec!(2));
+        assert_eq!(first.best_ask.unwrap().price, dec!(101));
     }
 
     #[test]

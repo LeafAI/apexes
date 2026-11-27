@@ -32,3 +32,6 @@ pub mod event_time;
 
 pub mod context_market;
 pub use context_market::InstrumentContext;
+
+pub mod book_context;
+pub use book_context::{BookIntegrity, BookObservation};

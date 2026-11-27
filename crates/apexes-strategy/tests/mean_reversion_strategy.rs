@@ -68,6 +68,7 @@ impl Run {
             HashMap::new(),
         );
         let ctx = StrategyContext {
+            book: None,
             market: None,
             positions: &positions,
             balances: &balances,

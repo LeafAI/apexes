@@ -137,6 +137,14 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         self.process_event(event, None)
     }
 
+    fn book_observation(
+        &self,
+        event: &MarketEvent,
+        now: DateTime<Utc>,
+    ) -> Option<apexes_strategy::BookObservation> {
+        self.lock_engine().book_observation(event, now)
+    }
+
     fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {
         let mut engine = self.lock_engine();
         let ids = engine.cancel_all_working();

@@ -56,6 +56,7 @@ fn step(
         );
     }
     let ctx = StrategyContext {
+        book: None,
         market: None,
         positions: &positions,
         balances: &HashMap::new(),

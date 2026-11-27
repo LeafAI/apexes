@@ -1,5 +1,5 @@
 //! F04.03 — Detached data-only Drift market metadata, no exchange actions.
-use crate::InstrumentContext;
+use crate::{BookIntegrity, BookObservation, InstrumentContext, StrategyContext};
 use apexes_core::{AssetClass, MarketEvent, SymbolRules};
 use drift_script::DriftValue;
 use rust_decimal::Decimal;
@@ -74,17 +74,57 @@ fn market_value(market: InstrumentContext<'_>) -> DriftValue {
     ])
 }
 
-pub(super) fn attach(
-    ctx: &mut DriftValue,
-    event: &MarketEvent,
-    market: Option<InstrumentContext<'_>>,
-) {
+fn level_value(level: apexes_core::PriceLevel) -> DriftValue {
+    object([
+        ("price", number(level.price)),
+        ("quantity", number(level.quantity)),
+    ])
+}
+
+fn book_value(book: &BookObservation) -> DriftValue {
+    let integrity = match book.integrity {
+        BookIntegrity::SnapshotOnly => "snapshot_only",
+        BookIntegrity::Contiguous => "contiguous",
+        BookIntegrity::VerifiedRanges => "verified_ranges",
+    };
+    object([
+        ("symbol", string(&book.symbol)),
+        ("venue", string(super::convert::venue_to_str(book.venue))),
+        ("source", string("simulated_remaining_depth")),
+        ("observed_at", string(&book.observed_at.to_rfc3339())),
+        ("decision_at", string(&book.decision_at.to_rfc3339())),
+        ("age_ms", DriftValue::Number(book.age_ms() as f64)),
+        ("max_age_ms", DriftValue::Number(f64::from(book.max_age_ms))),
+        ("integrity", string(integrity)),
+        // u64 exchange sequence IDs are not necessarily exact f64 values.
+        (
+            "sequence",
+            book.sequence
+                .map_or(DriftValue::Null, |seq| string(&seq.to_string())),
+        ),
+        (
+            "best_bid",
+            book.best_bid.map_or(DriftValue::Null, level_value),
+        ),
+        (
+            "best_ask",
+            book.best_ask.map_or(DriftValue::Null, level_value),
+        ),
+        ("spread", book.spread().map_or(DriftValue::Null, number)),
+    ])
+}
+
+pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &StrategyContext<'_>) {
     if let DriftValue::Object(fields) = ctx {
+        let market = context.market.filter(|m| m.matches(event));
         fields.insert(
             "market".into(),
-            market
-                .filter(|m| m.matches(event))
-                .map_or(DriftValue::Null, market_value),
+            market.map_or(DriftValue::Null, market_value),
         );
+        let book = context
+            .book
+            .as_ref()
+            .filter(|book| market.is_some() && book.matches_at(event, context.now));
+        fields.insert("book".into(), book.map_or(DriftValue::Null, book_value));
     }
 }
