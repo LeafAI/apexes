@@ -22,6 +22,11 @@ use crate::{OrderIntent, Position};
 /// `apexes-backtest::MatchingEngine` (synchronous simulated fills) and
 /// `apexes-oms::OrderManager` (asynchronous, fills-arrive-later real
 /// submission).
+/// Pre-commit guard for simulated resting fills. The last flag indicates
+/// terminal execution (including a triggered market stop's IOC remainder).
+pub type SimulatedRestingCheck<'a> =
+    dyn FnMut(OrderId, &[Fill], bool) -> Result<(), String> + Send + 'a;
+
 #[async_trait]
 pub trait OrderExecutor: Send + Sync {
     /// Submits `intent`, returning the accepted `Order` plus any fills
@@ -46,7 +51,7 @@ pub trait OrderExecutor: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError>;
 
-    /// Read-only simulated Spot market-buy budget, including modeled taker fees.
+    /// Read-only simulated Spot buy budget, including modeled execution fees.
     /// Live executors do not participate in event-time capital reservation.
     fn simulated_buy_budget(
         &self,
@@ -56,6 +61,14 @@ pub trait OrderExecutor: Send + Sync {
         Err(ApexesError::OrderRejected {
             reason: "simulated buy budget unavailable".into(),
         })
+    }
+
+    fn on_market_event_checked(
+        &self,
+        event: &MarketEvent,
+        _check: &mut SimulatedRestingCheck<'_>,
+    ) -> Vec<(OrderId, Vec<Fill>)> {
+        self.on_market_event(event)
     }
 
     /// Gives this executor's local resting-order book a chance to react

@@ -123,6 +123,7 @@ impl TriggerCheckResult {
     }
 }
 
+#[derive(Clone)]
 struct RestingOrder {
     order_id: OrderId,
     order: Order,
@@ -240,9 +241,9 @@ impl MatchingEngine {
                 .any(|orders| orders.iter().any(|o| o.order_id == id))
     }
 
-    /// Full requested quantity valued at the worst executable observed ask
-    /// (or IOC cap), plus quote-denominated taker fees. Read-only, never
-    /// consumes liquidity. A later arrival must obtain a fresh budget.
+    /// Quote capital estimate: market orders use causal depth or IOC cap;
+    /// resting orders use their limit or stop price and the larger fee.
+    /// This is read-only; arrival and resting fills require revalidation.
     pub(crate) fn simulated_buy_budget(
         &self,
         intent: &OrderIntent,
@@ -251,11 +252,24 @@ impl MatchingEngine {
         let reject = |reason: &str| ApexesError::OrderRejected {
             reason: reason.into(),
         };
-        if intent.side != Side::Buy
-            || intent.order_type != OrderType::Market
-            || intent.quantity <= Decimal::ZERO
-        {
-            return Err(reject("invalid market buy reservation intent"));
+        if intent.side != Side::Buy || intent.quantity <= Decimal::ZERO {
+            return Err(reject("invalid buy reservation intent"));
+        }
+        if intent.order_type != OrderType::Market {
+            self.execution.validate_intent(intent)?;
+            let price = match intent.order_type {
+                OrderType::Limit | OrderType::StopLimit => intent.price,
+                OrderType::Stop => intent.stop_price,
+                _ => None,
+            }
+            .filter(|p| *p > Decimal::ZERO)
+            .ok_or_else(|| reject("missing positive reservation price"))?;
+            let rate = self
+                .cost_model
+                .fee_schedule
+                .maker_fee_bps(intent.venue)
+                .max(self.cost_model.fee_schedule.taker_fee_bps(intent.venue));
+            return Self::budget_with_fee(intent.quantity, price, rate);
         }
         self.require_depth(intent, now)?;
         let (_, cap) = self.execution.market_buy(
@@ -289,11 +303,21 @@ impl MatchingEngine {
             worst.ok_or_else(|| reject("missing executable reservation ask"))?
         };
         let rate = self.cost_model.fee_schedule.taker_fee_bps(intent.venue);
+        Self::budget_with_fee(intent.quantity, price, rate)
+    }
+
+    fn budget_with_fee(
+        quantity: Decimal,
+        price: Decimal,
+        rate: Decimal,
+    ) -> Result<Decimal, ApexesError> {
+        let reject = |reason: &str| ApexesError::OrderRejected {
+            reason: reason.into(),
+        };
         if rate < Decimal::ZERO || rate >= Decimal::from(10000) {
             return Err(reject("invalid reservation fee rate"));
         }
-        intent
-            .quantity
+        quantity
             .checked_mul(price)
             .and_then(|notional| {
                 notional
@@ -686,6 +710,15 @@ impl MatchingEngine {
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
+        self.on_trade_event_checked(trade, now, None)
+    }
+
+    pub(crate) fn on_trade_event_checked(
+        &mut self,
+        trade: &apexes_core::TradeEvent,
+        now: DateTime<Utc>,
+        mut check: Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
+    ) -> Vec<(OrderId, Vec<Fill>)> {
         // Stop-market orders execute first. Existing maker orders then
         // receive the print's budget. Newly triggered stop-limits execute
         // against causal opposite-side depth only after that maker pass;
@@ -709,7 +742,7 @@ impl MatchingEngine {
         {
             return Vec::new();
         }
-        let trigger_result = self.check_pending_triggers(trade, now);
+        let trigger_result = self.check_pending_triggers(trade, now, &mut check);
 
         let mut results = trigger_result.stop_fills;
         if let Some(orders) = self
@@ -722,6 +755,7 @@ impl MatchingEngine {
                 trade,
                 now,
                 &self.cost_model,
+                &mut check,
             ));
         }
 
@@ -730,7 +764,7 @@ impl MatchingEngine {
                 .prepare_limit_order(&limit_intent, now)
                 .and_then(|mut order| {
                     order.id = original_order_id;
-                    self.execute_prepared_limit(order, now)
+                    self.execute_prepared_limit_checked(order, now, &mut check)
                 });
             match result {
                 Ok((_order, fills)) => {
@@ -774,6 +808,7 @@ impl MatchingEngine {
         &mut self,
         trade: &apexes_core::TradeEvent,
         now: DateTime<Utc>,
+        check: &mut Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> TriggerCheckResult {
         let Some(pending) = self
             .pending_triggers
@@ -808,7 +843,22 @@ impl MatchingEngine {
                 OrderType::Stop => {
                     let mut market_intent = trigger.intent.clone();
                     market_intent.order_type = OrderType::Market;
-                    match self.submit_market_order(&market_intent, now) {
+                    let result = if let Some(check) = check.as_deref_mut() {
+                        let mut guard = |_: Option<apexes_strategy::ParentOrderId>,
+                                         _: &OrderIntent,
+                                         fills: &[Fill]| {
+                            check(trigger.order_id, fills, true)
+                        };
+                        self.submit_market_inner(
+                            &market_intent,
+                            now,
+                            false,
+                            Some((trigger.order_id, None, &mut guard)),
+                        )
+                    } else {
+                        self.submit_market_order(&market_intent, now)
+                    };
+                    match result {
                         Ok((_order, mut fills)) if !fills.is_empty() => {
                             tracing::info!(
                                 symbol = %trade.symbol,

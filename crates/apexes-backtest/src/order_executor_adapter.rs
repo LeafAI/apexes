@@ -106,10 +106,35 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
     }
 
     fn on_market_event(&self, event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
+        self.process_event(event, None)
+    }
+
+    fn on_market_event_checked(
+        &self,
+        event: &MarketEvent,
+        check: &mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>,
+    ) -> Vec<(OrderId, Vec<Fill>)> {
+        self.process_event(event, Some(check))
+    }
+
+    async fn open_orders(&self) -> HashMap<OrderId, Order> {
+        let engine = self.lock_engine();
+        let mut open = self.lock_open_orders();
+        open.retain(|id, _| engine.is_working(*id));
+        open.clone()
+    }
+}
+
+impl MatchingEngineOrderExecutor {
+    fn process_event(
+        &self,
+        event: &MarketEvent,
+        check: Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
+    ) -> Vec<(OrderId, Vec<Fill>)> {
         match event {
             MarketEvent::Trade(trade) => {
                 let mut engine = self.lock_engine();
-                let fill_results = engine.on_trade_event(trade, trade.timestamp);
+                let fill_results = engine.on_trade_event_checked(trade, trade.timestamp, check);
                 let mut open_orders = self.lock_open_orders();
                 for (order_id, fills) in &fill_results {
                     // Mirror `event_loop.rs`'s `MarketEvent::Trade` arm
@@ -160,13 +185,6 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
                 Vec::new()
             }
         }
-    }
-
-    async fn open_orders(&self) -> HashMap<OrderId, Order> {
-        let engine = self.lock_engine();
-        let mut open = self.lock_open_orders();
-        open.retain(|id, _| engine.is_working(*id));
-        open.clone()
     }
 }
 

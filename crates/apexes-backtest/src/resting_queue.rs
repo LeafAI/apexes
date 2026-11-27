@@ -89,6 +89,7 @@ impl MatchingEngine {
         trade: &TradeEvent,
         now: DateTime<Utc>,
         cost_model: &CostModel,
+        check: &mut Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
         if trade.quantity <= Decimal::ZERO || trade.price <= Decimal::ZERO || trade.timestamp > now
         {
@@ -114,7 +115,23 @@ impl MatchingEngine {
             .filter(|o| o.order.side == side && o.eligible(trade))
         {
             let quantity = budget.allocate(order);
-            if let Some(fill) = order.maker_fill(quantity, now, cost_model) {
+            let mut candidate = order.clone();
+            if let Some(fill) = candidate.maker_fill(quantity, now, cost_model) {
+                if let Some(check) = check.as_deref_mut()
+                    && let Err(reason) = check(
+                        order.order_id,
+                        std::slice::from_ref(&fill),
+                        candidate.remaining_quantity.is_zero(),
+                    )
+                {
+                    // Cancel the unfundable order. Its rejected quantity
+                    // remains available to later price-time orders.
+                    budget.remaining += quantity;
+                    order.remaining_quantity = Decimal::ZERO;
+                    tracing::warn!(order_id = %order.order_id.0, %reason, "simulated resting fill rejected");
+                    continue;
+                }
+                *order = candidate;
                 results.push((order.order_id, vec![fill]));
             }
         }
@@ -194,6 +211,76 @@ mod tests {
             trade_id: None,
             timestamp: at,
         }
+    }
+
+    #[test]
+    fn rejected_maker_does_not_consume_other_orders_print_budget() {
+        let mut e = engine(dec!(0));
+        let at = Utc::now();
+        let first = e
+            .submit_limit_order(&intent(Side::Buy, dec!(100), dec!(1)), at)
+            .unwrap();
+        let second = e
+            .submit_limit_order(&intent(Side::Buy, dec!(100), dec!(1)), at)
+            .unwrap();
+        let t = at + TimeDelta::seconds(1);
+        let mut guard = |id: OrderId, _: &[Fill], _: bool| {
+            if id == first.id {
+                Err("unfundable".into())
+            } else {
+                Ok(())
+            }
+        };
+        let fills = e.on_trade_event_checked(
+            &trade(t, dec!(100), dec!(1), Some(Side::Sell)),
+            t,
+            Some(&mut guard),
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].0, second.id);
+        assert_eq!(fills[0].1[0].quantity, dec!(1));
+        assert!(!e.is_working(first.id));
+        assert!(!e.is_working(second.id));
+    }
+
+    #[test]
+    fn rejected_crossing_stop_limit_leaves_depth_for_next_order() {
+        let mut e = engine(dec!(0));
+        let at = Utc::now();
+        snapshot(&mut e, at, dec!(10), 1);
+        let mut stop = intent(Side::Buy, dec!(110), dec!(10));
+        stop.order_type = OrderType::StopLimit;
+        stop.stop_price = Some(dec!(105));
+        let first = e.submit_stop_order(&stop, at).unwrap();
+        let second = e.submit_stop_order(&stop, at).unwrap();
+        let t = at + TimeDelta::seconds(1);
+        let mut guard = |id: OrderId, _: &[Fill], _: bool| {
+            if id == first.id {
+                Err("unfundable".into())
+            } else {
+                Ok(())
+            }
+        };
+        let fills = e.on_trade_event_checked(
+            &trade(t, dec!(105), dec!(1), Some(Side::Buy)),
+            t,
+            Some(&mut guard),
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].0, second.id);
+        assert_eq!(fills[0].1[0].quantity, dec!(10));
+        assert!(!e.is_working(first.id));
+        assert!(!e.is_working(second.id));
+    }
+
+    #[test]
+    fn limit_budget_uses_larger_fee_and_price_bound() {
+        let e = engine(dec!(0));
+        assert_eq!(
+            e.simulated_buy_budget(&intent(Side::Buy, dec!(100), dec!(2)), Utc::now())
+                .unwrap(),
+            dec!(200.4)
+        );
     }
 
     #[test]

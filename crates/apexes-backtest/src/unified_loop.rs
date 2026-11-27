@@ -347,7 +347,31 @@ pub async fn run_unified_event_loop(
                 // executor also owns the `OrderId -> Order`
                 // filled_quantity/status bookkeeping this loop used to do
                 // inline here.
-                for (_order_id, fills) in executor.on_market_event(&event) {
+                let resting_fills = if let Some(queue) = &mut arrivals {
+                    let mut projected = ledger.execution_snapshot();
+                    let mut check = |id, fills: &[Fill], terminal| {
+                        let mut candidate = projected.execution_snapshot();
+                        let result = (|| {
+                            for fill in fills {
+                                candidate.apply_fill(fill).map_err(|error| error.to_string())?;
+                            }
+                            queue.accept_resting(id, fills, terminal, projected.balances(), candidate.balances())
+                        })();
+                        if result.is_ok() {
+                            projected = candidate;
+                        } else {
+                            queue.report.resting_capital_refused += 1;
+                        }
+                        result
+                    };
+                    executor.on_market_event_checked(&event, &mut check)
+                } else {
+                    executor.on_market_event(&event)
+                };
+                if let Some(queue) = &mut arrivals {
+                    queue.reconcile_resting(&executor.open_orders().await);
+                }
+                for (_order_id, fills) in resting_fills {
                     apply_fills(
                         diagnostics, "resting",
                         &mut ledger,
@@ -776,7 +800,7 @@ pub async fn run_unified_event_loop(
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
                     let mut admitted_hold = None;
                     if let Some(queue)=&mut arrivals {
-                        let hold = match spot_market_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
+                        let hold = match spot_intent_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
                             Ok(hold) if hold.as_ref().is_none_or(|hold| queue.check_capital(hold, ledger.balances())) => hold,
                             result => {
                                 queue.capital_refused(!arriving);
@@ -847,6 +871,10 @@ pub async fn run_unified_event_loop(
                     {
                         Ok((order, fills)) => {
                             trace.accepted(&order);
+                            if let (Some(queue), Some(hold)) = (&mut arrivals, admitted_hold)
+                                && matches!(order.status, apexes_core::OrderStatus::New | apexes_core::OrderStatus::PartiallyFilled) {
+                                queue.reserve_resting(&order, hold).map_err(|reason| ApexesError::InvalidBacktestConfig { reason })?;
+                            }
                             if let Some(log) = &mut order_log {
                                 log.submitted(&order);
                                 log.filled(&fills);
@@ -1102,9 +1130,9 @@ pub async fn run_unified_event_loop(
     })
 }
 
-/// Reserve market-intent spend assets while in transit. Parent admission
-/// and resting-order lifetime reservations are separate follow-up work.
-fn spot_market_hold(
+/// Reserve Spot intent spend assets while in transit, then transfer the
+/// remaining amount to a working direct order or admitted EMS parent.
+fn spot_intent_hold(
     intent: &apexes_strategy::OrderIntent,
     instruments: &HashMap<String, Instrument>,
     executor: &dyn OrderExecutor,
@@ -1118,7 +1146,6 @@ fn spot_market_hold(
         return Err("simulated Spot parent requires a market intent".into());
     }
     if intent.asset_class != AssetClass::Spot
-        || intent.order_type != OrderType::Market
         || intent.leverage.is_some()
         || intent.margin_mode.is_some()
     {
