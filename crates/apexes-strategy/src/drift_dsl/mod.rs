@@ -10,3 +10,5 @@ mod signals;
 mod strategy;
 
 pub use strategy::DriftScriptStrategy;
+
+mod symbol_state;
