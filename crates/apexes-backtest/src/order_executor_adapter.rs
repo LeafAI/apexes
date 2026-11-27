@@ -117,12 +117,12 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         Ok((order, fills))
     }
 
-    fn simulated_margin_budget(
+    fn simulated_margin_rates(
         &self,
         intent: &OrderIntent,
         now: DateTime<Utc>,
-    ) -> Result<Decimal, ApexesError> {
-        self.lock_engine().simulated_margin_budget(intent, now)
+    ) -> Result<(Decimal, Decimal), ApexesError> {
+        self.lock_engine().simulated_margin_rates(intent, now)
     }
 
     fn simulated_buy_budget(

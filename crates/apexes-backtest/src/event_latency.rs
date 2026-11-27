@@ -94,6 +94,91 @@ pub struct ChildLatencyReport {
 pub(crate) struct CapitalHold {
     pub asset: String,
     pub amount: Decimal,
+    pub margin: Option<MarginAllocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarginAllocation {
+    pub closing: Decimal,
+    pub unit_margin: Decimal,
+    pub unit_fee: Decimal,
+}
+
+impl CapitalHold {
+    pub fn plain(asset: String, amount: Decimal) -> Self {
+        Self {
+            asset,
+            amount,
+            margin: None,
+        }
+    }
+
+    pub fn leveraged(
+        asset: String,
+        quantity: Decimal,
+        allocation: MarginAllocation,
+    ) -> Result<Self, String> {
+        if quantity < Decimal::ZERO
+            || allocation.closing < Decimal::ZERO
+            || allocation.closing > quantity
+            || allocation.unit_margin <= Decimal::ZERO
+            || allocation.unit_fee < Decimal::ZERO
+        {
+            return Err("invalid leveraged allocation".into());
+        }
+        let amount = (quantity - allocation.closing)
+            .checked_mul(allocation.unit_margin)
+            .and_then(|margin| {
+                quantity
+                    .checked_mul(allocation.unit_fee)
+                    .and_then(|fee| margin.checked_add(fee))
+            })
+            .ok_or("margin allocation overflow")?;
+        Ok(Self {
+            asset,
+            amount,
+            margin: Some(allocation),
+        })
+    }
+
+    fn closing(&self) -> Decimal {
+        self.margin.as_ref().map_or(Decimal::ZERO, |m| m.closing)
+    }
+
+    /// A fill consumes closing quantity before opening quantity. For a
+    /// terminal child IOC, relinquish its requested allocation even if
+    /// only a fraction executed; this cannot underfund future slices.
+    fn remainder(&self, previous: Decimal, remaining: Decimal) -> Result<Self, String> {
+        if previous <= Decimal::ZERO || remaining < Decimal::ZERO || remaining > previous {
+            return Err("invalid reservation remainder".into());
+        }
+        if let Some(mut allocation) = self.margin.clone() {
+            allocation.closing = (allocation.closing - (previous - remaining)).max(Decimal::ZERO);
+            return Self::leveraged(self.asset.clone(), remaining, allocation);
+        }
+        let amount = self
+            .amount
+            .checked_mul(remaining)
+            .and_then(|n| n.checked_div(previous))
+            .ok_or("reservation arithmetic overflow")?;
+        Ok(Self::plain(self.asset.clone(), amount))
+    }
+}
+
+pub(crate) fn closing_quantity(
+    intent: &OrderIntent,
+    positions: &HashMap<String, apexes_strategy::Position>,
+) -> Decimal {
+    positions
+        .get(&intent.symbol)
+        .filter(|p| {
+            p.leverage.is_some()
+                && match intent.side {
+                    apexes_core::Side::Buy => p.quantity < Decimal::ZERO,
+                    apexes_core::Side::Sell => p.quantity > Decimal::ZERO,
+                }
+        })
+        .map_or(Decimal::ZERO, |p| p.quantity.abs().min(intent.quantity))
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +195,30 @@ struct ParentCapital {
 
 #[derive(Debug, Clone)]
 struct RestingCapital {
+    symbol: String,
     hold: CapitalHold,
     remaining: Decimal,
+}
+
+fn validate_closing(
+    symbol: &str,
+    side: apexes_core::Side,
+    required: Decimal,
+    positions: &HashMap<String, apexes_strategy::Position>,
+) -> Result<(), String> {
+    if required > Decimal::ZERO
+        && !positions.get(symbol).is_some_and(|p| {
+            p.leverage.is_some()
+                && p.quantity.abs() >= required
+                && match side {
+                    apexes_core::Side::Buy => p.quantity < Decimal::ZERO,
+                    apexes_core::Side::Sell => p.quantity > Decimal::ZERO,
+                }
+        })
+    {
+        return Err("reserved closing quantity no longer available".into());
+    }
+    Ok(())
 }
 
 pub(crate) struct ArrivalQueue {
@@ -179,8 +286,64 @@ impl ArrivalQueue {
             .try_fold(Decimal::ZERO, |sum, h| sum.checked_add(h.amount))
     }
 
+    /// The ledger is keyed by symbol. Closing quantity is granted only
+    /// when no other order on that symbol owns execution capacity.
+    pub fn has_symbol_owner(&self, symbol: &str) -> bool {
+        self.holds.keys().any(|(_, s)| s == symbol)
+            || self.parents.values().any(|p| p.symbol == symbol)
+            || self.resting.values().any(|r| r.symbol == symbol)
+    }
+
+    pub fn has_closing_owner(&self, symbol: &str) -> bool {
+        self.holds
+            .iter()
+            .any(|((_, s), h)| s == symbol && h.closing() > Decimal::ZERO)
+            || self
+                .parents
+                .values()
+                .any(|p| p.symbol == symbol && p.hold.closing() > Decimal::ZERO)
+            || self
+                .resting
+                .values()
+                .any(|r| r.symbol == symbol && r.hold.closing() > Decimal::ZERO)
+    }
+
+    pub fn validate_resting_claim(
+        &self,
+        id: OrderId,
+        fills: &[Fill],
+        positions: &HashMap<String, apexes_strategy::Position>,
+    ) -> Result<(), String> {
+        if let Some(r) = self.resting.get(&id)
+            && r.hold.closing() > Decimal::ZERO
+            && let Some(fill) = fills.first()
+        {
+            let required = r.hold.closing().min(fills.iter().map(|f| f.quantity).sum());
+            validate_closing(&r.symbol, fill.side, required, positions)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_child_claim(
+        &self,
+        parent: Option<ParentOrderId>,
+        intent: &OrderIntent,
+        positions: &HashMap<String, apexes_strategy::Position>,
+    ) -> Result<(), String> {
+        if let Some(p) = parent.and_then(|id| self.parents.get(&id)) {
+            validate_closing(
+                &p.symbol,
+                p.side,
+                p.hold.closing().min(intent.quantity),
+                positions,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn check_capital(&self, hold: &CapitalHold, balances: &HashMap<String, Decimal>) -> bool {
-        hold.amount > Decimal::ZERO
+        hold.amount >= Decimal::ZERO
+            && (hold.amount > Decimal::ZERO || hold.margin.is_some())
             && self
                 .reserved(&hold.asset, None)
                 .and_then(|amount| amount.checked_add(hold.amount))
@@ -236,21 +399,9 @@ impl ArrivalQueue {
         }
         if let Some(hold) = hold
             && remaining > Decimal::ZERO
+            && !self.check_capital(&hold.remainder(quantity, remaining)?, after)
         {
-            let amount = hold
-                .amount
-                .checked_mul(remaining)
-                .and_then(|n| n.checked_div(quantity))
-                .ok_or("direct reservation arithmetic overflow")?;
-            if !self.check_capital(
-                &CapitalHold {
-                    asset: hold.asset.clone(),
-                    amount,
-                },
-                after,
-            ) {
-                return Err("insufficient capital for working remainder".into());
-            }
+            return Err("insufficient capital for working remainder".into());
         }
         for asset in self
             .holds
@@ -271,18 +422,20 @@ impl ArrivalQueue {
         Ok(())
     }
 
-    pub fn reserve_resting(&mut self, order: &Order, mut hold: CapitalHold) -> Result<(), String> {
+    pub fn reserve_resting(&mut self, order: &Order, hold: CapitalHold) -> Result<(), String> {
         let remaining = order.quantity - order.filled_quantity;
         if remaining <= Decimal::ZERO {
             return Ok(());
         }
-        hold.amount = hold
-            .amount
-            .checked_mul(remaining)
-            .and_then(|n| n.checked_div(order.quantity))
-            .ok_or("resting reservation arithmetic overflow")?;
-        self.resting
-            .insert(order.id, RestingCapital { hold, remaining });
+        let hold = hold.remainder(order.quantity, remaining)?;
+        self.resting.insert(
+            order.id,
+            RestingCapital {
+                symbol: order.symbol.clone(),
+                hold,
+                remaining,
+            },
+        );
         self.report.resting_capital_reserved += 1;
         Ok(())
     }
@@ -326,15 +479,10 @@ impl ArrivalQueue {
         } else {
             Decimal::ZERO
         };
-        let new_amount = match old_hold {
-            Some(r) if remaining > Decimal::ZERO => r
-                .hold
-                .amount
-                .checked_mul(remaining)
-                .and_then(|n| n.checked_div(r.remaining))
-                .ok_or("resting reservation arithmetic overflow")?,
-            _ => Decimal::ZERO,
-        };
+        let replacement = old_hold
+            .map(|r| r.hold.remainder(r.remaining, remaining))
+            .transpose()?;
+        let new_amount = replacement.as_ref().map_or(Decimal::ZERO, |h| h.amount);
         for asset in self
             .holds
             .values()
@@ -359,9 +507,11 @@ impl ArrivalQueue {
                 return Err("resting fill would consume another order's reservation".into());
             }
         }
-        if let Some(r) = self.resting.get_mut(&id) {
+        if let Some(r) = self.resting.get_mut(&id)
+            && let Some(hold) = replacement
+        {
             r.remaining = remaining;
-            r.hold.amount = new_amount;
+            r.hold = hold;
         }
         Ok(())
     }
@@ -404,23 +554,7 @@ impl ArrivalQueue {
                 return Err("child does not match parent capital allocation".into());
             }
             let remaining = p.remaining - intent.quantity;
-            let amount = if remaining.is_zero() {
-                Decimal::ZERO
-            } else {
-                p.hold
-                    .amount
-                    .checked_mul(remaining)
-                    .and_then(|n| n.checked_div(p.remaining))
-                    .ok_or("parent reservation arithmetic overflow")?
-            };
-            Some((
-                id,
-                remaining,
-                CapitalHold {
-                    asset: p.hold.asset.clone(),
-                    amount,
-                },
-            ))
+            Some((id, remaining, p.hold.remainder(p.remaining, remaining)?))
         } else {
             if parent.is_some()
                 && matches!(
@@ -557,21 +691,60 @@ mod tests {
     }
 
     #[test]
+    fn leveraged_remainder_consumes_closing_quantity_before_opening_margin() {
+        let hold = CapitalHold::leveraged(
+            "USDT".into(),
+            Decimal::from(4),
+            MarginAllocation {
+                closing: Decimal::from(2),
+                unit_margin: Decimal::from(5),
+                unit_fee: Decimal::ONE,
+            },
+        )
+        .unwrap();
+        assert_eq!(hold.amount, Decimal::from(14));
+        let reduced = hold.remainder(Decimal::from(4), Decimal::from(3)).unwrap();
+        assert_eq!(reduced.amount, Decimal::from(13));
+        assert_eq!(reduced.closing(), Decimal::ONE);
+        let reduced = reduced
+            .remainder(Decimal::from(3), Decimal::from(2))
+            .unwrap();
+        assert_eq!(reduced.amount, Decimal::from(12));
+        assert_eq!(reduced.closing(), Decimal::ZERO);
+        let reduced = reduced.remainder(Decimal::from(2), Decimal::ONE).unwrap();
+        assert_eq!(reduced.amount, Decimal::from(6));
+    }
+
+    #[test]
+    fn closing_claim_rejects_missing_or_reversed_position() {
+        let mut positions = HashMap::new();
+        assert!(validate_closing("BTCUSDT", Side::Sell, Decimal::ONE, &positions).is_err());
+        positions.insert(
+            "BTCUSDT".into(),
+            apexes_strategy::Position {
+                symbol: "BTCUSDT".into(),
+                quantity: -Decimal::ONE,
+                average_entry_price: Decimal::from(10),
+                leverage: Some(Decimal::from(2)),
+                margin_mode: Some(apexes_core::MarginMode::Isolated),
+                allocated_margin: Decimal::from(5),
+            },
+        );
+        assert!(validate_closing("BTCUSDT", Side::Sell, Decimal::ONE, &positions).is_err());
+        assert!(validate_closing("BTCUSDT", Side::Buy, Decimal::ONE, &positions).is_ok());
+        assert!(validate_closing("BTCUSDT", Side::Buy, Decimal::from(2), &positions).is_err());
+    }
+
+    #[test]
     fn parent_child_spends_only_its_share_and_terminal_parent_releases_residual() {
         let mut queue = ArrivalQueue::new(EventLatencyPolicy { delay_ms: 500 });
         let parent = ParentOrderId(uuid::Uuid::new_v4());
         let mut request = intent("BTCUSDT");
         request.quantity = Decimal::from(2);
-        let hold = CapitalHold {
-            asset: "USDT".into(),
-            amount: Decimal::from(12),
-        };
+        let hold = CapitalHold::plain("USDT".into(), Decimal::from(12));
         let balances = HashMap::from([("USDT".into(), Decimal::from(15))]);
         queue.reserve_parent(parent, &request, hold);
-        let other = CapitalHold {
-            asset: "USDT".into(),
-            amount: Decimal::from(4),
-        };
+        let other = CapitalHold::plain("USDT".into(), Decimal::from(4));
         assert!(!queue.check_capital(&other, &balances));
         let child = intent("BTCUSDT");
         // First child cannot spend 10: the other slice still owns 6.
@@ -618,10 +791,7 @@ mod tests {
         queue.reserve_parent(
             parent,
             &request,
-            CapitalHold {
-                asset: "USDT".into(),
-                amount: Decimal::from(6),
-            },
+            CapitalHold::plain("USDT".into(), Decimal::from(6)),
         );
         let balance = HashMap::from([("USDT".into(), Decimal::from(6))]);
         let after = HashMap::from([("USDT".into(), Decimal::ZERO)]);
@@ -652,10 +822,7 @@ mod tests {
     fn due_batch_preserves_other_intents_holds_until_individual_release() {
         let at = Utc::now();
         let mut queue = ArrivalQueue::new(EventLatencyPolicy { delay_ms: 500 });
-        let hold = CapitalHold {
-            asset: "USDT".into(),
-            amount: Decimal::from(6),
-        };
+        let hold = CapitalHold::plain("USDT".into(), Decimal::from(6));
         let balances = HashMap::from([("USDT".into(), Decimal::from(12))]);
         let first = intent("BTCUSDT");
         let second = intent("ETHUSDT");
@@ -672,10 +839,7 @@ mod tests {
         assert_eq!(due.len(), 2);
         assert!(!queue.check_capital(&hold, &balances));
         queue.release(&first);
-        let expensive = CapitalHold {
-            asset: "USDT".into(),
-            amount: Decimal::from(7),
-        };
+        let expensive = CapitalHold::plain("USDT".into(), Decimal::from(7));
         assert!(!queue.check_capital(&expensive, &balances));
         assert!(
             queue

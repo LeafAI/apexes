@@ -65,11 +65,11 @@ pub trait OrderExecutor: Send + Sync {
         self.submit(intent, positions, balances, now).await
     }
 
-    fn simulated_margin_budget(
+    fn simulated_margin_rates(
         &self,
         _intent: &OrderIntent,
         _now: DateTime<Utc>,
-    ) -> Result<Decimal, ApexesError> {
+    ) -> Result<(Decimal, Decimal), ApexesError> {
         Err(ApexesError::OrderRejected {
             reason: "simulated margin budget unavailable".into(),
         })
