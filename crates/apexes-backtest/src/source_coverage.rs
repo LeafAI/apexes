@@ -1,10 +1,12 @@
 //! F03.02/F03.03 — Reconcile caller-supplied collection receipts against
 //! sealed replay data. A receipt is a claim, not an upstream attestation.
 
-use crate::historical_dataset::{DatasetManifest, DatasetStream, StreamKind, VerifiedDataset};
+use crate::historical_dataset::{
+    DatasetManifest, DatasetStream, OBSERVATION_SCHEMA, StreamKind, VerifiedDataset,
+};
 use crate::market_data_source::event_timestamp;
-use apexes_core::MarketEvent;
-use chrono::{DateTime, Utc};
+use apexes_core::{Bar, BarInterval, MarketEvent, Venue};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -44,8 +46,21 @@ pub struct CollectionWindow {
 #[serde(deny_unknown_fields)]
 pub struct StreamCoverage {
     pub stream: DatasetStream,
+    /// Required for bars in receipt schema 2. Omitted in schema 1 and on non-bar streams.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_bar_interval"
+    )]
+    pub bar_interval: Option<BarInterval>,
     pub sequence_contract: SequenceContract,
     pub windows: Vec<CollectionWindow>,
+}
+
+fn read_bar_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BarInterval>, D::Error> {
+    BarInterval::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,11 +90,11 @@ fn range_count(r: &SequenceRange) -> Option<u64> {
     r.last.checked_sub(r.first)?.checked_add(1)
 }
 
-fn validate_windows(
-    stream: &StreamCoverage,
+fn validate_windows<'a>(
+    stream: &'a StreamCoverage,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    receipts: &mut HashSet<String>,
+    receipts: &mut HashSet<&'a str>,
 ) -> Result<(), String> {
     match (stream.sequence_contract, stream.stream.kind) {
         (SequenceContract::Unavailable, _)
@@ -91,7 +106,7 @@ fn validate_windows(
     let mut last_sequence: Option<u64> = None;
     for w in &stream.windows {
         if w.receipt_id.trim().is_empty()
-            || !receipts.insert(w.receipt_id.clone())
+            || !receipts.insert(w.receipt_id.as_str())
             || !w.complete
             || w.start != next_start
             || w.end_exclusive <= w.start
@@ -145,10 +160,48 @@ fn event_sequence(event: &MarketEvent, contract: SequenceContract) -> Result<u64
     }
 }
 
+// The manifest retains its original stream/day partitions. Intervals refine
+// those stream identities only for coverage reconciliation.
+type StreamKey<'a> = (Venue, &'a str, StreamKind);
+type ReceiptKey<'a> = (StreamKey<'a>, Option<BarInterval>);
+
+fn stream_key(stream: &DatasetStream) -> StreamKey<'_> {
+    (stream.venue, &stream.symbol, stream.kind)
+}
+
+fn validate_bar(bar: &Bar, previous_close: Option<DateTime<Utc>>) -> Result<(), String> {
+    let seconds = match bar.interval {
+        BarInterval::OneSecond => 1,
+        BarInterval::OneMinute => 60,
+        BarInterval::FiveMinutes => 300,
+        BarInterval::FifteenMinutes => 900,
+        BarInterval::OneHour => 3_600,
+        BarInterval::OneDay => 86_400,
+    };
+    if bar
+        .open_time
+        .checked_add_signed(TimeDelta::seconds(seconds))
+        != Some(bar.close_time)
+    {
+        return Err(format!(
+            "invalid scheduled bar boundary for {:?}/{} {:?} at {}",
+            bar.venue, bar.symbol, bar.interval, bar.open_time
+        ));
+    }
+    if previous_close.is_some_and(|close| bar.open_time < close) {
+        return Err(format!(
+            "duplicate or overlapping bar for {:?}/{} {:?} at {}",
+            bar.venue, bar.symbol, bar.interval, bar.open_time
+        ));
+    }
+    Ok(())
+}
+
 struct Cursor<'a> {
     stream: &'a StreamCoverage,
     window: usize,
     count: u64,
+    previous_bar_close: Option<DateTime<Utc>>,
 }
 
 impl Cursor<'_> {
@@ -166,6 +219,12 @@ impl Cursor<'_> {
     }
 
     fn observe(&mut self, event: &MarketEvent) -> Result<(), String> {
+        if self.stream.bar_interval.is_some()
+            && let MarketEvent::Bar(bar) = event
+        {
+            validate_bar(bar, self.previous_bar_close)?;
+            self.previous_bar_close = Some(bar.close_time);
+        }
         let at = event_timestamp(event);
         while self
             .stream
@@ -196,7 +255,7 @@ impl Cursor<'_> {
                 ));
             }
         }
-        self.count += 1;
+        self.count = self.count.checked_add(1).ok_or("event count overflow")?;
         Ok(())
     }
 
@@ -238,16 +297,21 @@ impl SourceCoverage {
         manifest: &DatasetManifest,
         events: &[MarketEvent],
     ) -> Result<CoverageReport, String> {
+        let interval_specific = match self.schema_version {
+            1 => false,
+            2 if manifest.schema_version == OBSERVATION_SCHEMA => true,
+            _ => return Err("unsupported coverage schema for dataset manifest".into()),
+        };
         let d = &manifest.definition;
-        if manifest.schema_version == crate::historical_dataset::OBSERVATION_SCHEMA
+        if !interval_specific
+            && manifest.schema_version == OBSERVATION_SCHEMA
             && d.streams.iter().any(|s| s.kind == StreamKind::Bar)
         {
             return Err(
                 "schema 2 bar coverage requires an interval-specific receipt contract".into(),
             );
         }
-        if self.schema_version != 1
-            || self.dataset_id != d.dataset_id
+        if self.dataset_id != d.dataset_id
             || self.dataset_version != d.version
             || self.source_id != d.source_id
             || self.replay_sha256 != manifest.replay_sha256
@@ -264,8 +328,13 @@ impl SourceCoverage {
             .and_hms_opt(0, 0, 0)
             .ok_or("invalid end")?
             .and_utc();
-        let declared: HashSet<_> = d.streams.iter().collect();
-        let mut cursors = HashMap::new();
+        let mut declared: HashMap<_, _> =
+            d.streams.iter().map(|s| (stream_key(s), false)).collect();
+        if self.streams.len() > MAX_WINDOWS {
+            return Err("coverage exceeds window limit".into());
+        }
+        let mut keys: HashMap<ReceiptKey<'_>, usize> = HashMap::new();
+        let mut cursors = Vec::new();
         let mut receipts = HashSet::new();
         let mut total = 0usize;
         let mut empty = 0usize;
@@ -275,21 +344,25 @@ impl SourceCoverage {
                 .checked_add(stream.windows.len())
                 .filter(|n| *n <= MAX_WINDOWS)
                 .ok_or("coverage exceeds window limit")?;
-            if !declared.contains(&stream.stream)
-                || cursors
-                    .insert(
-                        &stream.stream,
-                        Cursor {
-                            stream,
-                            window: 0,
-                            count: 0,
-                        },
-                    )
-                    .is_some()
-            {
-                return Err("unknown or duplicate coverage stream".into());
+            let base = stream_key(&stream.stream);
+            if stream.bar_interval.is_some() != (interval_specific && base.2 == StreamKind::Bar) {
+                return Err("bar interval required only on schema 2 bar coverage streams".into());
             }
+            let covered = declared.get_mut(&base).ok_or("unknown coverage stream")?;
+            if keys
+                .insert((base, stream.bar_interval), cursors.len())
+                .is_some()
+            {
+                return Err("duplicate coverage stream".into());
+            }
+            *covered = true;
             validate_windows(stream, start, end, &mut receipts)?;
+            cursors.push(Cursor {
+                stream,
+                window: 0,
+                count: 0,
+                previous_bar_close: None,
+            });
             empty += stream
                 .windows
                 .iter()
@@ -300,21 +373,21 @@ impl SourceCoverage {
                     && stream.windows.iter().any(|w| w.expected_count > 0),
             );
         }
-        if cursors.len() != declared.len() {
+        if declared.values().any(|covered| !covered) {
             return Err("missing coverage stream".into());
         }
         for event in events {
-            let key = DatasetStream {
-                venue: event.venue(),
-                symbol: event.symbol().into(),
-                kind: StreamKind::of(event),
+            let interval = match event {
+                MarketEvent::Bar(bar) if interval_specific => Some(bar.interval),
+                _ => None,
             };
-            cursors
-                .get_mut(&key)
-                .ok_or("event outside coverage streams")?
-                .observe(event)?;
+            let base = (event.venue(), event.symbol(), StreamKind::of(event));
+            let index = keys
+                .get(&(base, interval))
+                .ok_or_else(|| format!("event outside coverage streams: {base:?}, {interval:?}"))?;
+            cursors[*index].observe(event)?;
         }
-        for cursor in cursors.into_values() {
+        for cursor in cursors {
             cursor.finish()?;
         }
         Ok(CoverageReport {

@@ -365,6 +365,7 @@ fn coverage_fixture() -> (DatasetManifest, Vec<MarketEvent>, SourceCoverage) {
         streams: vec![
             StreamCoverage {
                 stream: d.streams[0].clone(),
+                bar_interval: None,
                 sequence_contract: SequenceContract::ContiguousTradeId,
                 windows: vec![
                     receipt("trade", 1, 1, Some((100, 100))),
@@ -374,6 +375,7 @@ fn coverage_fixture() -> (DatasetManifest, Vec<MarketEvent>, SourceCoverage) {
             },
             StreamCoverage {
                 stream: d.streams[1].clone(),
+                bar_interval: None,
                 sequence_contract: SequenceContract::Unavailable,
                 windows: vec![
                     receipt("tick", 1, 1, None),
@@ -529,6 +531,7 @@ fn depth_sequence_contract_refuses_invalidation_and_missing_sequence() {
         replay_sha256: m.replay_sha256.clone(),
         streams: vec![StreamCoverage {
             stream: d.streams[0].clone(),
+            bar_interval: None,
             sequence_contract: SequenceContract::ContiguousDepthUpdate,
             windows: vec![
                 receipt("depth", 1, 1, Some((10, 10))),
