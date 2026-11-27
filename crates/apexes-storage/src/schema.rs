@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS depth_updates
     bids        Array(Tuple(Decimal(38, 10), Decimal(38, 10))),
     asks        Array(Tuple(Decimal(38, 10), Decimal(38, 10))),
     sequence    Nullable(UInt64),
+    source_first Nullable(UInt64),
+    source_last Nullable(UInt64),
+    source_previous_final Nullable(UInt64),
     is_snapshot Bool,
     timestamp   DateTime64(3, 'UTC')
 )
@@ -217,6 +220,9 @@ pub struct DepthRow {
     pub bids: Vec<(CkDecimal, CkDecimal)>,
     pub asks: Vec<(CkDecimal, CkDecimal)>,
     pub sequence: Option<u64>,
+    pub source_first: Option<u64>,
+    pub source_last: Option<u64>,
+    pub source_previous_final: Option<u64>,
     pub is_snapshot: bool,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     pub timestamp: DateTime<Utc>,
@@ -226,12 +232,18 @@ impl TryFrom<&DepthUpdate> for DepthRow {
     type Error = StorageError;
 
     fn try_from(update: &DepthUpdate) -> Result<Self, StorageError> {
+        update
+            .validate_source_range()
+            .map_err(|reason| StorageError::InvalidDepthRange { reason })?;
         Ok(DepthRow {
             symbol: update.symbol.clone(),
             venue: format!("{:?}", update.venue),
             bids: levels_to_pairs(&update.bids)?,
             asks: levels_to_pairs(&update.asks)?,
             sequence: update.sequence,
+            source_first: update.source_range.map(|r| r.first),
+            source_last: update.source_range.map(|r| r.last),
+            source_previous_final: update.source_range.and_then(|r| r.previous_final),
             is_snapshot: update.is_snapshot,
             timestamp: update.timestamp,
         })
@@ -242,15 +254,33 @@ impl TryFrom<DepthRow> for DepthUpdate {
     type Error = StorageError;
 
     fn try_from(row: DepthRow) -> Result<Self, StorageError> {
-        Ok(DepthUpdate {
+        let source_range = match (row.source_first, row.source_last, row.source_previous_final) {
+            (None, None, None) => None,
+            (Some(first), Some(last), previous_final) => Some(apexes_core::DepthSourceRange {
+                first,
+                last,
+                previous_final,
+            }),
+            _ => {
+                return Err(StorageError::InvalidDepthRange {
+                    reason: "partial stored range metadata".into(),
+                });
+            }
+        };
+        let update = DepthUpdate {
             symbol: row.symbol,
             venue: parse_venue(&row.venue)?,
             bids: pairs_to_levels(row.bids),
             asks: pairs_to_levels(row.asks),
             sequence: row.sequence,
+            source_range,
             is_snapshot: row.is_snapshot,
             timestamp: row.timestamp,
-        })
+        };
+        update
+            .validate_source_range()
+            .map_err(|reason| StorageError::InvalidDepthRange { reason })?;
+        Ok(update)
     }
 }
 
@@ -381,6 +411,74 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn original_range_round_trips_through_depth_storage_row() {
+        let mut d = DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![],
+            asks: vec![],
+            sequence: Some(103),
+            source_range: None,
+            is_snapshot: false,
+            timestamp: Utc::now(),
+        };
+        let row = DepthRow::try_from(&d).unwrap();
+        assert_eq!(
+            (row.source_first, row.source_last, row.source_previous_final),
+            (None, None, None)
+        );
+        assert_eq!(DepthUpdate::try_from(row).unwrap(), d);
+        for previous_final in [None, Some(98)] {
+            d.source_range = Some(apexes_core::DepthSourceRange {
+                first: 99,
+                last: 103,
+                previous_final,
+            });
+            let row = DepthRow::try_from(&d).unwrap();
+            assert_eq!(
+                (row.source_first, row.source_last, row.source_previous_final),
+                (Some(99), Some(103), previous_final)
+            );
+            assert_eq!(DepthUpdate::try_from(row).unwrap(), d);
+        }
+    }
+
+    #[test]
+    fn incomplete_and_inconsistent_stored_ranges_are_rejected() {
+        let mut d = DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![],
+            asks: vec![],
+            sequence: Some(103),
+            source_range: Some(apexes_core::DepthSourceRange {
+                first: 99,
+                last: 103,
+                previous_final: Some(98),
+            }),
+            is_snapshot: false,
+            timestamp: Utc::now(),
+        };
+        let mut row = DepthRow::try_from(&d).unwrap();
+        row.source_last = None;
+        assert!(matches!(
+            DepthUpdate::try_from(row),
+            Err(StorageError::InvalidDepthRange { .. })
+        ));
+        let mut row = DepthRow::try_from(&d).unwrap();
+        row.sequence = Some(104);
+        assert!(matches!(
+            DepthUpdate::try_from(row),
+            Err(StorageError::InvalidDepthRange { .. })
+        ));
+        d.is_snapshot = true;
+        assert!(matches!(
+            DepthRow::try_from(&d),
+            Err(StorageError::InvalidDepthRange { .. })
+        ));
+    }
+
+    #[test]
     fn trade_event_round_trips_through_trade_row() {
         let event = TradeEvent {
             symbol: "BTCUSDT".to_string(),
@@ -484,6 +582,7 @@ mod tests {
                 quantity: dec!(1.0),
             }],
             sequence: Some(12345),
+            source_range: None,
             is_snapshot: true,
             timestamp: Utc::now(),
         };
@@ -511,6 +610,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             sequence: None,
+            source_range: None,
             is_snapshot: false,
             timestamp: Utc::now(),
         };

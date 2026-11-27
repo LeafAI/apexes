@@ -1,6 +1,5 @@
-//! Offline range-aware depth continuity evidence. Normalized DepthUpdate
-//! exposes only the final sequence; never infer missing source endpoints
-//! or previous-final links from that number.
+//! Offline range-aware depth continuity evidence. Native source ranges
+//! are optional; never infer missing endpoints from final sequence IDs.
 
 use crate::historical_dataset::{DatasetManifest, DatasetStream, StreamKind, VerifiedDataset};
 use apexes_core::MarketEvent;
@@ -87,6 +86,7 @@ impl Cursor<'_> {
             self.snapshots += 1;
             return Ok(());
         }
+        d.validate_source_range()?;
         let prior = self.last.ok_or("increment before initial depth snapshot")?;
         let r = self
             .ranges
@@ -95,6 +95,13 @@ impl Cursor<'_> {
             .ok_or("missing original depth range")?;
         if r.event_index != index || r.last != final_id || r.first > r.last || r.last <= prior {
             return Err("invalid depth range, event binding or nonadvancing final ID".into());
+        }
+        if let Some(native) = d.source_range
+            && (native.first != r.first
+                || native.last != r.last
+                || native.previous_final != r.previous_final)
+        {
+            return Err("sidecar differs from native source range".into());
         }
         match self.ranges.contract {
             RangeContract::InclusiveNext => {
@@ -124,6 +131,72 @@ impl Cursor<'_> {
         self.first_increment = false;
         Ok(())
     }
+}
+
+/// Explicit stream contracts for native evidence generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRangeContract {
+    pub stream: DatasetStream,
+    pub contract: RangeContract,
+}
+
+/// Build the existing sidecar using only original native source fields.
+/// Refuse legacy records lacking endpoints or inconsistent contracts.
+pub fn build_native_evidence(
+    manifest: &DatasetManifest,
+    events: &[MarketEvent],
+    contracts: &[NativeRangeContract],
+) -> Result<DepthRangeEvidence, String> {
+    manifest.verify(events)?;
+    let mut positions = HashMap::new();
+    let mut streams = Vec::new();
+    for contract in contracts {
+        if positions
+            .insert(contract.stream.clone(), streams.len())
+            .is_some()
+        {
+            return Err("duplicate native range contract".into());
+        }
+        streams.push(DepthStreamRanges {
+            stream: contract.stream.clone(),
+            contract: contract.contract,
+            increments: Vec::new(),
+        });
+    }
+    for (event_index, event) in events.iter().enumerate() {
+        if let MarketEvent::Depth(d) = event
+            && !d.is_snapshot
+        {
+            let key = DatasetStream {
+                venue: d.venue,
+                symbol: d.symbol.clone(),
+                kind: StreamKind::Depth,
+            };
+            let index = *positions
+                .get(&key)
+                .ok_or("missing native stream contract")?;
+            let r = d
+                .source_range
+                .ok_or("missing original native depth range")?;
+            streams[index].increments.push(DepthRange {
+                event_index,
+                first: r.first,
+                last: r.last,
+                previous_final: r.previous_final,
+            });
+        }
+    }
+    let evidence = DepthRangeEvidence {
+        schema_version: 1,
+        dataset_id: manifest.definition.dataset_id.clone(),
+        dataset_version: manifest.definition.version.clone(),
+        source_id: manifest.definition.source_id.clone(),
+        replay_sha256: manifest.replay_sha256.clone(),
+        streams,
+    };
+    evidence.verify_receipts(manifest, events)?;
+    Ok(evidence)
 }
 
 impl DepthRangeEvidence {

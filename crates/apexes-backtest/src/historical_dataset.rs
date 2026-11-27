@@ -164,6 +164,9 @@ pub fn seal_dataset(
     let mut previous = None;
     let mut identified_trades = HashSet::new();
     for event in events {
+        if let MarketEvent::Depth(depth) = event {
+            depth.validate_source_range()?;
+        }
         let timestamp = event_timestamp(event);
         if previous.is_some_and(|at| timestamp < at) {
             return Err("historical events regress in time".into());

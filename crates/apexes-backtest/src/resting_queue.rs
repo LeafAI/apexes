@@ -191,6 +191,7 @@ mod tests {
                 quantity: dec!(10),
             }],
             sequence: Some(sequence),
+            source_range: None,
             is_snapshot: true,
             timestamp: at,
         });

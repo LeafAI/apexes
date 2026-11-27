@@ -120,7 +120,7 @@ async fn write_and_read_back_depth_with_nested_levels() {
 
     let now = Utc::now();
     let symbol = unique_symbol("TESTDEPTH", now);
-    let events = vec![MarketEvent::Depth(DepthUpdate {
+    let mut events = vec![MarketEvent::Depth(DepthUpdate {
         symbol: symbol.clone(),
         venue: Venue::Binance,
         bids: vec![
@@ -138,10 +138,24 @@ async fn write_and_read_back_depth_with_nested_levels() {
             quantity: dec!(2.0),
         }],
         sequence: Some(42),
+        source_range: None,
         is_snapshot: true,
         timestamp: now,
     })];
 
+    let MarketEvent::Depth(mut delta) = events[0].clone() else {
+        unreachable!()
+    };
+    delta.is_snapshot = false;
+    delta.sequence = Some(47);
+    delta.source_range = Some(apexes_core::DepthSourceRange {
+        first: 43,
+        last: 47,
+        previous_final: Some(42),
+    });
+    // Keep both rows within the same UTC day, independent of wall clock.
+    delta.timestamp = now;
+    events.push(MarketEvent::Depth(delta.clone()));
     writer.write_batch(&events).await.unwrap();
 
     let date = now.date_naive();
@@ -155,8 +169,12 @@ async fn write_and_read_back_depth_with_nested_levels() {
         .await
         .unwrap();
 
-    assert_eq!(read_back.len(), 1);
-    let MarketEvent::Depth(depth) = &read_back[0] else {
+    assert_eq!(read_back.len(), 2);
+    let snapshot = read_back
+        .iter()
+        .find(|event| matches!(event,MarketEvent::Depth(d) if d.is_snapshot))
+        .unwrap();
+    let MarketEvent::Depth(depth) = snapshot else {
         panic!("expected a Depth event");
     };
     assert_eq!(depth.bids.len(), 2);
@@ -166,6 +184,16 @@ async fn write_and_read_back_depth_with_nested_levels() {
     assert_eq!(depth.asks[0].price, dec!(65000.5));
     assert_eq!(depth.sequence, Some(42));
     assert!(depth.is_snapshot);
+    assert_eq!(depth.source_range, None);
+    let actual = read_back
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::Depth(d) if !d.is_snapshot => Some(d),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(actual.source_range, delta.source_range);
+    assert_eq!(actual.sequence, delta.sequence);
 }
 
 #[tokio::test]

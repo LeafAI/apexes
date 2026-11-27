@@ -8,6 +8,7 @@ pub mod depth_task;
 pub mod ingestion;
 pub mod mark_price_task;
 pub mod provider;
+pub mod raw_depth;
 pub mod supervised;
 pub mod symbol;
 pub mod testnet;

@@ -514,6 +514,7 @@ fn depth_sequence_contract_refuses_invalidation_and_missing_sequence() {
                 quantity: dec!(1),
             }],
             sequence,
+            source_range: None,
             is_snapshot: true,
             timestamp: day(1).and_hms_opt(0, 0, 1).unwrap().and_utc(),
         })
@@ -789,6 +790,7 @@ fn depth_increment_duplicates_removed_without_discarding_snapshots_or_invalidati
                 quantity: dec!(1),
             }],
             sequence,
+            source_range: None,
             is_snapshot: snapshot,
             timestamp: day(1).and_hms_opt(0, 0, 1).unwrap().and_utc(),
         })
@@ -995,6 +997,7 @@ fn range_fixture(
                 quantity: dec!(2),
             }],
             sequence: Some(seq),
+            source_range: None,
             is_snapshot: snapshot,
             timestamp: day(1).and_hms_opt(0, 0, 0).unwrap().and_utc()
                 + chrono::TimeDelta::milliseconds(ms),
@@ -1364,5 +1367,134 @@ fn cli_verifies_range_evidence_without_modifying_input() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(std::fs::read(ep).unwrap(), raw);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn native_fixture(
+    contract: RangeContract,
+) -> (
+    DatasetManifest,
+    Vec<MarketEvent>,
+    Vec<apexes_backtest::depth_ranges::NativeRangeContract>,
+) {
+    let (manifest, mut events, ranges) = range_fixture(contract);
+    for r in &ranges.streams[0].increments {
+        let MarketEvent::Depth(d) = &mut events[r.event_index] else {
+            unreachable!()
+        };
+        d.source_range = Some(apexes_core::DepthSourceRange {
+            first: r.first,
+            last: r.last,
+            previous_final: r.previous_final,
+        });
+    }
+    let manifest = seal_dataset(manifest.definition, &events).unwrap();
+    let contracts = vec![apexes_backtest::depth_ranges::NativeRangeContract {
+        stream: manifest.definition.streams[0].clone(),
+        contract,
+    }];
+    (manifest, events, contracts)
+}
+
+#[test]
+fn builds_verified_range_evidence_from_native_endpoints() {
+    use apexes_backtest::depth_ranges::build_native_evidence;
+    for contract in [RangeContract::InclusiveNext, RangeContract::PreviousFinal] {
+        let (m, events, contracts) = native_fixture(contract);
+        let evidence = build_native_evidence(&m, &events, &contracts).unwrap();
+        assert_eq!(evidence.streams[0].increments[0].event_index, 1);
+        assert_eq!(evidence.streams[0].increments[1].event_index, 3);
+        assert_eq!(
+            evidence
+                .verify_dataset(&m, &events)
+                .unwrap()
+                .depth_ranges
+                .unwrap()
+                .increments_verified,
+            2
+        );
+        assert_eq!(
+            build_native_evidence(&m, &events, &contracts).unwrap(),
+            evidence
+        );
+    }
+}
+
+#[test]
+fn native_metadata_is_hash_bound_and_sidecars_cannot_disagree() {
+    use apexes_backtest::depth_ranges::build_native_evidence;
+    let (m, mut events, contracts) = native_fixture(RangeContract::InclusiveNext);
+    let mut evidence = build_native_evidence(&m, &events, &contracts).unwrap();
+    evidence.streams[0].increments[0].first -= 1;
+    assert!(
+        evidence
+            .verify_dataset(&m, &events)
+            .unwrap_err()
+            .contains("sidecar differs")
+    );
+    let MarketEvent::Depth(d) = &mut events[1] else {
+        unreachable!()
+    };
+    d.source_range.as_mut().unwrap().first -= 1;
+    assert!(m.verify(&events).is_err());
+}
+
+#[test]
+fn native_builder_refuses_missing_endpoints_and_manifest_refuses_invalid_range() {
+    use apexes_backtest::depth_ranges::build_native_evidence;
+    let (m, mut events, contracts) = native_fixture(RangeContract::InclusiveNext);
+    let MarketEvent::Depth(d) = &mut events[1] else {
+        unreachable!()
+    };
+    d.source_range = None;
+    let m = seal_dataset(m.definition, &events).unwrap();
+    assert!(
+        build_native_evidence(&m, &events, &contracts)
+            .unwrap_err()
+            .contains("missing original")
+    );
+    let MarketEvent::Depth(d) = &mut events[1] else {
+        unreachable!()
+    };
+    d.source_range = Some(apexes_core::DepthSourceRange {
+        first: 99,
+        last: 999,
+        previous_final: None,
+    });
+    assert!(
+        seal_dataset(m.definition, &events)
+            .unwrap_err()
+            .contains("invalid original")
+    );
+}
+
+#[test]
+fn cli_builds_native_range_evidence() {
+    use apexes_backtest::depth_ranges::build_native_evidence;
+    let (m, events, contracts) = native_fixture(RangeContract::PreviousFinal);
+    let dir = std::env::temp_dir().join(format!("apexes-native-ranges-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let mp = dir.join("manifest.json");
+    let ep = dir.join("events.json");
+    let cp = dir.join("contracts.json");
+    std::fs::write(&mp, serde_json::to_vec(&m).unwrap()).unwrap();
+    std::fs::write(&ep, serde_json::to_vec(&events).unwrap()).unwrap();
+    std::fs::write(&cp, serde_json::to_vec(&contracts).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+        .arg("build-ranges")
+        .arg(&mp)
+        .arg(&ep)
+        .arg(&cp)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<DepthRangeEvidence>(&output.stdout).unwrap(),
+        build_native_evidence(&m, &events, &contracts).unwrap()
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }

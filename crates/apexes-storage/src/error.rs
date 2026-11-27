@@ -17,6 +17,9 @@ pub enum StorageError {
     #[error("failed to convert Decimal to ClickHouse FixedPoint: {reason}")]
     DecimalConversionFailed { reason: String },
 
+    #[error("invalid depth range: {reason}")]
+    InvalidDepthRange { reason: String },
+
     #[error("ClickHouse query failed: {reason}")]
     QueryFailed { reason: String },
 

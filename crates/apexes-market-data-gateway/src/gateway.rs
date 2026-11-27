@@ -328,6 +328,7 @@ mod tests {
                 symbol: "BTCUSDT".into(),
                 venue: Venue::Binance,
                 sequence: Some(sequence),
+                source_range: None,
                 is_snapshot,
                 bids: vec![PriceLevel {
                     price: dec!(100),

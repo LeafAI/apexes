@@ -43,6 +43,12 @@ impl StorageWriter {
             .map_err(|error| StorageError::ConnectionFailed {
                 reason: format!("failed to create depth_updates table: {error}"),
             })?;
+        // Additive and idempotent migration: historical rows have NULL
+        // endpoints. Do not derive first/previous IDs from final sequence.
+        client.query("ALTER TABLE depth_updates ADD COLUMN IF NOT EXISTS source_first Nullable(UInt64), ADD COLUMN IF NOT EXISTS source_last Nullable(UInt64), ADD COLUMN IF NOT EXISTS source_previous_final Nullable(UInt64)")
+            .execute().await.map_err(|error| StorageError::ConnectionFailed {
+                reason: format!("failed to migrate depth range columns: {error}"),
+            })?;
         client
             .query(BARS_TABLE_DDL)
             .execute()

@@ -18,9 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !(args.len() == 4
             && (args[0] == "verify-coverage"
                 || args[0] == "normalize"
-                || args[0] == "verify-ranges"))
+                || args[0] == "verify-ranges"
+                || args[0] == "build-ranges"))
     {
-        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json>".into());
+        return Err("usage: historical-manifest seal <definition.json> <events.json> | verify <manifest.json> <events.json> | verify-coverage <manifest.json> <events.json> <coverage.json> | normalize <definition.json> <events.json> <identity-policy.json> | verify-ranges <manifest.json> <events.json> <ranges.json> | build-ranges <manifest.json> <events.json> <contracts.json>".into());
     }
     let events: Vec<MarketEvent> = read(Path::new(&args[2]))?;
     let mut out = io::stdout().lock();
@@ -57,6 +58,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(io::Error::other)?;
             serde_json::to_writer_pretty(&mut out, &result)?;
         }
+        Some("build-ranges") if args.len() == 4 => {
+            let manifest: DatasetManifest = read(Path::new(&args[1]))?;
+            let contracts: Vec<apexes_backtest::depth_ranges::NativeRangeContract> =
+                read(Path::new(&args[3]))?;
+            let evidence = apexes_backtest::depth_ranges::build_native_evidence(
+                &manifest, &events, &contracts,
+            )
+            .map_err(io::Error::other)?;
+            serde_json::to_writer_pretty(&mut out, &evidence)?;
+        }
         Some("verify-ranges") if args.len() == 4 => {
             let manifest: DatasetManifest = read(Path::new(&args[1]))?;
             let evidence: apexes_backtest::depth_ranges::DepthRangeEvidence =
@@ -68,7 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "expected seal, verify, verify-coverage, normalize or verify-ranges".into(),
+                "expected seal, verify, verify-coverage, normalize, verify-ranges or build-ranges"
+                    .into(),
             );
         }
     }

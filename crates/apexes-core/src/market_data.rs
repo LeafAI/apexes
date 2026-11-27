@@ -62,12 +62,37 @@ pub struct DepthUpdate {
     pub asks: Vec<PriceLevel>,
     /// Sequence number for ordering incremental updates and detecting gaps (data-source dependent; not all sources provide one).
     pub sequence: Option<u64>,
+    /// Original source endpoints, when actually captured. Never inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<DepthSourceRange>,
     /// true if this is a full snapshot; false if this is an incremental update.
     pub is_snapshot: bool,
     pub timestamp: DateTime<Utc>,
 }
 
+/// Original incremental update identifiers. The last ID must equal
+/// DepthUpdate.sequence; snapshots have no incremental source range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepthSourceRange {
+    pub first: u64,
+    pub last: u64,
+    pub previous_final: Option<u64>,
+}
+
 impl DepthUpdate {
+    pub fn validate_source_range(&self) -> Result<(), String> {
+        if let Some(r) = self.source_range
+            && (self.is_snapshot
+                || self.sequence != Some(r.last)
+                || r.first > r.last
+                || r.previous_final.is_some_and(|previous| previous >= r.last))
+        {
+            return Err("invalid original depth source range".into());
+        }
+        Ok(())
+    }
+
     /// Explicit upstream book invalidation (F01.03). An empty snapshot
     /// without a sequence clears any previously synchronized depth.
     pub fn is_invalidation(&self) -> bool {
@@ -155,6 +180,58 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn legacy_depth_json_is_byte_compatible_and_native_range_round_trips() {
+        let raw = r#"{"Depth":{"symbol":"BTCUSDT","venue":"Binance","bids":[],"asks":[],"sequence":103,"is_snapshot":false,"timestamp":"2026-01-01T00:00:00Z"}}"#;
+        let mut event: MarketEvent = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), raw);
+        let MarketEvent::Depth(d) = &mut event else {
+            unreachable!()
+        };
+        assert_eq!(d.source_range, None);
+        d.source_range = Some(DepthSourceRange {
+            first: 99,
+            last: 103,
+            previous_final: Some(98),
+        });
+        assert!(d.validate_source_range().is_ok());
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MarketEvent>(&encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn malformed_native_range_is_refused() {
+        let mut d = DepthUpdate {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            bids: vec![],
+            asks: vec![],
+            sequence: Some(103),
+            source_range: Some(DepthSourceRange {
+                first: 99,
+                last: 103,
+                previous_final: None,
+            }),
+            is_snapshot: false,
+            timestamp: Utc::now(),
+        };
+        assert!(d.validate_source_range().is_ok());
+        d.is_snapshot = true;
+        assert!(d.validate_source_range().is_err());
+        d.is_snapshot = false;
+        d.sequence = None;
+        assert!(d.validate_source_range().is_err());
+        d.sequence = Some(103);
+        d.source_range.as_mut().unwrap().first = 104;
+        assert!(d.validate_source_range().is_err());
+        d.source_range.as_mut().unwrap().first = 99;
+        d.source_range.as_mut().unwrap().previous_final = Some(103);
+        assert!(d.validate_source_range().is_err());
+    }
+
+    #[test]
     fn every_event_kind_reports_its_symbol_and_venue() {
         let tick = MarketEvent::Tick(Tick {
             symbol: "ETHUSDT".to_string(),
@@ -222,6 +299,7 @@ mod tests {
                 quantity: dec!(150),
             }],
             sequence: Some(12345),
+            source_range: None,
             is_snapshot: false,
             timestamp: Utc::now(),
         });
@@ -244,6 +322,7 @@ mod tests {
                 quantity: dec!(2.0),
             }],
             sequence: None,
+            source_range: None,
             is_snapshot: true,
             timestamp: Utc::now(),
         });

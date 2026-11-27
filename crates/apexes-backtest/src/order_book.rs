@@ -256,6 +256,7 @@ mod tests {
             bids,
             asks,
             sequence: Some(1),
+            source_range: None,
             is_snapshot: true,
             timestamp: Utc::now(),
         }
@@ -268,6 +269,7 @@ mod tests {
             bids,
             asks,
             sequence: Some(sequence),
+            source_range: None,
             is_snapshot: false,
             timestamp: Utc::now(),
         }
