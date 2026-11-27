@@ -174,6 +174,7 @@ impl ValidRequest {
             simulated_execution: None,
             simulated_depth: None,
             event_latency: None,
+            live_observation: None,
             gateway_url: format!("ws://127.0.0.1:{gateway_port}/market"),
         };
         config

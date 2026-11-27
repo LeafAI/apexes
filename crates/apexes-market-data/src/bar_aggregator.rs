@@ -24,19 +24,15 @@ fn interval_seconds(interval: BarInterval) -> i64 {
     }
 }
 
-/// The interval-aligned bucket boundaries `[start, end)` for `time` at the given interval.
-///
-/// Computed by subtracting the remainder-into-the-current-bucket directly
-/// from `time` (rather than reconstructing a `DateTime` from epoch seconds),
-/// so this never needs to handle a theoretically-invalid timestamp -- `time`
-/// is already a valid `DateTime<Utc>`, and subtracting a `Duration` from a
-/// valid `DateTime<Utc>` cannot fail.
-fn bucket_bounds(interval: BarInterval, time: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+/// Exact UTC-aligned half-open bucket; checked at calendar extremes.
+fn bucket_bounds(
+    interval: BarInterval,
+    time: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let secs = interval_seconds(interval);
-    let remainder_secs = time.timestamp().rem_euclid(secs);
-    let start = time - chrono::Duration::seconds(remainder_secs);
-    let end = start + chrono::Duration::seconds(secs);
-    (start, end)
+    let start = DateTime::from_timestamp(time.timestamp().div_euclid(secs).checked_mul(secs)?, 0)?;
+    let end = start.checked_add_signed(chrono::Duration::seconds(secs))?;
+    Some((start, end))
 }
 
 #[derive(Debug, Clone)]
@@ -97,15 +93,14 @@ impl OpenBar {
 
 /// Aggregates a symbol's trade stream into OHLCV `Bar`s across all six
 /// `BarInterval`s in parallel. Empty intervals are skipped (no synthetic
-/// bars); out-of-order trades landing in an already-closed bucket are
-/// dropped defensively.
+/// bars); regressing trade timestamps are dropped from aggregation
+/// rather than revising open or closed OHLC history.
 pub struct BarAggregator {
     symbol: String,
     venue: Venue,
     open_bars: HashMap<BarInterval, OpenBar>,
-    /// The end boundary of the last-closed bucket per interval, used to
-    /// detect and drop late/out-of-order trades.
-    last_closed_end: HashMap<BarInterval, DateTime<Utc>>,
+    /// Last accepted trade timestamp; equal timestamps retain input order.
+    last_trade_at: Option<DateTime<Utc>>,
 }
 
 impl BarAggregator {
@@ -114,7 +109,7 @@ impl BarAggregator {
             symbol: symbol.into(),
             venue,
             open_bars: HashMap::new(),
-            last_closed_end: HashMap::new(),
+            last_trade_at: None,
         }
     }
 
@@ -124,21 +119,17 @@ impl BarAggregator {
     pub fn on_trade(&mut self, price: Decimal, quantity: Decimal, time: DateTime<Utc>) -> Vec<Bar> {
         let mut closed_bars = Vec::new();
 
-        for interval in ALL_INTERVALS {
-            if let Some(closed_end) = self.last_closed_end.get(&interval)
-                && time < *closed_end
-            {
-                tracing::warn!(
-                    symbol = %self.symbol,
-                    ?interval,
-                    trade_time = %time,
-                    closed_bucket_end = %closed_end,
-                    "dropping out-of-order trade: falls into an already-closed bar bucket"
-                );
-                continue;
-            }
+        if self.last_trade_at.is_some_and(|last| time < last) {
+            tracing::warn!(symbol = %self.symbol, trade_time = %time, "dropping regressing trade from bar aggregation");
+            return closed_bars;
+        }
+        self.last_trade_at = Some(time);
 
-            let (bucket_start, bucket_end) = bucket_bounds(interval, time);
+        for interval in ALL_INTERVALS {
+            let Some((bucket_start, bucket_end)) = bucket_bounds(interval, time) else {
+                tracing::warn!(symbol = %self.symbol, ?interval, trade_time = %time, "unrepresentable bar bucket");
+                continue;
+            };
 
             let open_bucket_is_stale = self
                 .open_bars
@@ -156,10 +147,6 @@ impl BarAggregator {
                 // than panicking.
                 if let Some(previous) = self.open_bars.remove(&interval) {
                     closed_bars.push(previous.into_bar(self.symbol.clone(), self.venue, interval));
-                    // Everything before the new trade's bucket start is now "passed" --
-                    // either closed (like the bucket we just removed) or skipped as
-                    // empty -- so any trade landing before it from here on is late.
-                    self.last_closed_end.insert(interval, bucket_start);
                 }
             }
 
@@ -375,5 +362,67 @@ mod tests {
         let open_bar = agg.current_open_bar(BarInterval::OneMinute).unwrap();
         assert_eq!(open_bar.high, dec!(120));
         assert_eq!(open_bar.volume, dec!(2));
+    }
+    #[test]
+    fn fractional_trade_times_share_exact_utc_buckets() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        let nanos = |seconds, nanos| Utc.timestamp_opt(seconds, nanos).single().unwrap();
+        assert!(
+            agg.on_trade(dec!(100), dec!(1), nanos(59, 100_000_000))
+                .is_empty()
+        );
+        assert!(
+            agg.on_trade(dec!(101), dec!(2), nanos(59, 999_999_999))
+                .is_empty()
+        );
+        let bars = agg.on_trade(dec!(102), dec!(3), t(60));
+        let minute = bars
+            .iter()
+            .find(|bar| bar.interval == BarInterval::OneMinute)
+            .unwrap();
+        assert_eq!((minute.open_time, minute.close_time), (t(0), t(60)));
+        assert_eq!(
+            (minute.open, minute.close, minute.volume),
+            (dec!(100), dec!(101), dec!(3))
+        );
+        let second = bars
+            .iter()
+            .find(|bar| bar.interval == BarInterval::OneSecond)
+            .unwrap();
+        assert_eq!((second.open_time, second.close_time), (t(59), t(60)));
+        assert_eq!(
+            agg.current_open_bar(BarInterval::OneSecond)
+                .unwrap()
+                .open_time,
+            t(60)
+        );
+        assert_eq!(
+            bucket_bounds(BarInterval::OneMinute, nanos(-1, 999_999_999)),
+            Some((t(-60), t(0)))
+        );
+    }
+
+    #[test]
+    fn late_first_bucket_and_same_bucket_trades_cannot_rewind_ohlc() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(65));
+        assert!(agg.on_trade(dec!(999), dec!(10), t(30)).is_empty());
+        assert!(agg.on_trade(dec!(999), dec!(10), t(64)).is_empty());
+        agg.on_trade(dec!(101), dec!(1), t(65));
+        let closed = agg.on_trade(dec!(200), dec!(1), t(120));
+        let minute = closed
+            .iter()
+            .find(|bar| bar.interval == BarInterval::OneMinute)
+            .unwrap();
+        assert_eq!((minute.open_time, minute.close_time), (t(60), t(120)));
+        assert_eq!(
+            (minute.open, minute.high, minute.close, minute.volume),
+            (dec!(100), dec!(101), dec!(101), dec!(2))
+        );
+        assert!(agg.on_trade(dec!(999), dec!(10), t(66)).is_empty());
+        assert_eq!(
+            agg.current_open_bar(BarInterval::OneMinute).unwrap().open,
+            dec!(200)
+        );
     }
 }

@@ -316,7 +316,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
             event = market_events.next() => {
                 let Some(event) = event else { break };
 
-                let timestamp=if arrivals.is_some() { match &event { MarketEvent::Bar(bar)=>bar.close_time,_=>event_timestamp(&event) } } else {event_timestamp(&event)};
+                let timestamp=clock.logical_timestamp(&event, arrivals.is_some())?;
                 if arrivals.as_mut().is_some_and(|q|!q.observe(timestamp)){continue;}
                 if !recorded_initial_equity {
                     let initial_equity = ledger.equity(&last_prices)?;
@@ -1614,16 +1614,6 @@ fn last_funding_boundary(
     }
 }
 
-fn event_timestamp(event: &MarketEvent) -> chrono::DateTime<chrono::Utc> {
-    match event {
-        MarketEvent::Tick(tick) => tick.timestamp,
-        MarketEvent::Depth(depth) => depth.timestamp,
-        MarketEvent::Bar(bar) => bar.open_time,
-        MarketEvent::Trade(trade) => trade.timestamp,
-        MarketEvent::MarkPrice(mark_price) => mark_price.timestamp,
-    }
-}
-
 /// Refreshes `open_parent_orders` by querying `ems.parent_order_status`
 /// for every `ParentOrderId` already tracked. `Ems` has no "list all
 /// parent order IDs" method (deliberately out of scope, per the design
@@ -2060,6 +2050,23 @@ mod tests {
         events: Vec<MarketEvent>,
         strategy: impl Strategy,
     ) -> BacktestReport {
+        run_with_clock(
+            config,
+            cost_model,
+            events,
+            strategy,
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+        )
+        .await
+    }
+
+    async fn run_with_clock(
+        config: UnifiedLoopConfig,
+        cost_model: CostModel,
+        events: Vec<MarketEvent>,
+        strategy: impl Strategy,
+        clock: BacktestClock,
+    ) -> BacktestReport {
         let matching_engine = Arc::new(Mutex::new(MatchingEngine::new(cost_model, dec!(0.5))));
         let executor: Arc<dyn OrderExecutor> = Arc::new(MatchingEngineOrderExecutor::new(
             Arc::clone(&matching_engine),
@@ -2077,7 +2084,7 @@ mod tests {
         run_unified_event_loop(
             config,
             futures::stream::iter(events),
-            BacktestClock::new(ReplaySpeed::AsFastAsPossible),
+            clock,
             executor,
             Arc::new(BacktestLiquidationPolicy),
             NeverFillSupplementalFillSource,
@@ -2088,6 +2095,80 @@ mod tests {
         )
         .await
         .expect("event loop must not error")
+    }
+
+    #[tokio::test]
+    async fn delayed_closed_bar_uses_consumer_time_for_gate_and_order_submission() {
+        use apexes_strategy::event_time::{TimeObservation, TimeState};
+        struct ClosedBarBuyer(TimeState);
+        impl Strategy for ClosedBarBuyer {
+            fn on_market_event(
+                &mut self,
+                event: &MarketEvent,
+                ctx: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                let observation = TimeObservation::new(event, ctx.now).unwrap();
+                if !self.0.accept_closed_bar(observation).unwrap() {
+                    return vec![];
+                }
+                vec![OrderIntent {
+                    symbol: "BTCUSDT".into(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Perpetual,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(1),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: Some(dec!(10)),
+                    margin_mode: Some(MarginMode::Isolated),
+                }]
+            }
+        }
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let close = t0 + Duration::seconds(60);
+        let delivered = close + Duration::seconds(5);
+        let bar = MarketEvent::Bar(apexes_core::Bar {
+            symbol: "BTCUSDT".into(),
+            venue: apexes_core::Venue::Binance,
+            open: dec!(100),
+            high: dec!(100),
+            low: dec!(100),
+            close: dec!(100),
+            volume: dec!(1),
+            interval: apexes_core::BarInterval::OneMinute,
+            open_time: t0,
+            close_time: close,
+        });
+        // A newer trade arrives before the delayed finalized bar, as in
+        // the actual trade task's trade-then-closed-bars delivery order.
+        let events = vec![
+            depth_snapshot(t0),
+            trade_event(dec!(100), delivered - Duration::milliseconds(1)),
+            bar.clone(),
+            bar,
+        ];
+        let mut samples = [
+            t0,
+            delivered,
+            delivered,
+            delivered + Duration::milliseconds(1),
+        ]
+        .into_iter();
+        let clock = BacktestClock::with_observation_source(move || samples.next().unwrap());
+        let report = run_with_clock(
+            unified_loop_config(dec!(1000), None, HashMap::new()),
+            zero_cost_model(None),
+            events,
+            ClosedBarBuyer(TimeState::default()),
+            clock,
+        )
+        .await;
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].filled_at, delivered);
+        assert!(report.equity_curve.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     /// End-to-end auto-liquidation: a 10x long opened at 100 collapses

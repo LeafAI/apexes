@@ -1,7 +1,9 @@
+use apexes_core::{ApexesError, MarketEvent};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Controls the pacing of backtest replay. Logical time for all
-/// strategy/risk calculations always derives from event
+/// historical strategy/risk calculations derives from event
 /// timestamps regardless of `ReplaySpeed` (design spec §8) -- this clock
 /// only controls whether/how long to artificially wait between
 /// dispatching events, purely for demo/visual-inspection purposes.
@@ -16,12 +18,22 @@ pub enum ReplaySpeed {
     RealTime,
 }
 
+/// Optional live-only decision clock. Historical and simulated paper
+/// clocks must not implicitly inherit local wall-clock arrival times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveObservationPolicy {
+    ConsumerUtc,
+}
+
 /// Paces backtest replay according to a `ReplaySpeed`. Tracks the
 /// timestamp of the previously-dispatched event to compute how long to
 /// wait before the next one, for `Multiplier`/`RealTime` modes.
 pub struct BacktestClock {
     speed: ReplaySpeed,
     last_event_timestamp: Option<DateTime<Utc>>,
+    live_source: Option<Box<dyn FnMut() -> DateTime<Utc> + Send>>,
+    last_observation: Option<DateTime<Utc>>,
 }
 
 impl BacktestClock {
@@ -29,7 +41,54 @@ impl BacktestClock {
         Self {
             speed,
             last_event_timestamp: None,
+            live_source: None,
+            last_observation: None,
         }
+    }
+
+    /// Live-only clock; uses consumer dequeue UTC, not exchange time.
+    pub fn live_observations(policy: LiveObservationPolicy) -> Self {
+        match policy {
+            LiveObservationPolicy::ConsumerUtc => Self::with_observation_source(Utc::now),
+        }
+    }
+
+    pub(crate) fn with_observation_source(
+        source: impl FnMut() -> DateTime<Utc> + Send + 'static,
+    ) -> Self {
+        let mut clock = Self::new(ReplaySpeed::AsFastAsPossible);
+        clock.live_source = Some(Box::new(source));
+        clock
+    }
+
+    pub(crate) fn logical_timestamp(
+        &mut self,
+        event: &MarketEvent,
+        causal: bool,
+    ) -> Result<DateTime<Utc>, ApexesError> {
+        if let Some(source) = &mut self.live_source {
+            let now = source();
+            let available = crate::market_data_source::observation_timestamp(event);
+            if matches!(event,MarketEvent::Bar(b) if b.close_time <= b.open_time)
+                || now < available
+                || self.last_observation.is_some_and(|last| now < last)
+            {
+                return Err(ApexesError::InvalidBacktestConfig {
+                    reason: format!(
+                        "invalid live observation clock for {}: consumer {now}, source availability {available}, previous {:?}",
+                        event.symbol(),
+                        self.last_observation
+                    ),
+                });
+            }
+            self.last_observation = Some(now);
+            return Ok(now);
+        }
+        Ok(if causal {
+            crate::market_data_source::observation_timestamp(event)
+        } else {
+            crate::market_data_source::event_timestamp(event)
+        })
     }
 
     /// Waits (if `speed` requires it) before the caller dispatches the
@@ -137,5 +196,54 @@ mod tests {
         clock.wait_for_next_event(time_at(10, 0, 10)).await; // 10 second event-time gap
 
         assert!(start.elapsed().as_millis() < 100);
+    }
+    #[test]
+    fn consumer_clock_rejects_future_and_regressing_samples_without_rewriting_source() {
+        use apexes_core::{Bar, BarInterval, Venue};
+        use rust_decimal::Decimal;
+        let start = time_at(10, 0, 0);
+        let close = start + chrono::TimeDelta::minutes(1);
+        let bar = MarketEvent::Bar(Bar {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+            interval: BarInterval::OneMinute,
+            open_time: start,
+            close_time: close,
+        });
+        let samples = [
+            close - chrono::TimeDelta::nanoseconds(1),
+            close + chrono::TimeDelta::seconds(5),
+            close + chrono::TimeDelta::seconds(4),
+            close + chrono::TimeDelta::seconds(5),
+        ];
+        let mut samples = samples.into_iter();
+        let mut clock = BacktestClock::with_observation_source(move || samples.next().unwrap());
+        assert!(clock.logical_timestamp(&bar, false).is_err());
+        assert_eq!(
+            clock.logical_timestamp(&bar, false).unwrap(),
+            close + chrono::TimeDelta::seconds(5)
+        );
+        assert!(clock.logical_timestamp(&bar, false).is_err());
+        assert_eq!(
+            clock.logical_timestamp(&bar, false).unwrap(),
+            close + chrono::TimeDelta::seconds(5)
+        );
+        assert_eq!(
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible)
+                .logical_timestamp(&bar, false)
+                .unwrap(),
+            start
+        );
+        assert_eq!(
+            BacktestClock::new(ReplaySpeed::AsFastAsPossible)
+                .logical_timestamp(&bar, true)
+                .unwrap(),
+            close
+        );
     }
 }

@@ -165,6 +165,9 @@ pub struct LaunchConfig {
     pub simulated_depth: Option<apexes_backtest::SimulatedDepthPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_latency: Option<apexes_backtest::EventLatencyPolicy>,
+    /// Opt-in consumer-time clock for live execution only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_observation: Option<apexes_backtest::clock::LiveObservationPolicy>,
     /// `apexes-market-data-gateway`'s `/market` WS URL this engine
     /// subscribes to for live market data (backtest mode ignores this
     /// -- historical replay reads from `apexes-storage` instead).
@@ -184,6 +187,8 @@ pub enum LaunchConfigError {
     SimulatedDepth(String),
     #[error("invalid event latency: {0}")]
     EventLatency(String),
+    #[error("live observation policy is only supported for live sessions")]
+    LiveObservation,
     #[error("live sessions need at least one instrument")]
     NoInstruments,
     #[error(
@@ -201,6 +206,9 @@ impl LaunchConfig {
     /// positive, and every live instrument is a Binance Spot instrument.
     /// Backtest and paper configs are not constrained here.
     pub fn validate(&self) -> Result<(), LaunchConfigError> {
+        if self.live_observation.is_some() && !matches!(self.mode, SessionMode::Live { .. }) {
+            return Err(LaunchConfigError::LiveObservation);
+        }
         if let Some(fees) = &self.simulated_fees {
             if matches!(self.mode, SessionMode::Live { .. }) {
                 return Err(LaunchConfigError::SimulatedFees(
@@ -378,6 +386,7 @@ mod tests {
             simulated_execution: None,
             simulated_depth: None,
             event_latency: None,
+            live_observation: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -415,6 +424,7 @@ mod tests {
             simulated_execution: None,
             simulated_depth: None,
             event_latency: None,
+            live_observation: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
     }
@@ -444,6 +454,32 @@ mod tests {
             StrategyRef::DriftScript { .. }
         ));
         assert!(!config.instruments.is_empty());
+    }
+
+    #[test]
+    fn live_observation_clock_is_opt_in_and_live_only() {
+        use apexes_backtest::clock::LiveObservationPolicy;
+        let mut live = sample_live_config();
+        let old = serde_json::to_value(&live).unwrap();
+        assert!(old.get("live_observation").is_none());
+        assert!(
+            serde_json::from_value::<LaunchConfig>(old)
+                .unwrap()
+                .live_observation
+                .is_none()
+        );
+        live.live_observation = Some(LiveObservationPolicy::ConsumerUtc);
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["live_observation"], "consumer_utc");
+        let roundtrip: LaunchConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip.live_observation, live.live_observation);
+        roundtrip.validate().unwrap();
+        let mut historical = sample_backtest_config();
+        historical.live_observation = live.live_observation;
+        assert!(matches!(
+            historical.validate(),
+            Err(LaunchConfigError::LiveObservation)
+        ));
     }
 
     #[test]
