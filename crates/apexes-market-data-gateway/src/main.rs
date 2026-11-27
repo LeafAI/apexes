@@ -115,6 +115,11 @@ struct Cli {
     #[arg(long)]
     network: apexes_core::binance_network::BinanceNetwork,
 
+    /// Opt in to quiet-market finalization of populated bars, with a
+    /// two-second lateness allowance. No synthetic empty bars.
+    #[arg(long)]
+    quiet_bars: bool,
+
     /// Where to write the PID file (`<pid>\n<port>\n`). Default:
     /// `~/.apexes/market-data-gateway-<network>.pid`. A supervisor running
     /// several gateways for one network gives each its own file.
@@ -359,7 +364,9 @@ async fn run(cli: Cli, port: u16) {
 
     tracing::info!(network = %cli.network, "apexes-market-data-gateway: upstream network");
     let gateway = Arc::new(Gateway::new(
-        Box::new(BinanceMarketDataProvider::for_network(cli.network)),
+        Box::new(
+            BinanceMarketDataProvider::for_network(cli.network).with_quiet_bars(cli.quiet_bars),
+        ),
         0,
     ));
 
@@ -429,5 +436,27 @@ async fn run(cli: Cli, port: u16) {
             "apexes-market-data-gateway: axum::serve exited with an error"
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod quiet_bar_cli_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_bars_cli_is_explicit_opt_in() {
+        let args = [
+            "gateway",
+            "--network",
+            "testnet",
+            "--instruments",
+            "BTCUSDT",
+        ];
+        assert!(!Cli::try_parse_from(args).unwrap().quiet_bars);
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--quiet-bars"]))
+                .unwrap()
+                .quiet_bars
+        );
     }
 }

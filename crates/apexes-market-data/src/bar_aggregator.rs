@@ -101,6 +101,10 @@ pub struct BarAggregator {
     open_bars: HashMap<BarInterval, OpenBar>,
     /// Last accepted trade timestamp; equal timestamps retain input order.
     last_trade_at: Option<DateTime<Utc>>,
+    // Explicit timer watermark; never regress or reopen finalized time.
+    watermark: Option<DateTime<Utc>>,
+    // Connection gaps invalidate the still-open bucket, not the raw feed.
+    discarded_until: HashMap<BarInterval, DateTime<Utc>>,
 }
 
 impl BarAggregator {
@@ -110,6 +114,8 @@ impl BarAggregator {
             venue,
             open_bars: HashMap::new(),
             last_trade_at: None,
+            watermark: None,
+            discarded_until: HashMap::new(),
         }
     }
 
@@ -119,8 +125,10 @@ impl BarAggregator {
     pub fn on_trade(&mut self, price: Decimal, quantity: Decimal, time: DateTime<Utc>) -> Vec<Bar> {
         let mut closed_bars = Vec::new();
 
-        if self.last_trade_at.is_some_and(|last| time < last) {
-            tracing::warn!(symbol = %self.symbol, trade_time = %time, "dropping regressing trade from bar aggregation");
+        if self.last_trade_at.is_some_and(|last| time < last)
+            || self.watermark.is_some_and(|watermark| time < watermark)
+        {
+            tracing::warn!(symbol = %self.symbol, trade_time = %time, "dropping regressing or past-watermark trade from bar aggregation");
             return closed_bars;
         }
         self.last_trade_at = Some(time);
@@ -130,6 +138,14 @@ impl BarAggregator {
                 tracing::warn!(symbol = %self.symbol, ?interval, trade_time = %time, "unrepresentable bar bucket");
                 continue;
             };
+
+            if self
+                .discarded_until
+                .get(&interval)
+                .is_some_and(|end| bucket_start < *end)
+            {
+                continue;
+            }
 
             let open_bucket_is_stale = self
                 .open_bars
@@ -162,6 +178,35 @@ impl BarAggregator {
         }
 
         closed_bars
+    }
+
+    /// Finalize only populated buckets ending at or before an explicit
+    /// nondecreasing watermark. No synthetic empty candles are generated.
+    pub fn advance_watermark(&mut self, watermark: DateTime<Utc>) -> Vec<Bar> {
+        if self.watermark.is_some_and(|last| watermark < last) {
+            return Vec::new();
+        }
+        self.watermark = Some(watermark);
+        let mut closed = Vec::new();
+        for interval in ALL_INTERVALS {
+            if self
+                .open_bars
+                .get(&interval)
+                .is_some_and(|bar| bar.close_time <= watermark)
+                && let Some(bar) = self.open_bars.remove(&interval)
+            {
+                closed.push(bar.into_bar(self.symbol.clone(), self.venue, interval));
+            }
+        }
+        closed
+    }
+
+    /// A detected connection gap makes any still-open bucket incomplete.
+    /// Discard it, and refuse to reopen that interval on reconnect.
+    pub fn discard_open_bars(&mut self) {
+        for (interval, bar) in self.open_bars.drain() {
+            self.discarded_until.insert(interval, bar.close_time);
+        }
     }
 
     /// Returns the still-forming (not yet closed) bar for `interval`,
@@ -424,5 +469,68 @@ mod tests {
             agg.current_open_bar(BarInterval::OneMinute).unwrap().open,
             dec!(200)
         );
+    }
+    #[test]
+    fn watermark_closes_only_populated_buckets_and_never_reopens_them() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(0));
+        assert!(agg.advance_watermark(t(0)).is_empty());
+        let bars = agg.advance_watermark(t(1));
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].interval, BarInterval::OneSecond);
+        assert_eq!(
+            (
+                bars[0].open_time,
+                bars[0].close_time,
+                bars[0].close,
+                bars[0].volume
+            ),
+            (t(0), t(1), dec!(100), dec!(1))
+        );
+        assert!(agg.advance_watermark(t(1)).is_empty());
+        assert!(agg.advance_watermark(t(0)).is_empty());
+        assert!(agg.on_trade(dec!(999), dec!(10), t(0)).is_empty());
+        assert!(agg.current_open_bar(BarInterval::OneSecond).is_none());
+        agg.on_trade(dec!(101), dec!(2), t(1));
+        let bars = agg.advance_watermark(t(60));
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].open_time, t(1));
+        assert_eq!(bars[0].close_time, t(2));
+        assert_eq!(bars[1].interval, BarInterval::OneMinute);
+        assert_eq!(
+            (bars[1].open, bars[1].close, bars[1].volume),
+            (dec!(100), dec!(101), dec!(3))
+        );
+        assert!(agg.advance_watermark(t(61)).is_empty());
+    }
+
+    #[test]
+    fn connection_gap_discards_open_buckets_without_reopening_partial_intervals() {
+        let mut agg = BarAggregator::new("BTCUSDT", Venue::Binance);
+        agg.on_trade(dec!(100), dec!(1), t(0));
+        assert_eq!(agg.advance_watermark(t(1)).len(), 1);
+        agg.discard_open_bars();
+        assert!(agg.advance_watermark(t(59)).is_empty());
+        agg.on_trade(dec!(200), dec!(1), t(59));
+        assert!(agg.current_open_bar(BarInterval::OneMinute).is_none());
+        let bars = agg.advance_watermark(t(60));
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].interval, BarInterval::OneSecond);
+        agg.on_trade(dec!(300), dec!(1), t(60));
+        let bars = agg.advance_watermark(t(120));
+        let minute = bars
+            .iter()
+            .find(|b| b.interval == BarInterval::OneMinute)
+            .unwrap();
+        assert_eq!(
+            (
+                minute.open_time,
+                minute.close_time,
+                minute.open,
+                minute.volume
+            ),
+            (t(60), t(120), dec!(300), dec!(1))
+        );
+        assert!(agg.current_open_bar(BarInterval::FiveMinutes).is_none());
     }
 }
