@@ -60,17 +60,28 @@ fn filter_binance_instruments(instruments: &[Instrument]) -> (Vec<&Instrument>, 
 /// the mainnet type.
 pub struct BinanceMarketDataProvider {
     network: BinanceNetwork,
+    quiet_bars: bool,
 }
 
 impl BinanceMarketDataProvider {
     pub fn new() -> Self {
         Self {
             network: BinanceNetwork::Mainnet,
+            quiet_bars: false,
         }
     }
 
     pub fn for_network(network: BinanceNetwork) -> Self {
-        Self { network }
+        Self {
+            network,
+            quiet_bars: false,
+        }
+    }
+
+    /// Opt in to timer finalization of nonempty bars during quiet periods.
+    pub fn with_quiet_bars(mut self, enabled: bool) -> Self {
+        self.quiet_bars = enabled;
+        self
     }
 
     pub fn network(&self) -> BinanceNetwork {
@@ -99,6 +110,7 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             perpetual.clear();
         }
         let network = self.network;
+        let quiet_bars = self.quiet_bars;
 
         if spot.is_empty() && perpetual.is_empty() {
             return Err(ApexesError::SubscriptionFailed {
@@ -120,7 +132,15 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             spawn_task_thread("trade_task_spot", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::trade_task::run(symbols, BinanceExchangeKind::Spot, network, tx)
+                move || {
+                    crate::trade_task::run(
+                        symbols,
+                        BinanceExchangeKind::Spot,
+                        network,
+                        tx,
+                        quiet_bars,
+                    )
+                }
             });
             spawn_task_thread("ticker_task_spot", {
                 let symbols = symbols.clone();
@@ -142,7 +162,15 @@ impl MarketDataProvider for BinanceMarketDataProvider {
             spawn_task_thread("trade_task_perpetual", {
                 let symbols = symbols.clone();
                 let tx = tx.clone();
-                move || crate::trade_task::run(symbols, BinanceExchangeKind::Perpetual, network, tx)
+                move || {
+                    crate::trade_task::run(
+                        symbols,
+                        BinanceExchangeKind::Perpetual,
+                        network,
+                        tx,
+                        quiet_bars,
+                    )
+                }
             });
             spawn_task_thread("ticker_task_perpetual", {
                 let symbols = symbols.clone();

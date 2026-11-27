@@ -149,17 +149,43 @@ where
     }
 }
 
+/// Internal timer and connection lifecycle messages; only Item represents
+/// upstream activity. Timer messages never reset the idle watchdog.
+pub(crate) enum Pulse<T> {
+    Item(T),
+    Tick,
+    Disconnected,
+}
+
 /// Like [`run`], but every attempt gets a fresh single-thread runtime that is
 /// dropped when the attempt ends. `barter-data` spawns its own forwarding
 /// task per stream and gives no handle to stop it, so dropping the stream
 /// would leave a dead socket and its task behind on every recovery; dropping
 /// the runtime ends them. Blocks the calling (dedicated) thread.
-pub fn run_isolated<C, Fut, S, T, H>(name: &str, timings: Timings, mut connect: C, mut handle: H)
+pub fn run_isolated<C, Fut, S, T, H>(name: &str, timings: Timings, connect: C, mut handle: H)
 where
     C: FnMut() -> Fut,
     Fut: Future<Output = Option<S>>,
     S: Stream<Item = T> + Unpin,
     H: FnMut(T) -> Flow,
+{
+    run_isolated_with_pulses(name, timings, None, connect, move |pulse| match pulse {
+        Pulse::Item(item) => handle(item),
+        _ => Flow::Continue,
+    });
+}
+
+pub(crate) fn run_isolated_with_pulses<C, Fut, S, T, H>(
+    name: &str,
+    timings: Timings,
+    period: Option<Duration>,
+    mut connect: C,
+    mut handle: H,
+) where
+    C: FnMut() -> Fut,
+    Fut: Future<Output = Option<S>>,
+    S: Stream<Item = T> + Unpin,
+    H: FnMut(Pulse<T>) -> Flow,
 {
     let mut backoff = Backoff::new(timings);
     loop {
@@ -173,11 +199,81 @@ where
                 return;
             }
         };
-        let outcome = runtime.block_on(attempt(name, timings, &mut connect, &mut handle));
+        let outcome = runtime.block_on(async {
+            if let Some(period) = period {
+                match tokio::time::timeout(timings.connect, connect()).await {
+                    Ok(Some(stream)) => {
+                        pump_pulses(name, timings.idle, period, stream, &mut handle).await
+                    }
+                    _ => {
+                        tracing::warn!(
+                            stream = name,
+                            "could not connect or connect timed out; retrying"
+                        );
+                        Outcome::Retry { healthy: false }
+                    }
+                }
+            } else {
+                attempt(name, timings, &mut connect, &mut |item| {
+                    handle(Pulse::Item(item))
+                })
+                .await
+            }
+        });
         drop(runtime);
         match outcome {
             Outcome::Stopped => return,
-            Outcome::Retry { healthy } => std::thread::sleep(backoff.after(healthy)),
+            Outcome::Retry { healthy } => {
+                if period.is_some() && handle(Pulse::Disconnected) == Flow::Stop {
+                    return;
+                }
+                std::thread::sleep(backoff.after(healthy));
+            }
+        }
+    }
+}
+
+/// Timer and upstream idle deadline are independent. Skip missed pulses
+/// rather than bursting after a stall. An expired watchdog wins over a tick.
+async fn pump_pulses<S, T, H>(
+    name: &str,
+    idle: Duration,
+    period: Duration,
+    mut stream: S,
+    handle: &mut H,
+) -> Outcome
+where
+    S: Stream<Item = T> + Unpin,
+    H: FnMut(Pulse<T>) -> Flow,
+{
+    use tokio::time::{Instant, MissedTickBehavior};
+    let watchdog = tokio::time::sleep(idle);
+    tokio::pin!(watchdog);
+    let mut timer = tokio::time::interval_at(Instant::now() + period, period);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut delivered = false;
+    loop {
+        let pulse = tokio::select! {
+            biased;
+            _=&mut watchdog=>{
+                tracing::warn!(stream=name,"no upstream trade data; reconnecting");
+                return Outcome::Retry{healthy:true};
+            },
+            _=timer.tick()=>Pulse::Tick,
+            item=stream.next()=>match item {
+                Some(item)=>{
+                    delivered=true;
+                    watchdog.as_mut().reset(Instant::now()+idle);
+                    Pulse::Item(item)
+                }
+                None=>{
+                    tracing::warn!(stream=name,"stream ended; reconnecting");
+                    return Outcome::Retry{healthy:delivered};
+                }
+            },
+        };
+        if handle(pulse) == Flow::Stop {
+            return Outcome::Stopped;
         }
     }
 }
@@ -576,5 +672,60 @@ mod isolated_tests {
         assert_eq!(secs, vec![1, 2, 4, 8, 8, 8]);
         assert_eq!(b.after(true).as_secs(), 1);
         assert_eq!(b.after(false).as_secs(), 2);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quiet_timer_pulses_do_not_keep_a_silent_connection_alive() {
+        let start = tokio::time::Instant::now();
+        let mut ticks = 0;
+        let mut items = 0;
+        let outcome = pump_pulses(
+            "quiet",
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            stream::iter([1u32]).chain(stream::pending()),
+            &mut |pulse| {
+                match pulse {
+                    Pulse::Item(_) => items += 1,
+                    Pulse::Tick => ticks += 1,
+                    Pulse::Disconnected => panic!("unexpected lifecycle pulse"),
+                }
+                Flow::Continue
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Retry { healthy: true });
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert_eq!(items, 1);
+        assert_eq!(ticks, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_pump_can_stop_on_timer_and_does_not_flush_on_eof() {
+        let mut ticks = 0;
+        let outcome = pump_pulses(
+            "empty",
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            stream::empty::<u32>(),
+            &mut |_| {
+                ticks += 1;
+                Flow::Continue
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Retry { healthy: false });
+        assert_eq!(ticks, 0);
+        let outcome = pump_pulses(
+            "stop",
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            stream::pending::<u32>(),
+            &mut |pulse| {
+                assert!(matches!(pulse, Pulse::Tick));
+                Flow::Stop
+            },
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Stopped);
     }
 }
