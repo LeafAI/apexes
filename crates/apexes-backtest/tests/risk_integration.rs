@@ -836,3 +836,165 @@ async fn pending_parent_budget_is_released_at_replay_end() {
     );
     assert_eq!(latency.child_orders.unwrap().expired_at_end, 1);
 }
+
+struct RestingThenDirect {
+    first: bool,
+    second: bool,
+    stop: bool,
+}
+
+impl Strategy for RestingThenDirect {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        if !self.first {
+            self.first = true;
+            let mut order = BuyOnceStrategy { has_bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            if self.stop {
+                order.order_type = apexes_core::OrderType::Stop;
+                order.stop_price = Some(dec!(6));
+            } else {
+                order.order_type = apexes_core::OrderType::Limit;
+                order.price = Some(dec!(6));
+                order.quantity = dec!(2);
+            }
+            return vec![order];
+        }
+        if !self.second && matches!(event, MarketEvent::Depth(depth) if depth.symbol == "ETHUSDT") {
+            self.second = true;
+            let mut order = BuyOnceStrategy { has_bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            order.symbol = "ETHUSDT".into();
+            return vec![order];
+        }
+        vec![]
+    }
+}
+
+fn resting_capital_events(stop: bool) -> Vec<MarketEvent> {
+    let MarketEvent::Depth(mut first) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    first.asks[0].price = if stop { dec!(5) } else { dec!(10) };
+    let mut events = vec![MarketEvent::Depth(first.clone())];
+    for (offset, symbol, price, seq) in [
+        (500, "BTCUSDT", first.asks[0].price, 2),
+        (600, "ETHUSDT", dec!(6), 1),
+        (700, "BTCUSDT", dec!(10), 3),
+    ] {
+        let mut d = first.clone();
+        d.symbol = symbol.into();
+        d.timestamp += chrono::Duration::milliseconds(offset);
+        d.asks[0].price = price;
+        d.sequence = Some(seq);
+        events.push(MarketEvent::Depth(d));
+    }
+    for offset in [800, 1200] {
+        events.push(MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: if stop { dec!(10) } else { dec!(6) },
+            quantity: dec!(1),
+            side: Some(apexes_core::Side::Sell),
+            trade_id: None,
+            timestamp: first.timestamp + chrono::Duration::milliseconds(offset),
+        }));
+    }
+    events
+}
+
+#[tokio::test]
+async fn resting_limit_reserves_quote_through_partial_fill_and_completion() {
+    let (config, _) = shared_quote_fixture(dec!(15), dec!(6));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(resting_capital_events(false)),
+        RestingThenDirect {
+            first: false,
+            second: false,
+            stop: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    assert!(
+        report
+            .trades
+            .iter()
+            .all(|f| f.symbol == "BTCUSDT" && f.price == dec!(6) && f.quantity == dec!(1))
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.capital_refused,
+            latency.resting_capital_reserved,
+            latency.resting_capital_released,
+            latency.resting_capital_released_at_end,
+            latency.resting_capital_refused
+        ),
+        (1, 1, 1, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn gapped_stop_cannot_spend_pending_direct_order_hold() {
+    let (config, _) = shared_quote_fixture(dec!(12), dec!(6));
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(resting_capital_events(true)),
+        RestingThenDirect {
+            first: false,
+            second: false,
+            stop: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "ETHUSDT");
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.resting_capital_reserved,
+            latency.resting_capital_released,
+            latency.resting_capital_refused
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn resting_remainder_reservation_released_at_replay_end() {
+    let (config, _) = shared_quote_fixture(dec!(15), dec!(6));
+    let registry = child_risk_registry(Default::default());
+    let mut events = resting_capital_events(false);
+    events.pop();
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        RestingThenDirect {
+            first: false,
+            second: false,
+            stop: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.resting_capital_reserved,
+            latency.resting_capital_released,
+            latency.resting_capital_released_at_end
+        ),
+        (1, 0, 1)
+    );
+}

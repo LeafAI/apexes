@@ -1,5 +1,5 @@
 //! F03.02: deterministic event-time latency for direct strategy orders.
-use apexes_core::{ApexesError, Venue, registry::Registry};
+use apexes_core::{ApexesError, Fill, Order, OrderId, Venue, registry::Registry};
 use apexes_strategy::{OrderIntent, ParentOrderId, ParentOrderStatus};
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -52,6 +52,14 @@ pub struct EventLatencyReport {
     pub parent_capital_released: u64,
     #[serde(default)]
     pub parent_capital_released_at_end: u64,
+    #[serde(default)]
+    pub resting_capital_reserved: u64,
+    #[serde(default)]
+    pub resting_capital_released: u64,
+    #[serde(default)]
+    pub resting_capital_released_at_end: u64,
+    #[serde(default)]
+    pub resting_capital_refused: u64,
 
     /// Separate EMS child transit accounting; None for legacy reports.
     #[serde(default)]
@@ -83,10 +91,17 @@ struct ParentCapital {
     remaining: Decimal,
 }
 
+#[derive(Debug, Clone)]
+struct RestingCapital {
+    hold: CapitalHold,
+    remaining: Decimal,
+}
+
 pub(crate) struct ArrivalQueue {
     pending: VecDeque<(DateTime<Utc>, OrderIntent)>,
     holds: HashMap<(Venue, String), CapitalHold>,
     parents: HashMap<ParentOrderId, ParentCapital>,
+    resting: HashMap<OrderId, RestingCapital>,
     pub report: EventLatencyReport,
     watermark: Option<DateTime<Utc>>,
 }
@@ -97,6 +112,7 @@ impl ArrivalQueue {
             pending: VecDeque::new(),
             holds: HashMap::new(),
             parents: HashMap::new(),
+            resting: HashMap::new(),
             report: EventLatencyReport {
                 policy,
                 scheduled: 0,
@@ -109,6 +125,10 @@ impl ArrivalQueue {
                 parent_capital_reserved: 0,
                 parent_capital_released: 0,
                 parent_capital_released_at_end: 0,
+                resting_capital_reserved: 0,
+                resting_capital_released: 0,
+                resting_capital_released_at_end: 0,
+                resting_capital_refused: 0,
                 child_orders: None,
             },
             watermark: None,
@@ -131,6 +151,7 @@ impl ArrivalQueue {
                     .filter(|(id, _)| Some(**id) != excluding)
                     .map(|(_, p)| &p.hold),
             )
+            .chain(self.resting.values().map(|r| &r.hold))
             .filter(|h| h.asset == asset)
             .try_fold(Decimal::ZERO, |sum, h| sum.checked_add(h.amount))
     }
@@ -174,6 +195,101 @@ impl ArrivalQueue {
             )
         });
         self.report.parent_capital_released += (before - self.parents.len()) as u64;
+    }
+
+    pub fn reserve_resting(&mut self, order: &Order, mut hold: CapitalHold) -> Result<(), String> {
+        let remaining = order.quantity - order.filled_quantity;
+        if remaining <= Decimal::ZERO {
+            return Ok(());
+        }
+        hold.amount = hold
+            .amount
+            .checked_mul(remaining)
+            .and_then(|n| n.checked_div(order.quantity))
+            .ok_or("resting reservation arithmetic overflow")?;
+        self.resting
+            .insert(order.id, RestingCapital { hold, remaining });
+        self.report.resting_capital_reserved += 1;
+        Ok(())
+    }
+
+    pub fn reconcile_resting(&mut self, orders: &HashMap<OrderId, Order>) {
+        let before = self.resting.len();
+        self.resting.retain(|id, _| orders.contains_key(id));
+        self.report.resting_capital_released += (before - self.resting.len()) as u64;
+    }
+
+    /// Match only against actual balances net of all other reservations.
+    /// Reduce the current order's hold proportionally to the proposed fill;
+    /// an IOC trigger releases its own entire hold at terminal execution.
+    pub fn accept_resting(
+        &mut self,
+        id: OrderId,
+        fills: &[Fill],
+        terminal: bool,
+        before: &HashMap<String, Decimal>,
+        after: &HashMap<String, Decimal>,
+    ) -> Result<(), String> {
+        let old_hold = self.resting.get(&id);
+        let remaining = if let Some(r) = old_hold {
+            let executed = fills
+                .iter()
+                .try_fold(Decimal::ZERO, |n, f| {
+                    if f.order_id != id || f.quantity <= Decimal::ZERO {
+                        return None;
+                    }
+                    n.checked_add(f.quantity)
+                })
+                .ok_or("invalid resting fill allocation")?;
+            if executed > r.remaining {
+                return Err("resting fill exceeds reserved quantity".into());
+            }
+            if terminal {
+                Decimal::ZERO
+            } else {
+                r.remaining - executed
+            }
+        } else {
+            Decimal::ZERO
+        };
+        let new_amount = match old_hold {
+            Some(r) if remaining > Decimal::ZERO => r
+                .hold
+                .amount
+                .checked_mul(remaining)
+                .and_then(|n| n.checked_div(r.remaining))
+                .ok_or("resting reservation arithmetic overflow")?,
+            _ => Decimal::ZERO,
+        };
+        for asset in self
+            .holds
+            .values()
+            .map(|h| &h.asset)
+            .chain(self.parents.values().map(|p| &p.hold.asset))
+            .chain(self.resting.values().map(|r| &r.hold.asset))
+        {
+            let mut total = self
+                .reserved(asset, None)
+                .ok_or("capital reservation arithmetic overflow")?;
+            if let Some(r) = old_hold
+                && &r.hold.asset == asset
+            {
+                total = total
+                    .checked_sub(r.hold.amount)
+                    .and_then(|n| n.checked_add(new_amount))
+                    .ok_or("capital reservation arithmetic overflow")?;
+            }
+            let old = before.get(asset).copied().unwrap_or_default();
+            let new = after.get(asset).copied().unwrap_or_default();
+            if new < old && new < total {
+                return Err("resting fill would consume another order's reservation".into());
+            }
+        }
+        if let Some(r) = self.resting.get_mut(&id) {
+            r.remaining = remaining;
+            r.hold.amount = new_amount;
+        }
+        Ok(())
     }
 
     pub fn capital_refused(&mut self, before_admission: bool) {
@@ -244,6 +360,7 @@ impl ArrivalQueue {
             .values()
             .map(|h| &h.asset)
             .chain(self.parents.values().map(|p| &p.hold.asset))
+            .chain(self.resting.values().map(|r| &r.hold.asset))
         {
             let old = before.get(asset).copied().unwrap_or_default();
             let new = after.get(asset).copied().unwrap_or_default();
@@ -323,6 +440,7 @@ impl ArrivalQueue {
         self.report.expired_at_end = self.pending.len() as u64;
         self.report.capital_released_at_end = self.holds.len() as u64;
         self.report.parent_capital_released_at_end = self.parents.len() as u64;
+        self.report.resting_capital_released_at_end = self.resting.len() as u64;
         self.report
     }
 }

@@ -14,8 +14,17 @@ impl MatchingEngine {
 
     pub(super) fn execute_prepared_limit(
         &mut self,
+        order: Order,
+        now: DateTime<Utc>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.execute_prepared_limit_checked(order, now, &mut None)
+    }
+
+    pub(super) fn execute_prepared_limit_checked(
+        &mut self,
         mut order: Order,
         now: DateTime<Utc>,
+        check: &mut Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
         let limit = order.price.ok_or_else(|| ApexesError::OrderRejected {
             reason: "Limit order requires a price".into(),
@@ -55,8 +64,14 @@ impl MatchingEngine {
                     leverage: order.leverage,
                     margin_mode: order.margin_mode,
                 });
-                book.consume(order.side, level.price, quantity);
                 order.filled_quantity += quantity;
+            }
+            if let Some(check) = check.as_deref_mut() {
+                check(order.id, &fills, order.filled_quantity == order.quantity)
+                    .map_err(|reason| ApexesError::OrderRejected { reason })?;
+            }
+            for fill in &fills {
+                book.consume(order.side, fill.price, fill.quantity);
             }
         }
         order.status = if order.filled_quantity == order.quantity {
