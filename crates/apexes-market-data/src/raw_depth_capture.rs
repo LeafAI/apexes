@@ -6,7 +6,7 @@ use crate::{
     raw_depth,
     supervised::{Backoff, Timings},
 };
-use apexes_core::{DepthUpdate, MarketEvent, Venue};
+use apexes_core::{DepthUpdate, MarketEvent, Venue, binance_network::BinanceNetwork};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -222,19 +222,18 @@ fn endpoints(symbol: &str, exchange: BinanceExchangeKind) -> Result<Endpoints, S
     {
         return Err("expected canonical uppercase Binance symbol".into());
     }
-    let (ws, rest) = match exchange {
-        BinanceExchangeKind::Spot => (
-            "wss://stream.binance.com:9443/ws",
-            "https://api.binance.com/api/v3/depth",
-        ),
+    let spot = BinanceNetwork::Mainnet.endpoints();
+    let (ws, rest, path) = match exchange {
+        BinanceExchangeKind::Spot => (spot.spot_market_ws, spot.spot_rest, "/api/v3/depth"),
         BinanceExchangeKind::Perpetual => (
             "wss://fstream.binance.com/ws",
-            "https://fapi.binance.com/fapi/v1/depth",
+            "https://fapi.binance.com",
+            "/fapi/v1/depth",
         ),
     };
     Ok(Endpoints {
         websocket: format!("{ws}/{}@depth@100ms", symbol.to_ascii_lowercase()),
-        snapshot: format!("{rest}?symbol={symbol}&limit={SNAPSHOT_LIMIT}"),
+        snapshot: format!("{rest}{path}?symbol={symbol}&limit={SNAPSHOT_LIMIT}"),
     })
 }
 
