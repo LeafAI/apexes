@@ -398,6 +398,10 @@ pub async fn run_unified_event_loop(
                         for fill in fills {
                             candidate.apply_fill(fill).map_err(|error| error.to_string())?;
                         }
+                        if let Some(queue) = &arrivals
+                            && !queue.preserves_capital(projected.balances(), candidate.balances()) {
+                            return Err("child would spend capital reserved by in-transit strategy intents".into());
+                        }
                         // Each accepted child advances the projection before
                         // the next competing child checks the same account.
                         if let Some(checker) = &risk_checker {
@@ -672,6 +676,9 @@ pub async fn run_unified_event_loop(
                 intents
                 };
                 for intent in intents {
+                    if arriving && let Some(queue) = &mut arrivals {
+                        queue.release(&intent);
+                    }
                     let trace = diagnostics.intent(&intent, if arriving {"strategy_arrival"} else {"strategy"}, timestamp);
                     // Make the order valid for its symbol (round the quantity
                     // down to the exchange's step, the price to its tick) before
@@ -768,8 +775,18 @@ pub async fn run_unified_event_loop(
 
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
                     if let Some(queue)=&mut arrivals {
+                        let hold = match spot_market_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
+                            Ok(hold) if hold.as_ref().is_none_or(|hold| queue.check_capital(hold, ledger.balances())) => hold,
+                            result => {
+                                queue.capital_refused(!arriving);
+                                let reason = result.err().unwrap_or_else(|| "insufficient unreserved capital".into());
+                                trace.outcome("rules_rejected", "capital_reservation");
+                                if let Some(log) = &mut order_log { record_refusal(log, &intent, timestamp, &reason); }
+                                continue;
+                            }
+                        };
                         if !arriving {
-                            match queue.schedule(timestamp,intent.clone()) {
+                            match queue.schedule(timestamp,intent.clone(),hold) {
                                 Ok(())=>trace.outcome("scheduled","event_latency"),
                                 Err(reason)=>{
                                     trace.outcome("rules_rejected",reason);
@@ -1078,6 +1095,47 @@ pub async fn run_unified_event_loop(
         simulated_depth: None,
         event_latency: arrivals.map(|q| q.finish()),
     })
+}
+
+/// Reserve market-intent spend assets while in transit. Parent admission
+/// and resting-order lifetime reservations are separate follow-up work.
+fn spot_market_hold(
+    intent: &apexes_strategy::OrderIntent,
+    instruments: &HashMap<String, Instrument>,
+    executor: &dyn OrderExecutor,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<crate::event_latency::CapitalHold>, String> {
+    use apexes_core::{AssetClass, Side};
+    if intent.asset_class != AssetClass::Spot
+        || intent.order_type != OrderType::Market
+        || intent.leverage.is_some()
+        || intent.margin_mode.is_some()
+    {
+        return Ok(None);
+    }
+    let instrument = instruments
+        .get(&intent.symbol)
+        .filter(|i| i.venue == intent.venue && i.asset_class == intent.asset_class)
+        .ok_or("unknown reservation instrument")?;
+    let (asset, amount) = match intent.side {
+        Side::Buy => (
+            instrument.quote_currency.as_ref(),
+            executor
+                .simulated_buy_budget(intent, now)
+                .map_err(|e| e.to_string())?,
+        ),
+        Side::Sell => (instrument.base_currency.as_ref(), intent.quantity),
+    };
+    let asset = asset
+        .filter(|asset| !asset.is_empty())
+        .ok_or("unknown reservation spend asset")?;
+    if amount <= Decimal::ZERO {
+        return Err("nonpositive reservation".into());
+    }
+    Ok(Some(crate::event_latency::CapitalHold {
+        asset: asset.clone(),
+        amount,
+    }))
 }
 
 /// `intent` as the risk checks should see it: a priceless order (market) gets

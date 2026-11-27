@@ -97,6 +97,14 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         Ok((order, fills))
     }
 
+    fn simulated_buy_budget(
+        &self,
+        intent: &OrderIntent,
+        now: DateTime<Utc>,
+    ) -> Result<Decimal, ApexesError> {
+        self.lock_engine().simulated_buy_budget(intent, now)
+    }
+
     fn on_market_event(&self, event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
         match event {
             MarketEvent::Trade(trade) => {
