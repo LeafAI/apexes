@@ -6,7 +6,7 @@ use crate::order_executor_adapter::{
     BacktestLiquidationPolicy, MatchingEngineOrderExecutor, NeverFillSupplementalFillSource,
 };
 use crate::report::BacktestReport;
-use crate::unified_loop::{UnifiedLoopConfig, run_unified_event_loop_with_funding};
+use crate::unified_loop::{UnifiedLoopConfig, run_unified_event_loop_with_attribution};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Instrument};
 use apexes_ems::Ems;
@@ -63,7 +63,7 @@ pub struct BacktestConfig {
 /// portfolio state via a `PortfolioLedger`, and producing a
 /// `BacktestReport` with overall + per-symbol + per-venue performance
 /// summaries (design spec §8). Internally delegates to the shared
-/// `crate::unified_loop::run_unified_event_loop_with_funding` core (see that module's
+/// `crate::unified_loop::run_unified_event_loop_with_attribution` core (see that module's
 /// docs) -- this function's job is to adapt
 /// `HistoricalMarketDataSource`'s pre-loaded `Vec<MarketEvent>` into the
 /// `Stream` the shared core expects, to build the backtest-flavored
@@ -299,7 +299,8 @@ pub async fn run_backtest(
         symbol_rules: HashMap::new(),
     };
 
-    let mut report = run_unified_event_loop_with_funding(
+    let mut fill_origins = Vec::new();
+    let mut report = run_unified_event_loop_with_attribution(
         unified_loop_config,
         event_stream,
         clock,
@@ -313,11 +314,18 @@ pub async fn run_backtest(
         Some(crate::funding_attribution::FundingReport::new(
             funding_rate_bps,
         )),
+        Some(&mut fill_origins),
     )
     .await?;
+    if fill_origins.len() != report.trades.len() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "historical fill attribution alignment mismatch".into(),
+        });
+    }
     report.execution_performance = Some(crate::execution_performance::evaluate(
         &performance_instruments,
         &report.trades,
+        Some(&fill_origins),
     ));
     if let (Some(funding), Some(execution)) = (&mut report.funding, &report.execution_performance) {
         funding.reconcile(execution);

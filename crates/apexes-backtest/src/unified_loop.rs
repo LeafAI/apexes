@@ -34,6 +34,7 @@ use crate::clock::BacktestClock;
 use crate::control::{ControlHandle, SessionSnapshot};
 use crate::cost_model::{CostModel, FlatFeeSchedule};
 use crate::diagnostics::{Diagnostics, error_code, rule_code};
+use crate::exit_attribution::ExitReason;
 use crate::latency::LatencyModel;
 use crate::ledger::PortfolioLedger;
 use crate::performance::PerformanceTracker;
@@ -173,7 +174,7 @@ pub async fn run_unified_event_loop(
     stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
     latency_model: Option<LatencyModel>,
 ) -> Result<BacktestReport, ApexesError> {
-    run_unified_event_loop_with_funding(
+    run_unified_event_loop_with_attribution(
         config,
         market_events,
         clock,
@@ -185,12 +186,13 @@ pub async fn run_unified_event_loop(
         stop_signal,
         latency_model,
         None,
+        None,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_unified_event_loop_with_funding(
+pub(crate) async fn run_unified_event_loop_with_attribution(
     config: UnifiedLoopConfig,
     mut market_events: impl Stream<Item = MarketEvent> + Unpin,
     mut clock: BacktestClock,
@@ -202,6 +204,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
     mut stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
     latency_model: Option<LatencyModel>,
     mut funding_report: Option<crate::funding_attribution::FundingReport>,
+    mut fill_origins: Option<&mut Vec<ExitReason>>,
 ) -> Result<BacktestReport, ApexesError> {
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
@@ -437,7 +440,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
                 }
                 for (_order_id, fills) in resting_fills {
                     apply_fills(
-                        diagnostics, "resting",
+                        diagnostics, ExitReason::Resting, fill_origins.as_deref_mut(),
                         &mut ledger,
                         &mut overall_tracker,
                         &mut per_symbol_trackers,
@@ -518,7 +521,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
                         log.filled(&ems_fills);
                     }
                     apply_fills(
-                        diagnostics, "ems",
+                        diagnostics, ExitReason::Ems, fill_origins.as_deref_mut(),
                         &mut ledger,
                         &mut overall_tracker,
                         &mut per_symbol_trackers,
@@ -633,7 +636,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
                             trace.accepted(&order);
                             tracing::error!(symbol = %symbol, "position force-liquidated (margin ratio breached)");
                             apply_fills(
-                                diagnostics, "liquidation",
+                                diagnostics, ExitReason::Liquidation, fill_origins.as_deref_mut(),
                                 &mut ledger,
                                 &mut overall_tracker,
                                 &mut per_symbol_trackers,
@@ -726,7 +729,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
                                 trace.accepted(&order);
                                 tracing::warn!(symbol = %symbol, %quantity, "position partially closed (extreme market conditions)");
                                 apply_fills(
-                                    diagnostics, "derisk",
+                                    diagnostics, ExitReason::Derisk, fill_origins.as_deref_mut(),
                                     &mut ledger,
                                     &mut overall_tracker,
                                     &mut per_symbol_trackers,
@@ -986,7 +989,7 @@ pub(crate) async fn run_unified_event_loop_with_funding(
                             }
                             if !fills.is_empty() {
                                 apply_fills(
-                                    diagnostics, "strategy",
+                                    diagnostics, ExitReason::Strategy, fill_origins.as_deref_mut(),
                                     &mut ledger,
                                     &mut overall_tracker,
                                     &mut per_symbol_trackers,
@@ -1499,7 +1502,8 @@ fn exposure_inputs(
 #[allow(clippy::too_many_arguments)]
 fn apply_fills(
     diagnostics: Diagnostics,
-    source: &'static str,
+    source: ExitReason,
+    fill_origins: Option<&mut Vec<ExitReason>>,
     ledger: &mut PortfolioLedger,
     overall_tracker: &mut PerformanceTracker,
     per_symbol_trackers: &mut HashMap<String, PerformanceTracker>,
@@ -1510,7 +1514,7 @@ fn apply_fills(
 ) -> Result<(), ApexesError> {
     for fill in fills {
         let result = ledger.apply_fill(fill);
-        diagnostics.fill(fill, source, result.as_ref().err());
+        diagnostics.fill(fill, source.label(), result.as_ref().err());
         result?;
         overall_tracker.record_fill(fill);
         record_fill_in_split_trackers(
@@ -1519,6 +1523,9 @@ fn apply_fills(
             fill,
             risk_free_return,
         );
+    }
+    if let Some(origins) = fill_origins {
+        origins.extend(std::iter::repeat_n(source, fills.len()));
     }
     all_fills.extend_from_slice(fills);
     Ok(())

@@ -126,10 +126,31 @@ fn economic_report(report: &BacktestReport) -> serde_json::Value {
     // Execution IDs are deliberately random UUIDs. Keep all other report
     // fields, including timestamps, quantity, fees and equity, comparable.
     let mut value = serde_json::to_value(report).unwrap();
-    for fill in value["trades"].as_array_mut().unwrap() {
+    let mut indices = std::collections::HashMap::new();
+    for (index, fill) in value["trades"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
         let fields = fill.as_object_mut().unwrap();
-        fields.remove("id");
+        let id = fields.remove("id").unwrap();
+        assert!(indices.insert(id.to_string(), index).is_none());
         fields.remove("order_id");
+    }
+    if let Some(symbols) = value["execution_performance"]["per_symbol"].as_object_mut() {
+        for summary in symbols.values_mut() {
+            if let Some(closes) = summary
+                .get_mut("exit_attribution")
+                .and_then(|a| a.get_mut("closes"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for close in closes {
+                    let id = close["fill_id"].to_string();
+                    close["fill_id"] = serde_json::json!(indices[&id]);
+                }
+            }
+        }
     }
     value
 }
