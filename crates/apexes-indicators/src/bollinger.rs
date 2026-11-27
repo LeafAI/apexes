@@ -17,6 +17,7 @@ pub struct BollingerOutput {
 
 /// Bollinger Bands: an SMA (`middle`) plus upper/lower bands offset by
 /// `num_std` rolling standard deviations, over the same trailing window.
+#[derive(Clone)]
 pub struct Bollinger {
     sma: Sma,
     stddev: RollingStdDev,

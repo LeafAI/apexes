@@ -30,6 +30,7 @@ impl From<&apexes_core::Bar> for AtrInput {
 
 /// Average True Range (Wilder's smoothing), the only indicator in this
 /// crate that needs more than a single price per update.
+#[derive(Clone)]
 pub struct Atr {
     period: usize,
     prev_close: Option<Decimal>,

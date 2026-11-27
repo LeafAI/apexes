@@ -11,6 +11,7 @@ use crate::indicator::Indicator;
 /// warm-up length) but does not itself count toward the returned
 /// warm-up-complete average -- see `returns_none_until_period_points_seen`
 /// below for the exact boundary.
+#[derive(Clone)]
 pub struct Ema {
     period: usize,
     alpha: Decimal,

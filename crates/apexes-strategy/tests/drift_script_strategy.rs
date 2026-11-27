@@ -553,3 +553,85 @@ fn symbol_state_isolates_interleaved_windows_and_rolls_back_failed_callbacks() {
         );
     });
 }
+
+#[test]
+fn scoped_native_indicators_isolate_warmup_and_rollback() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("scoped_indicators.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now,
+        };
+        let mut step = |symbol: &str, venue: Venue, price: Decimal| {
+            let MarketEvent::Trade(mut trade) = sample_trade_event() else {
+                panic!("trade fixture")
+            };
+            trade.symbol = symbol.into();
+            trade.venue = venue;
+            trade.price = price;
+            strategy.on_market_event(&MarketEvent::Trade(trade), &ctx)
+        };
+        for (symbol, venue, price) in [
+            ("BTCUSDT", Venue::Binance, dec!(10)),
+            ("ETHUSDT", Venue::Binance, dec!(100)),
+            ("BTCUSDT", Venue::Okx, dec!(1000)),
+            ("BTCUSDT", Venue::Binance, dec!(20)),
+            ("ETHUSDT", Venue::Binance, dec!(200)),
+            ("BTCUSDT", Venue::Okx, dec!(2000)),
+            ("BTCUSDT", Venue::Binance, dec!(999)),
+            ("BTCUSDT", Venue::Binance, dec!(998)),
+        ] {
+            assert!(step(symbol, venue, price).is_empty());
+        }
+        for (symbol, venue, price, expected) in [
+            ("BTCUSDT", Venue::Binance, dec!(30), dec!(20)),
+            ("ETHUSDT", Venue::Binance, dec!(300), dec!(200)),
+            ("BTCUSDT", Venue::Okx, dec!(3000), dec!(2000)),
+            ("BTCUSDT", Venue::Binance, dec!(40), dec!(30)),
+        ] {
+            let orders = step(symbol, venue, price);
+            assert_eq!(orders.len(), 1);
+            assert_eq!(orders[0].quantity, expected);
+            assert_eq!(orders[0].venue, venue);
+            assert_eq!(orders[0].symbol, symbol);
+        }
+    });
+}
+
+#[test]
+fn scoped_sma_migration_preserves_single_symbol_strategy_decisions() {
+    with_runtime(|| {
+        let mut legacy =
+            DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
+        let mut scoped =
+            DriftScriptStrategy::from_file(&fixture_path("uses_scoped_sma.drift")).unwrap();
+        let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
+        let ctx = StrategyContext {
+            positions: &positions,
+            balances: &balances,
+            open_orders: &open_orders,
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now,
+        };
+        let mut triggered = false;
+        for price in [dec!(10), dec!(12), dec!(11), dec!(14), dec!(10), dec!(16)] {
+            let MarketEvent::Trade(mut trade) = sample_trade_event() else {
+                panic!("trade fixture")
+            };
+            trade.price = price;
+            let event = MarketEvent::Trade(trade);
+            let a = legacy.on_market_event(&event, &ctx);
+            let b = scoped.on_market_event(&event, &ctx);
+            triggered |= !a.is_empty();
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        }
+        assert!(triggered);
+    });
+}

@@ -8,6 +8,7 @@ use crate::indicator::Indicator;
 
 /// Rolling population standard deviation: `sqrt(mean(x^2) - mean(x)^2)`
 /// over the current trailing window, updated in O(1) via running sums.
+#[derive(Clone)]
 pub struct RollingStdDev {
     period: usize,
     window: VecDeque<Decimal>,

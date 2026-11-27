@@ -10,6 +10,7 @@ use crate::indicator::Indicator;
 /// `avg = (avg * (period - 1) + current) / period`. When `avg_loss` is
 /// zero (the price has only risen over the tracked history), RSI is
 /// defined as `100` to avoid division by zero.
+#[derive(Clone)]
 pub struct Rsi {
     period: usize,
     prev_price: Option<Decimal>,
@@ -39,8 +40,18 @@ impl Rsi {
         if self.avg_loss.is_zero() {
             return Decimal::from(100);
         }
-        let rs = self.avg_gain / self.avg_loss;
-        Decimal::from(100) - Decimal::from(100) / (Decimal::ONE + rs)
+        // Preserve the ordinary calculation; avoid overflow for extreme gain/loss
+        // ratios by using the algebraically equivalent bounded fraction.
+        if let Some(denominator) = self
+            .avg_gain
+            .checked_div(self.avg_loss)
+            .and_then(|rs| Decimal::ONE.checked_add(rs))
+        {
+            Decimal::from(100) - Decimal::from(100) / denominator
+        } else {
+            let inverse = self.avg_loss / self.avg_gain;
+            Decimal::from(100) - Decimal::from(100) * inverse / (Decimal::ONE + inverse)
+        }
     }
 }
 
@@ -120,5 +131,12 @@ mod tests {
     #[should_panic(expected = "period must be > 0")]
     fn zero_period_panics() {
         Rsi::new(0);
+    }
+    #[test]
+    fn extreme_gain_loss_ratio_does_not_overflow() {
+        let mut rsi = Rsi::new(2);
+        rsi.avg_gain = dec!(1000000000000);
+        rsi.avg_loss = dec!(0.0000000000000000000000000001);
+        assert_eq!(rsi.rsi_from_averages(), dec!(100));
     }
 }
