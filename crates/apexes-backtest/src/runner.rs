@@ -275,6 +275,7 @@ pub async fn run_backtest(
         .with_replay_parent_namespace(replay_identity.map(|p| p.namespace)),
     );
 
+    let performance_instruments = config.instruments.clone();
     let unified_loop_config = UnifiedLoopConfig {
         instruments: config.instruments,
         initial_balances: config.initial_balances,
@@ -302,6 +303,10 @@ pub async fn run_backtest(
         latency,
     )
     .await?;
+    report.execution_performance = Some(crate::execution_performance::evaluate(
+        &performance_instruments,
+        &report.trades,
+    ));
     report.historical_dataset = historical_dataset;
     report.replay_identity = replay_identity;
     report.simulated_fees = Some(simulated_fees);
