@@ -635,3 +635,47 @@ fn scoped_sma_migration_preserves_single_symbol_strategy_decisions() {
         assert!(triggered);
     });
 }
+
+#[test]
+fn time_gates_isolate_instruments_and_rollback_failed_grants() {
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("time_gates.drift")).unwrap();
+        let (positions, balances, open_orders, _) = empty_ctx(Utc::now());
+        let start = chrono::DateTime::from_timestamp(1767225600, 0).unwrap();
+        let mut step = |symbol: &str, venue: Venue, ms: i64, price: Decimal| {
+            let now = start + chrono::TimeDelta::milliseconds(ms);
+            let MarketEvent::Trade(mut trade) = sample_trade_event() else {
+                panic!("trade fixture")
+            };
+            trade.symbol = symbol.into();
+            trade.venue = venue;
+            trade.price = price;
+            trade.timestamp = now;
+            let ctx = StrategyContext {
+                positions: &positions,
+                balances: &balances,
+                open_orders: &open_orders,
+                open_parent_orders: &HashMap::new(),
+                margin_status: &HashMap::new(),
+                now,
+            };
+            strategy
+                .on_market_event(&MarketEvent::Trade(trade), &ctx)
+                .len()
+        };
+        assert_eq!(step("BTCUSDT", Venue::Binance, 0, dec!(1)), 1);
+        assert_eq!(step("ETHUSDT", Venue::Binance, 500, dec!(1)), 1);
+        assert_eq!(step("BTCUSDT", Venue::Okx, 500, dec!(1)), 1);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 999, dec!(1)), 0);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 1000, dec!(998)), 0);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 1000, dec!(999)), 0);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 1000, dec!(1)), 1);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 1000, dec!(1)), 0);
+        assert_eq!(step("ETHUSDT", Venue::Binance, 1499, dec!(1)), 0);
+        assert_eq!(step("ETHUSDT", Venue::Binance, 1500, dec!(1)), 1);
+        assert_eq!(step("BTCUSDT", Venue::Okx, 1500, dec!(1)), 1);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 900, dec!(1)), 0);
+        assert_eq!(step("BTCUSDT", Venue::Binance, 2000, dec!(1)), 1);
+    });
+}

@@ -114,6 +114,7 @@ impl Strategy for DriftScriptStrategy {
         );
         let state = self.symbol_state.begin(event);
         state.attach(&mut ctx_value);
+        state.attach_time(&mut ctx_value, event, ctx.now);
         let event_value = market_event_to_drift_value(event);
 
         let handle = tokio::runtime::Handle::current();

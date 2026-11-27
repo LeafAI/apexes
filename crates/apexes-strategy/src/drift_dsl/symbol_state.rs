@@ -1,8 +1,10 @@
 //! F04.01: event-bound, transactional data and native indicator state bindings.
 use super::indicators::error_object;
 use super::scoped_indicators::{Instance, Kind, MAX_INDICATORS};
+use crate::event_time::{MAX_COOLDOWN_MS, TimeGateError, TimeObservation, TimeState};
 use crate::symbol_state::SymbolState;
 use apexes_core::MarketEvent;
+use chrono::{DateTime, Utc};
 use drift_script::{DriftValue, NativeFn};
 use std::{
     collections::HashMap,
@@ -21,6 +23,7 @@ type Values = HashMap<String, DriftValue>;
 struct InstrumentState {
     values: Values,
     indicators: HashMap<String, Instance>,
+    time: TimeState,
 }
 
 pub(super) struct ScriptState(SymbolState<InstrumentState>);
@@ -41,6 +44,12 @@ struct Stage {
 }
 
 pub(super) struct CallbackState(Arc<Mutex<Stage>>);
+
+#[derive(Clone, Copy)]
+enum TimeOperation {
+    Cooldown,
+    Bar,
+}
 
 fn valid_value(value: &DriftValue) -> bool {
     match value {
@@ -98,6 +107,44 @@ impl ScriptState {
 }
 
 impl Stage {
+    fn apply_time(
+        &mut self,
+        observation: Result<TimeObservation, TimeGateError>,
+        operation: TimeOperation,
+        args: &[DriftValue],
+    ) -> Result<bool, TimeGateError> {
+        let obs = observation?;
+        if matches!(operation, TimeOperation::Bar) && !args.is_empty() {
+            return Err(TimeGateError::InvalidObservation);
+        }
+        if matches!(operation, TimeOperation::Bar) && !obs.is_bar() {
+            return Ok(false);
+        }
+        if !self.writable {
+            return Err(TimeGateError::Capacity);
+        }
+        let granted = match operation {
+            TimeOperation::Cooldown => {
+                let key = name(args.first()).ok_or(TimeGateError::InvalidCooldown)?;
+                let Some(DriftValue::Number(ms)) = args.get(1) else {
+                    return Err(TimeGateError::InvalidCooldown);
+                };
+                if args.len() != 2
+                    || !ms.is_finite()
+                    || ms.fract() != 0.0
+                    || *ms < 1.0
+                    || *ms > MAX_COOLDOWN_MS as f64
+                {
+                    return Err(TimeGateError::InvalidCooldown);
+                }
+                self.state.time.try_cooldown(obs, key, *ms as u64)?
+            }
+            TimeOperation::Bar => self.state.time.accept_closed_bar(obs)?,
+        };
+        self.dirty = true;
+        Ok(granted)
+    }
+
     fn update_indicator(
         &mut self,
         kind: Kind,
@@ -149,6 +196,60 @@ impl CallbackState {
                 ),
             );
         }
+    }
+
+    pub(super) fn attach_time(
+        &self,
+        ctx: &mut DriftValue,
+        event: &MarketEvent,
+        now: DateTime<Utc>,
+    ) {
+        let observation = TimeObservation::new(event, now);
+        if let DriftValue::Object(obj) = ctx {
+            obj.insert(
+                "time".into(),
+                DriftValue::Object(HashMap::from([
+                    (
+                        "try_cooldown".into(),
+                        DriftValue::NativeFunction(
+                            self.time_fn(observation, TimeOperation::Cooldown),
+                        ),
+                    ),
+                    (
+                        "accept_closed_bar".into(),
+                        DriftValue::NativeFunction(self.time_fn(observation, TimeOperation::Bar)),
+                    ),
+                ])),
+            );
+        }
+    }
+
+    fn time_fn(
+        &self,
+        observation: Result<TimeObservation, TimeGateError>,
+        operation: TimeOperation,
+    ) -> NativeFn {
+        let stage = Arc::clone(&self.0);
+        Arc::new(move |args| {
+            let stage = Arc::clone(&stage);
+            Box::pin(async move {
+                let Ok(mut s) = stage.lock() else {
+                    return DriftValue::Bool(false);
+                };
+                if s.closed {
+                    return DriftValue::Bool(false);
+                }
+                let result = s.apply_time(observation, operation, &args);
+                match result {
+                    Ok(granted) => DriftValue::Bool(granted),
+                    Err(error) => {
+                        tracing::warn!(%error,"strategy time gate rejected");
+                        s.invalid = true;
+                        DriftValue::Bool(false)
+                    }
+                }
+            })
+        })
     }
 
     fn indicator_fn(&self, kind: Kind) -> NativeFn {
@@ -454,5 +555,33 @@ mod tests {
             DriftValue::Object(_)
         ));
         assert!(!state.finish(&event, stage, true));
+    }
+    #[test]
+    fn retained_time_gate_cannot_advance_committed_cooldown() {
+        let mut state = ScriptState::default();
+        let event = event("BTCUSDT");
+        let MarketEvent::Trade(t) = &event else {
+            panic!("trade fixture")
+        };
+        let obs = TimeObservation::new(&event, t.timestamp);
+        let stage = state.begin(&event);
+        let gate = stage.time_fn(obs, TimeOperation::Cooldown);
+        let args = || vec![string("entry"), DriftValue::Number(1000.0)];
+        assert!(matches!(
+            futures::executor::block_on(gate(args())),
+            DriftValue::Bool(true)
+        ));
+        assert!(state.finish(&event, stage, true));
+        assert!(matches!(
+            futures::executor::block_on(gate(args())),
+            DriftValue::Bool(false)
+        ));
+        let stage = state.begin(&event);
+        let gate = stage.time_fn(obs, TimeOperation::Cooldown);
+        assert!(matches!(
+            futures::executor::block_on(gate(args())),
+            DriftValue::Bool(false)
+        ));
+        assert!(state.finish(&event, stage, true));
     }
 }

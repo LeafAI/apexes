@@ -1,0 +1,18 @@
+function on_market_event(event, ctx) {
+    let grant = ctx.time.try_cooldown("entry", 1000);
+    if (event.price == 998) {
+        return 42;
+    }
+    if (event.price == 999) {
+        ctx.time.try_cooldown("invalid", 0);
+    }
+    if (!grant) { return []; }
+    return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "buy",
+        order_type: "market",
+        quantity: 1,
+    }];
+}
