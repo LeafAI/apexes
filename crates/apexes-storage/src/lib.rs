@@ -5,6 +5,7 @@
 
 pub mod conversion;
 pub mod error;
+pub mod raw_depth_store;
 pub mod reader;
 pub mod schema;
 pub mod writer;

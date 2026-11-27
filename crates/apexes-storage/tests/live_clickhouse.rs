@@ -410,3 +410,38 @@ fn test_bar(symbol: &str, venue: Venue, open_time_rfc3339: &str, volume: Decimal
         close_time: open_time + chrono::Duration::hours(1),
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn isolated_raw_depth_batch_preserves_payload_and_rejects_duplicates() {
+    use apexes_storage::raw_depth_store::{RawDepthBatch, RawDepthStore};
+    let store = RawDepthStore::new(CLICKHOUSE_URL).await.unwrap();
+    let now = Utc::now();
+    let run = unique_symbol("raw-run-", now);
+    let event = MarketEvent::Depth(DepthUpdate {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        bids: vec![PriceLevel {
+            price: dec!(0.123456789012),
+            quantity: dec!(1),
+        }],
+        asks: vec![],
+        sequence: Some(103),
+        source_range: Some(apexes_core::DepthSourceRange {
+            first: 101,
+            last: 103,
+            previous_final: Some(100),
+        }),
+        is_snapshot: false,
+        timestamp: now,
+    });
+    let batch = RawDepthBatch::new(&run, 0, std::slice::from_ref(&event)).unwrap();
+    assert!(store.read_batch(&run, 0).await.unwrap().is_none());
+    store.write_batch(&batch).await.unwrap();
+    let read = store.read_batch(&run, 0).await.unwrap().unwrap();
+    assert_eq!(read.events_json, batch.events_json);
+    assert_eq!(read.events().unwrap(), vec![event]);
+    assert!(store.read_batch(&run, 1).await.unwrap().is_none());
+    store.write_batch(&batch).await.unwrap();
+    assert!(store.read_batch(&run, 0).await.is_err());
+}

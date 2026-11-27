@@ -10,7 +10,7 @@ apexes-message-bus = { path = "../apexes-message-bus" }
 apexes-storage = { path = "../apexes-storage" }
 barter-data = { workspace = true }
 barter-instrument = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "fs", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "net"] }
