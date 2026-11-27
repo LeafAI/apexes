@@ -45,6 +45,9 @@ pub struct BacktestReport {
     pub drawdown_duration: Option<crate::drawdown_duration::DrawdownEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark: Option<crate::benchmark::BenchmarkEvidence>,
+    /// Historical simulation only; absent for legacy reports and paper/live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding: Option<crate::funding_attribution::FundingReport>,
 }
 
 /// `PerformanceSummary` (Task 13) does not itself derive `Serialize`/

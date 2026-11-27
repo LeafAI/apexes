@@ -233,7 +233,16 @@ impl PortfolioLedger {
         mark_prices: &HashMap<String, Decimal>,
         cost_model: &CostModel,
     ) -> Result<(), ApexesError> {
-        // Collect (quote_currency, payment) pairs first so we don't hold
+        self.settle_funding(mark_prices, cost_model).map(|_| ())
+    }
+
+    pub(crate) fn settle_funding(
+        &mut self,
+        mark_prices: &HashMap<String, Decimal>,
+        cost_model: &CostModel,
+    ) -> Result<Vec<crate::funding_attribution::FundingMovement>, ApexesError> {
+        use crate::funding_attribution::{FundingMovement, FundingPriceSource};
+        // Collect settlements first so we don't hold
         // an immutable borrow of self.positions while later mutably
         // crediting self.balances.
         let mut settlements = Vec::new();
@@ -252,14 +261,17 @@ impl PortfolioLedger {
                     reason: format!("Instrument {symbol} has no quote_currency"),
                 }
             })?;
-            let mark_price = instrument
+            let observed_mark = instrument
                 .base_currency
                 .as_ref()
                 .and_then(|base| mark_prices.get(base))
-                .copied()
-                .unwrap_or(position.average_entry_price);
+                .copied();
+            let mark_price = observed_mark.unwrap_or(position.average_entry_price);
             let notional = position.quantity.abs() * mark_price;
-            if let Some(payment) = cost_model.funding_payment(notional) {
+            if let (Some(rate_bps), Some(payment)) = (
+                cost_model.funding_rate_bps,
+                cost_model.funding_payment(notional),
+            ) {
                 // A long position paying funding debits its quote
                 // balance; a short position paying funding credits it
                 // (mirroring real exchanges' sign convention where
@@ -270,14 +282,28 @@ impl PortfolioLedger {
                 } else {
                     -payment
                 };
-                settlements.push((quote, signed_payment));
+                settlements.push(FundingMovement {
+                    symbol: symbol.clone(),
+                    venue: instrument.venue,
+                    quote_currency: quote,
+                    position_quantity: position.quantity,
+                    valuation_price: mark_price,
+                    price_source: if observed_mark.is_some() {
+                        FundingPriceSource::Mark
+                    } else {
+                        FundingPriceSource::EntryFallback
+                    },
+                    notional,
+                    rate_bps,
+                    balance_delta: -signed_payment,
+                });
             }
         }
 
-        for (quote, payment) in settlements {
-            self.credit(&quote, -payment);
+        for settlement in &settlements {
+            self.credit(&settlement.quote_currency, settlement.balance_delta);
         }
-        Ok(())
+        Ok(settlements)
     }
 
     /// Leveraged (perpetual futures) fill accounting -- cash-settled,
@@ -2440,5 +2466,65 @@ mod tests {
             let ledger = PortfolioLedger::new(HashMap::new(), balances);
             assert_eq!(ledger.equity(&HashMap::new()).unwrap(), ordered);
         }
+    }
+    #[test]
+    fn funding_movements_match_balance_changes_in_symbol_order_with_fallback() {
+        use crate::funding_attribution::FundingPriceSource;
+        let btc = btc_usdt();
+        let mut eth = btc.clone();
+        eth.symbol = "ETHUSDT".into();
+        eth.base_currency = Some("ETH".into());
+        let mut ledger = PortfolioLedger::new(
+            HashMap::from([("ETHUSDT".into(), eth), ("BTCUSDT".into(), btc)]),
+            HashMap::from([("USDT".into(), dec!(10000))]),
+        );
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "ETHUSDT",
+                Side::Sell,
+                dec!(100),
+                dec!(3),
+                dec!(10),
+            ))
+            .unwrap();
+        ledger
+            .apply_fill(&leveraged_fill_for_symbol(
+                "BTCUSDT",
+                Side::Buy,
+                dec!(100),
+                dec!(2),
+                dec!(10),
+            ))
+            .unwrap();
+        let marks = HashMap::from([("BTC".into(), dec!(150))]);
+        let before = ledger.balances()["USDT"];
+        let movements = ledger
+            .settle_funding(&marks, &cost_model_with_funding(dec!(10)))
+            .unwrap();
+        assert_eq!(movements.len(), 2);
+        assert_eq!(movements[0].symbol, "BTCUSDT");
+        assert_eq!(movements[0].position_quantity, dec!(2));
+        assert_eq!(movements[0].price_source, FundingPriceSource::Mark);
+        assert_eq!(movements[0].valuation_price, dec!(150));
+        assert_eq!(movements[0].notional, dec!(300));
+        assert_eq!(movements[0].balance_delta, dec!(-0.3));
+        assert_eq!(movements[1].symbol, "ETHUSDT");
+        assert_eq!(movements[1].position_quantity, dec!(-3));
+        assert_eq!(movements[1].price_source, FundingPriceSource::EntryFallback);
+        assert_eq!(movements[1].valuation_price, dec!(100));
+        assert_eq!(movements[1].balance_delta, dec!(0.3));
+        assert_eq!(ledger.balances()["USDT"], before);
+        let negative = ledger
+            .settle_funding(&marks, &cost_model_with_funding(dec!(-10)))
+            .unwrap();
+        assert_eq!(negative[0].balance_delta, dec!(0.3));
+        assert_eq!(negative[1].balance_delta, dec!(-0.3));
+        assert_eq!(ledger.balances()["USDT"], before);
+        let zero = ledger
+            .settle_funding(&marks, &cost_model_with_funding(Decimal::ZERO))
+            .unwrap();
+        assert_eq!(zero.len(), 2);
+        assert!(zero.iter().all(|m| m.balance_delta.is_zero()));
+        assert_eq!(ledger.balances()["USDT"], before);
     }
 }

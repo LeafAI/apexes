@@ -98,3 +98,5 @@ pub mod execution_performance;
 
 pub mod benchmark;
 pub mod drawdown_duration;
+
+pub mod funding_attribution;
