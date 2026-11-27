@@ -385,6 +385,7 @@ pub async fn run_unified_event_loop(
                             if emergency_event {
                                 return Err("emergency preempts resting execution".into());
                             }
+                            queue.validate_resting_claim(id, fills, projected.positions())?;
                             for fill in fills {
                                 candidate.apply_fill(fill).map_err(|error| error.to_string())?;
                             }
@@ -454,6 +455,7 @@ pub async fn run_unified_event_loop(
                         }
                         // Validate the entire child's proposed execution before
                         // committing any depth, including all fees and margin.
+                        queue.validate_child_claim(parent, intent, projected.positions())?;
                         let mut candidate = projected.execution_snapshot();
                         for fill in fills {
                             candidate.apply_fill(fill).map_err(|error| error.to_string())?;
@@ -854,7 +856,7 @@ pub async fn run_unified_event_loop(
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
                     let mut admitted_hold = None;
                     if let Some(queue)=&mut arrivals {
-                        let hold = match intent_capital_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
+                        let hold = match intent_capital_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp, queue, ledger.positions()) {
                             Ok(hold) if hold.as_ref().is_none_or(|hold| queue.check_capital(hold, ledger.balances())) => hold,
                             result => {
                                 queue.capital_refused(!arriving);
@@ -1199,9 +1201,14 @@ fn intent_capital_hold(
     instruments: &HashMap<String, Instrument>,
     executor: &dyn OrderExecutor,
     now: chrono::DateTime<chrono::Utc>,
+    queue: &crate::event_latency::ArrivalQueue,
+    positions: &HashMap<String, Position>,
 ) -> Result<Option<crate::event_latency::CapitalHold>, String> {
     use apexes_core::{AssetClass, Side};
     let leveraged = intent.asset_class == AssetClass::Perpetual;
+    if queue.has_closing_owner(&intent.symbol) {
+        return Err("another simulated order owns closing quantity".into());
+    }
     if !matches!(intent.asset_class, AssetClass::Spot | AssetClass::Perpetual) {
         if intent.leverage.is_some() || intent.margin_mode.is_some() {
             return Err("unsupported leveraged reservation asset class".into());
@@ -1228,34 +1235,46 @@ fn intent_capital_hold(
     if leveraged && instrument.multiplier != Decimal::ONE {
         return Err("leveraged reservation requires unit contract multiplier".into());
     }
-    let (asset, amount) = if leveraged {
-        (
-            instrument.quote_currency.as_ref(),
-            executor
-                .simulated_margin_budget(intent, now)
-                .map_err(|e| e.to_string())?,
-        )
-    } else {
-        match intent.side {
-            Side::Buy => (
-                instrument.quote_currency.as_ref(),
-                executor
-                    .simulated_buy_budget(intent, now)
-                    .map_err(|e| e.to_string())?,
-            ),
-            Side::Sell => (instrument.base_currency.as_ref(), intent.quantity),
-        }
+    use crate::event_latency::{CapitalHold, MarginAllocation, closing_quantity};
+    let asset = |value: Option<&String>| {
+        value
+            .filter(|a| !a.is_empty())
+            .cloned()
+            .ok_or("unknown reservation spend asset")
     };
-    let asset = asset
-        .filter(|asset| !asset.is_empty())
-        .ok_or("unknown reservation spend asset")?;
+    if leveraged {
+        let closing = if queue.has_symbol_owner(&intent.symbol) {
+            Decimal::ZERO
+        } else {
+            closing_quantity(intent, positions)
+        };
+        let (unit_margin, unit_fee) = executor
+            .simulated_margin_rates(intent, now)
+            .map_err(|e| e.to_string())?;
+        return CapitalHold::leveraged(
+            asset(instrument.quote_currency.as_ref())?,
+            intent.quantity,
+            MarginAllocation {
+                closing,
+                unit_margin,
+                unit_fee,
+            },
+        )
+        .map(Some);
+    }
+    let (asset, amount) = match intent.side {
+        Side::Buy => (
+            asset(instrument.quote_currency.as_ref())?,
+            executor
+                .simulated_buy_budget(intent, now)
+                .map_err(|e| e.to_string())?,
+        ),
+        Side::Sell => (asset(instrument.base_currency.as_ref())?, intent.quantity),
+    };
     if amount <= Decimal::ZERO {
         return Err("nonpositive reservation".into());
     }
-    Ok(Some(crate::event_latency::CapitalHold {
-        asset: asset.clone(),
-        amount,
-    }))
+    Ok(Some(CapitalHold::plain(asset, amount)))
 }
 
 /// `intent` as the risk checks should see it: a priceless order (market) gets

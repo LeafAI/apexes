@@ -1455,3 +1455,238 @@ async fn margin_liquidation_preempts_due_child_resting_and_transit_orders() {
 async fn extreme_trade_preempts_maker_fill_and_due_child() {
     assert_emergency_preempts_competing_orders(true).await;
 }
+
+struct ReduceSequence {
+    start: chrono::DateTime<Utc>,
+    opening_side: apexes_core::Side,
+    opening_quantity: rust_decimal::Decimal,
+    closing_quantity: rust_decimal::Decimal,
+    kind: apexes_core::OrderType,
+    algo: bool,
+    competing_close: bool,
+}
+
+impl Strategy for ReduceSequence {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        let offset = (ctx.now - self.start).num_milliseconds();
+        if offset != 0 && offset != 500 && !(self.competing_close && offset == 1100) {
+            return vec![];
+        }
+        let mut intent = BuyOnceStrategy { has_bought: false }
+            .on_market_event(event, ctx)
+            .remove(0);
+        intent.asset_class = AssetClass::Perpetual;
+        intent.leverage = Some(dec!(2));
+        intent.margin_mode = Some(apexes_core::MarginMode::Isolated);
+        if offset == 0 {
+            intent.side = self.opening_side;
+            intent.quantity = self.opening_quantity;
+        } else {
+            intent.side = match self.opening_side {
+                apexes_core::Side::Buy => apexes_core::Side::Sell,
+                apexes_core::Side::Sell => apexes_core::Side::Buy,
+            };
+            intent.quantity = self.closing_quantity;
+            if offset == 500 {
+                intent.order_type = self.kind;
+                if self.kind == apexes_core::OrderType::Limit {
+                    intent.price = Some(dec!(10));
+                }
+                if self.algo {
+                    intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                        duration: std::time::Duration::from_millis(200),
+                        slices: 2,
+                    });
+                }
+            }
+        }
+        vec![intent]
+    }
+}
+
+fn reducing_fixture(
+    balance: rust_decimal::Decimal,
+) -> (BacktestConfig, Vec<MarketEvent>, chrono::DateTime<Utc>) {
+    let (config, events) = leveraged_fixture(balance, dec!(9));
+    let MarketEvent::Depth(depth) = events[0].clone() else {
+        unreachable!()
+    };
+    let start = depth.timestamp;
+    let mut events = Vec::new();
+    for (seq, offset) in [0, 500, 1000, 1100, 1200, 1600, 1700, 1800, 2100]
+        .into_iter()
+        .enumerate()
+    {
+        let mut next = depth.clone();
+        next.timestamp = start + chrono::Duration::milliseconds(offset);
+        next.sequence = Some(seq as u64 + 1);
+        events.push(MarketEvent::Depth(next));
+    }
+    (config, events, start)
+}
+
+#[tokio::test]
+async fn fully_allocated_long_can_reduce_without_new_opening_margin() {
+    let (config, events, start) = reducing_fixture(dec!(5));
+    let report = run_backtest(
+        config,
+        &child_risk_registry(Default::default()),
+        InMemoryMarketDataSource::new(events),
+        ReduceSequence {
+            start,
+            opening_side: apexes_core::Side::Buy,
+            opening_quantity: dec!(1),
+            closing_quantity: dec!(0.5),
+            kind: apexes_core::OrderType::Market,
+            algo: false,
+            competing_close: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    assert_eq!(report.trades[1].side, apexes_core::Side::Sell);
+    assert_eq!(report.trades[1].quantity, dec!(0.5));
+    assert_eq!(report.event_latency.unwrap().capital_refused, 0);
+}
+
+#[tokio::test]
+async fn fully_allocated_short_can_close_without_new_opening_margin() {
+    let (config, events, start) = reducing_fixture(dec!(4.5));
+    let report = run_backtest(
+        config,
+        &child_risk_registry(Default::default()),
+        InMemoryMarketDataSource::new(events),
+        ReduceSequence {
+            start,
+            opening_side: apexes_core::Side::Sell,
+            opening_quantity: dec!(1),
+            closing_quantity: dec!(1),
+            kind: apexes_core::OrderType::Market,
+            algo: false,
+            competing_close: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    assert_eq!(report.trades[1].side, apexes_core::Side::Buy);
+    assert_eq!(report.trades[1].quantity, dec!(1));
+    assert_eq!(report.event_latency.unwrap().capital_refused, 0);
+}
+
+#[tokio::test]
+async fn reversal_reserves_only_excess_opening_margin_not_closing_proceeds() {
+    for (balance, expected) in [(dec!(9.5), 2), (dec!(9.4), 1)] {
+        let (config, events, start) = reducing_fixture(balance);
+        let report = run_backtest(
+            config,
+            &child_risk_registry(Default::default()),
+            InMemoryMarketDataSource::new(events),
+            ReduceSequence {
+                start,
+                opening_side: apexes_core::Side::Buy,
+                opening_quantity: dec!(1),
+                closing_quantity: dec!(2),
+                kind: apexes_core::OrderType::Market,
+                algo: false,
+                competing_close: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), expected);
+        if expected == 2 {
+            assert_eq!(report.trades[1].quantity, dec!(2));
+        } else {
+            assert_eq!(report.event_latency.unwrap().capital_refused, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn resting_reversal_keeps_opening_margin_after_closing_partial_fill() {
+    let (config, mut events, start) = reducing_fixture(dec!(10));
+    events.truncate(4);
+    for (offset, quantity) in [(1150, dec!(0.5)), (1200, dec!(0.5)), (1300, dec!(1))] {
+        events.push(MarketEvent::Trade(TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(10),
+            quantity,
+            side: Some(apexes_core::Side::Buy),
+            trade_id: None,
+            timestamp: start + chrono::Duration::milliseconds(offset),
+        }));
+    }
+    let report = run_backtest(
+        config,
+        &child_risk_registry(Default::default()),
+        InMemoryMarketDataSource::new(events),
+        ReduceSequence {
+            start,
+            opening_side: apexes_core::Side::Buy,
+            opening_quantity: dec!(1),
+            closing_quantity: dec!(2),
+            kind: apexes_core::OrderType::Limit,
+            algo: false,
+            competing_close: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 4, "{:?}", report.trades);
+    assert_eq!(
+        report.trades[1..]
+            .iter()
+            .map(|f| f.quantity)
+            .sum::<rust_decimal::Decimal>(),
+        dec!(2)
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.capital_refused,
+            latency.resting_capital_reserved,
+            latency.resting_capital_released
+        ),
+        (1, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn ems_closing_parent_owns_quantity_through_child_transit() {
+    let (config, events, start) = reducing_fixture(dec!(5));
+    let report = run_backtest(
+        config,
+        &child_risk_registry(Default::default()),
+        InMemoryMarketDataSource::new(events),
+        ReduceSequence {
+            start,
+            opening_side: apexes_core::Side::Buy,
+            opening_quantity: dec!(1),
+            closing_quantity: dec!(1),
+            kind: apexes_core::OrderType::Market,
+            algo: true,
+            competing_close: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 3, "{:?}", report.trades);
+    assert!(
+        report.trades[1..]
+            .iter()
+            .all(|f| f.side == apexes_core::Side::Sell && f.quantity == dec!(0.5))
+    );
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.capital_refused,
+            latency.parent_capital_reserved,
+            latency.parent_capital_released
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(latency.child_orders.unwrap().arrived, 2);
+}

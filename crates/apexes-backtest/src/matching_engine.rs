@@ -321,12 +321,12 @@ impl MatchingEngine {
         Self::budget_with_fee(intent.quantity, price, rate)
     }
 
-    /// Conservative full-size opening margin plus fees, independent of side.
-    pub(crate) fn simulated_margin_budget(
+    /// Conservative per-unit opening margin and fee estimates, independent of side.
+    pub(crate) fn simulated_margin_rates(
         &self,
         intent: &OrderIntent,
         now: DateTime<Utc>,
-    ) -> Result<Decimal, ApexesError> {
+    ) -> Result<(Decimal, Decimal), ApexesError> {
         let reject = |reason: &str| ApexesError::OrderRejected {
             reason: reason.into(),
         };
@@ -386,18 +386,15 @@ impl MatchingEngine {
         if rate < Decimal::ZERO || rate >= Decimal::from(10000) {
             return Err(reject("invalid margin reservation fee rate"));
         }
-        intent
-            .quantity
-            .checked_mul(price)
-            .and_then(|notional| {
-                let margin = notional.checked_div(leverage)?;
-                let fee = notional
-                    .checked_mul(rate)?
-                    .checked_div(Decimal::from(10000))?;
-                margin.checked_add(fee)
-            })
-            .filter(|n| *n > Decimal::ZERO)
-            .ok_or_else(|| reject("invalid or overflowing margin reservation"))
+        let margin = price
+            .checked_div(leverage)
+            .filter(|v| *v > Decimal::ZERO)
+            .ok_or_else(|| reject("invalid per-unit margin"))?;
+        let fee = price
+            .checked_mul(rate)
+            .and_then(|n| n.checked_div(Decimal::from(10000)))
+            .ok_or_else(|| reject("invalid per-unit fee"))?;
+        Ok((margin, fee))
     }
 
     pub(crate) fn submit_direct_checked(
