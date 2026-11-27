@@ -174,12 +174,15 @@ pub fn locate_binary(
         })
 }
 
-/// A free loopback port. There is an unavoidable gap between releasing it
-/// and the child binding it; the supervisor detects a lost race because the
-/// child then exits during startup and its log says the bind failed.
+fn reserve_loopback_listener() -> std::io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+}
+
+/// A candidate loopback port, free at the instant it was reserved.
+/// Releasing the listener does not guarantee that the port stays free:
+/// the supervisor retries when the child loses the subsequent bind race.
 pub fn free_loopback_port() -> std::io::Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    Ok(reserve_loopback_listener()?.local_addr()?.port())
 }
 
 #[cfg(test)]
@@ -291,9 +294,32 @@ mod tests {
     }
 
     #[test]
-    fn free_ports_are_usable_and_differ() {
-        let a = free_loopback_port().unwrap();
-        assert!(a > 0);
-        std::net::TcpListener::bind(("127.0.0.1", a)).expect("the returned port can be bound");
+    fn reserved_loopback_ports_are_usable_and_distinct_while_held() {
+        let first = reserve_loopback_listener().unwrap();
+        let second = reserve_loopback_listener().unwrap();
+        let a = first.local_addr().unwrap();
+        let b = second.local_addr().unwrap();
+        assert!(a.ip().is_loopback() && b.ip().is_loopback());
+        assert!(a.port() > 0 && b.port() > 0);
+        assert_ne!(a.port(), b.port());
+        // Verify usability without releasing the reservations.
+        for (listener, address) in [(first, a), (second, b)] {
+            let client =
+                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
+                    .unwrap();
+            let (_, peer) = listener.accept().unwrap();
+            assert_eq!(peer, client.local_addr().unwrap());
+        }
+    }
+
+    #[test]
+    fn candidate_port_does_not_conflict_with_held_listener() {
+        let held = reserve_loopback_listener().unwrap();
+        let candidate = free_loopback_port().unwrap();
+        assert!(candidate > 0);
+        assert_ne!(candidate, held.local_addr().unwrap().port());
+        // No assertion about re-binding the candidate after release:
+        // another process can legally take it. The gateway startup
+        // integration test exercises recovery from that race.
     }
 }
