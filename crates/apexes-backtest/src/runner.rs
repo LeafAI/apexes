@@ -266,7 +266,8 @@ pub async fn run_backtest(
             HashMap::new(),
             volume_curve_provider,
         )
-        .with_event_time(latency.is_some()),
+        .with_event_time(latency.is_some())
+        .with_replay_parent_namespace(replay_identity.map(|p| p.namespace)),
     );
 
     let unified_loop_config = UnifiedLoopConfig {

@@ -1691,3 +1691,208 @@ async fn ems_closing_parent_owns_quantity_through_child_transit() {
     );
     assert_eq!(latency.child_orders.unwrap().arrived, 2);
 }
+
+#[tokio::test]
+async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
+    use apexes_backtest::historical_dataset::{
+        DatasetDefinition, DatasetStream, StreamKind, seal_dataset,
+    };
+    use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
+    use apexes_strategy::ParentOrderId;
+    use std::sync::{Arc, Mutex};
+    struct Parents {
+        sent: bool,
+        observed: Arc<Mutex<Vec<ParentOrderId>>>,
+    }
+    impl Strategy for Parents {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            let mut ids: Vec<_> = ctx.open_parent_orders.keys().copied().collect();
+            ids.sort_by_key(|id| id.0);
+            self.observed.lock().unwrap().extend(ids);
+            if self.sent || !matches!(event, MarketEvent::Depth(d) if d.symbol == "ETHUSDT") {
+                return vec![];
+            }
+            self.sent = true;
+            let mut first = BuyOnceStrategy { has_bought: false }
+                .on_market_event(event, ctx)
+                .remove(0);
+            first.quantity = dec!(2);
+            first.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                duration: std::time::Duration::from_secs(2),
+                slices: 2,
+            });
+            let mut second = first.clone();
+            second.quantity = dec!(4);
+            second.symbol = "ETHUSDT".into();
+            vec![first, second]
+        }
+    }
+    let mut events = sample_events();
+    let MarketEvent::Depth(first) = events[0].clone() else {
+        unreachable!()
+    };
+    for (offset, price, seq) in [
+        (500, dec!(2), 2),
+        (600, dec!(3), 3),
+        (1100, dec!(4), 4),
+        (1600, dec!(5), 5),
+        (2100, dec!(6), 6),
+    ] {
+        let mut depth = first.clone();
+        depth.timestamp += chrono::Duration::milliseconds(offset);
+        depth.sequence = Some(seq);
+        depth.asks[0].price = price;
+        events.push(MarketEvent::Depth(depth));
+    }
+    let eth_events: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            MarketEvent::Depth(d) => {
+                let mut d = d.clone();
+                d.symbol = "ETHUSDT".into();
+                Some(MarketEvent::Depth(d))
+            }
+            _ => None,
+        })
+        .collect();
+    events.extend(eth_events);
+    events.sort_by_key(|e| match e {
+        MarketEvent::Depth(d) => d.timestamp,
+        MarketEvent::Trade(t) => t.timestamp,
+        _ => unreachable!(),
+    });
+    let day = first.timestamp.date_naive();
+    let end = day.succ_opt().unwrap();
+    let manifest = seal_dataset(
+        DatasetDefinition {
+            dataset_id: "deterministic-ems-fixture".into(),
+            version: "v1".into(),
+            source_id: "synthetic".into(),
+            start_day: day,
+            end_day_exclusive: end,
+            streams: vec![
+                DatasetStream {
+                    venue: Venue::Binance,
+                    symbol: "BTCUSDT".into(),
+                    kind: StreamKind::Depth,
+                },
+                DatasetStream {
+                    venue: Venue::Binance,
+                    symbol: "BTCUSDT".into(),
+                    kind: StreamKind::Trade,
+                },
+                DatasetStream {
+                    venue: Venue::Binance,
+                    symbol: "ETHUSDT".into(),
+                    kind: StreamKind::Depth,
+                },
+            ],
+        },
+        &events,
+    )
+    .unwrap();
+    let policy = ReplayIdentityPolicy {
+        namespace: uuid::Uuid::from_u128(77),
+    };
+    let registry = apexes_core::registry::Registry::new();
+    registry.register::<_, ()>((), manifest.clone()).unwrap();
+    registry.register::<_, ()>((), policy).unwrap();
+    registry
+        .register::<_, ()>((), apexes_backtest::EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    let config = || {
+        let mut cfg = base_config(end);
+        cfg.instruments.push(
+            Instrument::new(
+                "ETHUSDT",
+                MarketType::Crypto,
+                Venue::Binance,
+                AssetClass::Spot,
+                Some("ETH".into()),
+                Some("USDT".into()),
+                dec!(0.01),
+                dec!(0.0001),
+                dec!(1),
+            )
+            .unwrap(),
+        );
+        cfg
+    };
+    let mut expected = None;
+    for _ in 0..10 {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let report = run_backtest(
+            config(),
+            &registry,
+            InMemoryMarketDataSource::new(events.clone()),
+            Parents {
+                sent: false,
+                observed: observed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.trades.len(), 4);
+        assert_eq!(
+            report.trades.iter().map(|f| f.quantity).collect::<Vec<_>>(),
+            vec![dec!(1), dec!(2), dec!(1), dec!(2)]
+        );
+        assert_eq!(
+            report
+                .trades
+                .iter()
+                .map(|f| f.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"]
+        );
+        let children = report
+            .event_latency
+            .as_ref()
+            .unwrap()
+            .child_orders
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            (
+                children.scheduled,
+                children.arrived,
+                children.expired_at_end
+            ),
+            (4, 4, 0)
+        );
+        let ids = observed.lock().unwrap().clone();
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 2);
+        assert!(ids.iter().all(|id| id.0.get_version_num() == 8));
+        assert!(report.trades.iter().all(|fill| {
+            !ids.iter()
+                .any(|id| id.0 == fill.id.0 || id.0 == fill.order_id.0)
+        }));
+        let fingerprint = canonical_report_sha256(&report).unwrap();
+        let result = (ids, fingerprint);
+        if let Some(previous) = &expected {
+            assert_eq!(&result, previous);
+        }
+        expected = Some(result);
+    }
+    let registry = apexes_core::registry::Registry::new();
+    registry.register::<_, ()>((), manifest).unwrap();
+    registry.register::<_, ()>((), policy).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let report = run_backtest(
+        config(),
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        Parents {
+            sent: false,
+            observed: observed.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    assert!(observed.lock().unwrap().is_empty());
+}
