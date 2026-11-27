@@ -20,7 +20,7 @@ fn string_value(s: impl Into<String>) -> DriftValue {
     DriftValue::String(Arc::new(s.into()))
 }
 
-fn venue_to_str(venue: Venue) -> &'static str {
+pub(super) fn venue_to_str(venue: Venue) -> &'static str {
     match venue {
         Venue::Sse => "sse",
         Venue::Szse => "szse",

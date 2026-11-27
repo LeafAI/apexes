@@ -115,6 +115,16 @@ pub struct StrategyContext<'a> {
     pub margin_status: &'a HashMap<String, PositionMarginStatus>,
     /// Current simulated (backtest) or real (live) time.
     pub now: DateTime<Utc>,
+    /// Unique event instrument and optional rules used by the session.
+    pub market: Option<crate::InstrumentContext<'a>>,
+}
+
+impl StrategyContext<'_> {
+    /// Local session ledger value, not free/spendable exchange balance.
+    /// Missing assets are distinct from an explicitly recorded zero.
+    pub fn ledger_balance(&self, asset: &str) -> Option<Decimal> {
+        self.balances.get(asset).copied()
+    }
 }
 
 /// How an `OrderIntent` should be routed across venues of the same
@@ -303,6 +313,7 @@ mod tests {
         let open_orders = HashMap::new();
         let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,
@@ -348,6 +359,7 @@ mod tests {
         let now = Utc::now();
 
         let ctx = StrategyContext {
+            market: None,
             positions: &positions,
             balances: &balances,
             open_orders: &open_orders,

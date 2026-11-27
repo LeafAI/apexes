@@ -758,6 +758,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 let open_orders = executor.open_orders().await;
                 let arrived_margin_status = arrivals.as_ref().map(|_| ledger.margin_status(&mark_prices, &config.margin_tiers));
                 let ctx = StrategyContext {
+                    market: apexes_strategy::InstrumentContext::for_event(&event, &config.instruments, &config.symbol_rules),
                     positions: ledger.positions(),
                     balances: ledger.balances(),
                     open_orders: &open_orders,
@@ -2095,6 +2096,77 @@ mod tests {
         )
         .await
         .expect("event loop must not error")
+    }
+
+    #[tokio::test]
+    async fn strategy_market_context_sees_session_rules_and_post_fill_ledger() {
+        type ObservedBalances = Vec<(Option<Decimal>, Option<Decimal>)>;
+        struct ObserveContext(Arc<Mutex<ObservedBalances>>);
+        impl Strategy for ObserveContext {
+            fn on_market_event(
+                &mut self,
+                event: &MarketEvent,
+                ctx: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                let market = ctx.market.unwrap();
+                assert!(market.matches(event));
+                assert_eq!(market.instrument().lot_size, dec!(0.001));
+                let rule = market.rules().unwrap();
+                assert_eq!(rule.quantity_step, dec!(0.01));
+                let mut seen = self.0.lock().unwrap();
+                seen.push((ctx.ledger_balance("BTC"), ctx.ledger_balance("USDT")));
+                if seen.len() != 1 {
+                    return vec![];
+                }
+                vec![OrderIntent {
+                    symbol: "BTCUSDT".into(),
+                    venue: apexes_core::Venue::Binance,
+                    asset_class: AssetClass::Spot,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    quantity: dec!(0.027),
+                    price: None,
+                    stop_price: None,
+                    execution_algo: None,
+                    routing: OrderRouting::Fixed,
+                    leverage: None,
+                    margin_mode: None,
+                }]
+            }
+        }
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut config = unified_loop_config(dec!(1000), None, HashMap::new());
+        config.instruments[0].asset_class = AssetClass::Spot;
+        config.symbol_rules.insert(
+            "BTCUSDT".into(),
+            apexes_core::SymbolRules {
+                quantity_step: dec!(0.01),
+                min_quantity: dec!(0.01),
+                max_quantity: dec!(10),
+                price_tick: dec!(0.05),
+                min_notional: Decimal::ZERO,
+            },
+        );
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let report = run(
+            config,
+            zero_cost_model(None),
+            vec![
+                depth_snapshot(t0),
+                trade_event(dec!(100), t0 + Duration::seconds(1)),
+            ],
+            ObserveContext(observed.clone()),
+        )
+        .await;
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].quantity, dec!(0.02));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                (None, Some(dec!(1000))),
+                (Some(dec!(0.02)), Some(dec!(998)))
+            ]
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,23 @@
+function on_market_event(event, ctx) {
+    if (ctx.market == null) { return []; }
+    if (ctx.market.symbol != event.symbol || ctx.market.venue != event.venue) { return []; }
+    if (ctx.market.asset_class != "spot" || ctx.market.base_currency != "BTC" ||
+        ctx.market.quote_currency != "USDT" || ctx.market.tick_size != 0.01 ||
+        ctx.market.lot_size != 0.001 || ctx.market.multiplier != 1) { return []; }
+    if (ctx.ledger_balance("missing") != null || ctx.get_balance("missing") != 0) { return []; }
+    if (ctx.ledger_balance("BTC") != 0 || ctx.ledger_balance("USDT") != 100) { return []; }
+    if (ctx.market.rules == null) { return []; }
+    if (ctx.market.rules.quantity_step != 0.01 ||
+        ctx.market.rules.min_quantity != 0.02 ||
+        ctx.market.rules.max_quantity != 10 ||
+        ctx.market.rules.price_tick != 0.05 ||
+        ctx.market.rules.min_notional != 5) { return []; }
+    return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "buy",
+        order_type: "market",
+        quantity: ctx.market.rules.min_quantity,
+    }];
+}
