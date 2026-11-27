@@ -46,6 +46,49 @@ impl MatchingEngineChildOrderSink {
     }
 }
 
+impl MatchingEngineChildOrderSink {
+    fn submit_child_with_parent(
+        &self,
+        parent: Option<apexes_strategy::ParentOrderId>,
+        intent: ChildOrderIntent,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        let order_intent = OrderIntent {
+            symbol: intent.symbol,
+            venue: intent.venue,
+            asset_class: intent.asset_class,
+            side: intent.side,
+            order_type: OrderType::Market,
+            quantity: intent.quantity,
+            price: None,
+            stop_price: None,
+            execution_algo: None,
+            routing: apexes_strategy::OrderRouting::Fixed,
+            leverage: intent.leverage,
+            margin_mode: intent.margin_mode,
+        };
+        if let Some(arrivals) = &self.arrivals {
+            return self.schedule_child(arrivals, parent, order_intent, now);
+        }
+        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let (order, fills) = engine
+            .submit_market_child(&order_intent, now)
+            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
+                parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
+                reason: error.to_string(),
+            })?;
+
+        // The matching engine already returns the truthful terminal
+        // status and actual executed quantity for immediate orders.
+        self.submitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(order.id, order.clone());
+
+        Ok((order.id, fills))
+    }
+}
+
 #[async_trait]
 impl ChildOrderSink for MatchingEngineChildOrderSink {
     async fn reserve_parent(
@@ -92,39 +135,16 @@ impl ChildOrderSink for MatchingEngineChildOrderSink {
         intent: ChildOrderIntent,
         now: chrono::DateTime<Utc>,
     ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
-        let order_intent = OrderIntent {
-            symbol: intent.symbol,
-            venue: intent.venue,
-            asset_class: intent.asset_class,
-            side: intent.side,
-            order_type: OrderType::Market,
-            quantity: intent.quantity,
-            price: None,
-            stop_price: None,
-            execution_algo: None,
-            routing: apexes_strategy::OrderRouting::Fixed,
-            leverage: intent.leverage,
-            margin_mode: intent.margin_mode,
-        };
-        if let Some(arrivals) = &self.arrivals {
-            return self.schedule_child(arrivals, order_intent, now);
-        }
-        let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
-        let (order, fills) = engine
-            .submit_market_child(&order_intent, now)
-            .map_err(|error| EmsError::ChildOrderSubmissionFailed {
-                parent_id: apexes_strategy::ParentOrderId(uuid::Uuid::nil()),
-                reason: error.to_string(),
-            })?;
+        self.submit_child_with_parent(None, intent, now)
+    }
 
-        // The matching engine already returns the truthful terminal
-        // status and actual executed quantity for immediate orders.
-        self.submitted
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(order.id, order.clone());
-
-        Ok((order.id, fills))
+    async fn submit_parent_child_at(
+        &self,
+        parent: apexes_strategy::ParentOrderId,
+        intent: ChildOrderIntent,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        self.submit_child_with_parent(Some(parent), intent, now)
     }
 
     fn defers_children(&self) -> bool {

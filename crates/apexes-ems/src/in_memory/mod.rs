@@ -165,7 +165,7 @@ impl InMemoryEms {
         let at = *self.event_time.lock().unwrap_or_else(|p| p.into_inner());
         let result = if self.causal {
             self.sink
-                .submit_child_order_at(intent, at.ok_or(EmsError::SchedulingSuspended)?)
+                .submit_parent_child_at(parent_id, intent, at.ok_or(EmsError::SchedulingSuspended)?)
                 .await
         } else {
             self.sink.submit_child_order(intent).await

@@ -9,9 +9,16 @@ use crate::{ChildLatencyReport, EventLatencyPolicy};
 
 pub(super) struct ChildArrivalQueue {
     policy: EventLatencyPolicy,
-    pending: VecDeque<(DateTime<Utc>, OrderId, OrderIntent)>,
+    pending: VecDeque<PendingChild>,
     watermark: Option<DateTime<Utc>>,
     report: ChildLatencyReport,
+}
+
+struct PendingChild {
+    deadline: DateTime<Utc>,
+    id: OrderId,
+    parent: Option<apexes_strategy::ParentOrderId>,
+    intent: OrderIntent,
 }
 
 fn refusal(reason: impl Into<String>) -> EmsError {
@@ -37,6 +44,7 @@ impl MatchingEngineChildOrderSink {
     pub(super) fn schedule_child(
         &self,
         arrivals: &Mutex<ChildArrivalQueue>,
+        parent: Option<apexes_strategy::ParentOrderId>,
         intent: OrderIntent,
         now: DateTime<Utc>,
     ) -> Result<(OrderId, Vec<Fill>), EmsError> {
@@ -49,7 +57,7 @@ impl MatchingEngineChildOrderSink {
             || queue
                 .pending
                 .back()
-                .is_some_and(|(at, _, _)| deadline.is_some_and(|d| d < *at))
+                .is_some_and(|child| deadline.is_some_and(|d| d < child.deadline))
         {
             Err(refusal("regressing child submission timestamp"))
         } else if queue.pending.len() >= 1024 {
@@ -95,7 +103,12 @@ impl MatchingEngineChildOrderSink {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, order);
-        queue.pending.push_back((deadline, id, intent));
+        queue.pending.push_back(PendingChild {
+            deadline,
+            id,
+            parent,
+            intent,
+        });
         queue.report.scheduled += 1;
         Ok((id, Vec::new()))
     }
@@ -117,16 +130,21 @@ impl MatchingEngineChildOrderSink {
         while queue
             .pending
             .front()
-            .is_some_and(|(deadline, _, _)| *deadline <= now)
+            .is_some_and(|child| child.deadline <= now)
         {
-            let Some((_, id, intent)) = queue.pending.pop_front() else {
+            let Some(PendingChild {
+                id, parent, intent, ..
+            }) = queue.pending.pop_front()
+            else {
                 break;
             };
             queue.report.arrived += 1;
             let result = {
                 let mut engine = self.engine.lock().unwrap_or_else(|p| p.into_inner());
                 match check.as_deref_mut() {
-                    Some(check) => engine.submit_market_child_checked(&intent, now, id, check),
+                    Some(check) => {
+                        engine.submit_market_child_checked(&intent, now, id, parent, check)
+                    }
                     None => engine.submit_market_child(&intent, now),
                 }
             };
@@ -158,7 +176,7 @@ impl MatchingEngineChildOrderSink {
             return;
         };
         let mut queue = arrivals.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(index) = queue.pending.iter().position(|(_, child, _)| *child == id) {
+        if let Some(index) = queue.pending.iter().position(|child| child.id == id) {
             queue.pending.remove(index);
             queue.report.cancelled_before_arrival += 1;
             if let Some(order) = self
@@ -181,7 +199,7 @@ impl MatchingEngineChildOrderSink {
         let mut queue = arrivals.lock().unwrap_or_else(|p| p.into_inner());
         let now = queue.watermark;
         let mut orders = self.submitted.lock().unwrap_or_else(|p| p.into_inner());
-        while let Some((_, id, _)) = queue.pending.pop_front() {
+        while let Some(PendingChild { id, .. }) = queue.pending.pop_front() {
             queue.report.expired_at_end += 1;
             if let Some(order) = orders.get_mut(&id) {
                 order.status = OrderStatus::Cancelled;
@@ -307,14 +325,15 @@ mod tests {
         let (first, _) = sink.submit_child_order_at(child(dec!(2)), t).await.unwrap();
         let (second, _) = sink.submit_child_order_at(child(dec!(2)), t).await.unwrap();
         let mut seen = Vec::new();
-        let mut check = |_: &OrderIntent, fills: &[Fill]| {
-            seen.push(fills[0].order_id);
-            if fills[0].order_id == first {
-                Err("test rejection".into())
-            } else {
-                Ok(())
-            }
-        };
+        let mut check =
+            |_: Option<apexes_strategy::ParentOrderId>, _: &OrderIntent, fills: &[Fill]| {
+                seen.push(fills[0].order_id);
+                if fills[0].order_id == first {
+                    Err("test rejection".into())
+                } else {
+                    Ok(())
+                }
+            };
         let fills = sink
             .advance_simulated_time_checked(t + TimeDelta::milliseconds(500), &mut check)
             .await;

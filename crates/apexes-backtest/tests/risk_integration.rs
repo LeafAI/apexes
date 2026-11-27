@@ -759,3 +759,80 @@ async fn transit_buy_reservation_includes_taker_fee() {
     let latency = report.event_latency.unwrap();
     assert_eq!((latency.scheduled, latency.capital_refused), (0, 2));
 }
+
+#[tokio::test]
+async fn admitted_parent_keeps_capital_reserved_against_new_direct_order() {
+    let (config, _) = shared_quote_fixture(dec!(15), dec!(6));
+    let MarketEvent::Depth(mut first) = sample_events().remove(0) else {
+        unreachable!()
+    };
+    first.asks[0].price = dec!(12);
+    let mut events = vec![MarketEvent::Depth(first.clone())];
+    for (offset, symbol, price, seq) in [
+        (500, "BTCUSDT", dec!(12), 2),
+        (600, "BTCUSDT", dec!(12), 3),
+        (700, "ETHUSDT", dec!(6), 1),
+        (1100, "BTCUSDT", dec!(10), 4),
+        (1200, "ETHUSDT", dec!(6), 2),
+    ] {
+        let mut d = first.clone();
+        d.symbol = symbol.into();
+        d.timestamp += chrono::Duration::milliseconds(offset);
+        d.sequence = Some(seq);
+        d.asks[0].price = price;
+        events.push(MarketEvent::Depth(d));
+    }
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        config,
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        ParentThenDirect {
+            parent: false,
+            direct: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.trades[0].symbol, "BTCUSDT");
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.capital_refused,
+            latency.parent_capital_reserved,
+            latency.parent_capital_released,
+            latency.parent_capital_released_at_end
+        ),
+        (1, 1, 1, 0)
+    );
+}
+
+#[tokio::test]
+async fn pending_parent_budget_is_released_at_replay_end() {
+    let mut events = child_risk_events(dec!(10));
+    events.truncate(3);
+    let registry = child_risk_registry(Default::default());
+    let report = run_backtest(
+        base_config(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        ShortTwapOnce {
+            inner: BuyOnceStrategy { has_bought: false },
+            slices: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    let latency = report.event_latency.unwrap();
+    assert_eq!(
+        (
+            latency.parent_capital_reserved,
+            latency.parent_capital_released,
+            latency.parent_capital_released_at_end
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(latency.child_orders.unwrap().expired_at_end, 1);
+}

@@ -331,9 +331,10 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
         order_id: OrderId,
+        parent: Option<apexes_strategy::ParentOrderId>,
         check: &mut apexes_ems::SimulatedChildCheck<'_>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
-        self.submit_market_inner(intent, now, true, Some((order_id, check)))
+        self.submit_market_inner(intent, now, true, Some((order_id, parent, check)))
     }
 
     fn submit_market_inner(
@@ -341,7 +342,11 @@ impl MatchingEngine {
         intent: &OrderIntent,
         now: DateTime<Utc>,
         exact_quantity: bool,
-        check: Option<(OrderId, &mut apexes_ems::SimulatedChildCheck<'_>)>,
+        check: Option<(
+            OrderId,
+            Option<apexes_strategy::ParentOrderId>,
+            &mut apexes_ems::SimulatedChildCheck<'_>,
+        )>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
         if intent.order_type != OrderType::Market {
             return Err(ApexesError::OrderRejected {
@@ -389,7 +394,7 @@ impl MatchingEngine {
 
         let order_id = check
             .as_ref()
-            .map_or_else(|| OrderId(Uuid::new_v4()), |(id, _)| *id);
+            .map_or_else(|| OrderId(Uuid::new_v4()), |(id, _, _)| *id);
         let mut remaining = intent.quantity;
         let mut fills = Vec::new();
 
@@ -422,8 +427,9 @@ impl MatchingEngine {
         }
         // No depth is consumed until the complete proposed execution passes
         // the independent arrival check. The engine lock covers both phases.
-        if let Some((_, check)) = check {
-            check(&intent, &fills).map_err(|reason| ApexesError::OrderRejected { reason })?;
+        if let Some((_, parent, check)) = check {
+            check(parent, &intent, &fills)
+                .map_err(|reason| ApexesError::OrderRejected { reason })?;
         }
         for fill in &fills {
             book.consume(intent.side, fill.price, fill.quantity);

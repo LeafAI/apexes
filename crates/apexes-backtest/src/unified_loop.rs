@@ -374,10 +374,10 @@ pub async fn run_unified_event_loop(
                 }
 
                 let mut checked_child_fills = HashSet::new();
-                let ems_result = if arrivals.is_some() {
+                let ems_result = if let Some(queue) = &mut arrivals {
                     let open_orders = executor.open_orders().await;
                     let mut projected = ledger.execution_snapshot();
-                    let mut check = |intent: &apexes_strategy::OrderIntent, fills: &[Fill]| {
+                    let mut check = |parent: Option<ParentOrderId>, intent: &apexes_strategy::OrderIntent, fills: &[Fill]| {
                         let priced = apexes_strategy::OrderIntent {
                             // Conservative notional valuation across the proposed
                             // execution, not a stale last-trade reference.
@@ -398,10 +398,7 @@ pub async fn run_unified_event_loop(
                         for fill in fills {
                             candidate.apply_fill(fill).map_err(|error| error.to_string())?;
                         }
-                        if let Some(queue) = &arrivals
-                            && !queue.preserves_capital(projected.balances(), candidate.balances()) {
-                            return Err("child would spend capital reserved by in-transit strategy intents".into());
-                        }
+                        queue.accept_child(parent, intent, projected.balances(), candidate.balances())?;
                         // Each accepted child advances the projection before
                         // the next competing child checks the same account.
                         if let Some(checker) = &risk_checker {
@@ -456,6 +453,9 @@ pub async fn run_unified_event_loop(
                     }
                 }
                 refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+                if let Some(queue) = &mut arrivals {
+                    queue.reconcile_parents(&open_parent_orders);
+                }
 
                 // Funding settlement: once per crossed Binance-aligned 8-hour
                 // UTC boundary (00:00/08:00/16:00) -- not per-boundary-precise
@@ -774,6 +774,7 @@ pub async fn run_unified_event_loop(
                     }
 
                     trace.outcome("pretrade_passed", if risk_checker.is_none() && market_condition_monitor.is_none() { "checks_not_configured" } else { "none" });
+                    let mut admitted_hold = None;
                     if let Some(queue)=&mut arrivals {
                         let hold = match spot_market_hold(&intent, &instruments_by_symbol, executor.as_ref(), timestamp) {
                             Ok(hold) if hold.as_ref().is_none_or(|hold| queue.check_capital(hold, ledger.balances())) => hold,
@@ -795,6 +796,7 @@ pub async fn run_unified_event_loop(
                             }
                             continue;
                         }
+                        admitted_hold = hold;
                     } else if let Some(latency_model) = &latency_model {
                         latency_model.apply().await;
                     }
@@ -813,6 +815,9 @@ pub async fn run_unified_event_loop(
                         match ems.submit_algo_order(request).await {
                             Ok(parent_id) => {
                                 trace.parent_accepted(parent_id);
+                                if let (Some(queue), Some(hold)) = (&mut arrivals, admitted_hold) {
+                                    queue.reserve_parent(parent_id, &intent, hold);
+                                }
                                 open_parent_orders
                                     .insert(parent_id, apexes_strategy::ParentOrderStatus::Scheduling);
                                 // The parent order is what the strategy asked for and
@@ -1106,6 +1111,12 @@ fn spot_market_hold(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<crate::event_latency::CapitalHold>, String> {
     use apexes_core::{AssetClass, Side};
+    if intent.asset_class == AssetClass::Spot
+        && intent.execution_algo.is_some()
+        && intent.order_type != OrderType::Market
+    {
+        return Err("simulated Spot parent requires a market intent".into());
+    }
     if intent.asset_class != AssetClass::Spot
         || intent.order_type != OrderType::Market
         || intent.leverage.is_some()
