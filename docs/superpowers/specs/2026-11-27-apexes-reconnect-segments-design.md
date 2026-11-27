@@ -40,5 +40,6 @@ storage test ignored. Tests cover leading/repeated/trailing gaps,
 Spot and USD-M bridge/link rules, missing invalidation, snapshot-only
 segments, cross-batch bridge recovery, diagnostic invalidation-only
 runs and the strict replay policy. Full workspace CI and independent
-review pending. No production data or accounts accessed. This change
-depends on PR #56; do not merge ahead of it.
+review pending. No production data or accounts accessed. PR #56 merged at 9953794, including the supervisor loopback allocation
+test correction; PR #57 incorporates that master revision without
+rewriting the existing branch.
