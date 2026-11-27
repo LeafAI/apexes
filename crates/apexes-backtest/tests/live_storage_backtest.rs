@@ -214,6 +214,38 @@ async fn qualifies_complete_raw_capture_and_rejects_unreceipted_rows() {
     );
     let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(actual, serde_json::to_value(&qualified).unwrap());
+    // Exercise the same serialized output an operator will replay.
+    let bundle_path = dir.join("qualified.json");
+    let instrument_path = dir.join("instrument.json");
+    std::fs::write(&bundle_path, &output.stdout).unwrap();
+    let instrument = Instrument::new(
+        "BTCUSDT",
+        MarketType::Crypto,
+        Venue::Binance,
+        AssetClass::Spot,
+        Some("BTC".into()),
+        Some("USDT".into()),
+        dec!(0.01),
+        dec!(0.00001),
+        dec!(1),
+    )
+    .unwrap();
+    std::fs::write(&instrument_path, serde_json::to_vec(&instrument).unwrap()).unwrap();
+    let smoke = std::process::Command::new(env!("CARGO_BIN_EXE_historical-manifest"))
+        .arg("verify-collector-replay")
+        .arg(&bundle_path)
+        .arg(&instrument_path)
+        .output()
+        .unwrap();
+    assert!(
+        smoke.status.success(),
+        "{}",
+        String::from_utf8_lossy(&smoke.stderr)
+    );
+    let smoke: serde_json::Value = serde_json::from_slice(&smoke.stdout).unwrap();
+    assert_eq!(smoke["events_observed"], 2);
+    assert_eq!(smoke["fills"], 0);
+    assert_eq!(smoke["dataset"], actual["dataset"]);
     // A high unexpected index must be visible even though it exceeds
     // the claimed committed count.
     writer

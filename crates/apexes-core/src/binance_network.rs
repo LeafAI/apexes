@@ -54,6 +54,15 @@ impl BinanceNetwork {
         }
     }
 
+    /// Public raw depth capture uses the standard TLS port. Keep the
+    /// existing trading provider endpoint unchanged.
+    pub fn spot_public_capture_ws(self) -> &'static str {
+        match self {
+            Self::Mainnet => "wss://stream.binance.com:443/ws",
+            Self::Testnet => self.endpoints().spot_market_ws,
+        }
+    }
+
     /// Lowercase name used on command lines and in the gateway handshake.
     pub fn as_str(self) -> &'static str {
         match self {
