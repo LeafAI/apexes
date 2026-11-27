@@ -1,4 +1,5 @@
 //! F03.05: realized closing-fill economics in explicit quote units.
+use crate::exit_attribution::{ClosingSlice, ExitAttribution, ExitReason};
 use apexes_core::{AssetClass, Fill, Instrument, Side};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,9 @@ pub struct ClosingPerformance {
     pub profit_factor: Option<Decimal>,
     pub open_quantity: Decimal,
     pub unallocated_entry_fees: Decimal,
+    /// Closing-fill delivery origin, absent in legacy reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_attribution: Option<ExitAttribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,7 +59,7 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn apply(&mut self, fill: &Fill) -> Option<()> {
+    fn apply(&mut self, fill: &Fill) -> Option<Option<ClosingSlice>> {
         let signed = match fill.side {
             Side::Buy => fill.quantity,
             Side::Sell => -fill.quantity,
@@ -76,12 +80,12 @@ impl Accumulator {
                 .checked_div(next.abs())?;
             self.entry_fees = self.entry_fees.checked_add(fill.fee)?;
             self.qty = next;
-            return Some(());
+            return Some(None);
         }
         self.close(fill, signed)
     }
 
-    fn close(&mut self, fill: &Fill, signed: Decimal) -> Option<()> {
+    fn close(&mut self, fill: &Fill, signed: Decimal) -> Option<Option<ClosingSlice>> {
         let closed = self.qty.abs().min(fill.quantity);
         let opening_fee = if closed == self.qty.abs() {
             self.entry_fees
@@ -122,10 +126,20 @@ impl Accumulator {
             self.entry = Decimal::ZERO;
         }
         self.qty = next;
-        Some(())
+        Some(Some(ClosingSlice {
+            quantity: closed,
+            entry_fee: opening_fee,
+            exit_fee,
+            gross,
+            net,
+        }))
     }
 
-    fn finish(self, quote_currency: String) -> Option<ClosingPerformance> {
+    fn finish(
+        self,
+        quote_currency: String,
+        exit_attribution: Option<ExitAttribution>,
+    ) -> Option<ClosingPerformance> {
         let closing_count = self.wins + self.losses + self.breakevens;
         let (win_rate, expectancy_per_close) = if closing_count == 0 {
             (None, None)
@@ -158,11 +172,16 @@ impl Accumulator {
             profit_factor,
             open_quantity: self.qty,
             unallocated_entry_fees: self.entry_fees,
+            exit_attribution,
         })
     }
 }
 
-fn summarize(instrument: &Instrument, fills: &[&Fill]) -> Result<ClosingPerformance, String> {
+fn summarize(
+    instrument: &Instrument,
+    fills: &[(&Fill, Option<ExitReason>)],
+    attributed: bool,
+) -> Result<ClosingPerformance, String> {
     let quote = instrument
         .quote_currency
         .as_ref()
@@ -177,7 +196,8 @@ fn summarize(instrument: &Instrument, fills: &[&Fill]) -> Result<ClosingPerforma
         return Err("unsupported instrument economics".into());
     }
     let mut acc = Accumulator::default();
-    for fill in fills {
+    let mut attribution = attributed.then(ExitAttribution::default);
+    for &(fill, reason) in fills {
         if fill.venue != instrument.venue
             || fill.quantity <= Decimal::ZERO
             || fill.price <= Decimal::ZERO
@@ -190,16 +210,26 @@ fn summarize(instrument: &Instrument, fills: &[&Fill]) -> Result<ClosingPerforma
         {
             return Err("unsupported fill identity, economics or fee currency".into());
         }
-        acc.apply(fill)
+        let slice = acc
+            .apply(fill)
             .ok_or("execution performance arithmetic overflow")?;
+        if let (Some(attribution), Some(slice)) = (&mut attribution, slice) {
+            attribution
+                .record(fill, reason.ok_or("missing fill origin")?, slice)
+                .ok_or("exit attribution arithmetic overflow")?;
+        }
     }
-    acc.finish(quote.clone())
+    acc.finish(quote.clone(), attribution)
         .ok_or_else(|| "execution performance arithmetic overflow".into())
 }
 
 /// Only symbols with accepted fills are included. No cross-currency totals.
-pub(crate) fn evaluate(instruments: &[Instrument], fills: &[Fill]) -> ExecutionPerformance {
-    let mut by_symbol: BTreeMap<String, Vec<&Fill>> = BTreeMap::new();
+pub(crate) fn evaluate(
+    instruments: &[Instrument],
+    fills: &[Fill],
+    origins: Option<&[ExitReason]>,
+) -> ExecutionPerformance {
+    let mut by_symbol: BTreeMap<String, Vec<(&Fill, Option<ExitReason>)>> = BTreeMap::new();
     let mut lookup: HashMap<&str, Option<&Instrument>> = HashMap::new();
     for instrument in instruments {
         lookup
@@ -207,8 +237,11 @@ pub(crate) fn evaluate(instruments: &[Instrument], fills: &[Fill]) -> ExecutionP
             .and_modify(|entry| *entry = None)
             .or_insert(Some(instrument));
     }
-    for fill in fills {
-        by_symbol.entry(fill.symbol.clone()).or_default().push(fill);
+    for (index, fill) in fills.iter().enumerate() {
+        by_symbol
+            .entry(fill.symbol.clone())
+            .or_default()
+            .push((fill, origins.and_then(|o| o.get(index).copied())));
     }
     let per_symbol = by_symbol
         .into_iter()
@@ -218,7 +251,7 @@ pub(crate) fn evaluate(instruments: &[Instrument], fills: &[Fill]) -> ExecutionP
                 .copied()
                 .flatten()
                 .ok_or_else(|| "missing or ambiguous instrument".to_string())
-                .and_then(|instrument| summarize(instrument, &fills));
+                .and_then(|instrument| summarize(instrument, &fills, origins.is_some()));
             let value = match result {
                 Ok(summary) => SymbolExecutionPerformance::Available(Box::new(summary)),
                 Err(reason) => SymbolExecutionPerformance::Unavailable { reason },
@@ -268,7 +301,7 @@ mod tests {
     }
 
     fn report(fills: &[Fill]) -> ClosingPerformance {
-        let result = evaluate(&[instrument(AssetClass::Spot)], fills);
+        let result = evaluate(&[instrument(AssetClass::Spot)], fills, None);
         match &result.per_symbol["BTCUSDT"] {
             SymbolExecutionPerformance::Available(summary) => (**summary).clone(),
             other => panic!("{other:?}"),
@@ -316,11 +349,21 @@ mod tests {
             f.leverage = Some(dec!(10));
         }
         let i = instrument(AssetClass::Perpetual);
-        let partial = summarize(&i, &fills[..2].iter().collect::<Vec<_>>()).unwrap();
+        let partial = summarize(
+            &i,
+            &fills[..2].iter().map(|f| (f, None)).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
         assert_eq!(partial.net_realized, dec!(7));
         assert_eq!(partial.open_quantity, dec!(-1));
         assert_eq!(partial.unallocated_entry_fees, dec!(2));
-        let result = summarize(&i, &fills.iter().collect::<Vec<_>>()).unwrap();
+        let result = summarize(
+            &i,
+            &fills.iter().map(|f| (f, None)).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
         assert_eq!(result.gross_realized, dec!(15));
         assert_eq!(result.net_realized, dec!(9));
         assert_eq!(result.fees_paid, dec!(6));
@@ -353,7 +396,7 @@ mod tests {
         let mut f = fill(Side::Buy, dec!(1), dec!(100), dec!(1));
         f.fee_currency = Some("BNB".into());
         let i = instrument(AssetClass::Spot);
-        let result = evaluate(std::slice::from_ref(&i), &[f.clone()]);
+        let result = evaluate(std::slice::from_ref(&i), &[f.clone()], None);
         assert!(matches!(
             result.per_symbol["BTCUSDT"],
             SymbolExecutionPerformance::Unavailable { .. }
@@ -361,10 +404,50 @@ mod tests {
         f.fee_currency = None;
         f.price = Decimal::MAX;
         f.quantity = dec!(2);
-        let result = evaluate(&[i], &[f]);
+        let result = evaluate(&[i], &[f], None);
         assert!(matches!(
             result.per_symbol["BTCUSDT"],
             SymbolExecutionPerformance::Unavailable { .. }
         ));
+    }
+    #[test]
+    fn attributed_flip_counts_only_reducing_slice_and_allocates_fees() {
+        let mut fills = vec![
+            fill(Side::Buy, dec!(1), dec!(100), dec!(1)),
+            fill(Side::Sell, dec!(2), dec!(110), dec!(4)),
+            fill(Side::Buy, dec!(1), dec!(105), dec!(1)),
+        ];
+        for fill in &mut fills {
+            fill.leverage = Some(dec!(10));
+        }
+        let result = evaluate(
+            &[instrument(AssetClass::Perpetual)],
+            &fills,
+            Some(&[ExitReason::Strategy, ExitReason::Ems, ExitReason::Derisk]),
+        );
+        let SymbolExecutionPerformance::Available(metrics) = &result.per_symbol["BTCUSDT"] else {
+            panic!("missing metrics")
+        };
+        let attribution = metrics.exit_attribution.as_ref().unwrap();
+        assert_eq!(attribution.closes.len(), 2);
+        let flip = &attribution.closes[0];
+        assert_eq!(flip.fill_id, fills[1].id);
+        assert_eq!(flip.closed_quantity, dec!(1));
+        assert_eq!(flip.allocated_entry_fee, dec!(1));
+        assert_eq!(flip.allocated_exit_fee, dec!(2));
+        assert_eq!(flip.net_realized, dec!(7));
+        assert_eq!(
+            attribution.by_reason[&ExitReason::Derisk].allocated_entry_fees,
+            dec!(2)
+        );
+        assert_eq!(
+            attribution.by_reason[&ExitReason::Derisk].net_realized,
+            dec!(2)
+        );
+        assert_eq!(metrics.net_realized, dec!(9));
+        let mut legacy = serde_json::to_value(&**metrics).unwrap();
+        legacy.as_object_mut().unwrap().remove("exit_attribution");
+        let legacy: ClosingPerformance = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.exit_attribution.is_none());
     }
 }

@@ -361,6 +361,18 @@ async fn mixed_perpetual_replay_repeats_funding_and_fees() {
         assert_eq!(summary.losses, 1);
         assert_eq!(summary.profit_factor, Some(Decimal::ZERO));
         assert_eq!(summary.open_quantity, Decimal::ZERO);
+        use apexes_backtest::exit_attribution::ExitReason;
+        let exits = summary.exit_attribution.as_ref().unwrap();
+        assert_eq!(exits.closes.len(), 1);
+        assert_eq!(exits.closes[0].reason, ExitReason::Strategy);
+        assert_eq!(exits.closes[0].fill_id, report.trades[1].id);
+        assert_eq!(exits.closes[0].allocated_entry_fee, dec!(0.1));
+        assert_eq!(exits.closes[0].allocated_exit_fee, dec!(0.099));
+        assert_eq!(
+            exits.by_reason[&ExitReason::Strategy].net_realized,
+            summary.net_realized
+        );
+
         use apexes_backtest::funding_attribution::{FundingPriceSource, SymbolFunding};
         let funding = report.funding.as_ref().unwrap();
         assert_eq!(funding.rate_bps, Some(dec!(10)));
@@ -716,4 +728,157 @@ async fn funding_attribution_preserves_gap_and_boundary_order_in_both_modes() {
         assert_eq!(totals.net_realized_plus_funding, Some(dec!(-1.099)));
         assert_eq!(report.overall.total_pnl, dec!(-1.099));
     }
+}
+
+#[tokio::test]
+async fn extreme_market_exit_is_attributed_to_derisk_not_strategy() {
+    use apexes_backtest::{
+        execution_performance::SymbolExecutionPerformance, exit_attribution::ExitReason,
+    };
+    struct BuyOnce;
+    impl Strategy for BuyOnce {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if matches!(event,MarketEvent::Trade(t) if t.trade_id.as_deref()==Some("open")) {
+                vec![intent(AssetClass::Spot, Side::Buy, dec!(1), None)]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(100, dec!(100), "open"),
+        trade(200, dec!(130), "jump"),
+    ];
+    let mut config = configuration(AssetClass::Spot, None);
+    config.market_condition_config = Some(apexes_risk::MarketConditionConfig {
+        volatility_threshold: dec!(1000000),
+        jump_threshold_pct: dec!(0.1),
+        sensitivity: dec!(1),
+        volatility_window: 20,
+        price_source: apexes_risk::PriceSource::Trade,
+        account_equity_volatility_threshold: None,
+        include_spot: true,
+    });
+    let report = run_backtest(
+        config,
+        &Registry::new(),
+        InMemoryMarketDataSource::new(events),
+        BuyOnce,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.trades.len(), 2);
+    let SymbolExecutionPerformance::Available(metrics) =
+        &report.execution_performance.as_ref().unwrap().per_symbol[SYMBOL]
+    else {
+        panic!("missing metrics")
+    };
+    let exits = metrics.exit_attribution.as_ref().unwrap();
+    assert_eq!(exits.closes.len(), 1);
+    assert_eq!(exits.closes[0].reason, ExitReason::Derisk);
+    assert_eq!(exits.closes[0].fill_id, report.trades[1].id);
+    assert_eq!(
+        exits.by_reason[&ExitReason::Derisk].net_realized,
+        dec!(-1.199)
+    );
+}
+
+#[tokio::test]
+async fn resting_limit_and_ems_closing_fills_keep_distinct_origins() {
+    use apexes_backtest::{
+        execution_performance::SymbolExecutionPerformance, exit_attribution::ExitReason,
+    };
+    struct ExitStrategy;
+    impl Strategy for ExitStrategy {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            match event {
+                MarketEvent::Trade(t) if t.trade_id.as_deref() == Some("open") => {
+                    vec![intent(AssetClass::Spot, Side::Buy, dec!(3), None)]
+                }
+                MarketEvent::Trade(t) if t.trade_id.as_deref() == Some("limit") => vec![intent(
+                    AssetClass::Spot,
+                    Side::Sell,
+                    dec!(1),
+                    Some(dec!(101)),
+                )],
+                MarketEvent::Trade(t) if t.trade_id.as_deref() == Some("ems") => {
+                    let mut i = intent(AssetClass::Spot, Side::Sell, dec!(2), None);
+                    i.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+                        duration: std::time::Duration::from_secs(2),
+                        slices: 2,
+                    });
+                    vec![i]
+                }
+                _ => vec![],
+            }
+        }
+    }
+    let mut maker = trade(2000, dec!(101), "maker");
+    if let MarketEvent::Trade(t) = &mut maker {
+        t.side = Some(Side::Buy);
+    }
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(0, dec!(100), "open"),
+        tick(500),
+        trade(1000, dec!(100), "limit"),
+        tick(1500),
+        maker,
+        trade(3000, dec!(100), "ems"),
+        depth(3500, 2, dec!(100)),
+        tick(4000),
+        depth(4500, 3, dec!(100)),
+        tick(5000),
+        tick(5500),
+        tick(6000),
+    ];
+    let registry = Registry::new();
+    registry
+        .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    let report = run_backtest(
+        configuration(AssetClass::Spot, None),
+        &registry,
+        InMemoryMarketDataSource::new(events),
+        ExitStrategy,
+    )
+    .await
+    .unwrap();
+    let SymbolExecutionPerformance::Available(metrics) =
+        &report.execution_performance.as_ref().unwrap().per_symbol[SYMBOL]
+    else {
+        panic!("missing metrics")
+    };
+    let exits = metrics.exit_attribution.as_ref().unwrap();
+    assert_eq!(report.trades.len(), 4, "{:?}", report.trades);
+    assert_eq!(exits.closes.len(), 3);
+    assert_eq!(exits.closes[0].reason, ExitReason::Resting);
+    assert_eq!(
+        exits.by_reason[&ExitReason::Resting].closed_quantity,
+        dec!(1)
+    );
+    assert_eq!(exits.by_reason[&ExitReason::Ems].closed_quantity, dec!(2));
+    assert_eq!(exits.by_reason[&ExitReason::Ems].closing_count, 2);
+    assert_eq!(
+        exits.closes.iter().map(|c| c.net_realized).sum::<Decimal>(),
+        metrics.net_realized
+    );
+    assert_eq!(
+        exits
+            .closes
+            .iter()
+            .map(|c| c.allocated_entry_fee + c.allocated_exit_fee)
+            .sum::<Decimal>(),
+        metrics.fees_paid
+    );
+    assert_eq!(metrics.open_quantity, Decimal::ZERO);
 }

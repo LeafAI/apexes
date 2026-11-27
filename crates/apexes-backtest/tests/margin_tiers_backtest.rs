@@ -192,6 +192,23 @@ async fn run_backtest_auto_liquidates_leveraged_position_when_margin_tiers_suppl
         .map(|(_, equity)| *equity)
         .expect("equity curve must be non-empty");
     assert_eq!(final_equity, dec!(999));
+    use apexes_backtest::{
+        execution_performance::SymbolExecutionPerformance, exit_attribution::ExitReason,
+    };
+    let SymbolExecutionPerformance::Available(metrics) =
+        &report.execution_performance.as_ref().unwrap().per_symbol["BTCUSDT"]
+    else {
+        panic!("missing metrics")
+    };
+    let exits = metrics.exit_attribution.as_ref().unwrap();
+    assert_eq!(exits.closes.len(), 1);
+    assert_eq!(exits.closes[0].fill_id, liquidation_fill.id);
+    assert_eq!(exits.closes[0].reason, ExitReason::Liquidation);
+    assert_eq!(
+        exits.by_reason[&ExitReason::Liquidation].net_realized,
+        dec!(-1)
+    );
+    assert_eq!(metrics.net_realized, dec!(-1));
 }
 
 /// Companion no-op guard: the SAME setup with an empty `margin_tiers`
