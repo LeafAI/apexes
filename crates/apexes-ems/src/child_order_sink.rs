@@ -20,8 +20,13 @@ use crate::error::EmsError;
 
 /// Simulation-only pre-commit check. Proposed fills have not consumed depth.
 /// A successful check may advance its private execution-account projection.
-pub type SimulatedChildCheck<'a> =
-    dyn FnMut(&apexes_strategy::OrderIntent, &[Fill]) -> Result<(), String> + Send + 'a;
+pub type SimulatedChildCheck<'a> = dyn FnMut(
+        Option<apexes_strategy::ParentOrderId>,
+        &apexes_strategy::OrderIntent,
+        &[Fill],
+    ) -> Result<(), String>
+    + Send
+    + 'a;
 
 /// A single child order an `Ems` implementation wants submitted.
 /// Deliberately much narrower than `apexes_strategy::OrderIntent`
@@ -96,6 +101,16 @@ pub trait ChildOrderSink: Send + Sync {
         _at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(OrderId, Vec<Fill>), EmsError> {
         self.submit_child_order(intent).await
+    }
+
+    /// Preserve the owning parent across simulated child transit.
+    async fn submit_parent_child_at(
+        &self,
+        _parent: apexes_strategy::ParentOrderId,
+        intent: ChildOrderIntent,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError> {
+        self.submit_child_order_at(intent, at).await
     }
 
     /// Simulated sinks can defer child execution until a later market event.
