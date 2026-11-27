@@ -117,6 +117,8 @@ pub struct StrategyContext<'a> {
     pub now: DateTime<Utc>,
     /// Unique event instrument and optional rules used by the session.
     pub market: Option<crate::InstrumentContext<'a>>,
+    /// Validated remaining simulated book at this callback, if available.
+    pub book: Option<crate::BookObservation>,
 }
 
 impl StrategyContext<'_> {
@@ -313,6 +315,7 @@ mod tests {
         let open_orders = HashMap::new();
         let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
+            book: None,
             market: None,
             positions: &positions,
             balances: &balances,
@@ -359,6 +362,7 @@ mod tests {
         let now = Utc::now();
 
         let ctx = StrategyContext {
+            book: None,
             market: None,
             positions: &positions,
             balances: &balances,

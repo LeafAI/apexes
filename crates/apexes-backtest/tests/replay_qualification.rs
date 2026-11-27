@@ -1073,3 +1073,122 @@ fn observation_manifest_replays_overlapping_bars_at_close_without_reordering_sea
             .contains("historical dataset verification failed")
     );
 }
+
+#[test]
+fn causal_book_context_uses_remaining_execution_depth_and_rejects_stale_or_gapped_books() {
+    use apexes_strategy::{BookIntegrity, drift_dsl::DriftScriptStrategy};
+
+    // Native assertions observe the same callback that invokes Drift.
+    struct Probe {
+        inner: DriftScriptStrategy,
+        strict: bool,
+    }
+    impl Strategy for Probe {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            let ms = (ctx.now - at(0)).num_milliseconds();
+            if !self.strict || matches!(ms, 1001 | 1300) {
+                assert!(ctx.book.is_none(), "unexpected book at {ms}");
+            } else {
+                let book = ctx.book.as_ref().expect("validated book");
+                assert!(book.matches_at(event, ctx.now));
+                assert_eq!(book.integrity, BookIntegrity::Contiguous);
+                assert_eq!(book.max_age_ms, 1000);
+                assert_eq!(book.best_bid.unwrap().quantity, dec!(10));
+                match ms {
+                    0 | 500 | 1000 => {
+                        assert_eq!(book.sequence, Some(9007199254740993));
+                        assert_eq!(book.observed_at, at(0));
+                        assert_eq!(book.age_ms(), ms);
+                        assert_eq!(book.spread(), Some(dec!(1)));
+                        assert_eq!(
+                            book.best_ask.unwrap().quantity,
+                            match ms {
+                                0 => dec!(10),
+                                500 => dec!(9),
+                                _ => dec!(7),
+                            }
+                        );
+                    }
+                    1200 | 1400 => {
+                        assert_eq!(book.observed_at, ctx.now);
+                        assert_eq!(book.best_ask.unwrap().quantity, dec!(10));
+                        assert_eq!(book.sequence, Some(if ms == 1200 { 20 } else { 30 }));
+                    }
+                    _ => panic!("unexpected event {ms}"),
+                }
+            }
+            self.inner.on_market_event(event, ctx)
+        }
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/book_context.drift");
+    let mut gap = depth(1300, 22, dec!(111));
+    if let MarketEvent::Depth(update) = &mut gap {
+        update.is_snapshot = false;
+    }
+    let events = vec![
+        depth(0, 9007199254740993, dec!(100)),
+        tick(500),
+        tick(1000),
+        tick(1001),
+        depth(1200, 20, dec!(110)),
+        gap,
+        depth(1400, 30, dec!(120)),
+    ];
+    let mut fingerprint = None;
+    for strict in [true, true, false] {
+        let registry = registry(&events, "causal-book-context");
+        registry
+            .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        if strict {
+            registry
+                .register::<_, ()>(
+                    (),
+                    SimulatedDepthPolicy {
+                        max_age_ms: 1000,
+                        sequence: DepthSequence::Contiguous,
+                    },
+                )
+                .unwrap();
+        }
+        let strategy = Probe {
+            inner: DriftScriptStrategy::from_file(&script).unwrap(),
+            strict,
+        };
+        let report = futures::executor::block_on(run_backtest(
+            configuration(AssetClass::Spot, None),
+            &registry,
+            InMemoryMarketDataSource::new(events.clone()),
+            strategy,
+        ))
+        .unwrap();
+        if strict {
+            assert_eq!(
+                report
+                    .trades
+                    .iter()
+                    .map(|f| (f.quantity, f.price, f.filled_at))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (dec!(1), dec!(100), at(500)),
+                    (dec!(2), dec!(100), at(1000))
+                ]
+            );
+            let digest = canonical_report_sha256(&report).unwrap();
+            if let Some(prior) = &fingerprint {
+                assert_eq!(&digest, prior);
+            }
+            fingerprint = Some(digest);
+        } else {
+            assert!(report.trades.is_empty());
+        }
+    }
+}

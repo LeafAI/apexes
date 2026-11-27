@@ -224,6 +224,22 @@ impl MatchingEngine {
                     .is_some_and(|book| book.fresh_at(now, policy))
         })
     }
+    /// Query the strict execution book at decision time, not an
+    /// independent reconstruction. Legacy depth is deliberately absent.
+    pub(crate) fn book_observation(
+        &self,
+        event: &apexes_core::MarketEvent,
+        now: DateTime<Utc>,
+    ) -> Option<apexes_strategy::BookObservation> {
+        let policy = self.depth_policy?;
+        if !self.depth_available(event.venue(), event.symbol(), now) {
+            return None;
+        }
+        self.books
+            .get(&(event.venue(), event.symbol().to_owned()))?
+            .observation(event, now, policy)
+    }
+
     fn require_depth(&self, intent: &OrderIntent, now: DateTime<Utc>) -> Result<(), ApexesError> {
         if self.depth_available(intent.venue, &intent.symbol, now) {
             Ok(())

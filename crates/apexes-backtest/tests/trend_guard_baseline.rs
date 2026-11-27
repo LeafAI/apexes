@@ -344,6 +344,7 @@ fn trend_guard_protects_recovered_position_on_first_trade_before_warmup() {
     let balances = HashMap::from([("ETH".into(), dec!(0.5))]);
     let event = fixture(&[dec!(98)]).pop().unwrap();
     let ctx = StrategyContext {
+        book: None,
         market: None,
         positions: &positions,
         balances: &balances,

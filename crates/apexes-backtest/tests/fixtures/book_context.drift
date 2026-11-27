@@ -1,0 +1,31 @@
+function on_market_event(event, ctx) {
+    let book = ctx.book;
+    if (book == null || book.best_bid == null || book.best_ask == null) {
+        return [];
+    }
+    if (book.symbol != event.symbol || book.venue != event.venue ||
+        book.source != "simulated_remaining_depth" ||
+        book.integrity != "contiguous" || book.max_age_ms != 1000 ||
+        book.decision_at != ctx.now || book.sequence != "9007199254740993" ||
+        book.best_bid.price != 99 || book.best_bid.quantity != 10 ||
+        book.best_ask.price != 100 || book.spread != 1) {
+        return [];
+    }
+    let qty = 0;
+    if (event.type == "depth" && book.age_ms == 0 &&
+        book.observed_at == event.timestamp && book.best_ask.quantity == 10) {
+        qty = 1;
+    }
+    if (event.type == "tick" && book.age_ms == 500 && book.best_ask.quantity == 9) {
+        qty = 2;
+    }
+    if (qty == 0) { return []; }
+    return [{
+        symbol: event.symbol,
+        venue: event.venue,
+        asset_class: "spot",
+        side: "buy",
+        order_type: "market",
+        quantity: qty,
+    }];
+}

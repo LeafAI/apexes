@@ -87,6 +87,16 @@ pub trait OrderExecutor: Send + Sync {
         })
     }
 
+    /// Read-only validated book observation. No assumption of live
+    /// exchange depth or of integrity in legacy simulation.
+    fn book_observation(
+        &self,
+        _event: &MarketEvent,
+        _now: DateTime<Utc>,
+    ) -> Option<crate::BookObservation> {
+        None
+    }
+
     /// Cancel all local simulated working orders before emergency execution.
     /// Never dispatches a live cancellation by default.
     fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {

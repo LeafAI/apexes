@@ -757,8 +757,10 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 // this loop no longer keeps its own map.
                 let open_orders = executor.open_orders().await;
                 let arrived_margin_status = arrivals.as_ref().map(|_| ledger.margin_status(&mark_prices, &config.margin_tiers));
+                let market = apexes_strategy::InstrumentContext::for_event(&event, &config.instruments, &config.symbol_rules);
                 let ctx = StrategyContext {
-                    market: apexes_strategy::InstrumentContext::for_event(&event, &config.instruments, &config.symbol_rules),
+                    market,
+                    book: market.and_then(|_| executor.book_observation(&event, timestamp)).filter(|book| book.matches_at(&event, timestamp)),
                     positions: ledger.positions(),
                     balances: ledger.balances(),
                     open_orders: &open_orders,

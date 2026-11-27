@@ -112,7 +112,7 @@ impl Strategy for DriftScriptStrategy {
             ctx.open_orders.clone(),
             ctx.now,
         );
-        super::context_market::attach(&mut ctx_value, event, ctx.market);
+        super::context_market::attach(&mut ctx_value, event, ctx);
         let state = self.symbol_state.begin(event);
         state.attach(&mut ctx_value);
         state.attach_time(&mut ctx_value, event, ctx.now);
