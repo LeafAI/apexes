@@ -240,6 +240,21 @@ impl MatchingEngine {
             .observation(event, now, policy)
     }
 
+    pub(crate) fn cost_observation(
+        &self,
+        instrument: &apexes_core::Instrument,
+    ) -> Option<apexes_strategy::CostObservation> {
+        let rates = self
+            .cost_model
+            .fee_schedule
+            .frozen_rates(instrument.venue)?;
+        apexes_strategy::CostObservation::from_frozen_rates(
+            instrument,
+            rates.maker_bps,
+            rates.taker_bps,
+        )
+    }
+
     fn require_depth(&self, intent: &OrderIntent, now: DateTime<Utc>) -> Result<(), ApexesError> {
         if self.depth_available(intent.venue, &intent.symbol, now) {
             Ok(())

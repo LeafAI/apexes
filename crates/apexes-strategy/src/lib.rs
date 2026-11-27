@@ -35,3 +35,6 @@ pub use context_market::InstrumentContext;
 
 pub mod book_context;
 pub use book_context::{BookIntegrity, BookObservation};
+
+pub mod cost_context;
+pub use cost_context::{CostObservation, FeeRole};

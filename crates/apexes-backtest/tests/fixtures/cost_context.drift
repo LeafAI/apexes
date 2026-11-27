@@ -1,0 +1,26 @@
+function on_market_event(event, ctx) {
+    let cost = ctx.costs;
+    if (cost == null || cost.symbol != event.symbol || cost.venue != event.venue ||
+        cost.quote_currency != "USDT" || cost.source != "frozen_simulated_fees") {
+        return [];
+    }
+    let taker = cost.estimate_fee(100, "taker");
+    let maker = cost.estimate_fee(99, "maker");
+    if (cost.maker_fee_bps == 0 && cost.taker_fee_bps == 0) {
+        if (taker != 0 || maker != 0) { return []; }
+    } else {
+        if (cost.maker_fee_bps != 5 || cost.taker_fee_bps != 10 ||
+            taker != 0.1 || maker != 0.0495) { return []; }
+    }
+    if (cost.estimate_fee(0, "maker") != null ||
+        cost.estimate_fee(-1, "taker") != null) { return []; }
+    if (event.type == "trade" && event.price == 100) {
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "market", quantity: 1 }];
+    }
+    if (event.type == "tick") {
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "limit", quantity: 1, price: 99 }];
+    }
+    return [];
+}

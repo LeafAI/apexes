@@ -114,6 +114,36 @@ fn book_value(book: &BookObservation) -> DriftValue {
     ])
 }
 
+fn cost_value(costs: &crate::CostObservation) -> DriftValue {
+    let snapshot = costs.clone();
+    let estimate: drift_script::NativeFn = Arc::new(move |args| {
+        let snapshot = snapshot.clone();
+        Box::pin(async move {
+            let [DriftValue::Number(notional), DriftValue::String(role)] = args.as_slice() else {
+                return DriftValue::Undefined;
+            };
+            let role = match role.as_str() {
+                "maker" => crate::FeeRole::Maker,
+                "taker" => crate::FeeRole::Taker,
+                _ => return DriftValue::Undefined,
+            };
+            Decimal::try_from(*notional)
+                .ok()
+                .and_then(|n| snapshot.estimate_fee(n, role))
+                .map_or(DriftValue::Null, number)
+        })
+    });
+    object([
+        ("symbol", string(costs.symbol())),
+        ("venue", string(super::convert::venue_to_str(costs.venue()))),
+        ("source", string("frozen_simulated_fees")),
+        ("quote_currency", string(costs.quote_currency())),
+        ("maker_fee_bps", number(costs.maker_fee_bps())),
+        ("taker_fee_bps", number(costs.taker_fee_bps())),
+        ("estimate_fee", DriftValue::NativeFunction(estimate)),
+    ])
+}
+
 pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &StrategyContext<'_>) {
     if let DriftValue::Object(fields) = ctx {
         let market = context.market.filter(|m| m.matches(event));
@@ -126,5 +156,10 @@ pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &Strate
             .as_ref()
             .filter(|book| market.is_some() && book.matches_at(event, context.now));
         fields.insert("book".into(), book.map_or(DriftValue::Null, book_value));
+        let costs = context
+            .costs
+            .as_ref()
+            .filter(|c| market.is_some_and(|m| c.matches(event, m.instrument())));
+        fields.insert("costs".into(), costs.map_or(DriftValue::Null, cost_value));
     }
 }
