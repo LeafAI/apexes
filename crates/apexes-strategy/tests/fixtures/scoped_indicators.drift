@@ -1,0 +1,27 @@
+function on_market_event(event, ctx) {
+  if (event.type != "trade") {
+    return [];
+  }
+  let count = ctx.state_get("count", 0) + 1;
+  ctx.state_set("count", count);
+  let mean = ctx.indicators.sma("mean", 3, event.price);
+  let ema = ctx.indicators.ema("trend", 3, event.price);
+  let rsi = ctx.indicators.rsi("momentum", 2, event.price);
+  if (event.price == 999) {
+    ctx.indicators.sma("mean", 4, event.price);
+  }
+  if (event.price == 998) {
+    return 42;
+  }
+  if (mean == null || ema == null || rsi == null || count < 3) {
+    return [];
+  }
+  return [{
+    symbol: event.symbol,
+    venue: event.venue,
+    asset_class: "spot",
+    side: "buy",
+    order_type: "market",
+    quantity: mean,
+  }];
+}

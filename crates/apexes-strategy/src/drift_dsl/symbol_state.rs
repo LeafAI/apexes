@@ -1,4 +1,6 @@
-//! F04.01: event-bound, transactional data-only state bindings.
+//! F04.01: event-bound, transactional data and native indicator state bindings.
+use super::indicators::error_object;
+use super::scoped_indicators::{Instance, Kind, MAX_INDICATORS};
 use crate::symbol_state::SymbolState;
 use apexes_core::MarketEvent;
 use drift_script::{DriftValue, NativeFn};
@@ -15,7 +17,13 @@ const MAX_ARRAY_LEN: usize = 512;
 
 type Values = HashMap<String, DriftValue>;
 
-pub(super) struct ScriptState(SymbolState<Values>);
+#[derive(Clone, Default)]
+struct InstrumentState {
+    values: Values,
+    indicators: HashMap<String, Instance>,
+}
+
+pub(super) struct ScriptState(SymbolState<InstrumentState>);
 
 impl Default for ScriptState {
     fn default() -> Self {
@@ -25,7 +33,7 @@ impl Default for ScriptState {
 
 #[derive(Default)]
 struct Stage {
-    values: Values,
+    state: InstrumentState,
     dirty: bool,
     invalid: bool,
     closed: bool,
@@ -60,7 +68,7 @@ fn name(value: Option<&DriftValue>) -> Option<&str> {
 impl ScriptState {
     pub(super) fn begin(&self, event: &MarketEvent) -> CallbackState {
         CallbackState(Arc::new(Mutex::new(Stage {
-            values: self.0.get(event).cloned().unwrap_or_default(),
+            state: self.0.get(event).cloned().unwrap_or_default(),
             writable: event.symbol().len() <= MAX_NAME_BYTES
                 && !event.symbol().is_empty()
                 && self.0.can_insert(event),
@@ -78,7 +86,7 @@ impl ScriptState {
             return false;
         };
         stage.closed = true;
-        let values = std::mem::take(&mut stage.values);
+        let values = std::mem::take(&mut stage.state);
         if !valid_return || stage.invalid {
             return false;
         }
@@ -86,6 +94,32 @@ impl ScriptState {
             return false;
         }
         true
+    }
+}
+
+impl Stage {
+    fn update_indicator(
+        &mut self,
+        kind: Kind,
+        args: &[DriftValue],
+    ) -> Result<DriftValue, DriftValue> {
+        let key =
+            name(args.first()).ok_or_else(|| error_object("invalid indicator name".into()))?;
+        if !self.writable {
+            return Err(error_object("instrument state capacity exceeded".into()));
+        }
+        let (spec, input) = kind.parse(args)?;
+        let indicators = &mut self.state.indicators;
+        if !indicators.contains_key(key) {
+            if indicators.len() >= MAX_INDICATORS {
+                return Err(error_object("scoped indicator capacity exceeded".into()));
+            }
+            indicators.insert(key.to_owned(), Instance::new(spec)?);
+        }
+        let instance = indicators
+            .get_mut(key)
+            .ok_or_else(|| error_object("missing indicator".into()))?;
+        instance.update(spec, input)
     }
 }
 
@@ -100,7 +134,47 @@ impl CallbackState {
                 "state_set".into(),
                 DriftValue::NativeFunction(self.set_fn()),
             );
+            obj.insert(
+                "indicators".into(),
+                DriftValue::Object(
+                    Kind::ALL
+                        .into_iter()
+                        .map(|kind| {
+                            (
+                                kind.name().to_owned(),
+                                DriftValue::NativeFunction(self.indicator_fn(kind)),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
         }
+    }
+
+    fn indicator_fn(&self, kind: Kind) -> NativeFn {
+        let stage = Arc::clone(&self.0);
+        Arc::new(move |args| {
+            let stage = Arc::clone(&stage);
+            Box::pin(async move {
+                let Ok(mut s) = stage.lock() else {
+                    return error_object("state lock poisoned".into());
+                };
+                if s.closed {
+                    return error_object("expired indicator callback".into());
+                }
+                let result = s.update_indicator(kind, &args);
+                match result {
+                    Ok(value) => {
+                        s.dirty = true;
+                        value
+                    }
+                    Err(error) => {
+                        s.invalid = true;
+                        error
+                    }
+                }
+            })
+        })
     }
 
     fn get_fn(&self) -> NativeFn {
@@ -116,6 +190,7 @@ impl CallbackState {
                 }
                 match (name(args.first()), args.get(1)) {
                     (Some(key), Some(default)) if args.len() == 2 && valid_value(default) => s
+                        .state
                         .values
                         .get(key)
                         .cloned()
@@ -145,9 +220,10 @@ impl CallbackState {
                         if args.len() == 2
                             && s.writable
                             && valid_value(value)
-                            && (s.values.contains_key(key) || s.values.len() < MAX_KEYS) =>
+                            && (s.state.values.contains_key(key)
+                                || s.state.values.len() < MAX_KEYS) =>
                     {
-                        s.values.insert(key.to_owned(), value.clone());
+                        s.state.values.insert(key.to_owned(), value.clone());
                         s.dirty = true;
                         DriftValue::Bool(true)
                     }
@@ -265,5 +341,118 @@ mod tests {
             DriftValue::Bool(false)
         ));
         assert!(!state.finish(&existing, stage, true));
+    }
+    #[test]
+    fn all_scoped_native_indicators_match_independent_reference_instances() {
+        use super::super::scoped_indicators::Kind;
+        fn equal(a: &DriftValue, b: &DriftValue) {
+            match (a, b) {
+                (DriftValue::Null, DriftValue::Null) => (),
+                (DriftValue::Number(x), DriftValue::Number(y)) => assert_eq!(x, y),
+                (DriftValue::Object(x), DriftValue::Object(y)) => {
+                    assert_eq!(x.len(), y.len());
+                    for (key, v) in x {
+                        equal(v, &y[key]);
+                    }
+                }
+                _ => panic!("indicator output mismatch: {a:?} != {b:?}"),
+            }
+        }
+        fn args(kind: Kind, price: f64) -> Vec<DriftValue> {
+            let mut args = vec![string("instance"), DriftValue::Number(2.0)];
+            if kind == Kind::Macd {
+                args.extend([DriftValue::Number(3.0), DriftValue::Number(2.0)]);
+            } else if kind == Kind::Bollinger {
+                args.push(DriftValue::Number(2.0));
+            }
+            if kind == Kind::Atr {
+                args.push(DriftValue::Object(HashMap::from([
+                    ("high".into(), DriftValue::Number(price + 1.0)),
+                    ("low".into(), DriftValue::Number(price - 1.0)),
+                    ("close".into(), DriftValue::Number(price)),
+                ])));
+            } else {
+                args.push(DriftValue::Number(price));
+            }
+            args
+        }
+        for kind in Kind::ALL {
+            let mut state = ScriptState::default();
+            let a = event("BTCUSDT");
+            let b = event("ETHUSDT");
+            let (spec, _) = kind.parse(&args(kind, 10.0)).unwrap();
+            let mut expected_a = Instance::new(spec).unwrap();
+            let mut expected_b = Instance::new(spec).unwrap();
+            let mut warmed = false;
+            for p in [10.0, 12.0, 11.0, 14.0, 13.0, 16.0] {
+                for (event, price, expected) in
+                    [(&a, p, &mut expected_a), (&b, 100.0 - p, &mut expected_b)]
+                {
+                    let args = args(kind, price);
+                    let (spec, input) = kind.parse(&args).unwrap();
+                    let reference = expected.update(spec, input).unwrap();
+                    warmed |= !matches!(reference, DriftValue::Null);
+                    let stage = state.begin(event);
+                    let actual = futures::executor::block_on(stage.indicator_fn(kind)(args));
+                    equal(&actual, &reference);
+                    assert!(state.finish(event, stage, true));
+                }
+            }
+            assert!(warmed, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn indicator_capacity_configuration_and_expired_callback_refuse() {
+        let mut state = ScriptState::default();
+        let event = event("BTCUSDT");
+        let stage = state.begin(&event);
+        let update = stage.indicator_fn(Kind::Sma);
+        let call = |key: &str, period: f64, price: f64| {
+            futures::executor::block_on(update(vec![
+                string(key),
+                DriftValue::Number(period),
+                DriftValue::Number(price),
+            ]))
+        };
+        for i in 0..MAX_INDICATORS {
+            assert!(matches!(
+                call(&format!("s{i}"), 2.0, 10.0),
+                DriftValue::Null
+            ));
+        }
+        assert!(state.finish(&event, stage, true));
+        assert!(matches!(call("s0", 2.0, 999.0), DriftValue::Object(_)));
+        let stage = state.begin(&event);
+        let update = stage.indicator_fn(Kind::Sma);
+        let call = |key: &str, period: f64, price: f64| {
+            futures::executor::block_on(update(vec![
+                string(key),
+                DriftValue::Number(period),
+                DriftValue::Number(price),
+            ]))
+        };
+        assert!(matches!(call("s0", 2.0, 20.0), DriftValue::Number(15.0)));
+        assert!(matches!(call("overflow", 2.0, 10.0), DriftValue::Object(_)));
+        assert!(!state.finish(&event, stage, true));
+        let stage = state.begin(&event);
+        let update = stage.indicator_fn(Kind::Sma);
+        assert!(matches!(
+            futures::executor::block_on(update(vec![
+                string("s0"),
+                DriftValue::Number(2.0),
+                DriftValue::Number(30.0)
+            ])),
+            DriftValue::Number(20.0)
+        ));
+        assert!(matches!(
+            futures::executor::block_on(update(vec![
+                string("s0"),
+                DriftValue::Number(513.0),
+                DriftValue::Number(30.0)
+            ])),
+            DriftValue::Object(_)
+        ));
+        assert!(!state.finish(&event, stage, true));
     }
 }

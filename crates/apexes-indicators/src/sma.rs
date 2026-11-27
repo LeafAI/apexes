@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use crate::indicator::Indicator;
 
 /// Simple Moving Average over a fixed-size trailing window.
+#[derive(Clone)]
 pub struct Sma {
     period: usize,
     window: VecDeque<Decimal>,

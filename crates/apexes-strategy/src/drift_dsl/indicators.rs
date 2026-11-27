@@ -43,7 +43,7 @@ pub fn register_to(interp: &Interpreter) {
         .define_const("indicators".to_string(), DriftValue::Object(indicators_map));
 }
 
-fn error_object(message: String) -> DriftValue {
+pub(super) fn error_object(message: String) -> DriftValue {
     let mut map = HashMap::new();
     map.insert("error".to_string(), DriftValue::String(Arc::new(message)));
     DriftValue::Object(map)
@@ -52,7 +52,7 @@ fn error_object(message: String) -> DriftValue {
 /// Extracts a positive `usize` period from `args[index]`, or an
 /// `error_object` describing what went wrong (missing arg, non-number,
 /// non-positive, non-integer).
-fn require_positive_usize(
+pub(super) fn require_positive_usize(
     args: &[DriftValue],
     index: usize,
     fn_name: &str,
@@ -72,7 +72,11 @@ fn require_positive_usize(
     }
 }
 
-fn require_number(args: &[DriftValue], index: usize, fn_name: &str) -> Result<Decimal, DriftValue> {
+pub(super) fn require_number(
+    args: &[DriftValue],
+    index: usize,
+    fn_name: &str,
+) -> Result<Decimal, DriftValue> {
     match args.get(index) {
         Some(DriftValue::Number(n)) => Decimal::try_from(*n).map_err(|_| {
             error_object(format!(
@@ -89,7 +93,11 @@ fn require_number(args: &[DriftValue], index: usize, fn_name: &str) -> Result<De
     }
 }
 
-fn optional_decimal_field(obj: &DriftValue, key: &str, fn_name: &str) -> Result<Decimal, String> {
+pub(super) fn optional_decimal_field(
+    obj: &DriftValue,
+    key: &str,
+    fn_name: &str,
+) -> Result<Decimal, String> {
     let DriftValue::Object(map) = obj else {
         return Err(format!(
             "{fn_name}: expected an object argument, got {}",
@@ -179,7 +187,7 @@ fn stddev_factory() -> NativeFn {
     })
 }
 
-fn macd_output_to_drift_value(output: MacdOutput) -> DriftValue {
+pub(super) fn macd_output_to_drift_value(output: MacdOutput) -> DriftValue {
     let mut obj = HashMap::new();
     obj.insert(
         "macd".to_string(),
@@ -235,7 +243,7 @@ fn macd_factory() -> NativeFn {
     })
 }
 
-fn bollinger_output_to_drift_value(output: BollingerOutput) -> DriftValue {
+pub(super) fn bollinger_output_to_drift_value(output: BollingerOutput) -> DriftValue {
     let mut obj = HashMap::new();
     obj.insert(
         "upper".to_string(),

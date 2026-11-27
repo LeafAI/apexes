@@ -20,6 +20,7 @@ pub struct MacdOutput {
 /// difference (the signal line). `update` only starts returning
 /// `Some(MacdOutput)` once both underlying EMAs AND the signal EMA have
 /// all warmed up.
+#[derive(Clone)]
 pub struct Macd {
     fast_ema: Ema,
     slow_ema: Ema,
