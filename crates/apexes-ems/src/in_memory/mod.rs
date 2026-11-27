@@ -6,6 +6,7 @@
 //! make backtests take as long as the algorithm's real-time duration,
 //! defeating the purpose of historical replay).
 
+mod replay_parent_ids;
 mod routing;
 mod state;
 
@@ -40,6 +41,7 @@ pub struct InMemoryEms {
     parent_orders: Mutex<HashMap<ParentOrderId, ParentOrderState>>,
     market_state: Mutex<MarketStateTracker>,
     causal: bool,
+    replay_parent_ids: Option<Mutex<replay_parent_ids::ReplayParentIds>>,
     event_time: Mutex<Option<DateTime<Utc>>>,
 }
 
@@ -72,6 +74,7 @@ impl InMemoryEms {
             parent_orders: Mutex::new(HashMap::new()),
             market_state: Mutex::new(MarketStateTracker::default()),
             causal: false,
+            replay_parent_ids: None,
             event_time: Mutex::new(None),
         }
     }
@@ -79,6 +82,21 @@ impl InMemoryEms {
     pub fn with_event_time(mut self, enabled: bool) -> Self {
         self.causal = enabled;
         self
+    }
+
+    /// Enable run-local deterministic parent IDs for historical replay.
+    /// Algorithmic admission requires the existing causal event-time mode.
+    pub fn with_replay_parent_namespace(mut self, namespace: Option<Uuid>) -> Self {
+        self.replay_parent_ids =
+            namespace.map(|id| Mutex::new(replay_parent_ids::ReplayParentIds::new(id)));
+        self
+    }
+
+    fn next_parent_id(&self) -> ParentOrderId {
+        self.replay_parent_ids.as_ref().map_or_else(
+            || ParentOrderId(Uuid::new_v4()),
+            |ids| ids.lock().unwrap_or_else(|p| p.into_inner()).allocate(),
+        )
     }
 
     /// In causal simulation each fixed-route parent has one allocation.
@@ -760,6 +778,11 @@ impl Ems for InMemoryEms {
         &self,
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
+        if self.replay_parent_ids.is_some() && !self.causal {
+            return Err(EmsError::ParentAdmissionRejected {
+                reason: "deterministic EMS requires explicit event-time latency".into(),
+            });
+        }
         let started_at = if self.causal {
             let at = (*self.event_time.lock().unwrap_or_else(|p| p.into_inner())).ok_or(
                 EmsError::ParentAdmissionRejected {
@@ -771,7 +794,7 @@ impl Ems for InMemoryEms {
         } else {
             Utc::now()
         };
-        let parent_id = ParentOrderId(Uuid::new_v4());
+        let parent_id = self.next_parent_id();
         self.sink.reserve_parent(parent_id, &request).await?;
 
         let candidates = [AssetClass::Spot, AssetClass::Perpetual];
