@@ -20,11 +20,11 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = "1.40"
 chrono = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 uuid = { workspace = true, features = ["v4"] }
-serde_json = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
