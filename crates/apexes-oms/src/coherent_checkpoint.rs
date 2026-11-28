@@ -21,6 +21,8 @@ pub struct CoherentCheckpointReceipt {
     pub order_count: i64,
     pub fill_count: i64,
     pub journal_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_sha256: Option<String>,
 }
 
 /// Constructed only from the manager's contiguous, process-local progress.
@@ -44,6 +46,8 @@ pub(super) async fn migrate(pool: &PgPool) -> std::result::Result<(), OmsError> 
     )
     .execute(pool)
     .await?;
+    sqlx::query("ALTER TABLE strategy_checkpoint_boundary ADD COLUMN IF NOT EXISTS capture BYTEA CHECK (octet_length(capture) BETWEEN 1 AND 71303168)")
+        .execute(pool).await?;
     Ok(())
 }
 
@@ -210,6 +214,7 @@ async fn witness(
         order_count: orders,
         fill_count: fills,
         journal_sha256: format!("{:x}", digest.finalize()),
+        capture_sha256: None,
     })
 }
 
@@ -220,7 +225,11 @@ impl OrderStore {
         cursor: StateCursor,
         envelope: &[u8],
         prefix: CompletedPrefix,
+        capture: Option<&[u8]>,
     ) -> Result<CoherentCheckpointReceipt> {
+        if capture.is_some_and(|bytes| bytes.is_empty() || bytes.len() > 68 * 1024 * 1024) {
+            return Err(CheckpointStoreError::Boundary);
+        }
         let next = verify_checkpoint(envelope, &previous.identity, cursor)?;
         validate_transition(Some(previous), &next)?;
         let (owner, connection) = self.checkpoint_connection()?;
@@ -237,12 +246,13 @@ impl OrderStore {
                 return Err(CheckpointStoreError::Boundary);
             }
             select_head(&mut tx, owner, Some(previous)).await?;
-            let receipt = witness(&mut tx, prefix, next.clone()).await?;
+            let mut receipt = witness(&mut tx, prefix, next.clone()).await?;
+            receipt.capture_sha256 = capture.map(|bytes| format!("{:x}",Sha256::digest(bytes)));
             let head_json = serde_json::to_string(&next).map_err(|_| CheckpointStoreError::Corrupt)?;
             write_head(&mut tx, owner, Some(previous), &next, &head_json, envelope).await?;
             let receipt_json = serde_json::to_string(&receipt).map_err(|_| CheckpointStoreError::Corrupt)?;
-            sqlx::query("INSERT INTO strategy_checkpoint_boundary (singleton, owner, receipt) VALUES (TRUE,$1,$2)")
-                .bind(owner).bind(receipt_json).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO strategy_checkpoint_boundary (singleton, owner, receipt, capture) VALUES (TRUE,$1,$2,$3)")
+                .bind(owner).bind(receipt_json).bind(capture).execute(&mut *tx).await?;
             Ok(receipt)
         }.await;
         finish(tx, result).await
@@ -290,7 +300,7 @@ impl OrderStore {
             if claim != Some((owner.to_owned(),encoded)) {
                 return Err(CheckpointStoreError::Conflict);
             }
-            let envelope = verify_boundary(&mut tx, owner, expected).await?;
+            let (envelope, capture) = verify_boundary(&mut tx, owner, expected).await?;
             let inconsistent: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM orders o WHERE
                  o.leverage IS NOT NULL OR o.margin_mode IS NOT NULL OR o.quantity<=0
@@ -315,7 +325,7 @@ impl OrderStore {
             }
             let orders = orders.into_iter().map(apexes_core::Order::try_from)
                 .collect::<std::result::Result<Vec<_>,_>>().map_err(|_| CheckpointStoreError::Corrupt)?;
-            Ok(CoherentRecoverySnapshot { envelope, orders, fills })
+            Ok(CoherentRecoverySnapshot { envelope, orders, fills, capture })
         }.await;
         finish(tx, result).await
     }
@@ -327,37 +337,59 @@ pub struct CoherentRecoverySnapshot {
     pub envelope: Vec<u8>,
     pub orders: Vec<apexes_core::Order>,
     pub fills: Vec<crate::schema::FillRow>,
+    pub capture: Option<Vec<u8>>,
 }
 
 async fn verify_boundary(
     tx: &mut Transaction<'_, Postgres>,
     owner: &str,
     expected: &CoherentCheckpointReceipt,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     if expected.version != 1 {
         return Err(CheckpointStoreError::Corrupt);
     }
     let envelope = select_head(tx, owner, Some(&expected.checkpoint))
         .await?
         .ok_or(CheckpointStoreError::Missing)?;
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT owner, receipt FROM strategy_checkpoint_boundary WHERE singleton FOR SHARE",
+    let row: Option<(String, String, Option<i32>)> = sqlx::query_as(
+        "SELECT owner, receipt, octet_length(capture) FROM strategy_checkpoint_boundary WHERE singleton FOR SHARE",
     )
     .fetch_optional(&mut **tx)
     .await?;
     let encoded = serde_json::to_string(expected).map_err(|_| CheckpointStoreError::Corrupt)?;
-    if row != Some((owner.to_owned(), encoded)) {
+    let Some((stored_owner, stored_receipt, length)) = row else {
+        return Err(CheckpointStoreError::Conflict);
+    };
+    if stored_owner != owner || stored_receipt != encoded {
         return Err(CheckpointStoreError::Conflict);
     }
+    let capture = match (&expected.capture_sha256, length) {
+        (None, None) => None,
+        (Some(digest), Some(length)) if (1..=68 * 1024 * 1024).contains(&length) => {
+            let bytes: Vec<u8> = sqlx::query_scalar(
+                "SELECT capture FROM strategy_checkpoint_boundary WHERE singleton",
+            )
+            .fetch_one(&mut **tx)
+            .await?;
+            if &format!("{:x}", Sha256::digest(&bytes)) != digest {
+                return Err(CheckpointStoreError::Corrupt);
+            }
+            Some(bytes)
+        }
+        _ => return Err(CheckpointStoreError::Corrupt),
+    };
     let prefix = CompletedPrefix {
         run_scope: expected.run_scope,
         last_intent: expected.last_intent,
         fill_sequence: expected.fill_sequence,
         terminal_sequence: expected.terminal_sequence,
     };
-    let actual = witness(tx, prefix, expected.checkpoint.clone()).await?;
+    let mut actual = witness(tx, prefix, expected.checkpoint.clone()).await?;
+    actual.capture_sha256 = capture
+        .as_ref()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
     if &actual != expected {
         return Err(CheckpointStoreError::JournalChanged);
     }
-    Ok(envelope)
+    Ok((envelope, capture))
 }

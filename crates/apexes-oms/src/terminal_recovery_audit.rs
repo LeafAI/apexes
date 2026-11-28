@@ -285,6 +285,7 @@ mod tests {
             .collect();
         (
             CoherentRecoverySnapshot {
+                capture: None,
                 envelope: vec![],
                 orders,
                 fills,

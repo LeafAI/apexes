@@ -257,8 +257,8 @@ pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
 }
 
 /// Like the existing single-use stop checkpoint path, with actual
-/// completed observation records retained in memory until acknowledgement.
-/// The returned evidence is not persisted atomically in PostgreSQL.
+/// completed observation and partial risk evidence persisted in the
+/// existing PostgreSQL boundary transaction before acknowledgement.
 pub async fn run_live_trading_with_observation_capture_on_stop<S: Strategy>(
     config: LiveTradingConfig,
     registry: &Registry,

@@ -182,9 +182,10 @@ impl ObservationReceipt {
 }
 
 /// Actual loop-local observations returned only after the existing
-/// checkpoint publication has acknowledged success. Not a durable
-/// atomic DB witness or proof of upstream completeness.
-#[derive(Debug, Clone)]
+/// checkpoint publication has acknowledged success. Coverage remains
+/// partial; this cannot prove upstream completeness or risk restoration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturedObservations {
     pub receipt: ObservationReceipt,
     pub scope: Vec<(Venue, String)>,
@@ -195,6 +196,70 @@ pub struct CapturedObservations {
     pub market_monitor_unqualified: bool,
     /// Margin-tier monitoring is outside the supported capture contract.
     pub margin_monitor_unqualified: bool,
+}
+
+const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureEnvelope {
+    version: u32,
+    capture: CapturedObservations,
+}
+
+impl CapturedObservations {
+    fn validate(&self) -> Result<(), ObservationError> {
+        self.receipt.verify(&self.scope, &self.records)?;
+        if let Some(risk) = &self.registered_risk {
+            risk.validate().map_err(|_| ObservationError::Encoding)?;
+            if risk.pre_trade.iter().any(|s| matches!(s,apexes_risk::RegisteredRiskState::Limits(l) if l.day.is_some_and(|d|d>self.receipt.through.observed_at.date_naive()))) {
+                return Err(ObservationError::Time);
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical bounded inspection bytes, including unsupported coverage.
+    pub fn encode_durable(&self) -> Result<Vec<u8>, ObservationError> {
+        self.validate()?;
+        #[derive(Serialize)]
+        struct BorrowedEnvelope<'a> {
+            version: u32,
+            capture: &'a CapturedObservations,
+        }
+        let bytes = serde_json::to_vec(&BorrowedEnvelope {
+            version: 1,
+            capture: self,
+        })
+        .map_err(|_| ObservationError::Encoding)?;
+        if bytes.len() > MAX_CAPTURE_BYTES {
+            return Err(ObservationError::Capacity);
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode_durable(
+        bytes: &[u8],
+        predecessor: StateCursor,
+        through: StateCursor,
+    ) -> Result<Self, ObservationError> {
+        if bytes.is_empty() || bytes.len() > MAX_CAPTURE_BYTES {
+            return Err(ObservationError::Capacity);
+        }
+        let envelope: CaptureEnvelope =
+            serde_json::from_slice(bytes).map_err(|_| ObservationError::Encoding)?;
+        let capture = envelope.capture;
+        if envelope.version != 1
+            || capture.receipt.predecessor != predecessor
+            || capture.receipt.through != through
+        {
+            return Err(ObservationError::Cursor);
+        }
+        if capture.encode_durable()? != bytes {
+            return Err(ObservationError::Encoding);
+        }
+        Ok(capture)
+    }
 }
 
 pub(crate) struct ObservationCapture {
@@ -304,6 +369,36 @@ mod tests {
     }
     fn scope() -> Vec<(Venue, String)> {
         vec![(Venue::Binance, "BTCUSDT".into())]
+    }
+
+    #[test]
+    fn durable_capture_round_trip_refuses_noncanonical_and_wrong_cursor() {
+        let mut capture =
+            ObservationCapture::new(cursor(10, 0), ObservationClock::SourceAvailability, scope());
+        let item = trade(11, 1, 1);
+        capture.record(item.cursor, &item.event).unwrap();
+        let mut captured = capture.finish(item.cursor).unwrap();
+        captured.market_monitor_unqualified = true;
+        let bytes = captured.encode_durable().unwrap();
+        assert_eq!(
+            CapturedObservations::decode_durable(&bytes, cursor(10, 0), item.cursor).unwrap(),
+            captured
+        );
+        assert!(CapturedObservations::decode_durable(&bytes, cursor(9, 0), item.cursor).is_err());
+        let mut noncanonical = bytes;
+        noncanonical.push(b' ');
+        assert!(
+            CapturedObservations::decode_durable(&noncanonical, cursor(10, 0), item.cursor)
+                .is_err()
+        );
+        captured.registered_risk = Some(apexes_risk::RegisteredRiskSnapshot {
+            version: 2,
+            pre_trade: vec![],
+            in_trade: vec![],
+            position_monitor_count: 0,
+            market_condition_monitor_count: 0,
+        });
+        assert!(captured.encode_durable().is_err());
     }
 
     #[test]

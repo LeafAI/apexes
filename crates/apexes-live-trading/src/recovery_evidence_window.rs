@@ -133,6 +133,7 @@ mod tests {
             updated_at: at(5),
         };
         let snapshot = CoherentRecoverySnapshot {
+            capture: None,
             envelope: vec![],
             orders: vec![order],
             fills: vec![],

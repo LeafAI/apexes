@@ -95,3 +95,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Actual completed observation capture](2026-11-28-apexes-observation-capture-design.md) retains bounded loop-local observation records and returns a validated receipt only after the existing coherent stop publication acknowledges success. Atomic durable observation/risk persistence and actual risk-monitor capture remain open.
 
 [Actual registered risk-monitor inspection](2026-11-28-apexes-registered-risk-capture-design.md) captures supported registered slots with explicit unsupported coverage before coherent checkpoint publication. The acknowledged in-memory result is not an atomic durable or complete risk witness.
+
+[Atomic durable observation and partial-risk evidence](2026-11-28-apexes-durable-capture-design.md) persists the actual opt-in capture in the same coherent checkpoint transaction, binds its digest to the independently selected receipt, and exposes read-only validation after reopening. Complete monitor coverage, external shared-state atomicity and restoration remain open.

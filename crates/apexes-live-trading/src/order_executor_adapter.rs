@@ -55,6 +55,41 @@ pub struct OrderManagerExecutor {
 const OPEN_ORDERS_LOCK_WAIT: Duration = Duration::from_millis(50);
 
 impl OrderManagerExecutor {
+    async fn publish_checkpoint_attachment(
+        &self,
+        previous: &apexes_strategy::checkpoint::CheckpointReceipt,
+        cursor: apexes_strategy::checkpoint::StateCursor,
+        last_intent: u64,
+        envelope: &[u8],
+        capture: Option<&[u8]>,
+    ) -> Result<(), ApexesError> {
+        let failure = |reason: String| ApexesError::InvalidBacktestConfig { reason };
+        let request = self
+            .stop_checkpoint
+            .as_ref()
+            .filter(|r| &r.previous == previous)
+            .ok_or_else(|| failure("missing explicit stop checkpoint request".into()))?;
+        let mut manager = tokio::time::timeout(Duration::from_secs(2), self.order_manager.lock())
+            .await
+            .map_err(|_| failure("checkpoint boundary could not obtain the OMS lease".into()))?;
+        let receipt = manager
+            .publish_coherent_strategy_checkpoint_with_capture(
+                previous,
+                cursor,
+                self.intent_scope,
+                last_intent,
+                envelope,
+                capture,
+            )
+            .await
+            .map_err(|error| failure(format!("coherent strategy checkpoint: {error}")))?;
+        *request
+            .published
+            .lock()
+            .map_err(|_| failure("checkpoint receipt lock poisoned".into()))? = Some(receipt);
+        Ok(())
+    }
+
     pub fn new(order_manager: Arc<tokio::sync::Mutex<OrderManager>>) -> Self {
         let submission_gate = order_manager
             .try_lock()
@@ -135,30 +170,20 @@ impl OrderExecutor for OrderManagerExecutor {
         last_intent: u64,
         envelope: &[u8],
     ) -> Result<(), ApexesError> {
-        let failure = |reason: String| ApexesError::InvalidBacktestConfig { reason };
-        let request = self
-            .stop_checkpoint
-            .as_ref()
-            .filter(|r| &r.previous == previous)
-            .ok_or_else(|| failure("missing explicit stop checkpoint request".into()))?;
-        let mut manager = tokio::time::timeout(Duration::from_secs(2), self.order_manager.lock())
+        self.publish_checkpoint_attachment(previous, cursor, last_intent, envelope, None)
             .await
-            .map_err(|_| failure("checkpoint boundary could not obtain the OMS lease".into()))?;
-        let receipt = manager
-            .publish_coherent_strategy_checkpoint(
-                previous,
-                cursor,
-                self.intent_scope,
-                last_intent,
-                envelope,
-            )
+    }
+
+    async fn publish_completed_checkpoint_with_capture(
+        &self,
+        previous: &apexes_strategy::checkpoint::CheckpointReceipt,
+        cursor: apexes_strategy::checkpoint::StateCursor,
+        last_intent: u64,
+        envelope: &[u8],
+        capture: &[u8],
+    ) -> Result<(), ApexesError> {
+        self.publish_checkpoint_attachment(previous, cursor, last_intent, envelope, Some(capture))
             .await
-            .map_err(|error| failure(format!("coherent strategy checkpoint: {error}")))?;
-        *request
-            .published
-            .lock()
-            .map_err(|_| failure("checkpoint receipt lock poisoned".into()))? = Some(receipt);
-        Ok(())
     }
 
     fn intent_run_scope(&self) -> Option<uuid::Uuid> {

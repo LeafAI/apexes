@@ -60,6 +60,11 @@ impl ObservationBoundaryEvidence {
             || !digest_valid(&self.predecessor.envelope_sha256)
             || !digest_valid(&self.boundary.checkpoint.envelope_sha256)
             || !digest_valid(&self.boundary.journal_sha256)
+            || self
+                .boundary
+                .capture_sha256
+                .as_ref()
+                .is_some_and(|d| !digest_valid(d))
             || self.predecessor.identity != self.boundary.checkpoint.identity
             || self.history.predecessor != self.predecessor.cursor
             || self.history.through != self.boundary.checkpoint.cursor

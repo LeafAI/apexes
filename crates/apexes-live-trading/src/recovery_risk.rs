@@ -65,6 +65,11 @@ impl RiskBoundaryEvidence {
             || !digest_valid(&self.owner_fingerprint)
             || !digest_valid(&self.boundary.checkpoint.envelope_sha256)
             || !digest_valid(&self.boundary.journal_sha256)
+            || self
+                .boundary
+                .capture_sha256
+                .as_ref()
+                .is_some_and(|d| !digest_valid(d))
             || self.captured_at < self.boundary.checkpoint.cursor.observed_at
             || self
                 .limit_state
@@ -174,6 +179,7 @@ mod tests {
             order_count: 0,
             fill_count: 0,
             journal_sha256: "c".repeat(64),
+            capture_sha256: None,
         };
         let limits = RiskLimits {
             max_daily_trade_count: Some(1),
@@ -236,6 +242,7 @@ mod tests {
             envelope: vec![],
             orders: vec![],
             fills: vec![],
+            capture: None,
         };
         retained
             .compare(&snapshot, &owner, &boundary, at, (&limit, Some(&circuit)))
@@ -308,6 +315,7 @@ mod tests {
             envelope: vec![],
             orders: vec![],
             fills: vec![],
+            capture: None,
         };
         assert!(matches!(
             retained.compare(

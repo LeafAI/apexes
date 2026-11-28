@@ -57,6 +57,37 @@ pub struct RegisteredRiskSnapshot {
 }
 
 impl RegisteredRiskSnapshot {
+    /// Validate bounded partial evidence without constructing a monitor.
+    pub fn validate(&self) -> Result<(), RiskStateError> {
+        if self.version != 1
+            || [
+                self.pre_trade.len(),
+                self.in_trade.len(),
+                self.position_monitor_count,
+                self.market_condition_monitor_count,
+            ]
+            .into_iter()
+            .any(|n| n > 128)
+        {
+            return Err(RiskStateError::Invalid);
+        }
+        for state in &self.pre_trade {
+            match state {
+                RegisteredRiskState::Limits(s) => s.validate()?,
+                RegisteredRiskState::Circuit(s) => s.validate()?,
+                RegisteredRiskState::Unsupported => {}
+            }
+        }
+        for state in &self.in_trade {
+            match state {
+                RegisteredRiskState::Circuit(s) => s.validate()?,
+                RegisteredRiskState::Unsupported => {}
+                RegisteredRiskState::Limits(_) => return Err(RiskStateError::Invalid),
+            }
+        }
+        Ok(())
+    }
+
     /// Only the supported slot kinds have captured state. This is
     /// coverage information, not a recovery or trading authorization.
     pub fn has_unsupported_slots(&self) -> bool {
