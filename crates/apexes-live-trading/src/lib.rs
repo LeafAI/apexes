@@ -96,3 +96,6 @@ pub use recovery_collection::{CollectedSpotEvidence, SpotCollectionError};
 
 mod recovery_collection_receipt;
 pub use recovery_collection_receipt::SpotCollectionReceipt;
+
+mod recovery_opening_collection;
+pub use recovery_opening_collection::{CollectedOpeningEvidence, OpeningCollectionError};

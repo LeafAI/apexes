@@ -155,3 +155,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Strict owner-bound Spot evidence collection](2026-11-29-apexes-spot-evidence-collection-design.md) qualifies read-only terminal, raw account-wide open-order and wallet observations against the exact selected journal, without startup authority.
 
 [Durable Spot collection receipt](2026-11-29-apexes-spot-collection-receipt-design.md) binds complete historical query evidence to the exact independently selected journal, original inspection time and instrument metadata; reopening requires independent digest selection and cannot establish current freshness.
+
+[Read-only opening wallet collection](2026-11-29-apexes-opening-wallet-collection-design.md) checks the unclaimed exact opening head, brackets full wallet observations with account-wide open-order checks and compares independently selected tracked amounts without inferring funding ownership.

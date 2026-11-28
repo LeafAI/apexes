@@ -2286,3 +2286,194 @@ async fn read_only_collection_refuses_owner_mismatch_open_orders_and_incomplete_
     drop(store);
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn opening_collection_requires_unclaimed_checkpoint_and_independent_allocation() {
+    use apexes_live_trading as live;
+    use apexes_oms::SpotEvidenceBalance;
+    let fixture = Fixture::new().await;
+    let selection = fixture.seed().await;
+    let mut store = fixture.store().await;
+    let instruments = base_config().instruments;
+    let strategy = serde_json::json!({"RustNative":{"name":"fixture"}});
+    let balances = HashMap::from([
+        (
+            "BTC".into(),
+            SpotEvidenceBalance {
+                free: dec!(0),
+                locked: dec!(0),
+            },
+        ),
+        (
+            "USDT".into(),
+            SpotEvidenceBalance {
+                free: dec!(100000),
+                locked: dec!(0),
+            },
+        ),
+        (
+            "BNB".into(),
+            SpotEvidenceBalance {
+                free: dec!(3),
+                locked: dec!(0),
+            },
+        ),
+    ]);
+    let tracked = vec![("BTC".into(), dec!(0)), ("USDT".into(), dec!(100000))];
+    let mut source = CollectionSource {
+        terminal: None,
+        owner: "0".repeat(64),
+        open: 0,
+        wallet: Some(balances.clone()),
+        calls: Default::default(),
+    };
+    assert!(matches!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await,
+        Err(live::OpeningCollectionError::Owner)
+    ));
+    assert!(source.calls.lock().unwrap().is_empty());
+    source.owner = OWNER_SHA256.into();
+    assert!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                "wrong-db",
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await
+            .is_err()
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    source.open = 1;
+    assert!(matches!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await,
+        Err(live::OpeningCollectionError::OpenOrders)
+    ));
+    assert_eq!(*source.calls.lock().unwrap(), vec!["open"]);
+    source.open = 0;
+    source.calls.lock().unwrap().clear();
+    let wrong = vec![("BTC".into(), dec!(0)), ("USDT".into(), dec!(99999))];
+    assert!(matches!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &wrong,
+            )
+            .await,
+        Err(live::OpeningCollectionError::Allocation(_))
+    ));
+    source.wallet.as_mut().unwrap().remove("BTC");
+    assert!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await
+            .is_err()
+    );
+    source.wallet = Some(balances.clone());
+    source
+        .wallet
+        .as_mut()
+        .unwrap()
+        .get_mut("BNB")
+        .unwrap()
+        .locked = dec!(1);
+    assert!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await
+            .is_err()
+    );
+    source.wallet = Some(balances);
+    source.calls.lock().unwrap().clear();
+    let result = selection
+        .collect_opening_spot_evidence(
+            &mut store,
+            &fixture.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        vec!["open", "wallet", "open"]
+    );
+    assert_eq!(result.opening.predecessor, *selection.receipt());
+    assert_eq!(result.allocation.balances, tracked);
+    assert_eq!(result.opening.wallet.balances["BNB"].free, dec!(3));
+    assert!(result.open_before.finished_at <= result.opening.wallet.window.started_at);
+    assert!(result.opening.wallet.window.finished_at <= result.open_after.started_at);
+    assert!(result.open_after.finished_at <= result.inspected_at);
+    assert_eq!(fixture.claim_count().await, 0);
+    store
+        .inspect_opening_checkpoint(selection.receipt(), OWNER_SHA256, &fixture.url)
+        .await
+        .unwrap();
+    drop(store);
+    let a = flat_boundary(&fixture, selection.clone()).await;
+    let mut store = fixture.store().await;
+    source.calls.lock().unwrap().clear();
+    assert!(
+        selection
+            .collect_opening_spot_evidence(
+                &mut store,
+                &fixture.url,
+                &source,
+                &strategy,
+                &instruments,
+                &tracked,
+            )
+            .await
+            .is_err()
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.claim_count().await, 1);
+    store
+        .verify_coherent_boundary(a.selection.receipt())
+        .await
+        .unwrap();
+    drop(store);
+    fixture.cleanup().await;
+}
