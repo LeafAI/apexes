@@ -157,3 +157,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Durable Spot collection receipt](2026-11-29-apexes-spot-collection-receipt-design.md) binds complete historical query evidence to the exact independently selected journal, original inspection time and instrument metadata; reopening requires independent digest selection and cannot establish current freshness.
 
 [Read-only opening wallet collection](2026-11-29-apexes-opening-wallet-collection-design.md) checks the unclaimed exact opening head, brackets full wallet observations with account-wide open-order checks and compares independently selected tracked amounts without inferring funding ownership.
+
+[Durable opening collection receipt](2026-11-29-apexes-opening-collection-receipt-design.md) binds historical opening wallet, allocation and quiescence intervals to the exact original selection, and reinspects independently selected opening and closing receipts with ordered activity and exact cash-flow checks.

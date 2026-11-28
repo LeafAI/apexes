@@ -1836,12 +1836,20 @@ impl FlatTransitionFixture {
 }
 
 async fn flat_boundary(fixture: &Fixture, previous: RecoverySelection) -> FlatTransitionFixture {
+    let at = previous.receipt().cursor.observed_at + chrono::TimeDelta::seconds(10);
+    flat_boundary_at(fixture, previous, at).await
+}
+
+async fn flat_boundary_at(
+    fixture: &Fixture,
+    previous: RecoverySelection,
+    at: chrono::DateTime<Utc>,
+) -> FlatTransitionFixture {
     use apexes_backtest::observation_receipt::{
         CompletedObservation, ObservationClock, ObservationReceipt,
     };
     use apexes_live_trading as live;
     let start = previous.receipt().cursor.observed_at;
-    let at = start + chrono::TimeDelta::seconds(10);
     let mut event = sample_events().pop().unwrap();
     if let MarketEvent::Trade(trade) = &mut event {
         trade.timestamp = at;
@@ -2451,9 +2459,78 @@ async fn opening_collection_requires_unclaimed_checkpoint_and_independent_alloca
         .inspect_opening_checkpoint(selection.receipt(), OWNER_SHA256, &fixture.url)
         .await
         .unwrap();
+    let receipt = selection
+        .collect_opening_spot_receipt(
+            &mut store,
+            &fixture.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    let digest = receipt.sha256().to_owned();
+    let dir = std::env::temp_dir().join(format!("apexes-opening-receipt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("opening.json");
+    receipt.write_new(&path).unwrap();
+    assert!(receipt.write_new(&path).is_err());
+    assert!(live::OpeningCollectionReceipt::read(&path, &"0".repeat(64)).is_err());
+    let reopened = live::OpeningCollectionReceipt::read(&path, &digest).unwrap();
+    let mut modified: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    modified["body"]["allocation"]["balances"][0][1] = serde_json::json!("123");
+    let altered = dir.join("altered.json");
+    std::fs::write(&altered, serde_json::to_vec(&modified).unwrap()).unwrap();
+    assert!(live::OpeningCollectionReceipt::read(&altered, &digest).is_err());
+    let mut padded = std::fs::read(&path).unwrap();
+    padded.push(b' ');
+    let noncanonical = dir.join("noncanonical.json");
+    std::fs::write(&noncanonical, padded).unwrap();
+    assert!(live::OpeningCollectionReceipt::read(&noncanonical, &digest).is_err());
     drop(store);
-    let a = flat_boundary(&fixture, selection.clone()).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let a = flat_boundary_at(&fixture, selection.clone(), Utc::now()).await;
     let mut store = fixture.store().await;
+    let closing = a
+        .selection
+        .collect_spot_evidence_receipt(&mut store, &fixture.url, &source, &strategy, &instruments)
+        .await
+        .unwrap();
+    let pair = |tracked| live::OpeningClosingEvidenceSelection {
+        opening: &reopened,
+        opening_sha256: &digest,
+        tracked_balances: tracked,
+        closing: &closing,
+        closing_sha256: closing.sha256(),
+    };
+    let historical = a
+        .selection
+        .inspect_opening_collection_receipt(&mut store, &fixture.url, &instruments, pair(&tracked))
+        .await
+        .unwrap();
+    assert_eq!(historical.inspected_at, receipt.collected_at());
+    assert_eq!(historical.allocation.balances, tracked);
+    assert_eq!(historical.opening.wallet.balances["BNB"].free, dec!(3));
+    assert!(
+        a.selection
+            .inspect_opening_collection_receipt(
+                &mut store,
+                &fixture.url,
+                &instruments,
+                pair(&wrong),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        a.selection
+            .inspect_opening_collection_receipt(&mut store, &fixture.url, &[], pair(&tracked),)
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
     source.calls.lock().unwrap().clear();
     assert!(
         selection

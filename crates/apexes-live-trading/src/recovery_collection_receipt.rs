@@ -17,7 +17,10 @@ use std::{collections::BTreeMap, path::Path};
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
-fn digest(domain: &[u8], value: &impl Serialize) -> Result<String, StrategyRecoveryError> {
+pub(crate) fn digest(
+    domain: &[u8],
+    value: &impl Serialize,
+) -> Result<String, StrategyRecoveryError> {
     let bytes = serde_json::to_vec(value).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
     if bytes.len() > MAX_BYTES {
         return Err(StrategyRecoveryError::InvalidReceipt);
@@ -30,7 +33,7 @@ fn digest(domain: &[u8], value: &impl Serialize) -> Result<String, StrategyRecov
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RetainedWallet {
+pub(crate) struct RetainedWallet {
     window: EvidenceWindow,
     owner_fingerprint: String,
     venue: Venue,
@@ -41,7 +44,11 @@ struct RetainedWallet {
 }
 
 impl RetainedWallet {
-    fn retain(wallet: WalletEvidence) -> Self {
+    pub(crate) fn canonical_rows(&self) -> bool {
+        self.balances.len() <= 1024 && self.balances.windows(2).all(|w| w[0].0 < w[1].0)
+    }
+
+    pub(crate) fn retain(wallet: WalletEvidence) -> Self {
         let balances = wallet.balances.into_iter().collect::<BTreeMap<_, _>>();
         Self {
             window: wallet.window,
@@ -53,7 +60,7 @@ impl RetainedWallet {
         }
     }
 
-    fn evidence(&self) -> WalletEvidence {
+    pub(crate) fn evidence(&self) -> WalletEvidence {
         WalletEvidence {
             window: self.window,
             owner_fingerprint: self.owner_fingerprint.clone(),
