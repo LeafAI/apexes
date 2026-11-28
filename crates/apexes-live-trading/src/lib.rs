@@ -99,3 +99,6 @@ pub use recovery_collection_receipt::SpotCollectionReceipt;
 
 mod recovery_opening_collection;
 pub use recovery_opening_collection::{CollectedOpeningEvidence, OpeningCollectionError};
+
+mod recovery_opening_receipt;
+pub use recovery_opening_receipt::{OpeningClosingEvidenceSelection, OpeningCollectionReceipt};

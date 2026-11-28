@@ -58,7 +58,7 @@ fn valid_asset(asset: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-fn validate_allocation(
+pub(crate) fn validate_allocation(
     opening: &OpeningWalletEvidence,
     allocation: &OpeningTrackedAssetEvidence,
     instruments: &[Instrument],
