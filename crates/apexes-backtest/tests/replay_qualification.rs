@@ -1411,10 +1411,13 @@ async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
 #[test]
 fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_fills() {
     use apexes_strategy::{FillOutcome, FillSource, OrderOutcome, drift_dsl::DriftScriptStrategy};
+    use apexes_strategy::{TerminalKind, TerminalOutcome};
     type Evidence = Vec<(DateTime<Utc>, FillSource, apexes_core::Fill)>;
+    type Terminals = Vec<(DateTime<Utc>, apexes_core::OrderId)>;
     struct Probe {
         script: DriftScriptStrategy,
         seen: Arc<std::sync::Mutex<Evidence>>,
+        terminal: Arc<std::sync::Mutex<Terminals>>,
     }
     impl Strategy for Probe {
         fn on_market_event(
@@ -1426,6 +1429,20 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
         }
         fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
             self.script.on_order_outcome(outcome);
+        }
+        fn on_order_terminal(&mut self, outcome: &TerminalOutcome<'_>) {
+            let TerminalKind::Filled { order } = outcome.kind else {
+                panic!("unexpected terminal");
+            };
+            assert_eq!(order.filled_quantity, dec!(3));
+            assert_eq!(order.quantity, dec!(3));
+            assert_eq!(order.status, apexes_core::OrderStatus::Filled);
+            assert_eq!(
+                self.seen.lock().unwrap().last().unwrap().2.order_id,
+                order.id
+            );
+            self.terminal.lock().unwrap().push((outcome.at, order.id));
+            self.script.on_order_terminal(outcome);
         }
         fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
             self.seen
@@ -1455,9 +1472,11 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
         r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
             .unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let terminal = Arc::new(std::sync::Mutex::new(Vec::new()));
         let strategy: Box<dyn Strategy> = Box::new(Probe {
             script: DriftScriptStrategy::from_file(&path).unwrap(),
             seen: seen.clone(),
+            terminal: terminal.clone(),
         });
         let report = futures::executor::block_on(run_backtest(
             configuration(AssetClass::Spot, None),
@@ -1479,6 +1498,10 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
             ]
         );
         assert_eq!(seen[1].2.order_id, seen[2].2.order_id);
+        assert_eq!(
+            *terminal.lock().unwrap(),
+            vec![(at(2000), seen[2].2.order_id)]
+        );
         assert_ne!(seen[1].2.id, seen[2].2.id);
         assert_eq!(
             seen.iter().map(|(_, _, f)| f.clone()).collect::<Vec<_>>(),
@@ -1491,4 +1514,64 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
         }
         prior = Some((seen.clone(), digest));
     }
+}
+
+#[tokio::test]
+async fn transit_expiry_notifies_only_unsubmitted_direct_intents_at_observed_end() {
+    use apexes_strategy::{
+        AttemptStage, OrderOutcome, OrderOutcomeKind, TerminalKind, TerminalOutcome,
+    };
+    #[derive(Default)]
+    struct Evidence {
+        scheduled: usize,
+        expired: Vec<(DateTime<Utc>, Decimal)>,
+    }
+    struct Probe(Arc<std::sync::Mutex<Evidence>>);
+    impl Strategy for Probe {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            _: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            if matches!(event, MarketEvent::Trade(_)) {
+                vec![intent(AssetClass::Spot, Side::Buy, dec!(2), None)]
+            } else {
+                vec![]
+            }
+        }
+        fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            assert_eq!(outcome.stage, AttemptStage::Decision);
+            assert!(matches!(outcome.kind, OrderOutcomeKind::Scheduled));
+            self.0.lock().unwrap().scheduled += 1;
+        }
+        fn on_order_terminal(&mut self, outcome: &TerminalOutcome<'_>) {
+            let TerminalKind::TransitExpired { intent } = outcome.kind else {
+                panic!("unexpected terminal");
+            };
+            assert_eq!(intent.symbol, SYMBOL);
+            let mut evidence = self.0.lock().unwrap();
+            assert_eq!(evidence.scheduled, 1);
+            evidence.expired.push((outcome.at, intent.quantity));
+        }
+    }
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(100, dec!(100), "entry"),
+        tick(200),
+    ];
+    let r = registry(&events, "transit-expiry");
+    r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+        .unwrap();
+    let evidence = Arc::new(std::sync::Mutex::new(Evidence::default()));
+    let report = run_backtest(
+        configuration(AssetClass::Spot, None),
+        &r,
+        InMemoryMarketDataSource::new(events),
+        Probe(evidence.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(report.trades.is_empty());
+    assert_eq!(report.event_latency.unwrap().expired_at_end, 1);
+    assert_eq!(evidence.lock().unwrap().expired, vec![(at(200), dec!(2))]);
 }

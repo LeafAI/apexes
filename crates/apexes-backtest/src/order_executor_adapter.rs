@@ -40,6 +40,7 @@ pub struct MatchingEngineOrderExecutor {
     /// orders are reported through submissions/fills and the OrderLog,
     /// not retained in the strategy's open-order view.
     open_orders: Mutex<HashMap<OrderId, Order>>,
+    completed: Mutex<Vec<Order>>,
 }
 
 impl MatchingEngineOrderExecutor {
@@ -47,6 +48,7 @@ impl MatchingEngineOrderExecutor {
         Self {
             engine,
             open_orders: Mutex::new(HashMap::new()),
+            completed: Mutex::new(Vec::new()),
         }
     }
 
@@ -168,6 +170,10 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         self.process_event(event, Some(check))
     }
 
+    fn take_simulated_completions(&self) -> Vec<Order> {
+        std::mem::take(&mut *self.completed.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     async fn open_orders(&self) -> HashMap<OrderId, Order> {
         let engine = self.lock_engine();
         let mut open = self.lock_open_orders();
@@ -182,6 +188,8 @@ impl MatchingEngineOrderExecutor {
         event: &MarketEvent,
         check: Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
+        let mut completed = self.completed.lock().unwrap_or_else(|p| p.into_inner());
+        completed.clear();
         match event {
             MarketEvent::Trade(trade) => {
                 let mut engine = self.lock_engine();
@@ -199,6 +207,9 @@ impl MatchingEngineOrderExecutor {
                         order.updated_at = last_fill.filled_at;
                         if order.filled_quantity >= order.quantity {
                             order.status = OrderStatus::Filled;
+                            if order.filled_quantity == order.quantity {
+                                completed.push(order.clone());
+                            }
                         } else {
                             order.status = OrderStatus::PartiallyFilled;
                         }

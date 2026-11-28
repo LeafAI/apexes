@@ -710,6 +710,21 @@ impl ArrivalQueue {
         }
         due
     }
+    /// Remaining unsubmitted intents at the observed session boundary.
+    pub(crate) fn notify_expiry(&self, strategy: &mut impl apexes_strategy::Strategy) {
+        use apexes_strategy::{TerminalKind, TerminalOutcome};
+        if let Some(at) = self.watermark {
+            for (_, intent) in &self.pending {
+                if intent.execution_algo.is_none() {
+                    strategy.on_order_terminal(&TerminalOutcome {
+                        at,
+                        kind: TerminalKind::TransitExpired { intent },
+                    });
+                }
+            }
+        }
+    }
+
     pub fn finish(mut self) -> EventLatencyReport {
         self.report.expired_at_end = self.pending.len() as u64;
         self.report.capital_released_at_end = self.holds.len() as u64;
