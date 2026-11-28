@@ -17,6 +17,7 @@ pub mod coherent_recovery;
 pub mod flatten;
 pub mod halt;
 pub mod order_executor_adapter;
+pub mod recovery_evidence_window;
 pub mod runner;
 pub mod spot_recovery;
 pub mod startup_recovery;
@@ -38,4 +39,8 @@ pub use strategy_recovery::{RecoverySelection, StrategyRecoveryError, StrategySt
 
 pub use coherent_recovery::{
     CoherentInspectionError, CoherentRecoveryPreview, CoherentRecoverySelection,
+};
+
+pub use recovery_evidence_window::{
+    EvidenceWindow, EvidenceWindowError, OpenOrderCoverage, RecoveryEvidenceWindow,
 };

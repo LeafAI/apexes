@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("supplied recovery evidence window refused: {0}")]
+    EvidenceWindow(#[from] crate::EvidenceWindowError),
     #[error("terminal execution evidence comparison refused: {0}")]
     Terminal(#[from] apexes_oms::TerminalAuditError),
     #[error("Spot inventory preview refused: {0}")]
@@ -142,6 +144,45 @@ impl CoherentRecoverySelection {
             )
             .await?;
         apexes_oms::compare_terminal_evidence(&snapshot, evidence)?;
+        store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Offline comparison of complete supplied terminal/account evidence
+    /// within a single bounded observation window. The independently
+    /// supplied inspection time is not derived from the evidence itself.
+    /// This does not fetch exchange evidence or authorize startup.
+    pub async fn inspect_evidence_window(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        evidence: &crate::RecoveryEvidenceWindow,
+        inspected_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), CoherentInspectionError> {
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        crate::recovery_evidence_window::validate_evidence_window(
+            evidence,
+            &snapshot,
+            self.boundary.checkpoint.cursor.observed_at,
+            self.predecessor.owner_fingerprint(),
+            inspected_at,
+        )?;
+        apexes_oms::compare_terminal_evidence(&snapshot, &evidence.terminal_orders)?;
         store
             .inspect_coherent_recovery(
                 self.predecessor.receipt(),
