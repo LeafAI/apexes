@@ -470,6 +470,7 @@ mod tests {
             position: None,
             market_condition_monitor_count: 0,
             market_condition: None,
+            aliases: None,
         });
         assert!(captured.encode_durable().is_err());
     }

@@ -27,6 +27,12 @@ use crate::pre_trade::PreTradeCheck;
 /// margin state, no raw price) because volatility/jump detection needs
 /// the actual price, not a derived margin ratio.
 pub trait MarketConditionEventMonitor: Send + Sync {
+    /// Actual built-in shared monitor, when supported. No serialized
+    /// address or caller-chosen identity is retained.
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        None
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
@@ -244,6 +250,12 @@ impl MarketConditionMonitor {
 pub struct MarketConditionPreTradeAdapter(Arc<Mutex<MarketConditionMonitor>>);
 
 impl PreTradeCheck for MarketConditionPreTradeAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Market(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
@@ -270,6 +282,12 @@ impl PreTradeCheck for MarketConditionPreTradeAdapter {
 pub struct MarketConditionEventAdapter(Arc<Mutex<MarketConditionMonitor>>);
 
 impl MarketConditionEventMonitor for MarketConditionEventAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Market(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {

@@ -320,6 +320,12 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     use apexes_backtest::observation_receipt::{CompletedObservation, ObservationClock};
     let registered = captured.registered_risk.as_ref().unwrap();
     assert!(!registered.has_unsupported_slots());
+    let aliases = registered.aliases.as_ref().unwrap();
+    assert_eq!(aliases.pre_trade, vec![None, None, None, Some(0)]);
+    assert_eq!(aliases.position, vec![Some(0)]);
+    assert!(aliases.in_trade.is_empty());
+    assert!(aliases.market_condition.is_empty());
+
     assert!(!captured.market_monitor_unqualified);
     assert!(!captured.margin_monitor_unqualified);
     let market = captured.market_monitor.as_ref().unwrap();

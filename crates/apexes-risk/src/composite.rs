@@ -77,7 +77,8 @@ impl CompositeRiskChecker {
 
     /// Inspect actual registered slots at the caller's quiescent
     /// boundary. No risk decision, counter reset or trip clearing.
-    /// The locks do not prove atomicity with externally shared handles.
+    /// Built-in shared monitor locks are held together at inspection;
+    /// independent custom state and the database commit are not covered.
     pub fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskSnapshot, crate::RiskStateError> {
@@ -95,39 +96,43 @@ impl CompositeRiskChecker {
         {
             return Err(E::Invalid);
         }
+        use crate::shared_inspection::{InspectionPlan, resolve};
+        let mut plan = InspectionPlan::default();
+        let pre_slots = pre
+            .iter()
+            .map(|m| plan.add(m.shared_monitor(), || m.inspect_registered_state()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let in_slots = in_trade
+            .iter()
+            .map(|m| plan.add(m.shared_monitor(), || m.inspect_registered_state()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let position_slots = position
+            .iter()
+            .map(|m| plan.add(m.shared_monitor(), || m.inspect_registered_state()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let market_slots = market
+            .iter()
+            .map(|m| plan.add(m.shared_monitor(), || m.inspect_registered_state()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared = plan.inspect()?;
+        let (pre_trade, pre_ids) = resolve(pre_slots, &shared)?;
+        let (in_trade, in_ids) = resolve(in_slots, &shared)?;
+        let (position, position_ids) = resolve(position_slots, &shared)?;
+        let (market_condition, market_ids) = resolve(market_slots, &shared)?;
         let snapshot = crate::RegisteredRiskSnapshot {
             version: 1,
-            pre_trade: pre
-                .iter()
-                .map(|c| c.inspect_registered_state())
-                .collect::<Result<_, _>>()?,
-            in_trade: in_trade
-                .iter()
-                .map(|m| m.inspect_registered_state())
-                .collect::<Result<_, _>>()?,
+            pre_trade,
+            in_trade,
             position_monitor_count: position.len(),
-            position: if position.is_empty() {
-                None
-            } else {
-                Some(
-                    position
-                        .iter()
-                        .map(|m| m.inspect_registered_state())
-                        .collect::<Result<_, _>>()?,
-                )
-            },
-
-            market_condition_monitor_count: market.len(),
-            market_condition: if market.is_empty() {
-                None
-            } else {
-                Some(
-                    market
-                        .iter()
-                        .map(|m| m.inspect_registered_state())
-                        .collect::<Result<_, _>>()?,
-                )
-            },
+            position: (!position.is_empty()).then_some(position),
+            market_condition_monitor_count: market_condition.len(),
+            market_condition: (!market_condition.is_empty()).then_some(market_condition),
+            aliases: Some(crate::RegisteredAliases {
+                pre_trade: pre_ids,
+                in_trade: in_ids,
+                position: position_ids,
+                market_condition: market_ids,
+            }),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -387,6 +392,33 @@ mod tests {
     }
 
     #[test]
+    fn registered_aliases_distinguish_identical_independent_monitors() {
+        use crate::MarginMonitor;
+        let (first_pre, first_position) = MarginMonitor::new(dec!(1.5)).split();
+        let (second_pre, second_position) = MarginMonitor::new(dec!(1.5)).split();
+        let composite = CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(first_pre))
+            .with_pre_trade_check(Box::new(second_pre))
+            .with_position_monitor(Box::new(second_position))
+            .with_position_monitor(Box::new(first_position));
+        let state = composite.inspect_registered_state().unwrap();
+        assert_eq!(state.pre_trade[0], state.pre_trade[1]);
+        let ids = state.aliases.as_ref().unwrap();
+        assert_eq!(ids.pre_trade, vec![Some(0), Some(1)]);
+        assert_eq!(ids.position, vec![Some(1), Some(0)]);
+        assert_eq!(state, composite.inspect_registered_state().unwrap());
+        let mut invalid = state.clone();
+        invalid.aliases.as_mut().unwrap().pre_trade[0] = Some(2);
+        assert!(invalid.validate().is_err());
+        let mut invalid = state.clone();
+        invalid.aliases.as_mut().unwrap().position.pop();
+        assert!(invalid.validate().is_err());
+        let mut invalid = state;
+        invalid.aliases.as_mut().unwrap().position[0] = None;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn registered_capture_preserves_slots_budgets_and_shared_circuit_state() {
         use crate::{CircuitBreaker, LimitChecker, RegisteredRiskState, RiskLimits};
         let limits = RiskLimits {
@@ -476,6 +508,7 @@ mod tests {
         assert_eq!(state, composite.inspect_registered_state().unwrap());
         let mut old = state.clone();
         old.position = None;
+        old.aliases = None;
         assert!(old.has_unsupported_slots());
         old.validate().unwrap();
         let mut invalid = state.clone();

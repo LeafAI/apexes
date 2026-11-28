@@ -41,6 +41,9 @@ pub use self_trade::SelfTradePreventer;
 pub mod state_inspection;
 pub use state_inspection::{
     CircuitStateSnapshot, LimitStateSnapshot, ListState, MarginStateSnapshot,
-    MarketConditionSnapshot, MarketSymbolSnapshot, RegisteredRiskSnapshot, RegisteredRiskState,
-    RiskStateError, SymbolVenueListSnapshot,
+    MarketConditionSnapshot, MarketSymbolSnapshot, RegisteredAliases, RegisteredRiskSnapshot,
+    RegisteredRiskState, RiskStateError, SymbolVenueListSnapshot,
 };
+
+mod shared_inspection;
+pub use shared_inspection::SharedMonitorRef;

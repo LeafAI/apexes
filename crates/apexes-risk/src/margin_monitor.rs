@@ -110,6 +110,12 @@ impl MarginMonitor {
 pub struct MarginMonitorPreTradeAdapter(Arc<Mutex<MarginMonitor>>);
 
 impl PreTradeCheck for MarginMonitorPreTradeAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Margin(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
@@ -136,6 +142,12 @@ impl PreTradeCheck for MarginMonitorPreTradeAdapter {
 pub struct MarginMonitorPositionAdapter(Arc<Mutex<MarginMonitor>>);
 
 impl PositionMonitor for MarginMonitorPositionAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Margin(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
