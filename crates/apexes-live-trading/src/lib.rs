@@ -110,7 +110,8 @@ pub use recovery_opening_receipt::{OpeningClosingEvidenceSelection, OpeningColle
 
 mod recovery_risk_successor_receipt;
 pub use recovery_risk_successor_receipt::{
-    RiskBoundSuccessorReceipt, inspect_risk_bound_successor_receipt,
+    OpeningRiskReceiptSelection, RiskBoundSuccessorReceipt, RiskHandoffSuccessorReceipt,
+    inspect_risk_bound_successor_receipt, inspect_risk_handoff_successor_receipt,
 };
 
 mod recovery_opening_risk_receipt;

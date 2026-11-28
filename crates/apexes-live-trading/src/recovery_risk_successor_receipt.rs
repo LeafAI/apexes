@@ -1,7 +1,7 @@
 //! Durable historical qualification of two receipt-bound runs. Neither
 //! a checksum nor a successful comparison grants startup authority.
 use crate::{
-    ReceiptBoundSuccessorRun, StrategyRecoveryError, SuccessorInspectionError,
+    OpeningRiskReceipt, ReceiptBoundSuccessorRun, StrategyRecoveryError, SuccessorInspectionError,
     inspect_receipt_bound_risk_successor,
     recovery_collection_receipt::digest,
     strategy_recovery::{
@@ -134,6 +134,112 @@ pub async fn inspect_risk_bound_successor_receipt<S: Strategy, T: Strategy>(
     inspect_receipt_bound_risk_successor(prior, next, independently_selected_opening).await?;
     let sha256 = digest(DOMAIN, &body)?;
     let receipt = RiskBoundSuccessorReceipt { body, sha256 };
+    receipt.encode()?;
+    Ok(receipt)
+}
+
+/// Independently selected capture-time opening risk handoff, rather than
+/// a detached snapshot reconstructed from the closing database.
+pub struct OpeningRiskReceiptSelection<'a> {
+    pub receipt: &'a OpeningRiskReceipt,
+    pub sha256: &'a str,
+}
+
+const HANDOFF_DOMAIN: &[u8] = b"apexes-risk-handoff-successor-v1:";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffBody {
+    version: u32,
+    qualification: RiskBoundSuccessorReceipt,
+    opening_handoff_sha256: String,
+}
+
+/// Stronger historical receipt binding the independently retained
+/// capture-time handoff to the complete risk-bound qualification.
+/// Retain all original inputs independently and requalify before
+/// comparison. This does not grant live startup authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskHandoffSuccessorReceipt {
+    body: HandoffBody,
+    sha256: String,
+}
+
+impl RiskHandoffSuccessorReceipt {
+    fn encode(&self) -> Result<Vec<u8>, StrategyRecoveryError> {
+        let b = &self.body;
+        b.qualification.encode()?;
+        if b.version != 1
+            || !digest_valid(&b.opening_handoff_sha256)
+            || self.sha256 != digest(HANDOFF_DOMAIN, b)?
+        {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
+        if bytes.len() > MAX_RECEIPT_FILE_BYTES {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(bytes)
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn write_new(&self, path: &Path) -> Result<(), StrategyRecoveryError> {
+        write_receipt_file(path, &self.encode()?)
+    }
+
+    pub fn read(
+        path: &Path,
+        independently_selected_sha256: &str,
+    ) -> Result<Self, StrategyRecoveryError> {
+        let bytes = read_receipt_file(path)?;
+        let receipt: Self =
+            serde_json::from_slice(&bytes).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
+        if receipt.sha256 != independently_selected_sha256 || receipt.encode()? != bytes {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(receipt)
+    }
+
+    /// Compare against a newly independently qualified handoff receipt.
+    pub fn compare(&self, qualified: &Self) -> Result<(), StrategyRecoveryError> {
+        self.encode()?;
+        qualified.encode()?;
+        if self != qualified {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(())
+    }
+}
+
+/// Reinspect the exact independently selected handoff against the
+/// acknowledged successor capture, then run all existing successor
+/// checks with that snapshot. No detached snapshot input is accepted.
+pub async fn inspect_risk_handoff_successor_receipt<S: Strategy, T: Strategy>(
+    prior: ReceiptBoundSuccessorRun<'_, S>,
+    next: ReceiptBoundSuccessorRun<'_, T>,
+    opening: OpeningRiskReceiptSelection<'_>,
+) -> Result<RiskHandoffSuccessorReceipt, SuccessorInspectionError> {
+    let snapshot = next
+        .selection
+        .inspect_opening_risk_receipt(
+            next.store,
+            next.ems_postgres_url,
+            opening.receipt,
+            opening.sha256,
+        )
+        .await?;
+    let qualification = inspect_risk_bound_successor_receipt(prior, next, &snapshot).await?;
+    let body = HandoffBody {
+        version: 1,
+        qualification,
+        opening_handoff_sha256: opening.sha256.into(),
+    };
+    let sha256 = digest(HANDOFF_DOMAIN, &body)?;
+    let receipt = RiskHandoffSuccessorReceipt { body, sha256 };
     receipt.encode()?;
     Ok(receipt)
 }
