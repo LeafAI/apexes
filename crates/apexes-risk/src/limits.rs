@@ -21,7 +21,8 @@ use rust_decimal::Decimal;
 use crate::error::RiskViolation;
 use crate::pre_trade::PreTradeCheck;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RiskLimits {
     /// `None` means "no limit configured for this dimension" -- every
     /// field is optional so callers can enable only the dimensions they
@@ -89,6 +90,24 @@ impl LimitChecker {
                 traded_volume: Decimal::ZERO,
             }),
         }
+    }
+
+    /// Read-only capture of the actual accepted-order budget. Poisoned
+    /// state is refused rather than treated as a fresh budget.
+    pub fn inspect_checkpoint(&self) -> Result<crate::LimitStateSnapshot, crate::RiskStateError> {
+        let state = self
+            .daily_state
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?;
+        let snapshot = crate::LimitStateSnapshot {
+            version: 1,
+            limits: self.limits.clone(),
+            day: state.day,
+            trade_count: state.trade_count,
+            traded_volume: state.traded_volume,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Replaces the currently enforced limits. Does not reset the
@@ -340,6 +359,68 @@ mod tests {
     }
 
     use chrono::TimeZone;
+
+    #[test]
+    fn checkpoint_inspects_actual_accepted_budget_without_reset() {
+        let mut checker = LimitChecker::new(RiskLimits {
+            max_daily_trade_count: Some(2),
+            max_daily_volume: Some(dec!(3)),
+            ..Default::default()
+        });
+        let intent = sample_intent("BTCUSDT", Side::Buy, dec!(1.5), Some(dec!(100)));
+        let before = checker.inspect_checkpoint().unwrap();
+        assert_eq!(before.trade_count, 0);
+        checker.on_order_accepted(&intent, now());
+        checker.on_order_accepted(&intent, now());
+        let retained = checker.inspect_checkpoint().unwrap();
+        assert_eq!(retained.trade_count, 2);
+        assert_eq!(retained.traded_volume, dec!(3));
+        assert_eq!(retained.day, Some(now().date_naive()));
+        retained
+            .compare(&checker.inspect_checkpoint().unwrap())
+            .unwrap();
+        assert_eq!(
+            retained.compare(&before),
+            Err(crate::RiskStateError::Mismatch)
+        );
+        assert!(
+            checker
+                .check(
+                    &intent,
+                    &empty_positions(),
+                    &empty_balances(),
+                    &empty_open_orders(),
+                    now()
+                )
+                .is_err()
+        );
+        // Inspection cannot reset the budget or trip at UTC midnight;
+        // the existing check's day semantics remain unchanged.
+        assert!(
+            checker
+                .check(
+                    &intent,
+                    &empty_positions(),
+                    &empty_balances(),
+                    &empty_open_orders(),
+                    now() + chrono::TimeDelta::days(1)
+                )
+                .is_ok()
+        );
+        retained
+            .compare(&checker.inspect_checkpoint().unwrap())
+            .unwrap();
+        checker.update_limits(RiskLimits {
+            max_daily_trade_count: Some(1),
+            ..Default::default()
+        });
+        let tightened = checker.inspect_checkpoint().unwrap();
+        assert_eq!(tightened.trade_count, 2);
+        assert_eq!(
+            tightened.compare(&retained),
+            Err(crate::RiskStateError::Mismatch)
+        );
+    }
 
     #[test]
     fn verified_spot_exit_bypasses_entry_budgets_but_not_hard_order_limits() {

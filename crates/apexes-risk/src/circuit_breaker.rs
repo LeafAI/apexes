@@ -44,6 +44,21 @@ impl CircuitBreaker {
         }
     }
 
+    /// Read-only capture of retained trips, including ones not
+    /// inferable from the current ledger. No reset or restore operation.
+    pub fn inspect_checkpoint(&self) -> Result<crate::CircuitStateSnapshot, crate::RiskStateError> {
+        let mut tripped_symbols: Vec<_> = self.tripped_symbols.iter().cloned().collect();
+        tripped_symbols.sort();
+        let snapshot = crate::CircuitStateSnapshot {
+            version: 1,
+            limits: self.limits.clone(),
+            tripped_symbols,
+            account_tripped: self.account_tripped,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Wraps `self` in `Arc<Mutex<_>>` and returns two adapters sharing
     /// that same instance: the first implements `PreTradeCheck`, the
     /// second implements `InTradeMonitor`. Register both with a
@@ -175,6 +190,15 @@ impl PreTradeCheck for CircuitBreaker {
 /// Shares a [`CircuitBreaker`]'s state as a [`PreTradeCheck`]. See
 /// [`CircuitBreaker::split`].
 pub struct CircuitBreakerPreTradeAdapter(Arc<Mutex<CircuitBreaker>>);
+
+impl CircuitBreakerPreTradeAdapter {
+    pub fn inspect_checkpoint(&self) -> Result<crate::CircuitStateSnapshot, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+    }
+}
 
 impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
     fn check(
@@ -423,6 +447,46 @@ mod tests {
                     now()
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_inspects_shared_trip_state_without_clearing_it() {
+        let breaker = CircuitBreaker::new(RiskLimits {
+            max_position_per_symbol: Some(dec!(10)),
+            min_account_equity: Some(dec!(1000)),
+            ..Default::default()
+        });
+        let (pre, mut monitor) = breaker.split();
+        let empty = pre.inspect_checkpoint().unwrap();
+        for symbol in ["ETHUSDT", "BTCUSDT"] {
+            monitor
+                .on_fill(
+                    &sample_fill(symbol),
+                    &positions_with(symbol, dec!(15)),
+                    &empty_balances(),
+                )
+                .unwrap_err();
+        }
+        let retained = pre.inspect_checkpoint().unwrap();
+        assert_eq!(retained.tripped_symbols, vec!["BTCUSDT", "ETHUSDT"]);
+        assert!(retained.account_tripped);
+        retained
+            .compare(&pre.inspect_checkpoint().unwrap())
+            .unwrap();
+        assert_eq!(
+            retained.compare(&empty),
+            Err(crate::RiskStateError::Mismatch)
+        );
+        assert!(
+            pre.check(
+                &sample_intent("BTCUSDT"),
+                &HashMap::new(),
+                &empty_balances(),
+                &empty_open_orders(),
+                now()
+            )
+            .is_err()
         );
     }
 

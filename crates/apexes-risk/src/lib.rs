@@ -37,3 +37,6 @@ pub use market_condition_monitor::{
 pub use position_monitor::PositionMonitor;
 pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;
+
+pub mod state_inspection;
+pub use state_inspection::{CircuitStateSnapshot, LimitStateSnapshot, RiskStateError};
