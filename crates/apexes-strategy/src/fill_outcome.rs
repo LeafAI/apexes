@@ -39,3 +39,19 @@ pub struct FillOutcome<'a> {
     pub source: FillSource,
     pub fill: &'a Fill,
 }
+
+/// Immutable OMS linkage for an actual durable supplemental fill.
+/// The current strategy may only use an intent ordinal in its own run scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedFillLink {
+    Unlinked,
+    Unavailable,
+    Direct {
+        run_scope: uuid::Uuid,
+        intent_id: crate::IntentId,
+    },
+    Child {
+        parent_id: crate::ParentOrderId,
+        dispatch_id: uuid::Uuid,
+    },
+}

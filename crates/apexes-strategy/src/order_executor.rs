@@ -178,6 +178,23 @@ pub trait OrderExecutor: Send + Sync {
     /// Acknowledge a supplemental batch only after the ledger processed it.
     /// Simulated executors need no acknowledgement.
     async fn acknowledge_supplemental_fills(&self, _fills: &[Fill], _applied: bool) {}
+
+    /// Managed live executors return durable OMS linkage aligned to the
+    /// actual applied fill batch. None preserves the legacy/simulated path.
+    async fn persisted_supplemental_fill_links(
+        &self,
+        _fills: &[Fill],
+    ) -> Option<Vec<crate::PersistedFillLink>> {
+        None
+    }
+
+    /// A contradictory or unavailable managed attribution is not evidence
+    /// of non-execution. The ledger still receives the authoritative fill.
+    fn report_live_fill_attribution_fault(&self) {}
+
+    /// Observe returns from the callbacks for a fully applied supplemental batch.
+    /// This does not persist strategy state or replay callbacks after restart.
+    async fn acknowledge_supplemental_notifications(&self, _fills: &[Fill], _returned: bool) {}
 }
 
 /// Distinguishes why a position is being force/partially-closed, since

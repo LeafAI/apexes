@@ -202,6 +202,61 @@ impl OrderExecutor for OrderManagerExecutor {
             .await;
     }
 
+    async fn persisted_supplemental_fill_links(
+        &self,
+        fills: &[Fill],
+    ) -> Option<Vec<apexes_strategy::PersistedFillLink>> {
+        use apexes_strategy::PersistedFillLink;
+        let manager = self.order_manager.lock().await;
+        // Standalone/unmanaged adapters retain their existing correlation.
+        manager.fill_delivery_progress()?;
+        let ids: Vec<_> = fills.iter().map(|fill| fill.id).collect();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), manager.fill_identities(&ids)).await;
+        let Ok(Ok(identities)) = result else {
+            return Some(vec![PersistedFillLink::Unavailable; fills.len()]);
+        };
+        Some(
+            fills
+                .iter()
+                .zip(identities)
+                .map(|(fill, identity)| {
+                    let Some(identity) = identity.filter(|e| e.fill == *fill) else {
+                        return PersistedFillLink::Unavailable;
+                    };
+                    match (identity.intent_link, identity.child_link) {
+                        (Some(link), None) => PersistedFillLink::Direct {
+                            run_scope: link.run_scope,
+                            intent_id: link.intent_id,
+                        },
+                        (None, Some(link)) => PersistedFillLink::Child {
+                            parent_id: link.parent_id,
+                            dispatch_id: link.dispatch_id,
+                        },
+                        (None, None) => PersistedFillLink::Unlinked,
+                        _ => PersistedFillLink::Unavailable,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn report_live_fill_attribution_fault(&self) {
+        if let Some(gate) = &self.submission_gate {
+            gate.fault("live fill attribution unavailable or contradictory");
+        } else if let Ok(manager) = self.order_manager.try_lock() {
+            manager.report_health_fault("live fill attribution unavailable or contradictory");
+        }
+    }
+
+    async fn acknowledge_supplemental_notifications(&self, fills: &[Fill], returned: bool) {
+        let ids: Vec<_> = fills.iter().map(|fill| fill.id).collect();
+        self.order_manager
+            .lock()
+            .await
+            .acknowledge_fill_notifications(&ids, returned);
+    }
+
     fn on_market_event(&self, _event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
         // Live trading holds no local resting-order simulation to react
         // to market data with -- all fills come from the exchange via

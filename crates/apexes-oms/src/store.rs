@@ -565,6 +565,68 @@ impl OrderStore {
         .transpose()
     }
 
+    /// Read a persisted execution and immutable OMS linkage in one SQL snapshot.
+    /// An unknown fill ID is not evidence that an exchange never executed.
+    pub async fn fill_identity(
+        &self,
+        id: apexes_core::FillId,
+    ) -> Result<Option<crate::FillIdentity>, OmsError> {
+        Ok(self.fill_identities(&[id]).await?.pop().flatten())
+    }
+
+    /// Batch lookup, aligned to the caller's fill IDs. No execution or
+    /// delivery state is modified by this independent evidence query.
+    pub async fn fill_identities(
+        &self,
+        ids: &[apexes_core::FillId],
+    ) -> Result<Vec<Option<crate::FillIdentity>>, OmsError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            fill: FillRow,
+            delivery_seq: i64,
+            intent_scope: Option<uuid::Uuid>,
+            intent_ordinal: Option<rust_decimal::Decimal>,
+            ems_parent_id: Option<uuid::Uuid>,
+            ems_dispatch_id: Option<uuid::Uuid>,
+            matching_order: bool,
+        }
+        let keys: Vec<_> = ids.iter().map(|id| id.0).collect();
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT f.*, o.intent_scope, o.intent_ordinal, o.ems_parent_id, o.ems_dispatch_id,
+             (f.symbol=o.symbol AND f.venue=o.venue AND f.side=o.side
+              AND f.quantity>0 AND f.quantity<=o.quantity AND f.price>0 AND f.fee>=0)
+             AS matching_order
+             FROM fills f JOIN orders o ON o.id=f.order_id WHERE f.id=ANY($1)",
+        )
+        .bind(&keys)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_id = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let intent_link = decode_intent_link(row.intent_scope, row.intent_ordinal)?;
+            let child_link = decode_child_link(row.ems_parent_id, row.ems_dispatch_id)?;
+            if !row.matching_order
+                || row.delivery_seq <= 0
+                || row.fill.exchange_trade_id.is_empty()
+                || (intent_link.is_some() && child_link.is_some())
+            {
+                return Err(OmsError::InvalidRow {
+                    reason: "conflicting durable fill attribution".into(),
+                });
+            }
+            let identity = crate::FillIdentity {
+                delivery_sequence: row.delivery_seq,
+                exchange_trade_id: row.fill.exchange_trade_id.clone(),
+                fill: Fill::try_from(row.fill)?,
+                intent_link,
+                child_link,
+            };
+            by_id.insert(identity.fill.id, identity);
+        }
+        Ok(ids.iter().map(|id| by_id.remove(id)).collect())
+    }
+
     /// Resolve a previously persisted run-scoped intent, including terminal
     /// orders. Absence is not authority to retry a previous submission.
     pub async fn client_order_for_intent(

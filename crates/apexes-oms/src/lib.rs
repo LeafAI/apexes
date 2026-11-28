@@ -30,9 +30,11 @@ pub use gateway::{
     SpotPreflight,
 };
 pub use kill_switch::{KillSwitch, SessionPhase};
-pub use manager::{CancelAllReport, OrderManager};
+pub use manager::{CancelAllReport, FillDeliveryProgress, OrderManager};
 pub use mock_gateway::MockExecutionGateway;
 pub use store::{OrderStore, SubmissionState};
 
 pub mod identity_evidence;
-pub use identity_evidence::{ChildLink, IdentityEvidence, IntentLink, RemoteIdentity};
+pub use identity_evidence::{
+    ChildLink, FillIdentity, IdentityEvidence, IntentLink, RemoteIdentity,
+};

@@ -958,3 +958,221 @@ impl Strategy for CountingStrategy {
         Vec::new()
     }
 }
+
+/// Exercise current-run direct and EMS callback attribution, and an older
+/// run's identical ordinal, through the real managed journal and live loop.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
+    let admin = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let schema = format!("live_fill_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let url = format!("{POSTGRES_URL}?options[search_path]={schema}");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let gateway = Arc::new(MockExecutionGateway::new());
+    let registry = registry_with(gateway.clone(), Arc::new(SteadyFeed));
+    let health = Arc::new(apexes_oms::KillSwitch::managed());
+    let mut store = OrderStore::new(&url).await.unwrap();
+    store
+        .bind_spot_inventory("managed-live-fill-test")
+        .await
+        .unwrap();
+    let mut manager = OrderManager::new(store, &registry)
+        .await
+        .unwrap()
+        .with_kill_switch(health.clone());
+    manager.spot_inventory_fills().await.unwrap();
+    health.begin_reconciliation();
+    health.startup_ready();
+    let old_scope = uuid::Uuid::new_v4();
+    let old_order = manager
+        .submit_correlated_order(
+            callback_probe_intent(false),
+            &HashMap::new(),
+            &HashMap::new(),
+            apexes_oms::IntentLink {
+                run_scope: old_scope,
+                intent_id: apexes_strategy::IntentId(1),
+            },
+        )
+        .await
+        .unwrap();
+    let old_exchange = manager
+        .open_orders()
+        .get(&old_order)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    let (updates, stream) = futures::channel::mpsc::unbounded();
+    publish_mock_fill(&gateway, &updates, old_order, old_exchange, "old-run");
+    let driver_pool = pool.clone();
+    let driver = tokio::spawn(async move {
+        let direct = wait_for_callback_order(&driver_pool, old_scope, false).await;
+        publish_mock_fill(&gateway, &updates, direct.0, direct.1, "current-direct");
+        let child = wait_for_callback_order(&driver_pool, old_scope, true).await;
+        publish_mock_fill(&gateway, &updates, child.0, child.1, "current-child");
+        (direct.0, child.0, child.2.unwrap())
+    });
+    let mut config = base_config();
+    config.ems_postgres_url = url.clone();
+    config.kill_switch = Some(health.clone());
+    let (stop, receiver) = oneshot::channel();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let report = tokio::time::timeout(
+        Duration::from_secs(12),
+        run_live_trading(
+            config,
+            &registry,
+            ManagedCallbackProbe {
+                stage: 0,
+                observed: observed.clone(),
+                stop: Some(stop),
+            },
+            manager,
+            stream,
+            receiver,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (direct, child, parent) = driver.await.unwrap();
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![
+            (old_order, None, None, None),
+            (direct, Some(apexes_strategy::IntentId(1)), None, None),
+            (
+                child,
+                Some(apexes_strategy::IntentId(2)),
+                Some(apexes_strategy::ParentOrderId(parent)),
+                Some(dec!(1))
+            ),
+        ]
+    );
+    assert_eq!(report.trades.len(), 3);
+    assert!(!health.is_engaged(), "{:?}", health.reason());
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+fn callback_probe_intent(algo: bool) -> OrderIntent {
+    OrderIntent {
+        symbol: "BTCUSDT".into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        side: Side::Buy,
+        order_type: OrderType::Market,
+        quantity: dec!(1),
+        price: None,
+        stop_price: None,
+        execution_algo: algo.then_some(apexes_strategy::ExecutionAlgoSpec::Pov {
+            participation_rate: dec!(1),
+        }),
+        routing: OrderRouting::Fixed,
+        leverage: None,
+        margin_mode: None,
+    }
+}
+
+async fn wait_for_callback_order(
+    pool: &sqlx::PgPool,
+    old_scope: uuid::Uuid,
+    child: bool,
+) -> (OrderId, Option<String>, Option<uuid::Uuid>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(uuid::Uuid, Option<String>, Option<uuid::Uuid>)> = sqlx::query_as(
+                "SELECT id,exchange_order_id,ems_parent_id FROM orders WHERE submission_state='Accepted'
+                 AND (($2 AND ems_parent_id IS NOT NULL) OR (NOT $2 AND intent_scope<>$1))",
+            )
+            .bind(old_scope)
+            .bind(child)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some((id, exchange_id, parent)) = row {
+                break (OrderId(id), exchange_id, parent);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap()
+}
+
+fn publish_mock_fill(
+    gateway: &MockExecutionGateway,
+    updates: &futures::channel::mpsc::UnboundedSender<ExchangeUpdate>,
+    order: OrderId,
+    exchange_id: Option<String>,
+    trade_id: &str,
+) {
+    gateway.set_fills_for_order(
+        order,
+        vec![ExchangeFill {
+            exchange_trade_id: trade_id.into(),
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: Utc::now(),
+        }],
+    );
+    gateway.set_exchange_state(order, OrderStatus::Filled);
+    updates
+        .unbounded_send(ExchangeUpdate {
+            client_order_id: order,
+            exchange_order_id: exchange_id,
+            status: OrderStatus::Filled,
+        })
+        .unwrap();
+}
+
+type CallbackObservation = (
+    OrderId,
+    Option<apexes_strategy::IntentId>,
+    Option<apexes_strategy::ParentOrderId>,
+    Option<rust_decimal::Decimal>,
+);
+
+struct ManagedCallbackProbe {
+    stage: u8,
+    observed: Arc<std::sync::Mutex<Vec<CallbackObservation>>>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl Strategy for ManagedCallbackProbe {
+    fn on_market_event(&mut self, event: &MarketEvent, _: &StrategyContext) -> Vec<OrderIntent> {
+        if matches!(event, MarketEvent::Trade(_)) && matches!(self.stage, 0 | 2) {
+            let algo = self.stage == 2;
+            self.stage += 1;
+            vec![callback_probe_intent(algo)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn on_fill(&mut self, outcome: &apexes_strategy::FillOutcome<'_>) {
+        let mut observed = self.observed.lock().unwrap();
+        observed.push((
+            outcome.fill.order_id,
+            outcome.intent_id,
+            outcome.parent_id,
+            outcome.parent_executed_quantity,
+        ));
+        if outcome.intent_id == Some(apexes_strategy::IntentId(1)) && self.stage == 1 {
+            self.stage = 2;
+        }
+        if observed.len() == 3
+            && let Some(stop) = self.stop.take()
+        {
+            let _ = stop.send(());
+        }
+    }
+}

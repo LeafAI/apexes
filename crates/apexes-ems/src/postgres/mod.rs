@@ -17,11 +17,14 @@
 //! `apexes_oms::OrderManager::new`'s open-order recovery pattern.
 
 mod dispatch_inspection;
+mod fill_attribution;
 mod order_manager_sink;
 mod schema;
 mod state;
 
+pub use crate::ems::{ChildAssociation, FillParentEvidence};
 pub use dispatch_inspection::{DispatchEvidence, inspect_pending_dispatch};
+pub use fill_attribution::inspect_fill_parent;
 pub use order_manager_sink::OrderManagerChildOrderSink;
 pub use schema::PARENT_ORDERS_TABLE_DDL;
 
@@ -818,6 +821,20 @@ impl Ems for PostgresEms {
             self.state.trip("EMS parent persistence failed");
         }
         result
+    }
+
+    async fn inspect_live_fill_parents(
+        &self,
+        ids: &[apexes_core::FillId],
+    ) -> Result<Vec<FillParentEvidence>, EmsError> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fill_attribution::inspect_fill_parents(&self.pool, ids),
+        )
+        .await
+        .map_err(|_| EmsError::QueryFailed {
+            reason: "live fill attribution snapshot timed out".into(),
+        })?
     }
 
     async fn parent_order_status(

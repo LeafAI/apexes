@@ -53,3 +53,8 @@ orders remain a separate execution-model issue (F03.02).
 The fixture is intentionally synthetic and assumes executable depth at the
 displayed bid/ask. It proves accounting and control flow only. Actual
 production data, fees and execution assumptions are evaluated in Phase 3.
+
+
+## Managed live lifecycle evidence (F04.04)
+
+See [managed live fill attribution and notification progress](2026-11-28-apexes-live-fill-attribution-design.md). The existing durable execution journal remains authoritative; inventory replay is not a receipt for strategy callback execution or an atomic strategy-state checkpoint.

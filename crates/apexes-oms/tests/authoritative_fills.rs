@@ -828,3 +828,117 @@ async fn failed_ledger_acknowledgement_blocks_replay_and_new_exposure() {
     drop(store);
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn durable_fill_identity_and_notification_progress_survive_only_as_evidence() {
+    use apexes_oms::IntentLink;
+    use apexes_strategy::IntentId;
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let link = IntentLink {
+        run_scope: Uuid::new_v4(),
+        intent_id: IntentId(u64::MAX),
+    };
+    let order_id = manager
+        .submit_correlated_order(intent(), &HashMap::new(), &HashMap::new(), link)
+        .await
+        .unwrap();
+    fixture
+        .gateway
+        .set_exchange_state(order_id, OrderStatus::Filled);
+    fixture
+        .gateway
+        .set_fills_for_order(order_id, vec![fill("1", dec!(3), 0)]);
+    manager.reconcile().await.unwrap();
+    let batch = manager.durable_fill_batch().await.unwrap();
+    assert_eq!(batch.len(), 1);
+    let fill_id = batch[0].id;
+    let evidence = manager.fill_identity(fill_id).await.unwrap().unwrap();
+    assert_eq!(evidence.fill.order_id, order_id);
+    assert_eq!(evidence.fill.id, fill_id);
+    assert_eq!(evidence.intent_link, Some(link));
+    assert_eq!(evidence.child_link, None);
+    assert_eq!(evidence.exchange_trade_id, "1");
+    assert!(
+        manager
+            .fill_identity(apexes_core::FillId(Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let high = evidence.delivery_sequence;
+    let baseline = manager.fill_delivery_progress().unwrap();
+    assert_eq!(
+        baseline.ledger_acknowledged_through,
+        baseline.recovered_through
+    );
+    assert!(high > baseline.recovered_through);
+    manager.acknowledge_fill_batch(&[fill_id], true).await;
+    let progress = manager.fill_delivery_progress().unwrap();
+    assert_eq!(progress.ledger_acknowledged_through, high);
+    assert_eq!(progress.notifications_returned_through, None);
+    manager.acknowledge_fill_notifications(&[fill_id], true);
+    let progress = manager.fill_delivery_progress().unwrap();
+    assert_eq!(progress.notifications_returned_through, Some(high));
+    assert!(!progress.ledger_failed && !progress.notification_failed);
+    assert!(manager.durable_fill_batch().await.unwrap().is_empty());
+    drop(manager);
+    let manager = fixture.manager().await;
+    let reopened = manager.fill_identity(fill_id).await.unwrap().unwrap();
+    assert_eq!(reopened.intent_link, Some(link));
+    assert_eq!(reopened.delivery_sequence, high);
+    // Recovery establishes a new inventory baseline, not proof that the
+    // previous process delivered callbacks or persisted strategy state.
+    let progress = manager.fill_delivery_progress().unwrap();
+    assert_eq!(progress.recovered_through, high);
+    assert_eq!(progress.notifications_returned_through, None);
+    assert!(!progress.ledger_failed && !progress.notification_failed);
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mismatched_notification_receipt_does_not_advance_and_latches_health() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    fixture
+        .gateway
+        .set_exchange_state(id, OrderStatus::PartiallyFilled);
+    let first = fill("1", dec!(1), 0);
+    fixture.gateway.set_fills_for_order(id, vec![first.clone()]);
+    manager.reconcile().await.unwrap();
+    let batch = manager.durable_fill_batch().await.unwrap();
+    manager.acknowledge_fill_batch(&[batch[0].id], true).await;
+    manager.acknowledge_fill_notifications(&[apexes_core::FillId(Uuid::new_v4())], true);
+    let progress = manager.fill_delivery_progress().unwrap();
+    assert!(progress.ledger_acknowledged_through > progress.recovered_through);
+    assert_eq!(progress.notifications_returned_through, None);
+    assert!(progress.notification_failed);
+    assert!(!progress.ledger_failed);
+    assert!(fixture.health.is_engaged());
+    // A strategy notification receipt failure must not strand later
+    // authoritative executions outside the ledger.
+    fixture
+        .gateway
+        .set_fills_for_order(id, vec![first, fill("2", dec!(1), 1)]);
+    manager.reconcile().await.unwrap();
+    let next = manager.durable_fill_batch().await.unwrap();
+    assert_eq!(next.len(), 1);
+    manager.acknowledge_fill_batch(&[next[0].id], true).await;
+    manager.acknowledge_fill_notifications(&[next[0].id], true);
+    let later = manager.fill_delivery_progress().unwrap();
+    assert!(later.ledger_acknowledged_through > progress.ledger_acknowledged_through);
+    assert_eq!(later.notifications_returned_through, None);
+    assert!(later.notification_failed && !later.ledger_failed);
+    assert!(matches!(
+        manager
+            .submit_order(intent(), &HashMap::new(), &HashMap::new())
+            .await,
+        Err(OmsError::TradingHalted { .. })
+    ));
+    drop(manager);
+    fixture.cleanup().await;
+}

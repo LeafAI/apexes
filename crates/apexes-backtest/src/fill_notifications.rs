@@ -2,7 +2,7 @@
 //! in settlement or exchange acknowledgement.
 use apexes_core::{Fill, FillId};
 use apexes_strategy::ParentOrderId;
-use apexes_strategy::{FillOutcome, FillSource, Strategy};
+use apexes_strategy::{FillOutcome, FillSource, IntentId, Strategy};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,14 @@ use std::collections::{HashMap, HashSet};
 pub(crate) struct FillNotifications {
     seen: HashSet<FillId>,
     parent_executed: HashMap<ParentOrderId, Option<Decimal>>,
+    live_progress_uncertain: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NotificationAttribution {
+    pub intent_id: Option<IntentId>,
+    pub parent_id: Option<ParentOrderId>,
+    pub parent_progress_valid: bool,
 }
 
 impl FillNotifications {
@@ -27,7 +35,7 @@ impl FillNotifications {
             .map(|(id, total)| {
                 (
                     id.0,
-                    if correlation.parent_progress_valid(*id) {
+                    if !self.live_progress_uncertain && correlation.parent_progress_valid(*id) {
                         *total
                     } else {
                         None
@@ -48,12 +56,51 @@ impl FillNotifications {
         source: FillSource,
         fills: &[Fill],
         correlation: &crate::lifecycle_correlation::LifecycleCorrelation,
-    ) {
+    ) -> bool {
+        self.deliver_with(strategy, at, source, fills, |fill| {
+            let parent_id = correlation.child_parent(fill.order_id);
+            NotificationAttribution {
+                intent_id: correlation.order(fill.order_id),
+                parent_id,
+                parent_progress_valid: parent_id
+                    .is_some_and(|id| correlation.parent_progress_valid(id)),
+            }
+        })
+    }
+
+    /// Managed live callbacks use positive persisted evidence only. Never
+    /// fall back to a possibly stale in-memory ordinal or child association.
+    pub(crate) fn deliver_persisted(
+        &mut self,
+        strategy: &mut impl Strategy,
+        at: DateTime<Utc>,
+        fills: &[Fill],
+        evidence: &crate::live_fill_attribution::LiveFillAttributions,
+    ) -> bool {
+        self.live_progress_uncertain |= !evidence.complete;
+        let valid = !self.live_progress_uncertain;
+        self.deliver_with(strategy, at, FillSource::Supplemental, fills, |fill| {
+            let mut attribution = evidence.links.get(&fill.id).copied().unwrap_or_default();
+            attribution.parent_progress_valid &= valid;
+            attribution
+        })
+    }
+
+    fn deliver_with(
+        &mut self,
+        strategy: &mut impl Strategy,
+        at: DateTime<Utc>,
+        source: FillSource,
+        fills: &[Fill],
+        mut attribute: impl FnMut(&Fill) -> NotificationAttribution,
+    ) -> bool {
+        let mut all_returned = true;
         for fill in fills {
             if self.seen.insert(fill.id) {
-                let parent_id = correlation.child_parent(fill.order_id);
-                let parent_executed_quantity = parent_id
-                    .filter(|id| correlation.parent_progress_valid(*id))
+                let link = attribute(fill);
+                let parent_executed_quantity = link
+                    .parent_id
+                    .filter(|_| link.parent_progress_valid)
                     .and_then(|id| {
                         let total = self
                             .parent_executed
@@ -65,16 +112,18 @@ impl FillNotifications {
                         *total
                     });
                 strategy.on_fill(&FillOutcome {
-                    parent_id,
+                    parent_id: link.parent_id,
                     parent_executed_quantity,
-                    intent_id: correlation.order(fill.order_id),
+                    intent_id: link.intent_id,
                     at,
                     source,
                     fill,
                 });
             } else {
                 tracing::warn!(fill_id=?fill.id, "duplicate fill notification suppressed");
+                all_returned = false;
             }
         }
+        all_returned
     }
 }

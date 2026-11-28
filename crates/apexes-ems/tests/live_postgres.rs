@@ -210,6 +210,50 @@ async fn managed_pov_parent_reserves_before_dispatch_and_recovers_budget() {
     let recorded:uuid::Uuid=sqlx::query_scalar("SELECT dispatch_id FROM parent_order_children WHERE parent_order_id=$1 AND child_order_id=$2").bind(id.0).bind(child.0).fetch_one(&pool).await.unwrap();
     assert_eq!(recorded, link.dispatch_id);
 
+    use apexes_ems::postgres::{ChildAssociation, FillParentEvidence, inspect_fill_parent};
+    gateway.set_exchange_state(child, apexes_core::OrderStatus::PartiallyFilled);
+    gateway.set_fills_for_order(
+        child,
+        vec![apexes_oms::ExchangeFill {
+            exchange_trade_id: "managed-child-execution".into(),
+            price: dec!(100),
+            quantity: dec!(0.5),
+            fee: dec!(0.001),
+            fee_currency: Some("BTC".into()),
+            filled_at: chrono::Utc::now(),
+        }],
+    );
+    let mut locked = manager.lock().await;
+    locked.reconcile().await.unwrap();
+    let fills = locked.durable_fill_batch().await.unwrap();
+    assert_eq!(fills.len(), 1);
+    let fill = fills[0].id;
+    let identity = locked.fill_identity(fill).await.unwrap().unwrap();
+    assert_eq!(identity.child_link, Some(link));
+    assert_eq!(identity.intent_link, None);
+    assert_eq!(identity.fill.order_id, child);
+    locked.acknowledge_fill_batch(&[fill], true).await;
+    locked.acknowledge_fill_notifications(&[fill], true);
+    drop(locked);
+    assert_eq!(
+        inspect_fill_parent(&pool, fill).await.unwrap(),
+        FillParentEvidence::Linked {
+            order_id: child,
+            link,
+            intent_link: Some(apexes_oms::IntentLink {
+                run_scope: scope,
+                intent_id: ordinal
+            }),
+            association: ChildAssociation::Recorded,
+        }
+    );
+    assert_eq!(
+        inspect_fill_parent(&pool, apexes_core::FillId(uuid::Uuid::new_v4()))
+            .await
+            .unwrap(),
+        FillParentEvidence::MissingFill
+    );
+
     manager.lock().await.cancel_order(child).await.unwrap();
     drop(ems);
     let ems = PostgresEms::new_with_kill_switch(
@@ -733,6 +777,47 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
             .await
             .unwrap();
     assert!(still_pending);
+    // Even when the scheduling receipt failed, a later exchange fill is
+    // attributable to the exact pending dispatch without repairing it.
+    use apexes_ems::postgres::{ChildAssociation, FillParentEvidence, inspect_fill_parent};
+    gateway.set_exchange_state(child, apexes_core::OrderStatus::PartiallyFilled);
+    gateway.set_fills_for_order(
+        child,
+        vec![apexes_oms::ExchangeFill {
+            exchange_trade_id: "interrupted-child-execution".into(),
+            price: dec!(100),
+            quantity: dec!(0.5),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: chrono::Utc::now(),
+        }],
+    );
+    let mut locked = manager.lock().await;
+    locked.reconcile().await.unwrap();
+    let stored = OrderStore::new(&fixture.url).await.unwrap();
+    let fills = stored.get_fills_for_order(child).await.unwrap();
+    assert_eq!(fills.len(), 1);
+    let fill = fills[0].id;
+    assert_eq!(
+        locked
+            .fill_identity(fill)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_link,
+        Some(link)
+    );
+    drop(locked);
+    drop(stored);
+    assert_eq!(
+        inspect_fill_parent(&pool, fill).await.unwrap(),
+        FillParentEvidence::Linked {
+            order_id: child,
+            link,
+            intent_link: None,
+            association: ChildAssociation::Pending,
+        }
+    );
     // Simulate contradictory ownership evidence in this isolated fixture.
     sqlx::query("UPDATE orders SET ems_parent_id=$2 WHERE id=$1")
         .bind(child.0)
@@ -743,6 +828,10 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     assert_eq!(
         inspect_pending_dispatch(&pool, id).await.unwrap(),
         DispatchEvidence::Conflict
+    );
+    assert_eq!(
+        inspect_fill_parent(&pool, fill).await.unwrap(),
+        FillParentEvidence::Conflict
     );
     sqlx::query("UPDATE orders SET ems_parent_id=$2 WHERE id=$1")
         .bind(child.0)
