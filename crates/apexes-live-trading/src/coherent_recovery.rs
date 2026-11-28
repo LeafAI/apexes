@@ -396,6 +396,63 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Independently verify gross realized P&L for an unambiguous
+    /// fee-free journal after the existing captured-ledger comparison.
+    /// No accounting state is applied and no execution authority is granted.
+    pub async fn inspect_captured_realized_pnl<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        retained: &crate::ClosingPositionEvidence,
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_captured_ledger_reconciliation(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            retained,
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        crate::recovery_ledger::compare_realized_pnl(ledger, instruments, &fills)?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(
