@@ -143,3 +143,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Opening causal valuation history preview](2026-11-28-apexes-opening-valuation-preview-design.md) compares actual cold-start valuation decisions with independently selected pre-start observations and the same retained runtime prefixes; this is an offline counterfactual, not strategy warm-up or recovery authority.
 
 [Isolated no-order scoped Drift warm-up](2026-11-28-apexes-isolated-no-order-warmup-design.md) qualifies exact checkpoint equality from independently selected opening records and a dedicated restricted-context callback, not runnable state or startup authorization.
+
+[Isolated built-in risk state restoration](2026-11-28-apexes-isolated-risk-restoration-design.md) reconstructs and reinspects private built-ins with exact alias topology after independent pristine configuration qualification; returns no runnable checker or startup authorization.

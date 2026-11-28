@@ -420,9 +420,11 @@ mod tests {
         let fresh = make(limits.clone(), true);
         let before = fresh.inspect_registered_state().unwrap();
         retained.qualify_offline_candidate(&before).unwrap();
+        retained.qualify_isolated_restoration(&before).unwrap();
         assert_eq!(before, fresh.inspect_registered_state().unwrap());
         assert_eq!(retained, active.inspect_registered_state().unwrap());
         assert!(retained.qualify_offline_candidate(&retained).is_err());
+        assert!(retained.qualify_isolated_restoration(&retained).is_err());
         assert!(
             retained
                 .qualify_offline_candidate(
@@ -442,9 +444,11 @@ mod tests {
         let mut legacy = retained.clone();
         legacy.aliases = None;
         assert!(legacy.qualify_offline_candidate(&before).is_err());
+        assert!(legacy.qualify_isolated_restoration(&before).is_err());
         let mut unsupported = retained;
         unsupported.pre_trade[0] = crate::RegisteredRiskState::Unsupported;
         assert!(unsupported.qualify_offline_candidate(&before).is_err());
+        assert!(unsupported.qualify_isolated_restoration(&before).is_err());
     }
 
     #[test]

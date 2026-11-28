@@ -336,6 +336,28 @@ impl CapturedObservations {
         Ok(())
     }
 
+    /// Reconstruct isolated built-in risk state after exact candidate
+    /// qualification; all reconstructed instances are discarded.
+    /// Margin tiers are configuration evidence, not applied ledger state.
+    pub fn qualify_isolated_risk_restoration(
+        &self,
+        scope: &[(Venue, String)],
+        registered: Option<&apexes_risk::RegisteredRiskSnapshot>,
+        market: Option<&apexes_risk::MarketConditionSnapshot>,
+        margin_tiers: Option<&[(String, apexes_strategy::MarginTierTable)]>,
+    ) -> Result<(), ObservationError> {
+        self.qualify_offline_risk_candidate(scope, registered, market, margin_tiers)?;
+        if let (Some(a), Some(b)) = (&self.registered_risk, registered) {
+            a.qualify_isolated_restoration(b)
+                .map_err(|_| ObservationError::Mismatch)?;
+        }
+        if let (Some(a), Some(b)) = (&self.market_monitor, market) {
+            a.qualify_isolated_restoration(b)
+                .map_err(|_| ObservationError::Mismatch)?;
+        }
+        Ok(())
+    }
+
     /// Canonical bounded inspection bytes, including unsupported coverage.
     pub fn encode_durable(&self) -> Result<Vec<u8>, ObservationError> {
         self.validate()?;

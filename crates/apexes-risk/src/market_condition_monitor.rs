@@ -52,6 +52,40 @@ pub struct MarketConditionMonitor {
 }
 
 impl MarketConditionMonitor {
+    pub(crate) fn reconstruct_offline(
+        snapshot: &crate::MarketConditionSnapshot,
+    ) -> Result<Self, crate::RiskStateError> {
+        use crate::RiskStateError as E;
+        snapshot.validate()?;
+        let mut monitor = Self::new(snapshot.config.clone());
+        for symbol in &snapshot.symbols {
+            monitor.volatility.insert(
+                symbol.symbol.clone(),
+                symbol
+                    .volatility
+                    .clone()
+                    .restore(snapshot.config.volatility_window)
+                    .map_err(|_| E::Invalid)?,
+            );
+            monitor
+                .last_price
+                .insert(symbol.symbol.clone(), symbol.last_price);
+            if let Some(fraction) = symbol.reduce_fraction {
+                monitor
+                    .reduce_fractions
+                    .insert(symbol.symbol.clone(), fraction);
+            }
+        }
+        monitor.equity_volatility = snapshot
+            .equity_volatility
+            .clone()
+            .map(|state| state.restore(snapshot.config.volatility_window))
+            .transpose()
+            .map_err(|_| E::Invalid)?;
+        monitor.account_wide_reduce_fraction = snapshot.account_wide_reduce_fraction;
+        Ok(monitor)
+    }
+
     pub fn new(config: MarketConditionConfig) -> Self {
         let equity_volatility = config
             .account_equity_volatility_threshold
@@ -247,7 +281,7 @@ impl MarketConditionMonitor {
     }
 }
 
-pub struct MarketConditionPreTradeAdapter(Arc<Mutex<MarketConditionMonitor>>);
+pub struct MarketConditionPreTradeAdapter(pub(crate) Arc<Mutex<MarketConditionMonitor>>);
 
 impl PreTradeCheck for MarketConditionPreTradeAdapter {
     fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
@@ -279,7 +313,7 @@ impl PreTradeCheck for MarketConditionPreTradeAdapter {
     }
 }
 
-pub struct MarketConditionEventAdapter(Arc<Mutex<MarketConditionMonitor>>);
+pub struct MarketConditionEventAdapter(pub(crate) Arc<Mutex<MarketConditionMonitor>>);
 
 impl MarketConditionEventMonitor for MarketConditionEventAdapter {
     fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {

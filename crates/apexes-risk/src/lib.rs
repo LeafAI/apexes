@@ -49,3 +49,5 @@ mod shared_inspection;
 pub use shared_inspection::SharedMonitorRef;
 
 mod offline_qualification;
+
+mod offline_restore;
