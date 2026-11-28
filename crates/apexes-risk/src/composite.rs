@@ -75,6 +75,41 @@ impl CompositeRiskChecker {
         self
     }
 
+    /// Inspect actual registered slots at the caller's quiescent
+    /// boundary. No risk decision, counter reset or trip clearing.
+    /// The locks do not prove atomicity with externally shared handles.
+    pub fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskSnapshot, crate::RiskStateError> {
+        use crate::RiskStateError as E;
+        let pre = self.pre_trade_checks.lock().map_err(|_| E::Poisoned)?;
+        let in_trade = self.in_trade_monitors.lock().map_err(|_| E::Poisoned)?;
+        let position = self.position_monitors.lock().map_err(|_| E::Poisoned)?;
+        let market = self
+            .market_condition_monitors
+            .lock()
+            .map_err(|_| E::Poisoned)?;
+        if [pre.len(), in_trade.len(), position.len(), market.len()]
+            .into_iter()
+            .any(|n| n > 128)
+        {
+            return Err(E::Invalid);
+        }
+        Ok(crate::RegisteredRiskSnapshot {
+            version: 1,
+            pre_trade: pre
+                .iter()
+                .map(|c| c.inspect_registered_state())
+                .collect::<Result<_, _>>()?,
+            in_trade: in_trade
+                .iter()
+                .map(|m| m.inspect_registered_state())
+                .collect::<Result<_, _>>()?,
+            position_monitor_count: position.len(),
+            market_condition_monitor_count: market.len(),
+        })
+    }
+
     /// Runs every registered `PreTradeCheck`, collecting every
     /// violation from every checker (not stopping at the first
     /// checker that fails) into one combined `Vec`.
@@ -326,6 +361,56 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn registered_capture_preserves_slots_budgets_and_shared_circuit_state() {
+        use crate::{CircuitBreaker, LimitChecker, RegisteredRiskState, RiskLimits};
+        let limits = RiskLimits {
+            max_daily_trade_count: Some(2),
+            min_account_equity: Some(dec!(100)),
+            ..Default::default()
+        };
+        let (pre, monitor) = CircuitBreaker::new(limits.clone()).split();
+        let composite = CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(LimitChecker::new(limits.clone())))
+            .with_pre_trade_check(Box::new(AlwaysPassPreTrade))
+            .with_pre_trade_check(Box::new(pre))
+            .with_in_trade_monitor(Box::new(monitor));
+        composite.on_order_accepted(&sample_intent(), now());
+        composite
+            .on_fill(&sample_fill(), &HashMap::new(), &HashMap::new())
+            .unwrap_err();
+        let captured = composite.inspect_registered_state().unwrap();
+        assert!(captured.has_unsupported_slots());
+        assert_eq!(captured.pre_trade.len(), 3);
+        assert_eq!(captured.in_trade.len(), 1);
+        assert!(
+            matches!(&captured.pre_trade[0],RegisteredRiskState::Limits(s) if s.trade_count==1 && s.traded_volume==dec!(1) && s.limits==limits)
+        );
+        assert_eq!(captured.pre_trade[1], RegisteredRiskState::Unsupported);
+        assert!(
+            matches!(&captured.pre_trade[2],RegisteredRiskState::Circuit(s) if s.account_tripped)
+        );
+        assert_eq!(captured.pre_trade[2], captured.in_trade[0]);
+        assert_eq!(captured, composite.inspect_registered_state().unwrap());
+    }
+
+    #[test]
+    fn registered_capture_distinguishes_empty_and_unsupported_position_slots() {
+        let empty = CompositeRiskChecker::new()
+            .inspect_registered_state()
+            .unwrap();
+        assert!(!empty.has_unsupported_slots());
+        let c = CompositeRiskChecker::new().with_position_monitor(Box::new(
+            AlwaysRejectPositionMonitor(RiskViolation::EquityFloorBreached {
+                actual: dec!(0),
+                floor: dec!(1),
+            }),
+        ));
+        let snapshot = c.inspect_registered_state().unwrap();
+        assert_eq!(snapshot.position_monitor_count, 1);
+        assert!(snapshot.has_unsupported_slots());
     }
 
     #[test]

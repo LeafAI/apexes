@@ -93,3 +93,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Offline observation receipt inspection](2026-11-28-apexes-observation-continuity-design.md) compares independently supplied ordered completed market records against retained cursor/scope/clock-bound digests and the exact selected checkpoint journal; actual runtime capture and gap-free source provenance remain unqualified.
 
 [Actual completed observation capture](2026-11-28-apexes-observation-capture-design.md) retains bounded loop-local observation records and returns a validated receipt only after the existing coherent stop publication acknowledges success. Atomic durable observation/risk persistence and actual risk-monitor capture remain open.
+
+[Actual registered risk-monitor inspection](2026-11-28-apexes-registered-risk-capture-design.md) captures supported registered slots with explicit unsupported coverage before coherent checkpoint publication. The acknowledged in-memory result is not an atomic durable or complete risk witness.

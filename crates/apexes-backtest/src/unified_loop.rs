@@ -1361,12 +1361,23 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 .map_err(|error| ApexesError::InvalidBacktestConfig {
                     reason: format!("completed strategy checkpoint capture refused: {error}"),
                 })?;
-        let captured = observation_capture
+        let mut captured = observation_capture
             .map(|capture| capture.finish(cursor))
             .transpose()
             .map_err(|error| ApexesError::InvalidBacktestConfig {
                 reason: format!("completed observation receipt refused: {error}"),
             })?;
+        if let Some(capture) = &mut captured {
+            capture.registered_risk = risk_checker
+                .as_ref()
+                .map(|checker| checker.inspect_registered_state())
+                .transpose()
+                .map_err(|error| ApexesError::InvalidBacktestConfig {
+                    reason: format!("registered risk capture refused: {error}"),
+                })?;
+            capture.market_monitor_unqualified = market_condition_monitor.is_some();
+            capture.margin_monitor_unqualified = !config.margin_tiers.is_empty();
+        }
         executor
             .publish_completed_checkpoint(&previous, cursor, correlation.last_intent(), &envelope)
             .await?;

@@ -130,6 +130,18 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             keep_open: true,
         }),
     );
+    let risk_limits = apexes_risk::RiskLimits {
+        max_daily_trade_count: Some(2),
+        ..Default::default()
+    };
+    let checker = Arc::new(
+        apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+            apexes_risk::LimitChecker::new(risk_limits.clone()),
+        )),
+    );
+    registry
+        .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
+        .unwrap();
     let (manager, config, health) = fixture.manager(&registry).await;
     let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     let driver_pool = pool.clone();
@@ -278,6 +290,15 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     // Actual completed iteration capture, compared to independent
     // mock-source fixtures. The first depth event was filtered.
     use apexes_backtest::observation_receipt::{CompletedObservation, ObservationClock};
+    let registered = captured.registered_risk.as_ref().unwrap();
+    assert!(!registered.has_unsupported_slots());
+    assert!(!captured.market_monitor_unqualified);
+    assert!(!captured.margin_monitor_unqualified);
+    assert_eq!(registered, &checker.inspect_registered_state().unwrap());
+    assert!(
+        matches!(&registered.pre_trade[..], [apexes_risk::RegisteredRiskState::Limits(s)]
+        if s.trade_count==1 && s.traded_volume==dec!(1) && s.limits==risk_limits)
+    );
     assert_eq!(captured.receipt.clock, ObservationClock::SourceAvailability);
     assert_eq!(captured.receipt.predecessor, selection.receipt().cursor);
     assert_eq!(captured.receipt.through, receipt.checkpoint.cursor);

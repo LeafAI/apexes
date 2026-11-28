@@ -14,6 +14,14 @@ use std::collections::HashMap;
 use crate::error::RiskViolation;
 
 pub trait InTradeMonitor: Send {
+    /// Read-only inspection; custom implementations default to explicit
+    /// unsupported coverage rather than an inferred empty state.
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        Ok(crate::RegisteredRiskState::Unsupported)
+    }
+
     /// Returns `Ok(())` if the post-fill state passes this monitor, or
     /// `Err(violations)` describing what was breached. Implementations
     /// that carry mutable state (e.g. `CircuitBreaker`) update that
