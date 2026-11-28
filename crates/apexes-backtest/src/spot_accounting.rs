@@ -64,6 +64,8 @@ struct SymbolAccount {
 pub struct SpotAccounting {
     accounts: HashMap<String, SymbolAccount>,
     prices: HashMap<(Venue, String, String), BTreeMap<DateTime<Utc>, Decimal>>,
+    decisions: Vec<crate::fee_evidence::FeeDecisionEvidence>,
+    decisions_incomplete: bool,
 }
 
 impl SpotAccounting {
@@ -81,7 +83,8 @@ impl SpotAccounting {
             MAX_PRICE_ROWS, pair_key,
         };
         use crate::observation_receipt::ObservationError as E;
-        if self.accounts.len() > 128
+        if self.decisions_incomplete
+            || self.accounts.len() > 128
             || self.prices.len() > 128
             || self
                 .prices
@@ -138,6 +141,7 @@ impl SpotAccounting {
             version: 1,
             accounts,
             prices,
+            decisions: Some(self.decisions.clone()),
         };
         evidence.validate(scope)?;
         Ok(evidence)
@@ -170,13 +174,10 @@ impl SpotAccounting {
         asset: &str,
         quote: &str,
         at: DateTime<Utc>,
-    ) -> Option<Decimal> {
-        if asset == quote {
-            return Some(Decimal::ONE);
-        }
+    ) -> Option<(DateTime<Utc>, Decimal)> {
         let history = self.prices.get(&(venue, asset.into(), quote.into()))?;
         let (time, price) = history.range(..=at).next_back()?;
-        (at.signed_duration_since(*time) <= MAX_CONVERSION_AGE).then_some(*price)
+        (at.signed_duration_since(*time) <= MAX_CONVERSION_AGE).then_some((*time, *price))
     }
 
     fn mark(&self, venue: Venue, asset: &str, quote: &str) -> Option<Decimal> {
@@ -191,15 +192,24 @@ impl SpotAccounting {
 
     pub(crate) fn record(&mut self, fill: &Fill, base: &str, quote: &str, external_fee: bool) {
         let asset = fill.fee_currency.as_deref().unwrap_or(quote);
-        let fee_value = if fill.fee.is_zero() {
-            Some(Decimal::ZERO)
+        use crate::fee_evidence::FeeDecisionSource as Source;
+        let (fee_value, source) = if fill.fee.is_zero() {
+            (Some(Decimal::ZERO), Source::Zero)
         } else if asset == base {
-            Some(fill.fee * fill.price)
-        } else {
+            (Some(fill.fee * fill.price), Source::Base)
+        } else if asset == quote {
+            (Some(fill.fee * Decimal::ONE), Source::Quote)
+        } else if let Some((observed_at, rate)) =
             self.historical_rate(fill.venue, asset, quote, fill.filled_at)
-                .map(|rate| rate * fill.fee)
+        {
+            (
+                Some(rate * fill.fee),
+                Source::Observed { observed_at, rate },
+            )
+        } else {
+            (None, Source::Missing)
         };
-        self.record_valued(fill, base, quote, external_fee, fee_value);
+        self.record_with_source(fill, base, quote, external_fee, fee_value, source);
     }
 
     /// Replay a fill using previously validated durable conversion evidence.
@@ -212,7 +222,51 @@ impl SpotAccounting {
         external_fee: bool,
         fee_value: Option<Decimal>,
     ) {
+        self.record_with_source(
+            fill,
+            base,
+            quote,
+            external_fee,
+            fee_value,
+            crate::fee_evidence::FeeDecisionSource::Provided,
+        );
+    }
+
+    fn record_with_source(
+        &mut self,
+        fill: &Fill,
+        base: &str,
+        quote: &str,
+        external_fee: bool,
+        fee_value: Option<Decimal>,
+        source: crate::fee_evidence::FeeDecisionSource,
+    ) {
         let asset = fill.fee_currency.as_deref().unwrap_or(quote);
+        // Capture is bounded; overflow marks evidence unavailable, not a
+        // change to normal attribution behavior or execution policy.
+        if !self.decisions_incomplete {
+            if self.decisions.len() >= crate::fee_evidence::MAX_DECISIONS
+                || [fill.symbol.as_str(), asset]
+                    .iter()
+                    .any(|s| s.is_empty() || s.len() > 128 || s.chars().any(char::is_control))
+            {
+                self.decisions_incomplete = true;
+            } else {
+                self.decisions
+                    .push(crate::fee_evidence::FeeDecisionEvidence {
+                        fill_id: fill.id,
+                        venue: fill.venue,
+                        symbol: fill.symbol.clone(),
+                        asset: asset.to_string(),
+                        filled_at: fill.filled_at,
+                        price: fill.price,
+                        fee: fill.fee,
+                        external_fee,
+                        value: fee_value,
+                        source,
+                    });
+            }
+        }
         let account = self.accounts.entry(fill.symbol.clone()).or_default();
         account.base = base.into();
         account.quote = quote.into();
@@ -338,6 +392,119 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn retains_original_per_fill_decisions_after_price_replacement() {
+        use crate::fee_evidence::FeeDecisionSource as Source;
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut accounting = SpotAccounting::default();
+        let scope = vec![(Venue::Binance, "BTCUSDT".into())];
+        let f = fill(Side::Buy, dec!(1), dec!(100), dec!(0.01), "BNB", at);
+        accounting.observe(Venue::Binance, "BNB", "USDT", at, dec!(300));
+        accounting.record(&f, "BTC", "USDT", true);
+        accounting.observe(Venue::Binance, "BNB", "USDT", at, dec!(400));
+        accounting.record(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0.01), "OTHER", at),
+            "BTC",
+            "USDT",
+            true,
+        );
+        accounting.record(
+            &fill(Side::Sell, dec!(1), dec!(110), dec!(1), "USDT", at),
+            "BTC",
+            "USDT",
+            false,
+        );
+        accounting.record(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0.01), "BTC", at),
+            "BTC",
+            "USDT",
+            false,
+        );
+        accounting.record(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0), "USDT", at),
+            "BTC",
+            "USDT",
+            false,
+        );
+        accounting.record_valued(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0.01), "BNB", at),
+            "BTC",
+            "USDT",
+            true,
+            Some(dec!(3.5)),
+        );
+        let state = accounting.inspect_evidence(&scope).unwrap();
+        let decisions = state.decisions.as_ref().unwrap();
+        assert_eq!(decisions.len(), 6);
+        assert_eq!(decisions[0].fill_id, f.id);
+        assert_eq!(
+            decisions[0].source,
+            Source::Observed {
+                observed_at: at,
+                rate: dec!(300)
+            }
+        );
+        assert_eq!(decisions[0].value, Some(dec!(3)));
+        assert_eq!(state.prices[0].observations[0].1, dec!(400));
+        assert_eq!(decisions[1].source, Source::Missing);
+        assert_eq!(decisions[1].value, None);
+        assert_eq!(decisions[2].source, Source::Quote);
+        assert_eq!(decisions[3].source, Source::Base);
+        assert_eq!(decisions[4].source, Source::Zero);
+        assert_eq!(decisions[5].source, Source::Provided);
+        assert_eq!(state.accounts[0].historical_fee, dec!(8.5));
+        assert_eq!(state.accounts[0].missing_execution_valuations, 1);
+        let mut invalid = state.clone();
+        invalid.decisions.as_mut().unwrap()[0].value = Some(dec!(4));
+        assert!(invalid.validate(&scope).is_err());
+        let mut invalid = state.clone();
+        invalid.decisions.as_mut().unwrap().remove(1);
+        assert!(invalid.validate(&scope).is_err());
+        let mut invalid = state.clone();
+        let rows = invalid.decisions.as_mut().unwrap();
+        rows[1].fill_id = rows[0].fill_id;
+        assert!(invalid.validate(&scope).is_err());
+        let mut legacy = state.clone();
+        legacy.decisions = None;
+        legacy.validate(&scope).unwrap();
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("\"decisions\"")
+        );
+        assert_eq!(
+            state,
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn decision_capacity_refuses_evidence_without_changing_attribution() {
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut accounting = SpotAccounting::default();
+        for _ in 0..=crate::fee_evidence::MAX_DECISIONS {
+            accounting.record(
+                &fill(Side::Buy, dec!(1), dec!(100), dec!(1), "USDT", at),
+                "BTC",
+                "USDT",
+                false,
+            );
+        }
+        assert_eq!(
+            accounting.decisions.len(),
+            crate::fee_evidence::MAX_DECISIONS
+        );
+        assert_eq!(
+            accounting.summaries()["BTCUSDT"].fee_at_execution,
+            Some(Decimal::from(crate::fee_evidence::MAX_DECISIONS + 1))
+        );
+        assert!(
+            accounting
+                .inspect_evidence(&[(Venue::Binance, "BTCUSDT".into())])
+                .is_err()
+        );
     }
 
     #[test]

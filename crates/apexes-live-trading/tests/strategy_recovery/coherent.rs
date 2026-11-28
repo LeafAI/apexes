@@ -352,6 +352,17 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert_eq!(account.missing_execution_valuations, 0);
     assert!(account.fees.is_empty());
     assert!(account.external_fees.is_empty());
+    let decisions = attribution.decisions.as_ref().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].symbol, "BTCUSDT");
+    assert_eq!(decisions[0].price, dec!(100));
+    assert_eq!(decisions[0].fee, dec!(0));
+    assert_eq!(decisions[0].value, Some(dec!(0)));
+    assert_eq!(
+        decisions[0].source,
+        apexes_backtest::fee_evidence::FeeDecisionSource::Zero
+    );
+
     assert_eq!(attribution.prices.len(), 1);
     assert_eq!(attribution.prices[0].observations.len(), 1);
     assert_eq!(attribution.prices[0].observations[0].1, dec!(100));

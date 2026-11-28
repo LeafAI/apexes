@@ -594,6 +594,7 @@ mod tests {
                     missing_execution_valuations: 0,
                 }],
                 prices: vec![],
+                decisions: None,
             }),
         };
         let evidence = ThirdAssetFeeEvidence {
@@ -679,6 +680,7 @@ mod tests {
                     missing_execution_valuations: 0,
                 }],
                 prices: vec![],
+                decisions: None,
             }),
         };
         compare_direct_fees(&captured, &instruments, &fills[..2]).unwrap();
