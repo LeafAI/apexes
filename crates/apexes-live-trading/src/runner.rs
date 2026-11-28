@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 use crate::order_executor_adapter::{
     LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
 };
+use crate::strategy_recovery::{StrategyStartup, event_after_checkpoint};
 
 pub struct LiveTradingConfig {
     pub instruments: Vec<Instrument>,
@@ -110,6 +111,34 @@ pub struct LiveTradingConfig {
     pub position_source: Option<Arc<dyn crate::flatten::PositionSource>>,
 }
 
+// JoinHandle's Drop detaches the task. A detached cancellation task
+// would retain the manager/lease after runner shutdown indefinitely.
+#[derive(Default)]
+struct HaltTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl HaltTasks {
+    fn push(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.0.push(task);
+    }
+
+    async fn shutdown(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for HaltTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 pub struct LiveTradingReport {
     pub overall: PerformanceSummary,
     pub trades: Vec<Fill>,
@@ -162,6 +191,31 @@ pub async fn run_live_trading(
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
     stop_signal: oneshot::Receiver<()>,
 ) -> Result<LiveTradingReport, ApexesError> {
+    run_live_trading_with_startup(
+        config,
+        registry,
+        StrategyStartup::Legacy(strategy),
+        order_manager,
+        exchange_updates,
+        stop_signal,
+    )
+    .await
+}
+
+/// Explicit recovery startup drives the same live runner. Validate and
+/// claim the selected checkpoint before constructing EMS, subscribing to
+/// market data, starting halt tasks, or invoking a strategy callback.
+/// As with the legacy live runner, the caller owns exchange reconciliation
+/// and must supply the recovered wallet/positions. The engine does so with
+/// recover_live_state and spot_inventory_fills before reaching this entry.
+pub async fn run_live_trading_with_startup<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    mut order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+) -> Result<LiveTradingReport, ApexesError> {
     if config.reconcile_interval.is_zero() {
         return Err(ApexesError::InvalidBacktestConfig {
             reason: "reconcile_interval must be non-zero".to_string(),
@@ -184,6 +238,14 @@ pub async fn run_live_trading(
         .map_err(|error| ApexesError::InvalidBacktestConfig {
             reason: format!("registry lookup for VolumeCurveProvider failed: {error}"),
         })?;
+
+    let (strategy, restored_through) =
+        startup
+            .prepare(&mut order_manager, &config)
+            .await
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("strategy checkpoint startup: {error}"),
+            })?;
 
     // `tokio::sync::Mutex` (matching `OrderManagerChildOrderSink`'s
     // expected type): every critical section the executor/sink runs
@@ -227,7 +289,7 @@ pub async fn run_live_trading(
     let activity_clock = Arc::new(crate::halt::ActivityClock::for_instruments(
         &config.instruments,
     ));
-    let mut halt_tasks = Vec::new();
+    let mut halt_tasks = HaltTasks::default();
     if let Some(kill_switch) = &config.kill_switch {
         let flatten = config
             .position_source
@@ -264,6 +326,22 @@ pub async fn run_live_trading(
     let market_events =
         subscribe_all_venues(registry, &config.instruments, config.kill_switch.clone())
             .await?
+            .filter({
+                let kill_switch = config.kill_switch.clone();
+                move |event| {
+                    let after = restored_through
+                        .is_none_or(|through| event_after_checkpoint(event, through));
+                    // Even a pre-boundary depth invalidation is a safety
+                    // signal; never hide it from the managed health gate.
+                    if !after
+                        && matches!(event, MarketEvent::Depth(depth) if depth.is_invalidation())
+                        && let Some(gate) = &kill_switch
+                    {
+                        gate.engage("market data order book invalidated");
+                    }
+                    futures::future::ready(after)
+                }
+            })
             .inspect({
                 let activity_clock = Arc::clone(&activity_clock);
                 let kill_switch = config.kill_switch.clone();
@@ -363,7 +441,9 @@ pub async fn run_live_trading(
         None,
         None,
     )
-    .await?;
+    .await;
+    halt_tasks.shutdown().await;
+    let report = report?;
 
     // `UnifiedLoopReport` (a `BacktestReport` alias) carries
     // `overall: SerializablePerformanceSummary` (a serde-derived

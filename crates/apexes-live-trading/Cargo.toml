@@ -23,6 +23,9 @@ thiserror = { workspace = true }
 
 uuid = { workspace = true, features = ["v4"] }
 
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [dev-dependencies]
 rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

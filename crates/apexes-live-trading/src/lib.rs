@@ -19,13 +19,17 @@ pub mod order_executor_adapter;
 pub mod runner;
 pub mod spot_recovery;
 pub mod startup_recovery;
+pub mod strategy_recovery;
 
 pub use flatten::{FlattenConfig, FlattenReport, FlattenSetup, PositionSource, flatten_positions};
 pub use order_executor_adapter::{
     LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
 };
-pub use runner::{LiveTradingConfig, LiveTradingReport, run_live_trading};
+pub use runner::{
+    LiveTradingConfig, LiveTradingReport, run_live_trading, run_live_trading_with_startup,
+};
 pub use spot_recovery::{SpotRecoveryError, SpotWalletBalance, recover_spot_positions};
 pub use startup_recovery::{
     ExchangeSnapshot, RecoveredState, RecoveryError, RecoveryOrders, recover_live_state,
 };
+pub use strategy_recovery::{RecoverySelection, StrategyRecoveryError, StrategyStartup};

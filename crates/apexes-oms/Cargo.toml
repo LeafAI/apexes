@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
+sha2 = { workspace = true }
+
 [dev-dependencies]
 rust_decimal_macros = "1.40"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
