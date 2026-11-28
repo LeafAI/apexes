@@ -17,7 +17,11 @@ pub mod coherent_recovery;
 pub mod flatten;
 pub mod halt;
 pub mod order_executor_adapter;
+mod recovery_conversion_scope;
 pub mod recovery_evidence_window;
+pub use recovery_conversion_scope::{
+    ConversionScopeEvidence, EvidenceInstrumentRole, EvidenceInstrumentScope,
+};
 mod recovery_fee;
 mod recovery_fee_mark;
 pub use recovery_fee_mark::{ClosingFeeMarkEvidence, ClosingFeeMarkRate, ClosingFeeRevaluation};

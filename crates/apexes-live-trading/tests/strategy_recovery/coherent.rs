@@ -909,6 +909,22 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    let scope = apexes_live_trading::ConversionScopeEvidence {
+        version: 1,
+        boundary: receipt.clone(),
+        owner_fingerprint: exact_opening.wallet.owner_fingerprint.clone(),
+        instruments: vec![apexes_live_trading::EvidenceInstrumentScope {
+            venue: Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            role: apexes_live_trading::EvidenceInstrumentRole::StrategyInventory,
+        }],
+    };
+    coherent
+        .inspect_conversion_scope_evidence(&mut store, &fixture.url, &instruments, &scope)
+        .await
+        .unwrap();
     let mut changed = retained.clone();
     changed.positions[0].average_entry_price = dec!(101);
     assert!(matches!(
