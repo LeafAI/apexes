@@ -22,6 +22,10 @@ pub enum SuccessorContinuityError {
     Inventory,
     #[error("execution identities overlap between runs")]
     ExecutionOverlap,
+    #[error(
+        "successor opening risk state is missing, differs from independent evidence or prior closing state"
+    )]
+    RiskState,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +214,25 @@ pub async fn inspect_receipt_bound_successor<S: Strategy, T: Strategy>(
     prior: ReceiptBoundSuccessorRun<'_, S>,
     next: ReceiptBoundSuccessorRun<'_, T>,
 ) -> Result<(), SuccessorInspectionError> {
+    inspect_receipt_bound_successor_inner(prior, next, None).await
+}
+
+/// additionally require the independently retained actual opening risk
+/// snapshot, not just an equivalent pristine configuration. Legacy
+/// captures without an opening snapshot cannot qualify.
+pub async fn inspect_receipt_bound_risk_successor<S: Strategy, T: Strategy>(
+    prior: ReceiptBoundSuccessorRun<'_, S>,
+    next: ReceiptBoundSuccessorRun<'_, T>,
+    independently_selected_opening: &apexes_backtest::observation_receipt::OpeningRiskSnapshot,
+) -> Result<(), SuccessorInspectionError> {
+    inspect_receipt_bound_successor_inner(prior, next, Some(independently_selected_opening)).await
+}
+
+async fn inspect_receipt_bound_successor_inner<S: Strategy, T: Strategy>(
+    prior: ReceiptBoundSuccessorRun<'_, S>,
+    next: ReceiptBoundSuccessorRun<'_, T>,
+    independent_risk: Option<&apexes_backtest::observation_receipt::OpeningRiskSnapshot>,
+) -> Result<(), SuccessorInspectionError> {
     use SuccessorContinuityError as E;
     compare_selection(prior.selection, next.selection)?;
     if prior.witness.sha256() != prior.witness_sha256
@@ -266,6 +289,40 @@ pub async fn inspect_receipt_bound_successor<S: Strategy, T: Strategy>(
         .is_none_or(|record| record.cursor.observed_at <= next_opening.inspected_at)
     {
         return Err(E::Interval.into());
+    }
+    if let Some(independent) = independent_risk {
+        compare_opening_risk(
+            &capture,
+            &next_capture,
+            independent,
+            next_opening.inspected_at,
+            next_closing.window.terminal_window.started_at,
+        )?;
+    }
+    Ok(())
+}
+
+// Both captures have already undergone complete independent isolated
+// risk qualification. The actual pre-event state must equal the prior
+// closing state, not merely its configuration; no reset is assumed.
+fn compare_opening_risk(
+    prior: &apexes_backtest::observation_receipt::CapturedObservations,
+    next: &apexes_backtest::observation_receipt::CapturedObservations,
+    independent: &apexes_backtest::observation_receipt::OpeningRiskSnapshot,
+    opening_finished: chrono::DateTime<chrono::Utc>,
+    closing_started: chrono::DateTime<chrono::Utc>,
+) -> Result<(), SuccessorContinuityError> {
+    use SuccessorContinuityError as E;
+    let actual = next.opening_risk.as_ref().ok_or(E::RiskState)?;
+    if actual != independent
+        || actual.registered_risk != prior.registered_risk
+        || actual.market_monitor != prior.market_monitor
+        || next.margin_tiers != prior.margin_tiers
+    {
+        return Err(E::RiskState);
+    }
+    if actual.captured_at < opening_finished || actual.captured_at > closing_started {
+        return Err(E::Interval);
     }
     Ok(())
 }
@@ -493,6 +550,76 @@ mod tests {
         assert_eq!(
             compare_inventory(&ledger, &positions, &allocation),
             Err(SuccessorContinuityError::Inventory)
+        );
+    }
+    #[test]
+    fn risk_boundary_refuses_missing_snapshot_reset_and_clock_regression() {
+        use apexes_backtest::observation_receipt::{
+            CapturedObservations, ObservationClock, ObservationReceipt, OpeningRiskSnapshot,
+        };
+        use apexes_risk::{CompositeRiskChecker, LimitChecker, RegisteredRiskState, RiskLimits};
+        let checker = CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+            LimitChecker::new(RiskLimits {
+                max_daily_trade_count: Some(2),
+                ..Default::default()
+            }),
+        ));
+        let pristine = checker.inspect_registered_state().unwrap();
+        let mut retained = pristine.clone();
+        let RegisteredRiskState::Limits(limits) = &mut retained.pre_trade[0] else {
+            panic!("limit slot")
+        };
+        limits.day = Some(at(1).date_naive());
+        limits.trade_count = 1;
+        limits.traded_volume = dec!(1);
+        retained.validate().unwrap();
+        let snapshot = OpeningRiskSnapshot {
+            captured_at: at(4),
+            registered_risk: Some(retained.clone()),
+            market_monitor: None,
+        };
+        let prior = CapturedObservations {
+            receipt: ObservationReceipt {
+                version: 1,
+                predecessor: checkpoint(1).cursor,
+                through: checkpoint(2).cursor,
+                clock: ObservationClock::SourceAvailability,
+                count: 1,
+                sha256: "a".repeat(64),
+            },
+            scope: vec![],
+            records: vec![],
+            registered_risk: Some(retained),
+            market_monitor_unqualified: false,
+            margin_monitor_unqualified: false,
+            market_monitor: None,
+            margin_tiers: None,
+            ledger: None,
+            fill_observation_prefixes: None,
+            opening_risk: None,
+        };
+        // Unit-only DTOs: complete receipt/journal qualification is exercised
+        // separately by the two-store PostgreSQL fixture.
+        let mut next = prior.clone();
+        next.opening_risk = Some(snapshot.clone());
+        compare_opening_risk(&prior, &next, &snapshot, at(3), at(5)).unwrap();
+        assert_eq!(
+            compare_opening_risk(&prior, &next, &snapshot, at(5), at(6)),
+            Err(SuccessorContinuityError::Interval)
+        );
+        next.opening_risk = None;
+        assert_eq!(
+            compare_opening_risk(&prior, &next, &snapshot, at(3), at(5)),
+            Err(SuccessorContinuityError::RiskState)
+        );
+        let reset = OpeningRiskSnapshot {
+            registered_risk: Some(pristine),
+            ..snapshot.clone()
+        };
+        next.opening_risk = Some(reset.clone());
+        assert_eq!(
+            compare_opening_risk(&prior, &next, &reset, at(3), at(5)),
+            Err(SuccessorContinuityError::RiskState)
         );
     }
 }

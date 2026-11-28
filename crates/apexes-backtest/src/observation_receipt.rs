@@ -190,6 +190,28 @@ pub struct FillObservationPrefix {
     pub observations: usize,
 }
 
+/// Actual pre-event risk state, including explicit absence of configured
+/// checkers. Timestamp is consumer UTC, not the market source clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpeningRiskSnapshot {
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    pub registered_risk: Option<apexes_risk::RegisteredRiskSnapshot>,
+    pub market_monitor: Option<apexes_risk::MarketConditionSnapshot>,
+}
+
+impl OpeningRiskSnapshot {
+    fn validate(&self) -> Result<(), ObservationError> {
+        if let Some(risk) = &self.registered_risk {
+            risk.validate().map_err(|_| ObservationError::Encoding)?;
+        }
+        if let Some(market) = &self.market_monitor {
+            market.validate().map_err(|_| ObservationError::Encoding)?;
+        }
+        Ok(())
+    }
+}
+
 /// Actual loop-local observations returned only after the existing
 /// checkpoint publication has acknowledged success. Coverage remains
 /// partial; this cannot prove upstream completeness or risk restoration.
@@ -217,6 +239,9 @@ pub struct CapturedObservations {
     /// Actual applied-fill order and observation prefix, absent on legacy captures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_observation_prefixes: Option<Vec<FillObservationPrefix>>,
+    /// None on legacy captures; Some records actual pre-event inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_risk: Option<OpeningRiskSnapshot>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
@@ -231,6 +256,9 @@ struct CaptureEnvelope {
 impl CapturedObservations {
     fn validate(&self) -> Result<(), ObservationError> {
         self.receipt.verify(&self.scope, &self.records)?;
+        if let Some(opening) = &self.opening_risk {
+            opening.validate()?;
+        }
         if let Some(ledger) = &self.ledger {
             ledger.validate(&self.scope)?;
             if let Some(fees) = &ledger.fee_valuation {
@@ -492,6 +520,7 @@ impl ObservationCapture {
             margin_tiers: None,
             ledger: None,
             fill_observation_prefixes: self.fill_observation_prefixes,
+            opening_risk: None,
         })
     }
 }

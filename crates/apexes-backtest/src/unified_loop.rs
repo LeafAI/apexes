@@ -372,6 +372,33 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         None
     };
 
+    // Inspect the actual configured risk state before any market or
+    // supplemental event is consumed. Do not infer opening state from
+    // the closing snapshot or from a pristine configuration.
+    let opening_risk = if observation_capture.is_some() {
+        let registered_risk = risk_checker
+            .as_ref()
+            .map(|checker| checker.inspect_registered_state())
+            .transpose()
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("opening registered risk capture refused: {error}"),
+            })?;
+        let market_monitor = market_condition_monitor
+            .as_ref()
+            .map(|(_, _, monitor)| monitor.inspect_checkpoint())
+            .transpose()
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("opening market monitor capture refused: {error}"),
+            })?;
+        Some(crate::observation_receipt::OpeningRiskSnapshot {
+            captured_at: chrono::Utc::now(),
+            registered_risk,
+            market_monitor,
+        })
+    } else {
+        None
+    };
+
     loop {
         // Polled at the top of each iteration -- NOT as a
         // `tokio::select!` arm. Both `run_paper_trading` and
@@ -1382,6 +1409,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 reason: format!("completed observation receipt refused: {error}"),
             })?;
         if let Some(capture) = &mut captured {
+            capture.opening_risk = opening_risk;
             capture.ledger = Some(ledger.inspect_evidence().map_err(|error| {
                 ApexesError::InvalidBacktestConfig {
                     reason: format!("ledger evidence capture refused: {error}"),

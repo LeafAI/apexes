@@ -625,6 +625,7 @@ mod tests {
             margin_tiers: None,
             ledger: Some(ledger.inspect_evidence().unwrap()),
             fill_observation_prefixes: Some(prefixes),
+            opening_risk: None,
         };
         let compare = |capture: &apexes_backtest::observation_receipt::CapturedObservations| {
             crate::recovery_ledger_application::compare_applied_ledger(
