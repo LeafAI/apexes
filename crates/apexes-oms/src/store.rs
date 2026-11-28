@@ -88,6 +88,11 @@ impl OrderStore {
             .execute(&pool).await?;
         sqlx::query("UPDATE orders SET submission_state = CASE WHEN exchange_order_id IS NOT NULL THEN 'Accepted' ELSE 'Rejected' END WHERE submission_state = 'Uncertain' AND (exchange_order_id IS NOT NULL OR status = 'Rejected')")
             .execute(&pool).await?;
+        // Existing rows intentionally remain unlinked; no inferred identity.
+        sqlx::query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS intent_scope UUID, ADD COLUMN IF NOT EXISTS intent_ordinal NUMERIC(20,0)")
+            .execute(&pool).await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_scoped_intent ON orders(intent_scope, intent_ordinal) WHERE intent_scope IS NOT NULL AND intent_ordinal IS NOT NULL")
+            .execute(&pool).await?;
         sqlx::query(ORDERS_EXCHANGE_ID_INDEX_DDL)
             .execute(&pool)
             .await?;
@@ -284,7 +289,7 @@ impl OrderStore {
     /// lifecycle: once at creation, again after gateway submission
     /// updates `exchange_order_id`, again on every status change.
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
-        self.write_order(order, SubmissionState::from_order(order), None, None)
+        self.write_order(order, SubmissionState::from_order(order), None, None, None)
             .await
     }
 
@@ -294,14 +299,22 @@ impl OrderStore {
         order: &Order,
         reservation: Option<&SpotReservation>,
         parent: Option<uuid::Uuid>,
+        link: Option<crate::IntentLink>,
     ) -> Result<(), OmsError> {
         if self.inventory_bound() && reservation.is_none_or(|r| r.commission.is_none()) {
             return Err(OmsError::InvalidRow {
                 reason: "managed submission requires durable reservation".into(),
             });
         }
-        self.write_order(order, SubmissionState::Submitting, reservation, parent)
-            .await
+        let link = link.map(crate::IntentLink::validate).transpose()?;
+        self.write_order(
+            order,
+            SubmissionState::Submitting,
+            reservation,
+            parent,
+            link,
+        )
+        .await
     }
 
     pub(crate) async fn has_reservation_breach(&self) -> Result<bool, OmsError> {
@@ -431,6 +444,7 @@ impl OrderStore {
         state: SubmissionState,
         reservation: Option<&SpotReservation>,
         parent: Option<uuid::Uuid>,
+        link: Option<crate::IntentLink>,
     ) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
         let mut tx = self.pool.begin().await?;
@@ -442,8 +456,8 @@ impl OrderStore {
         }
         let result = sqlx::query(
             "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state,
-                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset, parent_allocation_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset, parent_allocation_id, intent_scope, intent_ordinal)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 leverage = EXCLUDED.leverage,
@@ -481,6 +495,8 @@ impl OrderStore {
         .bind(reservation.and_then(|r| r.commission.as_ref().map(|c| c.observed_at)))
         .bind(reservation.and_then(|r| r.commission.as_ref().and_then(|c| c.discount_asset.as_deref())))
         .bind(parent)
+        .bind(link.map(|l|l.run_scope))
+        .bind(link.map(|l|rust_decimal::Decimal::from(l.intent_id.0)))
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
@@ -496,12 +512,14 @@ impl OrderStore {
     pub(crate) async fn identity_snapshot(
         &self,
         id: OrderId,
-    ) -> Result<Option<(Order, SubmissionState)>, OmsError> {
+    ) -> Result<Option<(Order, SubmissionState, Option<crate::IntentLink>)>, OmsError> {
         #[derive(sqlx::FromRow)]
         struct IdentityRow {
             #[sqlx(flatten)]
             order: OrderRow,
             submission_state: String,
+            intent_scope: Option<uuid::Uuid>,
+            intent_ordinal: Option<rust_decimal::Decimal>,
         }
         let row: Option<IdentityRow> = sqlx::query_as("SELECT * FROM orders WHERE id = $1")
             .bind(id.0)
@@ -511,9 +529,27 @@ impl OrderStore {
             Ok((
                 Order::try_from(row.order)?,
                 SubmissionState::parse(&row.submission_state)?,
+                decode_intent_link(row.intent_scope, row.intent_ordinal)?,
             ))
         })
         .transpose()
+    }
+
+    /// Resolve a previously persisted run-scoped intent, including terminal
+    /// orders. Absence is not authority to retry a previous submission.
+    pub async fn client_order_for_intent(
+        &self,
+        link: crate::IntentLink,
+    ) -> Result<Option<OrderId>, OmsError> {
+        let link = link.validate()?;
+        let id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM orders WHERE intent_scope = $1 AND intent_ordinal = $2",
+        )
+        .bind(link.run_scope)
+        .bind(rust_decimal::Decimal::from(link.intent_id.0))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(OrderId))
     }
 
     pub async fn get_order(&self, id: OrderId) -> Result<Option<Order>, OmsError> {
@@ -561,5 +597,59 @@ impl OrderStore {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(Fill::try_from).collect()
+    }
+}
+
+fn decode_intent_link(
+    scope: Option<uuid::Uuid>,
+    ordinal: Option<rust_decimal::Decimal>,
+) -> Result<Option<crate::IntentLink>, OmsError> {
+    use rust_decimal::prelude::ToPrimitive;
+    match (scope, ordinal) {
+        (None, None) => Ok(None),
+        (Some(run_scope), Some(ordinal)) if ordinal.fract().is_zero() => {
+            let id = ordinal.to_u64().ok_or_else(|| OmsError::InvalidRow {
+                reason: "invalid intent ordinal".into(),
+            })?;
+            crate::IntentLink {
+                run_scope,
+                intent_id: apexes_strategy::IntentId(id),
+            }
+            .validate()
+            .map(Some)
+        }
+        _ => Err(OmsError::InvalidRow {
+            reason: "incomplete or invalid intent linkage".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod intent_link_tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
+    #[test]
+    fn decode_scoped_identity_without_rounding_or_partial_links() {
+        let scope = Uuid::new_v4();
+        assert_eq!(decode_intent_link(None, None).unwrap(), None);
+        assert_eq!(
+            decode_intent_link(Some(scope), Some(Decimal::from(u64::MAX))).unwrap(),
+            Some(crate::IntentLink {
+                run_scope: scope,
+                intent_id: apexes_strategy::IntentId(u64::MAX)
+            })
+        );
+        for (scope, ordinal) in [
+            (Some(scope), None),
+            (None, Some(Decimal::ONE)),
+            (Some(Uuid::nil()), Some(Decimal::ONE)),
+            (Some(scope), Some(Decimal::ZERO)),
+            (Some(scope), Some(Decimal::NEGATIVE_ONE)),
+            (Some(scope), Some(Decimal::new(15, 1))),
+            (Some(scope), Some(Decimal::from(u64::MAX) + Decimal::ONE)),
+        ] {
+            assert!(decode_intent_link(scope, ordinal).is_err());
+        }
     }
 }

@@ -35,6 +35,7 @@ use rust_decimal::Decimal;
 pub struct OrderManagerExecutor {
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
     submission_gate: Option<Arc<apexes_oms::KillSwitch>>,
+    intent_scope: uuid::Uuid,
     /// The open orders as of the last time the manager's lock was obtained.
     /// Served when the lock is busy, so the trading loop never stalls behind a
     /// slow exchange query (see [`OrderManagerExecutor::open_orders`]).
@@ -55,8 +56,14 @@ impl OrderManagerExecutor {
         Self {
             order_manager,
             submission_gate,
+            intent_scope: uuid::Uuid::new_v4(),
             last_open_orders: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Scope of the live executor's session-local strategy intent ordinals.
+    pub fn intent_scope(&self) -> uuid::Uuid {
+        self.intent_scope
     }
 
     /// Construct before the manager is shared with async exchange tasks,
@@ -68,6 +75,7 @@ impl OrderManagerExecutor {
         Self {
             order_manager,
             submission_gate,
+            intent_scope: uuid::Uuid::new_v4(),
             last_open_orders: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -118,19 +126,48 @@ impl OrderExecutor for OrderManagerExecutor {
         intent: &OrderIntent,
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
+        now: DateTime<Utc>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit_correlated(intent, positions, balances, now, None)
+            .await
+    }
+
+    async fn submit_correlated(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
         _now: DateTime<Utc>,
+        intent_id: Option<apexes_strategy::IntentId>,
     ) -> Result<(Order, Vec<Fill>), ApexesError> {
         // `now` is unused: `OrderManager::submit_order` stamps its own
         // `Order::created_at`/`updated_at` via `Utc::now()` internally
         // -- unlike `MatchingEngine`, which needs a caller-supplied
         // simulation clock, live trading always means "right now".
         let mut manager = self.order_manager.lock().await;
-        let order_id = manager
-            .submit_order(intent.clone(), positions, balances)
-            .await
-            .map_err(|error| ApexesError::OrderRejected {
-                reason: error.to_string(),
-            })?;
+        let order_id = match intent_id {
+            Some(intent_id) => {
+                manager
+                    .submit_correlated_order(
+                        intent.clone(),
+                        positions,
+                        balances,
+                        apexes_oms::IntentLink {
+                            run_scope: self.intent_scope,
+                            intent_id,
+                        },
+                    )
+                    .await
+            }
+            None => {
+                manager
+                    .submit_order(intent.clone(), positions, balances)
+                    .await
+            }
+        }
+        .map_err(|error| ApexesError::OrderRejected {
+            reason: error.to_string(),
+        })?;
 
         // `OrderManager::submit_order` returns only `OrderId`, but the
         // trait needs the full `Order` -- look up the just-inserted
@@ -445,6 +482,73 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL"]
+    async fn strategy_submission_adapter_persists_run_scoped_identity() {
+        let url =
+            std::env::var("APEXES_INTENT_TEST_PG_URL").unwrap_or_else(|_| POSTGRES_URL.into());
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let registry = registry_with_gateway(gateway.clone());
+        let manager = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
+            .await
+            .unwrap();
+        let shared = Arc::new(tokio::sync::Mutex::new(manager));
+        let executor = OrderManagerExecutor::new(shared.clone());
+        let scope = executor.intent_scope();
+        let second = OrderManagerExecutor::new(shared.clone());
+        assert_ne!(scope, second.intent_scope());
+        let ordinal = apexes_strategy::IntentId(5);
+        let positions = HashMap::new();
+        let balances = HashMap::new();
+        let (order, fills) = executor
+            .submit_correlated(
+                &sample_intent(),
+                &positions,
+                &balances,
+                Utc::now(),
+                Some(ordinal),
+            )
+            .await
+            .unwrap();
+        assert!(fills.is_empty());
+        let link = apexes_oms::IntentLink {
+            run_scope: scope,
+            intent_id: ordinal,
+        };
+        let evidence = shared
+            .lock()
+            .await
+            .inspect_client_identity(order.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.intent_link, Some(link));
+        assert_eq!(
+            shared
+                .lock()
+                .await
+                .client_order_for_intent(link)
+                .await
+                .unwrap(),
+            Some(order.id)
+        );
+        let (legacy, _) = executor
+            .submit(&sample_intent(), &positions, &balances, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            shared
+                .lock()
+                .await
+                .inspect_client_identity(legacy.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent_link,
+            None
+        );
     }
 
     #[tokio::test]

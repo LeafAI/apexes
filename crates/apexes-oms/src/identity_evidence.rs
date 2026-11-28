@@ -3,6 +3,25 @@
 use crate::{ExecutionGateway, SubmissionState};
 use apexes_core::{Order, OrderStatus};
 
+/// A strategy intent ordinal scoped to one live executor run, not a
+/// globally reusable strategy ID or exchange idempotency key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentLink {
+    pub run_scope: uuid::Uuid,
+    pub intent_id: apexes_strategy::IntentId,
+}
+
+impl IntentLink {
+    pub(crate) fn validate(self) -> Result<Self, crate::OmsError> {
+        if self.run_scope.is_nil() || self.intent_id.0 == 0 {
+            return Err(crate::OmsError::InvalidRow {
+                reason: "invalid scoped intent identity".into(),
+            });
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteIdentity {
     /// Actual client-ID lookup response, consistent with the stored exchange ID.
@@ -23,6 +42,7 @@ pub struct IdentityEvidence {
     /// One database-row snapshot, not an assertion of current exchange status.
     pub local: Order,
     pub submission_state: SubmissionState,
+    pub intent_link: Option<IntentLink>,
     pub remote: RemoteIdentity,
 }
 
@@ -30,6 +50,7 @@ pub(crate) async fn observe(
     gateway: &dyn ExecutionGateway,
     local: Order,
     submission_state: SubmissionState,
+    intent_link: Option<IntentLink>,
 ) -> IdentityEvidence {
     let remote = match gateway.query_order_by_client_id(&local).await {
         Ok(Some((exchange_order_id, status))) => {
@@ -54,6 +75,7 @@ pub(crate) async fn observe(
     IdentityEvidence {
         local,
         submission_state,
+        intent_link,
         remote,
     }
 }
@@ -92,7 +114,7 @@ mod tests {
     async fn client_lookup_preserves_local_snapshot_and_distinguishes_conflict() {
         let gateway = MockExecutionGateway::new();
         let mut local = order();
-        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting).await;
+        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting, None).await;
         assert_eq!(evidence.remote, RemoteIdentity::NotFound);
         assert_eq!(evidence.local.exchange_order_id, None);
         gateway.force_register_exchange_order(
@@ -101,7 +123,7 @@ mod tests {
             OrderStatus::Filled,
             local.asset_class,
         );
-        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting).await;
+        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting, None).await;
         assert_eq!(
             evidence.remote,
             RemoteIdentity::Found {
@@ -113,28 +135,28 @@ mod tests {
         assert_eq!(evidence.local.filled_quantity, Decimal::ZERO);
         assert_eq!(evidence.submission_state, SubmissionState::Submitting);
         assert_eq!(
-            observe(&gateway, local.clone(), SubmissionState::Rejected)
+            observe(&gateway, local.clone(), SubmissionState::Rejected, None)
                 .await
                 .remote,
             RemoteIdentity::Conflict
         );
         local.exchange_order_id = Some("456".into());
         assert_eq!(
-            observe(&gateway, local.clone(), SubmissionState::Accepted)
+            observe(&gateway, local.clone(), SubmissionState::Accepted, None)
                 .await
                 .remote,
             RemoteIdentity::Conflict
         );
         local.exchange_order_id = Some("123".into());
         assert!(matches!(
-            observe(&gateway, local.clone(), SubmissionState::Accepted)
+            observe(&gateway, local.clone(), SubmissionState::Accepted, None)
                 .await
                 .remote,
             RemoteIdentity::Found { .. }
         ));
         gateway.force_register_exchange_order(local.id, "", OrderStatus::New, local.asset_class);
         assert_eq!(
-            observe(&gateway, local, SubmissionState::Uncertain)
+            observe(&gateway, local, SubmissionState::Uncertain, None)
                 .await
                 .remote,
             RemoteIdentity::Conflict
@@ -170,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_lookup_is_unavailable_not_negative() {
         assert_eq!(
-            observe(&Unsupported, order(), SubmissionState::Uncertain)
+            observe(&Unsupported, order(), SubmissionState::Uncertain, None)
                 .await
                 .remote,
             RemoteIdentity::Unavailable

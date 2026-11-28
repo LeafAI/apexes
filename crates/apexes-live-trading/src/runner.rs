@@ -304,10 +304,10 @@ pub async fn run_live_trading(
     // costs nothing in the common case.
     let exchange_updates = exchange_updates.chain(futures::stream::pending());
 
-    let executor: Arc<dyn OrderExecutor> = Arc::new(OrderManagerExecutor::with_submission_gate(
-        Arc::clone(&order_manager),
-        submission_gate,
-    ));
+    let live_executor =
+        OrderManagerExecutor::with_submission_gate(Arc::clone(&order_manager), submission_gate);
+    tracing::info!(intent_scope = %live_executor.intent_scope(), "live strategy intent correlation scope");
+    let executor: Arc<dyn OrderExecutor> = Arc::new(live_executor);
     let liquidation_policy = Arc::new(LiveLiquidationPolicy::new(config.auto_derisk_live));
     let mut supplemental_fills = LiveSupplementalFillSource::new(
         Arc::clone(&order_manager),

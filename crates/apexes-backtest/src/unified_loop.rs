@@ -1008,7 +1008,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         };
                         executor.submit_simulated_checked(&intent, ledger.positions(), ledger.balances(), timestamp, &mut check).await
                     } else {
-                        executor.submit(&intent, ledger.positions(), ledger.balances(), timestamp).await
+                        executor.submit_correlated(&intent, ledger.positions(), ledger.balances(), timestamp, intent_id).await
                     };
                     match submission {
                         Ok((order, fills)) => {

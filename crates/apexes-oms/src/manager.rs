@@ -278,14 +278,34 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, positions, balances, false, None)
+        self.submit_order_inner(intent, positions, balances, false, None, None)
             .await
+    }
+
+    /// Persist the scoped strategy identity in the same transaction as
+    /// the client order and any reservations before gateway submission.
+    pub async fn submit_correlated_order(
+        &mut self,
+        intent: OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        link: crate::IntentLink,
+    ) -> Result<OrderId, OmsError> {
+        self.submit_order_inner(
+            intent,
+            positions,
+            balances,
+            false,
+            None,
+            Some(link.validate()?),
+        )
+        .await
     }
 
     /// EMS already persisted its dispatch quantity. Refuse rather than
     /// silently changing the quantity recorded by the parent scheduler.
     pub async fn submit_child_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, None)
+        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, None, None)
             .await
     }
 
@@ -398,7 +418,7 @@ impl OrderManager {
         intent: OrderIntent,
     ) -> Result<OrderId, OmsError> {
         let parent = self.store.inventory_bound().then_some(parent);
-        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, parent)
+        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, parent, None)
             .await
     }
 
@@ -409,6 +429,7 @@ impl OrderManager {
         balances: &HashMap<String, Decimal>,
         exact_quantity: bool,
         parent: Option<Uuid>,
+        link: Option<crate::IntentLink>,
     ) -> Result<OrderId, OmsError> {
         if let Some(kill_switch) = &self.kill_switch
             && kill_switch.blocks_submissions()
@@ -498,7 +519,9 @@ impl OrderManager {
             return Err(OmsError::RiskCheckFailed { violations });
         }
 
-        let result = self.place_order(intent, false, reservation, parent).await;
+        let result = self
+            .place_order(intent, false, reservation, parent, link)
+            .await;
         if matches!(
             &result,
             Err(OmsError::QueryFailed { .. } | OmsError::SubmissionUnresolved { .. })
@@ -521,7 +544,7 @@ impl OrderManager {
     /// limit). Callers must only pass orders that reduce exposure.
     pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
-        self.place_order(intent, true, None, None).await
+        self.place_order(intent, true, None, None, None).await
     }
 
     /// Validate fresh rule/availability evidence and reserve the spend
@@ -738,6 +761,7 @@ impl OrderManager {
         flatten: bool,
         reservation: Option<SpotReservation>,
         parent: Option<Uuid>,
+        link: Option<crate::IntentLink>,
     ) -> Result<OrderId, OmsError> {
         // Do not rely on strategies checking has_open_order: the OMS is
         // the final guard, including when a caller attempts a flatten.
@@ -780,7 +804,7 @@ impl OrderManager {
             updated_at: now,
         };
         self.store
-            .begin_submission(&order, reservation.as_ref(), parent)
+            .begin_submission(&order, reservation.as_ref(), parent, link)
             .await?;
         let order_id = order.id;
         // Retain the guard before awaiting network I/O. Cancellation or a
@@ -1299,12 +1323,21 @@ impl OrderManager {
         &self,
         id: OrderId,
     ) -> Result<Option<crate::IdentityEvidence>, OmsError> {
-        let Some((order, state)) = self.store.identity_snapshot(id).await? else {
+        let Some((order, state, link)) = self.store.identity_snapshot(id).await? else {
             return Ok(None);
         };
         Ok(Some(
-            crate::identity_evidence::observe(self.gateway.as_ref(), order, state).await,
+            crate::identity_evidence::observe(self.gateway.as_ref(), order, state, link).await,
         ))
+    }
+
+    /// Find a persisted client ID by its scoped intent identity.
+    /// This does not query the exchange or grant permission to retry.
+    pub async fn client_order_for_intent(
+        &self,
+        link: crate::IntentLink,
+    ) -> Result<Option<OrderId>, OmsError> {
+        self.store.client_order_for_intent(link).await
     }
 
     /// Durable lookup for background EMS reconciliation, including terminal children.
@@ -1888,11 +1921,25 @@ mod tests {
             exchange: MockExecutionGateway::new(),
             dispatched: tokio::sync::Notify::new(),
         });
-        let mut manager = fresh_manager(gateway.clone()).await;
+        let url = std::env::var("APEXES_INTENT_TEST_PG_URL").ok();
+        let mut manager = if let Some(url) = &url {
+            let registry = registry_with_gateway(gateway.clone());
+            OrderManager::new(OrderStore::new(url).await.unwrap(), &registry)
+                .await
+                .unwrap()
+        } else {
+            fresh_manager(gateway.clone()).await
+        };
+        let url = url.as_deref().unwrap_or(POSTGRES_URL);
         let positions = HashMap::new();
         let balances = HashMap::new();
+        let link = crate::IntentLink {
+            run_scope: Uuid::new_v4(),
+            intent_id: apexes_strategy::IntentId(1),
+        };
         {
-            let submit = manager.submit_order(sample_intent(), &positions, &balances);
+            let submit =
+                manager.submit_correlated_order(sample_intent(), &positions, &balances, link);
             tokio::pin!(submit);
             tokio::select! {
                 _ = gateway.dispatched.notified() => {}
@@ -1900,7 +1947,11 @@ mod tests {
             }
         }
         let order_id = *manager.open_orders().keys().next().unwrap();
-        let store = OrderStore::new(POSTGRES_URL).await.unwrap();
+        let store = OrderStore::new(url).await.unwrap();
+        assert_eq!(
+            store.client_order_for_intent(link).await.unwrap(),
+            Some(order_id)
+        );
         assert_eq!(
             store.get_submission_state(order_id).await.unwrap(),
             Some(SubmissionState::Submitting)
@@ -1911,16 +1962,20 @@ mod tests {
         ));
         drop(manager);
         let registry = registry_with_gateway(gateway);
-        let mut recovered =
-            OrderManager::new(OrderStore::new(POSTGRES_URL).await.unwrap(), &registry)
-                .await
-                .unwrap();
+        let mut recovered = OrderManager::new(OrderStore::new(url).await.unwrap(), &registry)
+            .await
+            .unwrap();
         let evidence = recovered
             .inspect_client_identity(order_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(evidence.local.id, order_id);
+        assert_eq!(evidence.intent_link, Some(link));
+        assert_eq!(
+            recovered.client_order_for_intent(link).await.unwrap(),
+            Some(order_id)
+        );
         assert_eq!(evidence.submission_state, SubmissionState::Submitting);
         assert_eq!(evidence.local.exchange_order_id, None);
         assert_eq!(
@@ -1953,6 +2008,98 @@ mod tests {
             Some("EX-INTERRUPTED")
         );
     }
+    #[tokio::test]
+    #[ignore]
+    async fn correlated_submission_preserves_link_and_rejects_duplicate_across_restart() {
+        let url =
+            std::env::var("APEXES_INTENT_TEST_PG_URL").unwrap_or_else(|_| POSTGRES_URL.into());
+        // No truncation: the locally qualified run uses a dedicated disposable database.
+        let gateway = Arc::new(MockExecutionGateway::new());
+        let registry = registry_with_gateway(gateway.clone());
+        let mut manager = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
+            .await
+            .unwrap();
+        let link = crate::IntentLink {
+            run_scope: Uuid::new_v4(),
+            intent_id: apexes_strategy::IntentId(u64::MAX),
+        };
+        let positions = HashMap::new();
+        let balances = HashMap::new();
+        let id = manager
+            .submit_correlated_order(sample_intent(), &positions, &balances, link)
+            .await
+            .unwrap();
+        let evidence = manager.inspect_client_identity(id).await.unwrap().unwrap();
+        assert_eq!(evidence.intent_link, Some(link));
+        assert_eq!(evidence.submission_state, crate::SubmissionState::Accepted);
+        assert_eq!(
+            manager.client_order_for_intent(link).await.unwrap(),
+            Some(id)
+        );
+        let other = crate::IntentLink {
+            run_scope: Uuid::new_v4(),
+            ..link
+        };
+        let other_id = manager
+            .submit_correlated_order(sample_intent(), &positions, &balances, other)
+            .await
+            .unwrap();
+        assert_ne!(id, other_id);
+        let legacy = manager
+            .submit_order(sample_intent(), &positions, &balances)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .inspect_client_identity(legacy)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent_link,
+            None
+        );
+        let count = gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap()
+            .len();
+        drop(manager);
+        let mut recovered = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.client_order_for_intent(link).await.unwrap(),
+            Some(id)
+        );
+        assert!(
+            recovered
+                .submit_correlated_order(sample_intent(), &positions, &balances, link)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            gateway
+                .query_all_open_orders(AssetClass::Spot)
+                .await
+                .unwrap()
+                .len(),
+            count
+        );
+        assert_eq!(
+            recovered.client_order_for_intent(link).await.unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            recovered
+                .inspect_client_identity(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent_link,
+            Some(link)
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn managed_oms_blocks_startup_and_latches_uncertain_submission() {
