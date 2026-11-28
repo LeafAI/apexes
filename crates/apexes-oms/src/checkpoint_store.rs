@@ -344,6 +344,34 @@ impl OrderStore {
         finish(tx, result).await
     }
 
+    /// Read-only qualification of the exact unclaimed, execution-free
+    /// opening boundary. Never reserve or advance a startup claim.
+    pub async fn inspect_opening_checkpoint(
+        &mut self,
+        expected: &CheckpointReceipt,
+        owner_sha256: &str,
+        ems_postgres_url: &str,
+    ) -> Result<()> {
+        let url_hash: [u8; 32] = Sha256::digest(ems_postgres_url.as_bytes()).into();
+        if self.checkpoint_database_sha256 != url_hash {
+            return Err(CheckpointStoreError::DatabaseScope);
+        }
+        let (owner, connection) = self.checkpoint_connection()?;
+        if format!("{:x}", Sha256::digest(owner.as_bytes())) != owner_sha256 {
+            return Err(CheckpointStoreError::Owner);
+        }
+        let mut tx = connection.begin().await?;
+        let result = async {
+            select_head(&mut tx, owner, Some(expected)).await?;
+            require_unclaimed(&mut tx).await?;
+            coherent_checkpoint::require_absent(&mut tx).await?;
+            require_empty_execution_history(&mut tx).await?;
+            Ok(())
+        }
+        .await;
+        finish(tx, result).await
+    }
+
     /// A conservative, one-use startup reservation for an independently
     /// selected pre-execution checkpoint. Never infer callback receipts from
     /// the OMS recovery baseline. A successful claim is not reversible by
