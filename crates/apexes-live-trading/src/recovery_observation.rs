@@ -179,11 +179,7 @@ impl OpeningObservationEvidence {
         records: &[CompletedObservation],
         earliest_fill: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), ObservationEvidenceError> {
-        self.encode()
-            .map_err(|_| ObservationEvidenceError::Encoding)?;
-        if self.owner_fingerprint != owner || &self.checkpoint != checkpoint {
-            return Err(ObservationEvidenceError::Identity);
-        }
+        self.verify_history(owner, checkpoint, scope, records)?;
         // The receipt excludes observations at its opening timestamp.
         // Start strictly before every potentially relevant five-minute horizon.
         let earliest = earliest_fill.map_or(checkpoint.cursor.observed_at, |at| {
@@ -194,6 +190,22 @@ impl OpeningObservationEvidence {
             .ok_or(ObservationError::Time)?;
         if self.history.predecessor.observed_at >= horizon {
             return Err(ObservationError::Time.into());
+        }
+        Ok(())
+    }
+
+    /// Warm-up has a strategy-specific horizon, not a fee lookback.
+    pub(crate) fn verify_history(
+        &self,
+        owner: &str,
+        checkpoint: &CheckpointReceipt,
+        scope: &[(Venue, String)],
+        records: &[CompletedObservation],
+    ) -> Result<(), ObservationEvidenceError> {
+        self.encode()
+            .map_err(|_| ObservationEvidenceError::Encoding)?;
+        if self.owner_fingerprint != owner || &self.checkpoint != checkpoint {
+            return Err(ObservationEvidenceError::Identity);
         }
         self.history.verify(scope, records)?;
         Ok(())

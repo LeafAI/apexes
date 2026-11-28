@@ -9,7 +9,7 @@ mod params;
 mod signals;
 mod strategy;
 
-pub use strategy::DriftScriptStrategy;
+pub use strategy::{DriftScriptStrategy, WarmupError};
 
 mod symbol_state;
 

@@ -77,3 +77,6 @@ pub use recovery_risk::{RiskBoundaryEvidence, RiskEvidenceError};
 pub use recovery_observation::{
     ObservationBoundaryEvidence, ObservationEvidenceError, OpeningObservationEvidence,
 };
+
+mod recovery_warmup;
+pub use recovery_warmup::{WarmupInspectionError, inspect_no_order_warmup};
