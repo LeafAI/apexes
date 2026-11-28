@@ -687,6 +687,79 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .await
         .unwrap();
     assert_eq!(ledger.owned_positions["BTCUSDT"].quantity, dec!(1));
+    // Independently expected mock fill quantity and price, not a copy
+    // of the reconstructed journal preview.
+    let retained = apexes_live_trading::ClosingPositionEvidence {
+        version: 1,
+        owner_fingerprint: wallet_evidence.owner_fingerprint.clone(),
+        boundary: receipt.clone(),
+        captured_at: wallet_evidence.window.finished_at,
+        symbols: vec!["BTCUSDT".into()],
+        positions: vec![apexes_live_trading::ClosingSpotPosition {
+            symbol: "BTCUSDT".into(),
+            quantity: dec!(1),
+            average_entry_price: dec!(100),
+        }],
+    };
+    coherent
+        .inspect_closing_position_evidence(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&opening, &window, &wallet_evidence, wallet_at),
+            &retained,
+        )
+        .await
+        .unwrap();
+    let mut changed = retained.clone();
+    changed.positions[0].average_entry_price = dec!(101);
+    assert!(matches!(
+        coherent
+            .inspect_closing_position_evidence(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&opening, &window, &wallet_evidence, wallet_at),
+                &changed
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Ledger(
+            apexes_live_trading::LedgerContinuityError::PositionMismatch
+        ))
+    ));
+    let mut changed = retained.clone();
+    changed.positions.clear();
+    assert!(
+        coherent
+            .inspect_closing_position_evidence(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&opening, &window, &wallet_evidence, wallet_at),
+                &changed
+            )
+            .await
+            .is_err()
+    );
+    let mut changed = retained;
+    changed.symbols.push("ETHUSDT".into());
+    assert!(
+        coherent
+            .inspect_closing_position_evidence(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&opening, &window, &wallet_evidence, wallet_at),
+                &changed
+            )
+            .await
+            .is_err()
+    );
+
     let mut changed_wallet = wallet_evidence.clone();
     changed_wallet.balances.get_mut("USDT").unwrap().free += dec!(1);
     assert!(matches!(

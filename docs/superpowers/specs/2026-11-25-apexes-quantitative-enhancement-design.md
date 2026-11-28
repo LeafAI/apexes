@@ -105,3 +105,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Shared built-in monitor identity and simultaneous inspection](2026-11-28-apexes-monitor-identity-design.md) captures actual alias topology with all distinct registered built-in shared monitor locks held together. Full runtime/ledger atomicity and restoration remain unqualified.
 
 [Offline risk candidate compatibility](2026-11-28-apexes-offline-risk-contract-design.md) validates independently configured pristine candidates against retained evidence without applying state or changing startup authorization.
+
+[Offline closing position evidence](2026-11-28-apexes-offline-ledger-contract-design.md) compares independently supplied strategy-owned Spot quantities and cost basis with the selected journal and verified cash-flow continuity preview, without ledger mutation or startup permission.
