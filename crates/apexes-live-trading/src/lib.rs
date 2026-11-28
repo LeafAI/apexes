@@ -19,6 +19,7 @@ pub mod halt;
 pub mod order_executor_adapter;
 pub mod recovery_evidence_window;
 mod recovery_fee;
+pub use recovery_fee::{ThirdAssetFeeEvidence, ThirdAssetFeeRate};
 pub mod recovery_ledger;
 pub mod recovery_observation;
 pub mod recovery_risk;
