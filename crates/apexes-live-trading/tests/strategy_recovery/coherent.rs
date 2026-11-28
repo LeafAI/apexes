@@ -275,6 +275,68 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let path = dir.join("coherent.json");
     coherent.write_new(&path).unwrap();
     let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
+    // Independently supplied synthetic coverage for the offline preview.
+    // No live exchange lookup is performed by the inspection API.
+    let started = Utc::now();
+    let end = started + chrono::TimeDelta::seconds(1);
+    let inspected = end + chrono::TimeDelta::seconds(1);
+    let window = apexes_live_trading::RecoveryEvidenceWindow {
+        terminal_window: apexes_live_trading::EvidenceWindow {
+            started_at: started,
+            finished_at: end,
+        },
+        terminal_owner_fingerprint: OWNER_SHA256.into(),
+        terminal_evidence_complete: true,
+        terminal_orders: vec![evidence.clone()],
+        open_orders: apexes_live_trading::OpenOrderCoverage {
+            window: apexes_live_trading::EvidenceWindow {
+                started_at: end,
+                finished_at: inspected,
+            },
+            venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
+            owner_fingerprint: OWNER_SHA256.into(),
+            account_wide_complete: true,
+            open_order_count: 0,
+            foreign_order_count: 0,
+        },
+    };
+    coherent
+        .inspect_evidence_window(&mut store, &fixture.url, &window, inspected)
+        .await
+        .unwrap();
+    assert!(matches!(
+        coherent
+            .inspect_evidence_window(
+                &mut store,
+                &fixture.url,
+                &window,
+                inspected + chrono::TimeDelta::seconds(61)
+            )
+            .await,
+        Err(
+            apexes_live_trading::CoherentInspectionError::EvidenceWindow(
+                apexes_live_trading::EvidenceWindowError::Stale
+            )
+        )
+    ));
+    let mut incomplete = window.clone();
+    incomplete.open_orders.account_wide_complete = false;
+    assert!(
+        coherent
+            .inspect_evidence_window(&mut store, &fixture.url, &incomplete, inspected)
+            .await
+            .is_err()
+    );
+    let mut foreign = window.clone();
+    foreign.open_orders.foreign_order_count = 1;
+    assert!(
+        coherent
+            .inspect_evidence_window(&mut store, &fixture.url, &foreign, inspected)
+            .await
+            .is_err()
+    );
+
     coherent
         .inspect_terminal_evidence(&mut store, &fixture.url, std::slice::from_ref(&evidence))
         .await
