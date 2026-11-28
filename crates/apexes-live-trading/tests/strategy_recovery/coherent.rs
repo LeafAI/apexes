@@ -379,6 +379,60 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         ),
     ]);
     let instruments = base_config().instruments;
+    let wallet_evidence = apexes_live_trading::WalletEvidence {
+        window: apexes_live_trading::EvidenceWindow {
+            started_at: inspected,
+            finished_at: inspected + chrono::TimeDelta::seconds(1),
+        },
+        owner_fingerprint: OWNER_SHA256.into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        account_wide_complete: true,
+        balances: wallet.clone(),
+    };
+    let wallet_at = wallet_evidence.window.finished_at;
+    let qualified = coherent
+        .inspect_wallet_continuity(
+            &mut store,
+            &fixture.url,
+            (Probe::new(999), Probe::new(0)),
+            &instruments,
+            (&window, &wallet_evidence, wallet_at),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qualified.owned_positions["BTCUSDT"].quantity, dec!(1));
+    assert_eq!(qualified.wallet_balances["BTC"].free, dec!(5));
+    let mut missing = wallet_evidence.clone();
+    missing.balances.remove("USDT");
+    assert!(matches!(
+        coherent
+            .inspect_wallet_continuity(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&window, &missing, wallet_at)
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Wallet(
+            apexes_live_trading::WalletEvidenceError::MissingAsset
+        ))
+    ));
+    let mut short = wallet_evidence.clone();
+    short.balances.get_mut("BTC").unwrap().free = dec!(0.5);
+    assert!(matches!(
+        coherent
+            .inspect_wallet_continuity(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&window, &short, wallet_at)
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Inventory(_))
+    ));
     let candidate = Probe::new(0);
     let observed = candidate.observed.clone();
     let preview = coherent
