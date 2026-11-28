@@ -131,3 +131,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent closing fee mark revaluation](2026-11-28-apexes-fee-mark-evidence-design.md) compares independently supplied closing fee marks and revaluation totals against exact retained price observations and qualified historical fees.
 
 [Combined read-only fee evidence](2026-11-28-apexes-combined-fee-evidence-design.md) combines classification, historical decisions, realized P&L and closing marks without changing account or owned-position recovery restrictions. Nonzero external-fee end-to-end qualification remains open.
+
+[Offline conversion-only scope evidence](2026-11-28-apexes-conversion-scope-evidence-design.md) compares a complete independently declared instrument classification with the exact retained journal and price/ledger footprint; no recovery allowlist or startup gate is changed.
