@@ -391,6 +391,44 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         balances: wallet.clone(),
     };
     let wallet_at = wallet_evidence.window.finished_at;
+    let mut opening_wallet = wallet_evidence.clone();
+    opening_wallet.window = apexes_live_trading::EvidenceWindow {
+        started_at: cursor().observed_at,
+        finished_at: cursor().observed_at,
+    };
+    opening_wallet.balances.get_mut("BTC").unwrap().free = dec!(4);
+    opening_wallet.balances.get_mut("USDT").unwrap().free = dec!(100000);
+    let opening = apexes_live_trading::OpeningWalletEvidence {
+        predecessor: selection.receipt().clone(),
+        wallet: opening_wallet,
+    };
+    let ledger = coherent
+        .inspect_ledger_continuity(
+            &mut store,
+            &fixture.url,
+            (Probe::new(999), Probe::new(0)),
+            &instruments,
+            (&opening, &window, &wallet_evidence, wallet_at),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ledger.owned_positions["BTCUSDT"].quantity, dec!(1));
+    let mut changed_wallet = wallet_evidence.clone();
+    changed_wallet.balances.get_mut("USDT").unwrap().free += dec!(1);
+    assert!(matches!(
+        coherent
+            .inspect_ledger_continuity(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&opening, &window, &changed_wallet, wallet_at)
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Ledger(
+            apexes_live_trading::LedgerContinuityError::Mismatch
+        ))
+    ));
     let qualified = coherent
         .inspect_wallet_continuity(
             &mut store,
