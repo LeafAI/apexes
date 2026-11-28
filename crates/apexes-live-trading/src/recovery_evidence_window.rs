@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 /// Older evidence requires a fresh, independently collected set.
 pub const MAX_EVIDENCE_AGE: TimeDelta = TimeDelta::seconds(60);
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EvidenceWindow {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
@@ -16,7 +16,7 @@ pub struct EvidenceWindow {
 
 /// The evidence supplier must establish account-wide coverage, including
 /// foreign/manual orders. A symbol-scoped empty response is insufficient.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenOrderCoverage {
     pub window: EvidenceWindow,
     pub venue: Venue,
@@ -30,7 +30,7 @@ pub struct OpenOrderCoverage {
 /// Independently supplied observations. The owner fingerprint and time
 /// intervals are assertions from the evidence supplier, not authentication
 /// or a proof of an atomic exchange snapshot.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryEvidenceWindow {
     pub terminal_window: EvidenceWindow,
     pub terminal_owner_fingerprint: String,

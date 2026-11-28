@@ -154,8 +154,12 @@ pub(super) fn write_receipt_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(super) fn read_receipt_file(path: &Path) -> Result<Vec<u8>> {
+    read_bounded_receipt_file(path, MAX_RECEIPT_FILE_BYTES)
+}
+
+pub(super) fn read_bounded_receipt_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-    if !meta.is_file() || meta.len() > MAX_RECEIPT_FILE_BYTES as u64 {
+    if !meta.is_file() || meta.len() > limit as u64 {
         return Err(StrategyRecoveryError::InvalidReceipt);
     }
     let file = File::open(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
@@ -167,10 +171,10 @@ pub(super) fn read_receipt_file(path: &Path) -> Result<Vec<u8>> {
         return Err(StrategyRecoveryError::InvalidReceipt);
     }
     let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_FILE_BYTES as u64 + 1)
+    file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-    if bytes.len() > MAX_RECEIPT_FILE_BYTES {
+    if bytes.len() > limit {
         return Err(StrategyRecoveryError::InvalidReceipt);
     }
     Ok(bytes)

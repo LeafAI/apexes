@@ -153,3 +153,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Offline successor-boundary continuity](2026-11-29-apexes-offline-successor-boundary-design.md) independently requalifies consecutive historical boundaries and verifies flat-inventory accounting and disjoint execution identities without changing startup authority.
 
 [Strict owner-bound Spot evidence collection](2026-11-29-apexes-spot-evidence-collection-design.md) qualifies read-only terminal, raw account-wide open-order and wallet observations against the exact selected journal, without startup authority.
+
+[Durable Spot collection receipt](2026-11-29-apexes-spot-collection-receipt-design.md) binds complete historical query evidence to the exact independently selected journal, original inspection time and instrument metadata; reopening requires independent digest selection and cannot establish current freshness.

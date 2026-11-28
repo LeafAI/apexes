@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 
 /// Account-level amounts; neither of these implies strategy ownership.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpotWalletBalance {
     pub free: Decimal,
     pub locked: Decimal,
