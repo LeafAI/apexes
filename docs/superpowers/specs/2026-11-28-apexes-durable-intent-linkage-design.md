@@ -87,3 +87,21 @@ remain unqualified locally. Independent review pending.
 Next: durable live EMS parent/child ownership and original strategy
 intent correlation, followed by in-flight fill evidence and
 authoritative terminal callbacks. F04.04 remains in progress.
+
+
+### CI follow-up
+
+PR #91's first CI run passed lint and Docker but failed the new
+correlated-submission restart regression in the shared PostgreSQL
+suite. The fixture incorrectly assumed an empty database; the
+preceding test left an unresolved order, and the OMS correctly
+refused a new submission. Use the existing fresh-manager fixture
+for the default shared CI database in both new correlation tests.
+An explicitly configured disposable test URL still requires an
+empty database and is not truncated. No production logic changed.
+
+Reproduced the CI PostgreSQL step locally against a newly initialized
+temporary PostgreSQL 17 cluster: OMS 78, EMS 32, live trading 42,
+all 152 tests passed including previously ignored tests. Verified
+the local endpoint's data directory before running destructive
+test-only fixtures. Temporary cluster stopped and removed.

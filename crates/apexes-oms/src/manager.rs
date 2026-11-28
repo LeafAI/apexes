@@ -2011,14 +2011,19 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn correlated_submission_preserves_link_and_rejects_duplicate_across_restart() {
-        let url =
-            std::env::var("APEXES_INTENT_TEST_PG_URL").unwrap_or_else(|_| POSTGRES_URL.into());
-        // No truncation: the locally qualified run uses a dedicated disposable database.
+        let url = std::env::var("APEXES_INTENT_TEST_PG_URL").ok();
         let gateway = Arc::new(MockExecutionGateway::new());
         let registry = registry_with_gateway(gateway.clone());
-        let mut manager = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
-            .await
-            .unwrap();
+        // Explicit URL is a dedicated disposable database. Default CI
+        // shares its test database and must clear preceding test orders.
+        let mut manager = if let Some(url) = &url {
+            OrderManager::new(OrderStore::new(url).await.unwrap(), &registry)
+                .await
+                .unwrap()
+        } else {
+            fresh_manager(gateway.clone()).await
+        };
+        let url = url.as_deref().unwrap_or(POSTGRES_URL);
         let link = crate::IntentLink {
             run_scope: Uuid::new_v4(),
             intent_id: apexes_strategy::IntentId(u64::MAX),
@@ -2064,7 +2069,7 @@ mod tests {
             .unwrap()
             .len();
         drop(manager);
-        let mut recovered = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
+        let mut recovered = OrderManager::new(OrderStore::new(url).await.unwrap(), &registry)
             .await
             .unwrap();
         assert_eq!(

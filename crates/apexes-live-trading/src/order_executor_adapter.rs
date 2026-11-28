@@ -487,13 +487,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL"]
     async fn strategy_submission_adapter_persists_run_scoped_identity() {
-        let url =
-            std::env::var("APEXES_INTENT_TEST_PG_URL").unwrap_or_else(|_| POSTGRES_URL.into());
         let gateway = Arc::new(MockExecutionGateway::new());
-        let registry = registry_with_gateway(gateway.clone());
-        let manager = OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
-            .await
-            .unwrap();
+        // Use the existing isolation fixture on CI's shared database.
+        // Explicit URLs must point at an empty, disposable database.
+        let manager = if let Ok(url) = std::env::var("APEXES_INTENT_TEST_PG_URL") {
+            let registry = registry_with_gateway(gateway.clone());
+            OrderManager::new(OrderStore::new(&url).await.unwrap(), &registry)
+                .await
+                .unwrap()
+        } else {
+            fresh_order_manager(gateway.clone()).await
+        };
         let shared = Arc::new(tokio::sync::Mutex::new(manager));
         let executor = OrderManagerExecutor::new(shared.clone());
         let scope = executor.intent_scope();
