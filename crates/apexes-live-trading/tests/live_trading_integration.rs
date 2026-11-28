@@ -1023,7 +1023,7 @@ async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = tokio::time::timeout(
-        Duration::from_secs(12),
+        Duration::from_secs(45),
         run_live_trading(
             config,
             &registry,
@@ -1039,7 +1039,14 @@ async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
         ),
     )
     .await
-    .unwrap()
+    .unwrap_or_else(|err| {
+        panic!(
+            "managed callback runner timed out: {err}; health={:?}; fills={:?}; terminals={:?}",
+            health.reason(),
+            observed.lock().unwrap(),
+            terminals.lock().unwrap()
+        )
+    })
     .unwrap();
     let (direct, child, parent) = driver.await.unwrap();
     let observed = observed.lock().unwrap().clone();
@@ -1104,16 +1111,19 @@ fn callback_probe_intent(algo: bool) -> OrderIntent {
     }
 }
 
+// CI can run this alongside Docker builds on a contended runner. Keep
+// a bounded, generous harness deadline, distinct from production OMS/EMS
+// health and submission deadlines. Report durable state on failure.
 async fn wait_for_callback_order(
     pool: &sqlx::PgPool,
     old_scope: uuid::Uuid,
     child: bool,
 ) -> (OrderId, Option<String>, Option<uuid::Uuid>) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let row: Option<(uuid::Uuid, Option<String>, Option<uuid::Uuid>)> = sqlx::query_as(
                 "SELECT id,exchange_order_id,ems_parent_id FROM orders WHERE submission_state='Accepted'
-                 AND (($2 AND ems_parent_id IS NOT NULL) OR (NOT $2 AND intent_scope<>$1))",
+                 AND (($2 AND ems_parent_id IS NOT NULL) OR (NOT $2 AND ems_parent_id IS NULL AND intent_scope<>$1))",
             )
             .bind(old_scope)
             .bind(child)
@@ -1125,7 +1135,19 @@ async fn wait_for_callback_order(
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap()
+    }).await;
+    match result {
+        Ok(row) => row,
+        Err(err) => {
+            let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<uuid::Uuid>)>(
+                "SELECT id, status, submission_state, ems_parent_id FROM orders ORDER BY created_at"
+            ).fetch_all(pool).await;
+            panic!(
+                "timed out waiting for accepted {} order: {err}; journal={rows:?}",
+                if child { "EMS child" } else { "direct" }
+            );
+        }
+    }
 }
 
 fn publish_mock_fill(

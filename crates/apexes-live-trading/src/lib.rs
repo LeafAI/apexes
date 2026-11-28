@@ -19,6 +19,7 @@ pub mod halt;
 pub mod order_executor_adapter;
 pub mod recovery_evidence_window;
 pub mod recovery_ledger;
+pub mod recovery_observation;
 pub mod recovery_risk;
 pub mod recovery_wallet;
 pub mod runner;
@@ -53,3 +54,5 @@ pub use recovery_wallet::{WalletEvidence, WalletEvidenceError};
 pub use recovery_ledger::{LedgerContinuityError, OpeningWalletEvidence};
 
 pub use recovery_risk::{RiskBoundaryEvidence, RiskEvidenceError};
+
+pub use recovery_observation::{ObservationBoundaryEvidence, ObservationEvidenceError};

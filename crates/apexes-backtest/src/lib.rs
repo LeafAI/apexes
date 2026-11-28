@@ -113,3 +113,5 @@ mod lifecycle_correlation;
 pub mod lifecycle_archive;
 
 pub mod submission_journal;
+
+pub mod observation_receipt;
