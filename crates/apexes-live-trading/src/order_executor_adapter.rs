@@ -29,6 +29,8 @@ use rust_decimal::Decimal;
 pub(crate) struct StopCheckpoint {
     pub(crate) previous: apexes_strategy::checkpoint::CheckpointReceipt,
     pub(crate) published: std::sync::Mutex<Option<apexes_oms::CoherentCheckpointReceipt>>,
+    pub(crate) opening_risk_handoff:
+        std::sync::Mutex<Option<(crate::RecoverySelection, crate::OpeningRiskHandoff)>>,
 }
 
 /// Adapts `OrderManager` (live trading's real, asynchronous order
@@ -169,6 +171,26 @@ impl OrderExecutor for OrderManagerExecutor {
         self.stop_checkpoint
             .as_ref()
             .map(|request| request.previous.clone())
+    }
+
+    fn retain_opening_risk_snapshot(&self, snapshot: &[u8]) -> Result<(), ApexesError> {
+        let Some(request) = &self.stop_checkpoint else {
+            return Ok(());
+        };
+        let handoff = request
+            .opening_risk_handoff
+            .lock()
+            .map_err(|_| ApexesError::InvalidBacktestConfig {
+                reason: "opening risk handoff lock poisoned".into(),
+            })?
+            .take();
+        if let Some((selection, handoff)) = handoff {
+            crate::OpeningRiskReceipt::retain(&selection, self.intent_scope, snapshot, handoff)
+                .map_err(|error| ApexesError::InvalidBacktestConfig {
+                    reason: format!("opening risk handoff refused: {error}"),
+                })?;
+        }
+        Ok(())
     }
 
     async fn publish_completed_checkpoint(

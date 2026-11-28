@@ -167,3 +167,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Cross-boundary risk state continuity](2026-11-29-apexes-cross-boundary-risk-continuity-design.md) retains actual pre-event registered and separate market risk state and independently compares the successor opening to exact prior closing state within the selected collection chronology. No live carryover or restart authority is inferred.
 
 [Durable risk-bound successor receipt](2026-11-29-apexes-risk-bound-successor-receipt-design.md) binds both complete historical checkpoint boundaries, independently selected receipt-bound transition witness digests and the exact opening risk snapshot digest and timestamp after full independent requalification. No startup authority is issued.
+
+[Pre-event opening risk snapshot handoff](2026-11-29-apexes-opening-risk-handoff-design.md) binds the actual opening risk snapshot to the exact original checkpoint, owner and executor run scope in a separate durable file and delivers its digest at capture time before consuming events. No restart authority is inferred.

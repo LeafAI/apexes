@@ -252,6 +252,7 @@ pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
         exchange_updates,
         stop_signal,
         None,
+        None,
     )
     .await
 }
@@ -274,6 +275,64 @@ pub async fn run_live_trading_with_observation_capture_on_stop<S: Strategy>(
     ),
     ApexesError,
 > {
+    run_observation_capture(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        None,
+    )
+    .await
+}
+
+/// Opt-in to durable pre-event opening risk handoff. The caller must
+/// retain the delivered digest independently of the database and file.
+pub async fn run_live_trading_with_opening_risk_handoff_on_stop<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+    handoff: crate::OpeningRiskHandoff,
+) -> Result<
+    (
+        LiveTradingReport,
+        apexes_oms::CoherentCheckpointReceipt,
+        CapturedObservations,
+    ),
+    ApexesError,
+> {
+    run_observation_capture(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        Some(handoff),
+    )
+    .await
+}
+
+async fn run_observation_capture<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+    handoff: Option<crate::OpeningRiskHandoff>,
+) -> Result<
+    (
+        LiveTradingReport,
+        apexes_oms::CoherentCheckpointReceipt,
+        CapturedObservations,
+    ),
+    ApexesError,
+> {
     let mut observations = None;
     let (report, receipt) = run_checkpoint_on_stop(
         config,
@@ -283,6 +342,7 @@ pub async fn run_live_trading_with_observation_capture_on_stop<S: Strategy>(
         exchange_updates,
         stop_signal,
         Some(&mut observations),
+        handoff,
     )
     .await?;
     let observations = observations.ok_or_else(|| ApexesError::InvalidBacktestConfig {
@@ -291,6 +351,7 @@ pub async fn run_live_trading_with_observation_capture_on_stop<S: Strategy>(
     Ok((report, receipt, observations))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_checkpoint_on_stop<S: Strategy>(
     config: LiveTradingConfig,
     registry: &Registry,
@@ -299,6 +360,7 @@ async fn run_checkpoint_on_stop<S: Strategy>(
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
     stop_signal: oneshot::Receiver<()>,
     observations: Option<&mut Option<CapturedObservations>>,
+    handoff: Option<crate::OpeningRiskHandoff>,
 ) -> Result<(LiveTradingReport, apexes_oms::CoherentCheckpointReceipt), ApexesError> {
     let StrategyStartup::Restore { selection, .. } = &startup else {
         return Err(ApexesError::InvalidBacktestConfig {
@@ -308,6 +370,9 @@ async fn run_checkpoint_on_stop<S: Strategy>(
     let request = Arc::new(StopCheckpoint {
         previous: selection.receipt().clone(),
         published: Default::default(),
+        opening_risk_handoff: std::sync::Mutex::new(
+            handoff.map(|h| (selection.as_ref().clone(), h)),
+        ),
     });
     let gate = config.kill_switch.clone();
     let result = run_live_trading_inner(
