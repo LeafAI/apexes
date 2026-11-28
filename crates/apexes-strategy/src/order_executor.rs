@@ -54,6 +54,19 @@ pub trait OrderExecutor: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(Order, Vec<Fill>), ApexesError>;
 
+    /// Optional strategy correlation at the actual submission boundary.
+    /// Legacy/simulated executors retain the original submission path.
+    async fn submit_correlated(
+        &self,
+        intent: &OrderIntent,
+        positions: &HashMap<String, Position>,
+        balances: &HashMap<String, Decimal>,
+        now: DateTime<Utc>,
+        _intent_id: Option<crate::IntentId>,
+    ) -> Result<(Order, Vec<Fill>), ApexesError> {
+        self.submit(intent, positions, balances, now).await
+    }
+
     async fn submit_simulated_checked(
         &self,
         intent: &OrderIntent,
