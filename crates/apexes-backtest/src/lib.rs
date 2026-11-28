@@ -52,6 +52,7 @@ pub mod mark_price_source;
 
 // Populated in Task 7.
 pub mod ledger;
+pub mod ledger_evidence;
 pub mod spot_accounting;
 
 // Populated in Tasks 8-11 (walk_book, MatchingEngine core, limit orders, Stop/StopLimit).

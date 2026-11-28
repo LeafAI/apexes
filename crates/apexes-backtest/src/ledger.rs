@@ -61,6 +61,59 @@ impl PortfolioLedger {
         }
     }
 
+    /// Capture the actual basic Spot ledger maps without modifying them.
+    /// Fee-valuation history and external balance provenance are not covered.
+    pub fn inspect_evidence(
+        &self,
+    ) -> Result<crate::ledger_evidence::LedgerEvidence, crate::observation_receipt::ObservationError>
+    {
+        use crate::observation_receipt::ObservationError as E;
+        if self.instruments.len() > 128
+            || self.balances.len() > 1024
+            || self.positions.len() > 128
+            || self.realized_pnl.len() > 128
+        {
+            return Err(E::Capacity);
+        }
+        if self
+            .instruments
+            .iter()
+            .any(|(key, i)| key != &i.symbol || i.asset_class != apexes_core::AssetClass::Spot)
+            || self.positions.iter().any(|(key, p)| key != &p.symbol)
+        {
+            return Err(E::Scope);
+        }
+        let mut scope = self
+            .instruments
+            .values()
+            .map(|i| (i.venue, i.symbol.clone()))
+            .collect::<Vec<_>>();
+        scope.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut balances = self
+            .balances
+            .iter()
+            .map(|(a, v)| (a.clone(), *v))
+            .collect::<Vec<_>>();
+        balances.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut positions = self.positions.values().cloned().collect::<Vec<_>>();
+        positions.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        let mut realized_pnl = self
+            .realized_pnl
+            .iter()
+            .map(|(s, v)| (s.clone(), *v))
+            .collect::<Vec<_>>();
+        realized_pnl.sort_by(|a, b| a.0.cmp(&b.0));
+        let snapshot = crate::ledger_evidence::LedgerEvidence {
+            version: 1,
+            scope,
+            balances,
+            positions,
+            realized_pnl,
+        };
+        snapshot.validate(&snapshot.scope)?;
+        Ok(snapshot)
+    }
+
     pub fn balances(&self) -> &HashMap<String, Decimal> {
         &self.balances
     }
@@ -971,6 +1024,41 @@ mod tests {
         let mut initial_balances = HashMap::new();
         initial_balances.insert("USDT".to_string(), dec!(10000));
         PortfolioLedger::new(instruments, initial_balances)
+    }
+
+    #[test]
+    fn evidence_captures_actual_basic_maps_and_refuses_inconsistent_scope() {
+        let mut ledger = ledger_with_10k_usdt();
+        ledger
+            .apply_fill(&sample_fill(Side::Buy, dec!(100), dec!(2), Decimal::ZERO))
+            .unwrap();
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(120), dec!(1), Decimal::ZERO))
+            .unwrap();
+        let evidence = ledger.inspect_evidence().unwrap();
+        assert_eq!(
+            evidence.balances,
+            vec![("BTC".into(), dec!(1)), ("USDT".into(), dec!(9920))]
+        );
+        assert_eq!(evidence.positions.len(), 1);
+        assert_eq!(evidence.positions[0].quantity, dec!(1));
+        assert_eq!(evidence.positions[0].average_entry_price, dec!(100));
+        assert_eq!(evidence.realized_pnl, vec![("BTCUSDT".into(), dec!(20))]);
+        assert_eq!(evidence, ledger.inspect_evidence().unwrap());
+        assert!(
+            evidence
+                .validate(&[(Venue::Binance, "ETHUSDT".into())])
+                .is_err()
+        );
+        let mut invalid = evidence.clone();
+        invalid.balances.push(("USDT".into(), Decimal::ZERO));
+        assert!(invalid.validate(&evidence.scope).is_err());
+        ledger
+            .apply_fill(&sample_fill(Side::Sell, dec!(110), dec!(1), Decimal::ZERO))
+            .unwrap();
+        let flat = ledger.inspect_evidence().unwrap();
+        assert_eq!(flat.positions[0].quantity, Decimal::ZERO);
+        assert_eq!(flat.realized_pnl, vec![("BTCUSDT".into(), dec!(30))]);
     }
 
     fn fill_with_fee(
