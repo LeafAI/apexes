@@ -26,6 +26,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+apexes-research = { path = "../apexes-research" }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 uuid = { workspace = true, features = ["v4"] }
 tracing-subscriber = { workspace = true, features = ["json"] }
