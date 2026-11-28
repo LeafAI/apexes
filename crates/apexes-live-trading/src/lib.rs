@@ -19,6 +19,8 @@ pub mod halt;
 pub mod order_executor_adapter;
 pub mod recovery_evidence_window;
 mod recovery_fee;
+mod recovery_fee_mark;
+pub use recovery_fee_mark::{ClosingFeeMarkEvidence, ClosingFeeMarkRate, ClosingFeeRevaluation};
 mod recovery_fee_ownership;
 pub use recovery_fee_ownership::OpeningTrackedAssetEvidence;
 mod recovery_pnl;

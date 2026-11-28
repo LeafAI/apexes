@@ -857,6 +857,29 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    let marks = apexes_live_trading::ClosingFeeMarkEvidence {
+        version: 1,
+        boundary: receipt.clone(),
+        owner_fingerprint: exact_opening.wallet.owner_fingerprint.clone(),
+        rates: vec![],
+        symbols: vec![apexes_live_trading::ClosingFeeRevaluation {
+            symbol: "BTCUSDT".into(),
+            fee_at_execution: dec!(0),
+            fee_at_mark: dec!(0),
+            fee_revaluation: dec!(0),
+        }],
+    };
+    coherent
+        .inspect_captured_fee_revaluation(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &third_asset_rates, &marks),
+        )
+        .await
+        .unwrap();
     let allocation = apexes_live_trading::OpeningTrackedAssetEvidence {
         version: 1,
         predecessor: exact_opening.predecessor.clone(),
