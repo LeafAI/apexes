@@ -294,6 +294,7 @@ version = "0.1.0"
 dependencies = [
  "apexes-core",
  "apexes-ems",
+ "apexes-research",
  "apexes-risk",
  "apexes-storage",
  "apexes-strategy",
@@ -694,6 +695,17 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "apexes-research"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
  "uuid",
 ]
 

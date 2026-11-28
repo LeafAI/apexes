@@ -16,11 +16,36 @@
 > 3. Keep "Now" to one active plan. Finished plans move to "Completed" with their commit range.
 > 4. Every plan-level item links to its plan file; per-task detail lives in that plan, not here.
 
-_Last updated: 2026-11-27 (supervised raw depth capture qualification)_
+_Last updated: 2026-11-28 (independent F05.01 research artifact implementation)_
 
 ---
 
 ## Now — Quantitative trading enhancement
+
+F05.01 independent remaining-scope implementation:
+[research artifact design, usage and verification](research.md).
+Execution and risk behavior are unchanged; research references use immutable
+content identities rather than mutable strategy pointers. Four typed inputs, executor
+identity, seed and results are retained; verification replays retained bytes through
+a caller executor. The synthetic V1 integration uses the existing Drift/unified
+backtest loop with nonzero fees.
+
+Local verification passed: 16 research tests, 10 V1 baseline tests, 93.77% research
+line coverage, workspace build, strict workspace Clippy and formatting; independent
+code review returned no findings. After reconciling merged master `05bb96a`,
+workspace build, strict Clippy and formatting passed again; the available-package
+run passed 1,328 tests with 42 ignored, excluding `apexes-chart`, `apexes-ui`,
+`apexes-oms`, `apexes-ems` and `apexes-live-trading`. Full workspace tests stop at the existing chart render
+test without a GPU adapter. The non-GUI run also encounters existing
+PostgreSQL-dependent tests with no server available (isolated reproduction confirms
+a connection-pool timeout); repeated service timeouts were stopped. CI with database
+services and a configured headless renderer remains the qualification gate before
+updating the authoritative F05.01 feature status. Ignored external tests are not
+claimed as verified.
+
+No strategy optimization (F05.04), strategy changes (F05.02–03), walk-forward
+qualification (F05.05), exchange access or production promotion is bundled into
+this task.
 
 Feature F00.01: preserve the original Trend Guard script and add deterministic
 offline replay through the real Drift runtime and matching engine. See the
