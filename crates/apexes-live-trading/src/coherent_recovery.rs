@@ -958,6 +958,65 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Check independently supplied fill-time observation prefixes against
+    /// the exact selected journal and captured valuation decisions.
+    /// A successful comparison does not authenticate the interleaving.
+    pub async fn inspect_fill_observation_availability(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: (
+            &crate::ConversionScopeEvidence,
+            &crate::ObservationBoundaryEvidence,
+            &crate::FillObservationAvailability,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_conversion_price_provenance(
+            store,
+            ems_postgres_url,
+            instruments,
+            (evidence.0, evidence.1),
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        evidence.2.compare(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            evidence.0,
+            ledger,
+            &capture.records,
+            &fills,
+        )?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(

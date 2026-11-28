@@ -377,6 +377,127 @@ mod tests {
     }
 
     #[test]
+    fn fill_observation_prefix_distinguishes_late_replacement_and_future_source() {
+        use crate::{FillObservationAvailability, FillObservationPrefix};
+        let (scope, captured, _, _, fill) = fixture();
+        let records = vec![
+            trade("BNBUSDT", 1, 2, dec!(300)),
+            trade("BNBUSDT", 3, 3, dec!(400)),
+            trade("BNBUSDT", 1, 4, dec!(350)),
+        ];
+        let evidence = FillObservationAvailability {
+            version: 1,
+            boundary: scope.boundary.clone(),
+            owner_fingerprint: "owner".into(),
+            prefixes: vec![FillObservationPrefix {
+                fill_id: fill.id,
+                observations: 1,
+            }],
+        };
+        let check = |e: &FillObservationAvailability, c: &LedgerEvidence| {
+            e.compare(
+                &scope.boundary,
+                "owner",
+                &scope,
+                c,
+                &records,
+                std::slice::from_ref(&fill),
+            )
+        };
+        check(&evidence, &captured).unwrap();
+        let mut changed = evidence.clone();
+        changed.prefixes[0].observations = 2;
+        // The later source timestamp cannot value an earlier execution.
+        check(&changed, &captured).unwrap();
+        changed.prefixes[0].observations = 3;
+        assert_eq!(check(&changed, &captured), Err(E::FeeMismatch));
+        changed.prefixes[0].observations = 0;
+        assert_eq!(check(&changed, &captured), Err(E::FeeMismatch));
+        let mut missing = captured.clone();
+        let fees = missing.fee_valuation.as_mut().unwrap();
+        fees.accounts[0].historical_fee = dec!(0);
+        fees.accounts[0].missing_execution_valuations = 1;
+        let decision = &mut fees.decisions.as_mut().unwrap()[0];
+        decision.source = apexes_backtest::fee_evidence::FeeDecisionSource::Missing;
+        decision.value = None;
+        check(&changed, &missing).unwrap();
+        assert_eq!(check(&evidence, &missing), Err(E::FeeMismatch));
+        changed.prefixes[0].observations = 4;
+        assert_eq!(check(&changed, &captured), Err(E::FeeMismatch));
+        changed = evidence.clone();
+        changed.prefixes[0].fill_id = FillId(Uuid::new_v4());
+        assert_eq!(check(&changed, &captured), Err(E::FeeMismatch));
+        changed = evidence.clone();
+        changed.prefixes.clear();
+        assert_eq!(check(&changed, &captured), Err(E::FeeMismatch));
+        changed = evidence.clone();
+        changed.owner_fingerprint = "wrong".into();
+        assert_eq!(check(&changed, &captured), Err(E::Identity));
+        let mut supplied = captured.clone();
+        supplied
+            .fee_valuation
+            .as_mut()
+            .unwrap()
+            .decisions
+            .as_mut()
+            .unwrap()[0]
+            .source = apexes_backtest::fee_evidence::FeeDecisionSource::Provided;
+        assert_eq!(check(&evidence, &supplied), Err(E::FeeMismatch));
+    }
+
+    #[test]
+    fn fill_observation_prefix_rejects_regressing_order_and_duplicate_ids() {
+        use crate::{FillObservationAvailability, FillObservationPrefix};
+        let (scope, mut captured, _, _, fill) = fixture();
+        let mut zero = fill.clone();
+        zero.id = FillId(Uuid::new_v4());
+        zero.fee = dec!(0);
+        zero.fee_currency = None;
+        let rows = captured
+            .fee_valuation
+            .as_mut()
+            .unwrap()
+            .decisions
+            .as_mut()
+            .unwrap();
+        let mut row = rows[0].clone();
+        row.fill_id = zero.id;
+        row.fee = dec!(0);
+        row.asset = "USDT".into();
+        row.external_fee = false;
+        row.source = apexes_backtest::fee_evidence::FeeDecisionSource::Zero;
+        row.value = Some(dec!(0));
+        rows.push(row);
+        let fills = vec![fill.clone(), zero.clone()];
+        let records = vec![
+            trade("BNBUSDT", 1, 2, dec!(300)),
+            trade("BNBUSDT", 3, 3, dec!(400)),
+        ];
+        let mut evidence = FillObservationAvailability {
+            version: 1,
+            boundary: scope.boundary.clone(),
+            owner_fingerprint: "owner".into(),
+            prefixes: vec![
+                FillObservationPrefix {
+                    fill_id: fill.id,
+                    observations: 1,
+                },
+                FillObservationPrefix {
+                    fill_id: zero.id,
+                    observations: 2,
+                },
+            ],
+        };
+        let check = |e: &FillObservationAvailability, f: &[Fill]| {
+            e.compare(&scope.boundary, "owner", &scope, &captured, &records, f)
+        };
+        check(&evidence, &fills).unwrap();
+        assert_eq!(check(&evidence, &[fill.clone(), fill]), Err(E::FeeMismatch));
+        evidence.prefixes[1].observations = 0;
+        assert_eq!(check(&evidence, &fills), Err(E::FeeMismatch));
+    }
+
+    #[test]
     fn conversion_price_provenance_requires_exact_final_windows() {
         let (e, c, _, _, _) = fixture();
         let records = vec![

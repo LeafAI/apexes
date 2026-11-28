@@ -135,3 +135,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Offline conversion-only scope evidence](2026-11-28-apexes-conversion-scope-evidence-design.md) compares a complete independently declared instrument classification with the exact retained journal and price/ledger footprint; no recovery allowlist or startup gate is changed.
 
 [Retained conversion-price window provenance](2026-11-28-apexes-conversion-price-provenance-design.md) independently compares final price windows against receipt-bound completed observations. Fill-time availability, source authenticity and recovery authority remain unqualified.
+
+[Offline fill observation-prefix comparison](2026-11-28-apexes-fill-observation-availability-design.md) checks conditional valuation consistency with independently supplied observation-prefix witnesses, not actual callback interleaving or recovery authority.

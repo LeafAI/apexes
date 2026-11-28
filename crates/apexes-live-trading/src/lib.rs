@@ -22,6 +22,8 @@ pub mod recovery_evidence_window;
 pub use recovery_conversion_scope::{
     ConversionScopeEvidence, EvidenceInstrumentRole, EvidenceInstrumentScope,
 };
+mod recovery_fill_availability;
+pub use recovery_fill_availability::{FillObservationAvailability, FillObservationPrefix};
 mod recovery_fee;
 mod recovery_fee_mark;
 pub use recovery_fee_mark::{ClosingFeeMarkEvidence, ClosingFeeMarkRate, ClosingFeeRevaluation};
