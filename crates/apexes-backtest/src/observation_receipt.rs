@@ -181,6 +181,88 @@ impl ObservationReceipt {
     }
 }
 
+/// Actual loop-local observations returned only after the existing
+/// checkpoint publication has acknowledged success. Not a durable
+/// atomic DB witness or proof of upstream completeness.
+#[derive(Debug, Clone)]
+pub struct CapturedObservations {
+    pub receipt: ObservationReceipt,
+    pub scope: Vec<(Venue, String)>,
+    pub records: Vec<CompletedObservation>,
+}
+
+pub(crate) struct ObservationCapture {
+    predecessor: StateCursor,
+    clock: ObservationClock,
+    scope: Vec<(Venue, String)>,
+    records: Vec<CompletedObservation>,
+    bytes: usize,
+}
+
+impl ObservationCapture {
+    pub(crate) fn new(
+        predecessor: StateCursor,
+        clock: ObservationClock,
+        scope: Vec<(Venue, String)>,
+    ) -> Self {
+        Self {
+            predecessor,
+            clock,
+            scope,
+            records: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        cursor: StateCursor,
+        event: &MarketEvent,
+    ) -> Result<(), ObservationError> {
+        use ObservationError as E;
+        if self.records.len() >= MAX_RECORDS {
+            return Err(E::Capacity);
+        }
+        // Bound variable-size payloads before cloning or serializing.
+        if event.symbol().len() > 128
+            || matches!(event,MarketEvent::Depth(d) if d.bids.len()>4096 || d.asks.len()>4096)
+            || matches!(event,MarketEvent::Trade(t) if t.trade_id.as_ref().is_some_and(|id|id.len()>256))
+        {
+            return Err(E::Scope);
+        }
+        let record = CompletedObservation {
+            cursor,
+            event: event.clone(),
+        };
+        let size = serde_json::to_vec(&record).map_err(|_| E::Encoding)?.len();
+        let total = self.bytes.checked_add(size).ok_or(E::Capacity)?;
+        if size > MAX_RECORD_BYTES || total > MAX_TOTAL_BYTES {
+            return Err(E::Capacity);
+        }
+        self.bytes = total;
+        self.records.push(record);
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+        through: StateCursor,
+    ) -> Result<CapturedObservations, ObservationError> {
+        let receipt = ObservationReceipt::build(
+            self.predecessor,
+            through,
+            self.clock,
+            &self.scope,
+            &self.records,
+        )?;
+        Ok(CapturedObservations {
+            receipt,
+            scope: self.scope,
+            records: self.records,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +295,42 @@ mod tests {
     }
     fn scope() -> Vec<(Venue, String)> {
         vec![(Venue::Binance, "BTCUSDT".into())]
+    }
+
+    #[test]
+    fn capture_uses_actual_records_and_exact_completed_cursor() {
+        let mut capture =
+            ObservationCapture::new(cursor(10, 0), ObservationClock::ConsumerUtc, scope());
+        let first = trade(11, 1, 2);
+        let second = trade(12, 2, 3);
+        capture.record(first.cursor, &first.event).unwrap();
+        capture.record(second.cursor, &second.event).unwrap();
+        let captured = capture.finish(second.cursor).unwrap();
+        assert_eq!(captured.records, vec![first, second]);
+        captured
+            .receipt
+            .verify(&captured.scope, &captured.records)
+            .unwrap();
+        assert_eq!(captured.receipt.clock, ObservationClock::ConsumerUtc);
+    }
+
+    #[test]
+    fn capture_refuses_capacity_and_invalid_completion() {
+        let mut capture =
+            ObservationCapture::new(cursor(10, 0), ObservationClock::SourceAvailability, scope());
+        let item = trade(11, 1, 1);
+        capture.bytes = MAX_TOTAL_BYTES;
+        assert_eq!(
+            capture.record(item.cursor, &item.event),
+            Err(ObservationError::Capacity)
+        );
+        assert!(capture.records.is_empty());
+        capture.bytes = 0;
+        capture.record(item.cursor, &item.event).unwrap();
+        assert_eq!(
+            capture.finish(cursor(12, 2)).unwrap_err(),
+            ObservationError::Cursor
+        );
     }
 
     #[test]
