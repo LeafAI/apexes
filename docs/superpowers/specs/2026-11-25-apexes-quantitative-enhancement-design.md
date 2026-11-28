@@ -133,3 +133,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Combined read-only fee evidence](2026-11-28-apexes-combined-fee-evidence-design.md) combines classification, historical decisions, realized P&L and closing marks without changing account or owned-position recovery restrictions. Nonzero external-fee end-to-end qualification remains open.
 
 [Offline conversion-only scope evidence](2026-11-28-apexes-conversion-scope-evidence-design.md) compares a complete independently declared instrument classification with the exact retained journal and price/ledger footprint; no recovery allowlist or startup gate is changed.
+
+[Retained conversion-price window provenance](2026-11-28-apexes-conversion-price-provenance-design.md) independently compares final price windows against receipt-bound completed observations. Fill-time availability, source authenticity and recovery authority remain unqualified.

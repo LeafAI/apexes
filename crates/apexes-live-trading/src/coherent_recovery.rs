@@ -925,6 +925,39 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Compare final conversion price windows with independently receipt-
+    /// bound completed observations. No replay, fill-time provenance or
+    /// authoritative market-source completeness is established.
+    pub async fn inspect_conversion_price_provenance(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: (
+            &crate::ConversionScopeEvidence,
+            &crate::ObservationBoundaryEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_conversion_scope_evidence(store, ems_postgres_url, instruments, evidence.0)
+            .await?;
+        let capture = self
+            .inspect_durable_capture(store, ems_postgres_url)
+            .await?;
+        evidence.1.compare(
+            self.predecessor.owner_fingerprint(),
+            self.predecessor.receipt(),
+            &self.boundary,
+            &capture.scope,
+            &capture.records,
+        )?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        evidence.0.compare_prices(ledger, &capture.records)?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(
