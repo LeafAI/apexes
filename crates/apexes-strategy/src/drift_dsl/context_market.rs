@@ -144,6 +144,31 @@ fn cost_value(costs: &crate::CostObservation) -> DriftValue {
     ])
 }
 
+fn capital_value(capital: &HashMap<String, crate::CapitalObservation>) -> DriftValue {
+    let snapshot = Arc::new(capital.clone());
+    let lookup: drift_script::NativeFn = Arc::new(move |args| {
+        let snapshot = Arc::clone(&snapshot);
+        Box::pin(async move {
+            let [DriftValue::String(asset)] = args.as_slice() else {
+                return DriftValue::Undefined;
+            };
+            snapshot
+                .get(asset.as_str())
+                .map_or(DriftValue::Null, |entry| {
+                    object([
+                        ("ledger_balance", number(entry.ledger_balance)),
+                        ("reserved", number(entry.reserved)),
+                        ("unreserved", number(entry.unreserved)),
+                    ])
+                })
+        })
+    });
+    object([
+        ("source", string("simulated_spot_reservations")),
+        ("get", DriftValue::NativeFunction(lookup)),
+    ])
+}
+
 pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &StrategyContext<'_>) {
     if let DriftValue::Object(fields) = ctx {
         let market = context.market.filter(|m| m.matches(event));
@@ -161,5 +186,12 @@ pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &Strate
             .as_ref()
             .filter(|c| market.is_some_and(|m| c.matches(event, m.instrument())));
         fields.insert("costs".into(), costs.map_or(DriftValue::Null, cost_value));
+        fields.insert(
+            "capital".into(),
+            context
+                .capital
+                .as_ref()
+                .map_or(DriftValue::Null, capital_value),
+        );
     }
 }

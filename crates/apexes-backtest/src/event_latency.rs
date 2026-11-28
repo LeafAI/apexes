@@ -286,6 +286,59 @@ impl ArrivalQueue {
             .try_fold(Decimal::ZERO, |sum, h| sum.checked_add(h.amount))
     }
 
+    /// Read the same reservation totals used for admission. Scope this to
+    /// configured unit-multiplier Spot assets; leveraged/mixed sessions
+    /// need a distinct margin-aware availability contract.
+    pub(crate) fn capital_snapshot(
+        &self,
+        instruments: &[apexes_core::Instrument],
+        positions: &HashMap<String, apexes_strategy::Position>,
+        balances: &HashMap<String, Decimal>,
+    ) -> Option<HashMap<String, apexes_strategy::CapitalObservation>> {
+        use std::collections::HashSet;
+        let mut symbols = HashSet::new();
+        let mut assets = HashSet::new();
+        for instrument in instruments {
+            let base = instrument
+                .base_currency
+                .as_deref()
+                .filter(|a| !a.is_empty())?;
+            let quote = instrument
+                .quote_currency
+                .as_deref()
+                .filter(|a| !a.is_empty())?;
+            if instrument.asset_class != apexes_core::AssetClass::Spot
+                || instrument.multiplier != Decimal::ONE
+                || base == quote
+                || !symbols.insert(instrument.symbol.as_str())
+            {
+                return None;
+            }
+            assets.extend([base, quote]);
+        }
+        if symbols.is_empty()
+            || positions.values().any(|p| {
+                p.leverage.is_some()
+                    || p.quantity < Decimal::ZERO
+                    || !symbols.contains(p.symbol.as_str())
+            })
+        {
+            return None;
+        }
+        let mut result = HashMap::new();
+        for asset in assets {
+            if let Some(balance) = balances.get(asset) {
+                // Overflow or invalid ledger values are unavailable, never zero.
+                if let Some(observation) = self.reserved(asset, None).and_then(|reserved| {
+                    apexes_strategy::CapitalObservation::from_balances(*balance, reserved)
+                }) {
+                    result.insert(asset.to_owned(), observation);
+                }
+            }
+        }
+        Some(result)
+    }
+
     /// The ledger is keyed by symbol. Closing quantity is granted only
     /// when no other order on that symbol owns execution capacity.
     pub fn has_symbol_owner(&self, symbol: &str) -> bool {
@@ -688,6 +741,73 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn capital_snapshot_sums_shared_wallet_holds_and_retains_unknown_parent() {
+        use apexes_core::{Instrument, MarketType};
+        let d = Decimal::from;
+        let instruments: Vec<_> = [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH")]
+            .into_iter()
+            .map(|(symbol, base)| {
+                Instrument::new(
+                    symbol,
+                    MarketType::Crypto,
+                    Venue::Binance,
+                    AssetClass::Spot,
+                    Some(base.into()),
+                    Some("USDT".into()),
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                )
+                .unwrap()
+            })
+            .collect();
+        let balances = HashMap::from([("USDT".into(), d(100)), ("BTC".into(), Decimal::ZERO)]);
+        let positions = HashMap::new();
+        let mut queue = ArrivalQueue::new(EventLatencyPolicy { delay_ms: 500 });
+        let parent = ParentOrderId(uuid::Uuid::new_v4());
+        queue.reserve_parent(
+            parent,
+            &intent("BTCUSDT"),
+            CapitalHold::plain("USDT".into(), d(30)),
+        );
+        let pending = intent("ETHUSDT");
+        queue
+            .schedule(
+                Utc::now(),
+                pending.clone(),
+                Some(CapitalHold::plain("USDT".into(), d(20))),
+            )
+            .unwrap();
+        let snapshot = |q: &ArrivalQueue| {
+            q.capital_snapshot(&instruments, &positions, &balances)
+                .unwrap()
+        };
+        assert_eq!(snapshot(&queue)["USDT"].unreserved, d(50));
+        assert_eq!(snapshot(&queue)["BTC"].unreserved, Decimal::ZERO);
+        assert!(!snapshot(&queue).contains_key("ETH"));
+        queue.reconcile_parents(&HashMap::new());
+        assert_eq!(snapshot(&queue)["USDT"].reserved, d(50));
+        queue.reconcile_parents(&HashMap::from([(parent, ParentOrderStatus::Cancelled)]));
+        assert_eq!(snapshot(&queue)["USDT"].reserved, d(20));
+        queue.release(&pending);
+        assert_eq!(snapshot(&queue)["USDT"].unreserved, d(100));
+        let mut mixed = instruments.clone();
+        mixed[0].asset_class = AssetClass::Perpetual;
+        assert!(
+            queue
+                .capital_snapshot(&mixed, &positions, &balances)
+                .is_none()
+        );
+        let mut ambiguous = instruments.clone();
+        ambiguous.push(instruments[0].clone());
+        assert!(
+            queue
+                .capital_snapshot(&ambiguous, &positions, &balances)
+                .is_none()
+        );
     }
 
     #[test]

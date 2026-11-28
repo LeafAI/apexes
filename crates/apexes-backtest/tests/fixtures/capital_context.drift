@@ -1,0 +1,11 @@
+function on_market_event(event, ctx) {
+    if (ctx.capital == null || ctx.capital.source != "simulated_spot_reservations") { return []; }
+    let cash = ctx.capital.get("USDT");
+    if (cash == null || ctx.capital.get("UNKNOWN") != null) { return []; }
+    if (event.type == "depth" && event.symbol == "BTCUSDT" &&
+        cash.ledger_balance == 1000 && cash.reserved == 0 && cash.unreserved == 1000) {
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "limit", quantity: 1, price: 99 }];
+    }
+    return [];
+}

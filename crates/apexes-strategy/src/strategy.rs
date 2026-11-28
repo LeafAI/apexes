@@ -121,6 +121,8 @@ pub struct StrategyContext<'a> {
     pub book: Option<crate::BookObservation>,
     /// Frozen simulated fee assumptions for the event instrument.
     pub costs: Option<crate::CostObservation>,
+    /// Tracked local Spot reservations; absent when unsupported. Missing asset entries are unknown.
+    pub capital: Option<HashMap<String, crate::CapitalObservation>>,
 }
 
 impl StrategyContext<'_> {
@@ -317,6 +319,7 @@ mod tests {
         let open_orders = HashMap::new();
         let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -365,6 +368,7 @@ mod tests {
         let now = Utc::now();
 
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,

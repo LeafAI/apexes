@@ -57,6 +57,7 @@ fn always_buy_returns_one_buy_intent() {
             DriftScriptStrategy::from_file(&fixture_path("always_buy.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -85,6 +86,7 @@ fn uses_math_binding_computes_average_and_buys() {
             DriftScriptStrategy::from_file(&fixture_path("uses_math.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -124,6 +126,7 @@ fn uses_ctx_position_skips_when_already_long() {
         let balances = HashMap::new();
         let open_orders = HashMap::new();
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -153,6 +156,7 @@ fn uses_ctx_position_buys_when_flat_and_no_open_orders() {
             DriftScriptStrategy::from_file(&fixture_path("uses_ctx_position.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -199,6 +203,7 @@ fn runtime_error_script_returns_empty_vec_not_panic() {
             DriftScriptStrategy::from_file(&fixture_path("runtime_panic.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -227,6 +232,7 @@ fn uses_indicators_sma_stays_flat_during_warmup_then_buys() {
             DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -294,6 +300,7 @@ fn uses_indicators_sma_state_is_independent_per_strategy_instance() {
             DriftScriptStrategy::from_file(&fixture_path("uses_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -328,6 +335,7 @@ fn uses_signals_produces_no_order_during_indicator_warmup() {
             DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -365,6 +373,7 @@ fn uses_signals_produces_rebalance_order_once_warm() {
             DriftScriptStrategy::from_file(&fixture_path("uses_signals.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -435,6 +444,7 @@ fn top_level_param_call_does_not_hot_reload() {
             DriftScriptStrategy::from_file(&fixture_path("top_level_param.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -474,6 +484,7 @@ fn inside_on_market_event_param_call_does_hot_reload() {
             DriftScriptStrategy::from_file(&fixture_path("hot_reloadable_param.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -537,6 +548,7 @@ fn symbol_state_isolates_interleaved_windows_and_rolls_back_failed_callbacks() {
             DriftScriptStrategy::from_file(&fixture_path("symbol_state.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -597,6 +609,7 @@ fn scoped_native_indicators_isolate_warmup_and_rollback() {
             DriftScriptStrategy::from_file(&fixture_path("scoped_indicators.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -652,6 +665,7 @@ fn scoped_sma_migration_preserves_single_symbol_strategy_decisions() {
             DriftScriptStrategy::from_file(&fixture_path("uses_scoped_sma.drift")).unwrap();
         let (positions, balances, open_orders, now) = empty_ctx(Utc::now());
         let ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: None,
@@ -695,6 +709,7 @@ fn time_gates_isolate_instruments_and_rollback_failed_grants() {
             trade.price = price;
             trade.timestamp = now;
             let ctx = StrategyContext {
+                capital: None,
                 costs: None,
                 book: None,
                 market: None,
@@ -758,6 +773,7 @@ fn market_context_uses_unique_event_instrument_and_distinguishes_missing_balance
         let balances = HashMap::from([("BTC".into(), dec!(0)), ("USDT".into(), dec!(100))]);
         let single = [instrument.clone()];
         let mut ctx = StrategyContext {
+            capital: None,
             costs: None,
             book: None,
             market: InstrumentContext::for_event(&event, &single, &rules),
