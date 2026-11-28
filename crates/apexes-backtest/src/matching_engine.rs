@@ -4,7 +4,7 @@ use crate::replay_identity::{MatchingIds, ReplayIdentityPolicy};
 use apexes_core::{
     ApexesError, DepthUpdate, Fill, Order, OrderId, OrderStatus, OrderType, PriceLevel, Side, Venue,
 };
-use apexes_strategy::OrderIntent;
+use apexes_strategy::{OrderIntent, SimulatedTriggerTerminal, TriggerTerminalReason};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -95,6 +95,7 @@ pub struct MatchingEngine {
     /// Pending Stop/StopLimit orders awaiting their trigger price, keyed
     /// by symbol -> list of `PendingTrigger`.
     pending_triggers: HashMap<(Venue, String), Vec<PendingTrigger>>,
+    trigger_terminals: Vec<SimulatedTriggerTerminal>,
 }
 
 struct PendingTrigger {
@@ -102,6 +103,7 @@ struct PendingTrigger {
     intent: OrderIntent,
     stop_price: Decimal,
     created_at: DateTime<Utc>,
+    original_order: Order,
 }
 
 /// The outcome of `MatchingEngine::check_pending_triggers`: fills from
@@ -111,7 +113,7 @@ struct PendingTrigger {
 /// deferred conversion into resting Limit orders.
 struct TriggerCheckResult {
     stop_fills: Vec<(OrderId, Vec<Fill>)>,
-    stop_limit_conversions: Vec<(OrderId, OrderIntent)>,
+    stop_limit_conversions: Vec<(PendingTrigger, OrderIntent)>,
 }
 
 impl TriggerCheckResult {
@@ -150,6 +152,7 @@ impl MatchingEngine {
             queue_position_factor,
             resting_orders: HashMap::new(),
             pending_triggers: HashMap::new(),
+            trigger_terminals: Vec::new(),
         }
     }
 
@@ -856,6 +859,7 @@ impl MatchingEngine {
                 intent: intent.clone(),
                 stop_price,
                 created_at: now,
+                original_order: order.clone(),
             });
 
         Ok(order)
@@ -887,6 +891,7 @@ impl MatchingEngine {
         now: DateTime<Utc>,
         mut check: Option<&mut apexes_strategy::order_executor::SimulatedRestingCheck<'_>>,
     ) -> Vec<(OrderId, Vec<Fill>)> {
+        self.trigger_terminals.clear();
         // Stop-market orders execute first. Existing maker orders then
         // receive the print's budget. Newly triggered stop-limits execute
         // against causal opposite-side depth only after that maker pass;
@@ -928,7 +933,8 @@ impl MatchingEngine {
             ));
         }
 
-        for (original_order_id, limit_intent) in trigger_result.stop_limit_conversions {
+        for (trigger, limit_intent) in trigger_result.stop_limit_conversions {
+            let original_order_id = trigger.order_id;
             let result = self
                 .prepare_limit_order(&limit_intent, now)
                 .and_then(|mut order| {
@@ -941,16 +947,46 @@ impl MatchingEngine {
                         results.push((original_order_id, fills));
                     }
                 }
-                Err(error) => tracing::warn!(
-                    symbol = %trade.symbol,
-                    order_id = ?original_order_id,
-                    ?error,
-                    "StopLimit order triggered but failed to execute as a Limit order"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        symbol = %trade.symbol,
+                        order_id = ?original_order_id,
+                        ?error,
+                        "StopLimit order triggered but failed to execute as a Limit order"
+                    );
+                    self.record_trigger_terminal(
+                        trigger.original_order,
+                        Decimal::ZERO,
+                        now,
+                        TriggerTerminalReason::ConversionRejected,
+                    );
+                }
             }
         }
 
         results
+    }
+
+    /// Consume the explicit terminal evidence from the current trade.
+    pub(crate) fn take_trigger_terminals(&mut self) -> Vec<SimulatedTriggerTerminal> {
+        std::mem::take(&mut self.trigger_terminals)
+    }
+
+    fn record_trigger_terminal(
+        &mut self,
+        mut order: Order,
+        filled_quantity: Decimal,
+        now: DateTime<Utc>,
+        reason: TriggerTerminalReason,
+    ) {
+        order.filled_quantity = filled_quantity;
+        order.updated_at = now;
+        order.status = match reason {
+            TriggerTerminalReason::IocRemainderExpired => OrderStatus::Cancelled,
+            TriggerTerminalReason::ConversionRejected => OrderStatus::Rejected,
+        };
+        self.trigger_terminals
+            .push(SimulatedTriggerTerminal { order, reason });
     }
 
     /// Checks every pending Stop/StopLimit trigger at `trade.symbol`
@@ -964,7 +1000,7 @@ impl MatchingEngine {
     /// `on_trade_event` can merge them into its own results -- they flow
     /// through the exact same downstream mechanism as resting-order
     /// fills (ledger, equity curve, `BacktestReport.trades`). A triggered
-    /// `StopLimit` is returned as an `(OrderId, Limit OrderIntent)` pair
+    /// `StopLimit` is returned as an `(PendingTrigger, Limit OrderIntent)` pair
     /// (the original order's ID alongside the converted intent) for the
     /// caller to execute against causal depth AFTER the current maker
     /// pass. Only its unfilled remainder joins the queue; the trigger
@@ -1028,7 +1064,15 @@ impl MatchingEngine {
                         self.submit_market_order(&market_intent, now)
                     };
                     match result {
-                        Ok((_order, mut fills)) if !fills.is_empty() => {
+                        Ok((order, mut fills)) if !fills.is_empty() => {
+                            if order.status == OrderStatus::Cancelled {
+                                self.record_trigger_terminal(
+                                    trigger.original_order.clone(),
+                                    order.filled_quantity,
+                                    now,
+                                    TriggerTerminalReason::IocRemainderExpired,
+                                );
+                            }
                             tracing::info!(
                                 symbol = %trade.symbol,
                                 order_id = ?trigger.order_id,
@@ -1044,7 +1088,15 @@ impl MatchingEngine {
                             }
                             stop_fills.push((trigger.order_id, fills));
                         }
-                        Ok(_) => {
+                        Ok((order, _)) => {
+                            if order.status == OrderStatus::Cancelled {
+                                self.record_trigger_terminal(
+                                    trigger.original_order.clone(),
+                                    order.filled_quantity,
+                                    now,
+                                    TriggerTerminalReason::IocRemainderExpired,
+                                );
+                            }
                             tracing::warn!(
                                 symbol = %trade.symbol,
                                 order_id = ?trigger.order_id,
@@ -1058,6 +1110,12 @@ impl MatchingEngine {
                                 ?error,
                                 "Stop order triggered but failed to submit as a Market order"
                             );
+                            self.record_trigger_terminal(
+                                trigger.original_order,
+                                Decimal::ZERO,
+                                now,
+                                TriggerTerminalReason::ConversionRejected,
+                            );
                         }
                     }
                 }
@@ -1068,7 +1126,7 @@ impl MatchingEngine {
                     // the caller -- see this method's doc comment.
                     let mut limit_intent = trigger.intent.clone();
                     limit_intent.order_type = OrderType::Limit;
-                    stop_limit_conversions.push((trigger.order_id, limit_intent));
+                    stop_limit_conversions.push((trigger, limit_intent));
                 }
                 _ => unreachable!(
                     "PendingTrigger only ever holds Stop/StopLimit intents, enforced by submit_stop_order"

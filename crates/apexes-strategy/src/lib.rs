@@ -53,7 +53,8 @@ pub use fill_outcome::{FillOutcome, FillSource, PersistedFillLink};
 
 pub mod terminal_outcome;
 pub use terminal_outcome::{
-    LiveTerminalEvidence, LiveTerminalStatus, TerminalKind, TerminalOutcome,
+    LiveTerminalEvidence, LiveTerminalStatus, SimulatedTriggerTerminal, TerminalKind,
+    TerminalOutcome, TriggerTerminalReason,
 };
 
 pub mod parent_outcome;

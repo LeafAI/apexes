@@ -941,8 +941,7 @@ async fn resting_limit_reserves_quote_through_partial_fill_and_completion() {
     );
 }
 
-// A disappearing trigger or an end-of-replay working remainder is
-// not explicit cancellation, expiry or completion evidence.
+// End-of-replay working remainder is not explicit terminal evidence.
 struct NoTerminal(RestingThenDirect);
 impl Strategy for NoTerminal {
     fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
@@ -953,24 +952,52 @@ impl Strategy for NoTerminal {
     }
 }
 
+struct RejectedTrigger {
+    inner: RestingThenDirect,
+    terminals: std::sync::Arc<std::sync::Mutex<Vec<apexes_core::OrderId>>>,
+}
+
+impl Strategy for RejectedTrigger {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        self.inner.on_market_event(event, ctx)
+    }
+    fn on_order_terminal(&mut self, outcome: &apexes_strategy::TerminalOutcome<'_>) {
+        use apexes_strategy::{TerminalKind, TriggerTerminalReason};
+        let TerminalKind::Triggered { evidence } = outcome.kind else {
+            panic!("unexpected terminal: {outcome:?}");
+        };
+        assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(1)));
+        assert_eq!(evidence.reason, TriggerTerminalReason::ConversionRejected);
+        assert_eq!(evidence.order.order_type, apexes_core::OrderType::Stop);
+        assert_eq!(evidence.order.status, apexes_core::OrderStatus::Rejected);
+        assert_eq!(evidence.order.filled_quantity, dec!(0));
+        self.terminals.lock().unwrap().push(evidence.order.id);
+    }
+}
+
 #[tokio::test]
 async fn gapped_stop_cannot_spend_pending_direct_order_hold() {
     let (config, _) = shared_quote_fixture(dec!(12), dec!(6));
     let registry = child_risk_registry(Default::default());
+    let terminals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = run_backtest(
         config,
         &registry,
         InMemoryMarketDataSource::new(resting_capital_events(true)),
-        NoTerminal(RestingThenDirect {
-            first: false,
-            second: false,
-            stop: true,
-        }),
+        RejectedTrigger {
+            inner: RestingThenDirect {
+                first: false,
+                second: false,
+                stop: true,
+            },
+            terminals: terminals.clone(),
+        },
     )
     .await
     .unwrap();
     assert_eq!(report.trades.len(), 1);
     assert_eq!(report.trades[0].symbol, "ETHUSDT");
+    assert_eq!(terminals.lock().unwrap().len(), 1);
     let latency = report.event_latency.unwrap();
     assert_eq!(
         (

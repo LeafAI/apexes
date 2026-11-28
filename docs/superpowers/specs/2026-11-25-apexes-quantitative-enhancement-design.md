@@ -61,3 +61,5 @@ See [managed live fill attribution and notification progress](2026-11-28-apexes-
 
 
 See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-terminal-callbacks-design.md): a terminal delivery marker shares the existing authoritative status/fill transaction; live terminal callbacks wait for the fill notification prefix and never infer terminal state from disappearance. Startup inventory and terminal baselines are not durable strategy receipts.
+
+[Explicit simulated trigger terminal evidence](2026-11-28-apexes-trigger-terminal-evidence-design.md) separates an actual stop-market IOC remainder from a rejected stop conversion. Both preserve original order identity and notify after committed fills; disappearance due to invalid depth is not terminal evidence. Live exchange terminal normalization remains unchanged.
