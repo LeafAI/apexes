@@ -228,6 +228,21 @@ pub trait OrderExecutor: Send + Sync {
         })
     }
 
+    /// Optional durable inspection attachment. Backends must explicitly
+    /// support this, rather than silently dropping requested evidence.
+    async fn publish_completed_checkpoint_with_capture(
+        &self,
+        _previous: &crate::checkpoint::CheckpointReceipt,
+        _cursor: crate::checkpoint::StateCursor,
+        _last_intent: u64,
+        _envelope: &[u8],
+        _capture: &[u8],
+    ) -> Result<(), ApexesError> {
+        Err(ApexesError::InvalidBacktestConfig {
+            reason: "durable checkpoint capture backend is unsupported".into(),
+        })
+    }
+
     /// Observe returns from the callbacks for a fully applied supplemental batch.
     /// This does not persist strategy state or replay callbacks after restart.
     async fn acknowledge_supplemental_notifications(&self, _fills: &[Fill], _returned: bool) {}
@@ -262,4 +277,12 @@ pub trait LiquidationPolicy: Send + Sync {
 /// is a stream that never yields.
 pub trait SupplementalFillSource: Send {
     fn stream(&mut self) -> impl Stream<Item = Vec<Fill>> + Unpin + '_;
+
+    /// After dropping the stream, await any work detached from its polling
+    /// before the opt-in stop checkpoint. Ordinary sources have no such work.
+    fn quiesce_for_checkpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), ApexesError>> + Send {
+        async { Ok(()) }
+    }
 }

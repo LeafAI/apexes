@@ -50,6 +50,7 @@ impl CoherentRecoverySelection {
             || b.checkpoint.cursor.observed_at < previous.cursor.observed_at
             || !digest_valid(&b.checkpoint.envelope_sha256)
             || !digest_valid(&b.journal_sha256)
+            || b.capture_sha256.as_ref().is_some_and(|d| !digest_valid(d))
             || !(0..=2048).contains(&b.order_count)
             || !(0..=8192).contains(&b.fill_count)
             || b.fill_sequence < 0
@@ -355,6 +356,35 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Load the exact checkpoint-bound durable capture. This is read-only
+    /// and may describe unsupported risk slots; no restoration is performed.
+    pub async fn inspect_durable_capture(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+    ) -> Result<apexes_backtest::observation_receipt::CapturedObservations, CoherentInspectionError>
+    {
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        Ok(capture)
+    }
+
     /// Compare independent completed observation records to the retained
     /// receipt and exact selected durable journal. No replay or source
     /// completeness claim is made.
@@ -509,6 +539,7 @@ mod tests {
             order_count: 1,
             fill_count: 1,
             journal_sha256: "e".repeat(64),
+            capture_sha256: None,
         };
         (selection, boundary)
     }

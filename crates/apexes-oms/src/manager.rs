@@ -290,6 +290,28 @@ impl OrderManager {
         last_intent: u64,
         envelope: &[u8],
     ) -> Result<crate::CoherentCheckpointReceipt, crate::CheckpointStoreError> {
+        self.publish_coherent_strategy_checkpoint_with_capture(
+            previous,
+            cursor,
+            run_scope,
+            last_intent,
+            envelope,
+            None,
+        )
+        .await
+    }
+
+    /// Same stop-only checkpoint contract, retaining optional inspection bytes
+    /// atomically. The bytes are evidence, never a startup authorization.
+    pub async fn publish_coherent_strategy_checkpoint_with_capture(
+        &mut self,
+        previous: &apexes_strategy::checkpoint::CheckpointReceipt,
+        cursor: apexes_strategy::checkpoint::StateCursor,
+        run_scope: Uuid,
+        last_intent: u64,
+        envelope: &[u8],
+        capture: Option<&[u8]>,
+    ) -> Result<crate::CoherentCheckpointReceipt, crate::CheckpointStoreError> {
         use crate::{CheckpointStoreError, store::CompletedPrefix};
         let healthy = self.kill_switch.as_ref().is_some_and(|gate| {
             gate.phase() == Some(crate::SessionPhase::Running) && !gate.is_engaged()
@@ -329,7 +351,7 @@ impl OrderManager {
         let result = match prefix {
             Some(prefix) => {
                 self.store
-                    .publish_coherent_boundary(previous, cursor, envelope, prefix)
+                    .publish_coherent_boundary(previous, cursor, envelope, prefix, capture)
                     .await
             }
             None => Err(CheckpointStoreError::Boundary),

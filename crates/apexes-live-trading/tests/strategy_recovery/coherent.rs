@@ -310,6 +310,39 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert_eq!(captured.scope, scope);
     assert_eq!(captured.records, expected_records);
     captured.receipt.verify(&scope, &expected_records).unwrap();
+    assert!(receipt.capture_sha256.is_some());
+    let recovered = coherent
+        .inspect_durable_capture(&mut store, &fixture.url)
+        .await
+        .unwrap();
+    assert_eq!(recovered, captured);
+    let original = captured.encode_durable().unwrap();
+    for damaged in [Some(vec![1u8]), None] {
+        sqlx::query("UPDATE strategy_checkpoint_boundary SET capture=$1 WHERE singleton")
+            .bind(damaged)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.verify_coherent_boundary(&receipt).await.is_err());
+        assert!(
+            coherent
+                .inspect_durable_capture(&mut store, &fixture.url)
+                .await
+                .is_err()
+        );
+    }
+    sqlx::query("UPDATE strategy_checkpoint_boundary SET capture=$1 WHERE singleton")
+        .bind(original)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        coherent
+            .inspect_durable_capture(&mut store, &fixture.url)
+            .await
+            .unwrap(),
+        captured
+    );
     let records = captured.records;
     let history = captured.receipt;
     let retained = apexes_live_trading::ObservationBoundaryEvidence::new(
@@ -1016,6 +1049,7 @@ async fn zero_fill_terminal_callback_is_included_in_the_coherent_boundary() {
     );
     assert!(receipt.terminal_sequence > 0);
     let mut store = fixture.store().await;
+    assert!(receipt.capture_sha256.is_none());
     store.verify_coherent_boundary(&receipt).await.unwrap();
     let bytes = store
         .load_strategy_checkpoint(Some(&receipt.checkpoint))

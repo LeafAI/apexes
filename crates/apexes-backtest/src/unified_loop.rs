@@ -1350,7 +1350,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         queue.notify_expiry(&mut strategy);
     }
 
+    drop(supplemental_fill_stream);
     if let (Some(previous), Some(cursor)) = (checkpoint_predecessor, checkpoint_cursor) {
+        supplemental_fills.quiesce_for_checkpoint().await?;
         if checkpoint_invalid || cursor.ordinal <= previous.cursor.ordinal {
             return Err(ApexesError::InvalidBacktestConfig {
                 reason: "no valid completed observation boundary for checkpoint publication".into(),
@@ -1378,9 +1380,32 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
             capture.market_monitor_unqualified = market_condition_monitor.is_some();
             capture.margin_monitor_unqualified = !config.margin_tiers.is_empty();
         }
-        executor
-            .publish_completed_checkpoint(&previous, cursor, correlation.last_intent(), &envelope)
-            .await?;
+        if let Some(capture) = &captured {
+            let bytes =
+                capture
+                    .encode_durable()
+                    .map_err(|error| ApexesError::InvalidBacktestConfig {
+                        reason: format!("durable observation/risk encoding refused: {error}"),
+                    })?;
+            executor
+                .publish_completed_checkpoint_with_capture(
+                    &previous,
+                    cursor,
+                    correlation.last_intent(),
+                    &envelope,
+                    &bytes,
+                )
+                .await?;
+        } else {
+            executor
+                .publish_completed_checkpoint(
+                    &previous,
+                    cursor,
+                    correlation.last_intent(),
+                    &envelope,
+                )
+                .await?;
+        }
         if let Some(output) = observations {
             *output = captured;
         }

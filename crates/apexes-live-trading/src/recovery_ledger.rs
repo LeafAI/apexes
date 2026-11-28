@@ -316,6 +316,7 @@ mod tests {
             close,
             evidence,
             CoherentRecoverySnapshot {
+                capture: None,
                 envelope: vec![],
                 orders: vec![],
                 fills: vec![],
