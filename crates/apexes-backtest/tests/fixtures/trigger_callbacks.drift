@@ -1,0 +1,40 @@
+let submitted = false;
+let order_id = null;
+let triggered_quantity = 0;
+let terminal_ready = false;
+
+function on_order_outcome(outcome) {
+    if (outcome.kind == "returned" && outcome.intent_id == "1") {
+        order_id = outcome.order_id;
+    }
+}
+
+function on_fill(fill) {
+    if (fill.source == "resting" && fill.order_id == order_id && fill.intent_id == "1") {
+        triggered_quantity = triggered_quantity + fill.quantity;
+    }
+}
+
+function on_order_terminal(outcome) {
+    if (outcome.kind == "trigger_expired" && outcome.order_id == order_id &&
+        outcome.intent_id == "1" && outcome.quantity == 15 &&
+        outcome.filled_quantity == 10 && triggered_quantity == 10) {
+        terminal_ready = true;
+    }
+    return [{ symbol: outcome.symbol, venue: outcome.venue, asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 999 }];
+}
+
+function on_market_event(event, ctx) {
+    if (event.type == "trade" && !submitted && event.price == 100) {
+        submitted = true;
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "stop", quantity: 15, stop_price: 101 }];
+    }
+    if (event.type == "tick" && terminal_ready) {
+        terminal_ready = false;
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "sell", order_type: "market", quantity: 1 }];
+    }
+    return [];
+}

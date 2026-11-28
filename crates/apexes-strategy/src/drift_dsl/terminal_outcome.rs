@@ -1,5 +1,5 @@
 //! Detached explicit terminal outcome; transit intents have no order ID.
-use crate::{LiveTerminalStatus, TerminalKind, TerminalOutcome};
+use crate::{LiveTerminalStatus, TerminalKind, TerminalOutcome, TriggerTerminalReason};
 use drift_script::DriftValue;
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -26,6 +26,17 @@ pub(super) fn to_value(outcome: &TerminalOutcome<'_>) -> DriftValue {
         TerminalKind::Cancelled { order_id } => {
             ("cancelled", Some(order_id), None, None, None, None)
         }
+        TerminalKind::Triggered { evidence } => (
+            match evidence.reason {
+                TriggerTerminalReason::IocRemainderExpired => "trigger_expired",
+                TriggerTerminalReason::ConversionRejected => "trigger_rejected",
+            },
+            Some(evidence.order.id),
+            Some(evidence.order.symbol.as_str()),
+            Some(evidence.order.venue),
+            Some(evidence.order.quantity),
+            Some(evidence.order.filled_quantity),
+        ),
         TerminalKind::Live { order, status, .. } => (
             match status {
                 LiveTerminalStatus::Filled => "filled",

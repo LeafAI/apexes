@@ -41,6 +41,7 @@ pub struct MatchingEngineOrderExecutor {
     /// not retained in the strategy's open-order view.
     open_orders: Mutex<HashMap<OrderId, Order>>,
     completed: Mutex<Vec<Order>>,
+    trigger_terminals: Mutex<Vec<apexes_strategy::SimulatedTriggerTerminal>>,
 }
 
 impl MatchingEngineOrderExecutor {
@@ -49,6 +50,7 @@ impl MatchingEngineOrderExecutor {
             engine,
             open_orders: Mutex::new(HashMap::new()),
             completed: Mutex::new(Vec::new()),
+            trigger_terminals: Mutex::new(Vec::new()),
         }
     }
 
@@ -174,6 +176,15 @@ impl OrderExecutor for MatchingEngineOrderExecutor {
         std::mem::take(&mut *self.completed.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    fn take_simulated_trigger_terminals(&self) -> Vec<apexes_strategy::SimulatedTriggerTerminal> {
+        std::mem::take(
+            &mut *self
+                .trigger_terminals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
     async fn open_orders(&self) -> HashMap<OrderId, Order> {
         let engine = self.lock_engine();
         let mut open = self.lock_open_orders();
@@ -190,6 +201,11 @@ impl MatchingEngineOrderExecutor {
     ) -> Vec<(OrderId, Vec<Fill>)> {
         let mut completed = self.completed.lock().unwrap_or_else(|p| p.into_inner());
         completed.clear();
+        let mut trigger_terminals = self
+            .trigger_terminals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        trigger_terminals.clear();
         match event {
             MarketEvent::Trade(trade) => {
                 let mut engine = self.lock_engine();
@@ -215,6 +231,17 @@ impl MatchingEngineOrderExecutor {
                         }
                     }
                 }
+                // Only the actual conversion result supplies a terminal
+                // reason. Reconcile the original tracked order before pruning.
+                trigger_terminals.extend(engine.take_trigger_terminals().into_iter().filter(
+                    |evidence| {
+                        open_orders.get(&evidence.order.id).is_some_and(|order| {
+                            order.filled_quantity == evidence.order.filled_quantity
+                                && order.quantity == evidence.order.quantity
+                                && order.order_type == evidence.order.order_type
+                        })
+                    },
+                ));
                 open_orders.retain(|id, _| engine.is_working(*id));
                 fill_results
             }
@@ -366,6 +393,8 @@ mod tests {
         };
         let market = market_intent(OrderType::Market, None);
         let limit = market_intent(OrderType::Limit, Some(dec!(99)));
+        let mut stop = market_intent(OrderType::Stop, None);
+        stop.stop_price = Some(dec!(100));
         assert!(
             executor
                 .submit(&market, &HashMap::new(), &HashMap::new(), at)
@@ -378,11 +407,18 @@ mod tests {
             .await
             .unwrap();
         assert!(executor.open_orders().await.contains_key(&order.id));
+        let (pending, _) = executor
+            .submit(&stop, &HashMap::new(), &HashMap::new(), at)
+            .await
+            .unwrap();
+        assert!(executor.open_orders().await.contains_key(&pending.id));
         depth.is_snapshot = false;
         depth.sequence = Some(3);
         depth.timestamp = at + chrono::Duration::milliseconds(1);
         executor.on_market_event(&MarketEvent::Depth(depth.clone()));
         assert!(executor.open_orders().await.is_empty());
+        assert!(executor.take_simulated_trigger_terminals().is_empty());
+        assert!(executor.take_simulated_completions().is_empty());
         assert!(
             executor
                 .submit(&market, &HashMap::new(), &HashMap::new(), depth.timestamp)
@@ -397,6 +433,11 @@ mod tests {
             .await
             .unwrap();
         assert!(executor.open_orders().await.contains_key(&order.id));
+        let (pending, _) = executor
+            .submit(&stop, &HashMap::new(), &HashMap::new(), depth.timestamp)
+            .await
+            .unwrap();
+        assert!(executor.open_orders().await.contains_key(&pending.id));
         let later = at + chrono::Duration::milliseconds(1002);
         let trade = MarketEvent::Trade(TradeEvent {
             symbol: "BTCUSDT".into(),
@@ -409,6 +450,8 @@ mod tests {
         });
         assert!(executor.on_market_event(&trade).is_empty());
         assert!(executor.open_orders().await.is_empty());
+        assert!(executor.take_simulated_trigger_terminals().is_empty());
+        assert!(executor.take_simulated_completions().is_empty());
         depth.is_snapshot = false;
         depth.sequence = Some(11);
         depth.timestamp = later;
@@ -500,6 +543,21 @@ mod tests {
         assert_eq!(result[0].1[0].order_id, order.id);
         assert_eq!(result[0].1[0].quantity, dec!(10));
         assert!(executor.open_orders().await.is_empty());
+        let terminals = executor.take_simulated_trigger_terminals();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(
+            terminals[0].reason,
+            apexes_strategy::TriggerTerminalReason::IocRemainderExpired
+        );
+        assert_eq!(terminals[0].order.id, order.id);
+        assert_eq!(terminals[0].order.created_at, order.created_at);
+        assert_eq!(terminals[0].order.order_type, OrderType::Stop);
+        assert_eq!(terminals[0].order.stop_price, order.stop_price);
+        assert_eq!(terminals[0].order.status, OrderStatus::Cancelled);
+        assert_eq!(terminals[0].order.quantity, dec!(15));
+        assert_eq!(terminals[0].order.filled_quantity, dec!(10));
+        assert!(executor.take_simulated_completions().is_empty());
+        assert!(executor.take_simulated_trigger_terminals().is_empty());
         let (empty, _) = executor
             .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
             .await
@@ -514,6 +572,75 @@ mod tests {
         });
         assert!(executor.on_market_event(&event).is_empty());
         assert!(executor.open_orders().await.is_empty());
+        let terminals = executor.take_simulated_trigger_terminals();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(
+            terminals[0].reason,
+            apexes_strategy::TriggerTerminalReason::IocRemainderExpired
+        );
+        assert_eq!(terminals[0].order.id, empty.id);
+        assert_eq!(terminals[0].order.filled_quantity, Decimal::ZERO);
+        assert!(executor.on_market_event(&event).is_empty());
+        assert!(executor.take_simulated_trigger_terminals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_trigger_conversions_emit_original_identity_and_leave_depth_untouched() {
+        for order_type in [OrderType::Stop, OrderType::StopLimit] {
+            let executor = MatchingEngineOrderExecutor::new(engine_with_book());
+            let mut intent = market_intent(
+                order_type,
+                (order_type == OrderType::StopLimit).then_some(dec!(65010)),
+            );
+            intent.stop_price = Some(dec!(65000));
+            let (order, _) = executor
+                .submit(&intent, &HashMap::new(), &HashMap::new(), Utc::now())
+                .await
+                .unwrap();
+            let event = MarketEvent::Trade(TradeEvent {
+                symbol: "BTCUSDT".into(),
+                venue: Venue::Binance,
+                price: dec!(65010),
+                quantity: dec!(1),
+                side: Some(Side::Sell),
+                trade_id: None,
+                timestamp: Utc::now(),
+            });
+            let mut calls = 0;
+            let result = executor.on_market_event_checked(&event, &mut |id, fills, terminal| {
+                assert_eq!(id, order.id);
+                assert_eq!(fills.len(), 1);
+                assert!(terminal);
+                calls += 1;
+                Err("simulated execution guard refused".into())
+            });
+            assert_eq!(calls, 1);
+            assert!(result.is_empty());
+            assert!(executor.open_orders().await.is_empty());
+            let terminals = executor.take_simulated_trigger_terminals();
+            assert_eq!(terminals.len(), 1);
+            let evidence = &terminals[0];
+            assert_eq!(
+                evidence.reason,
+                apexes_strategy::TriggerTerminalReason::ConversionRejected
+            );
+            assert_eq!(evidence.order.id, order.id);
+            assert_eq!(evidence.order.order_type, order_type);
+            assert_eq!(evidence.order.stop_price, order.stop_price);
+            assert_eq!(evidence.order.status, OrderStatus::Rejected);
+            assert_eq!(evidence.order.filled_quantity, Decimal::ZERO);
+            assert!(executor.take_simulated_completions().is_empty());
+            assert!(executor.on_market_event(&event).is_empty());
+            assert!(executor.take_simulated_trigger_terminals().is_empty());
+            // Refused conversion did not consume the book.
+            let mut market = market_intent(OrderType::Market, None);
+            market.quantity = dec!(10);
+            let (filled, _) = executor
+                .submit(&market, &HashMap::new(), &HashMap::new(), Utc::now())
+                .await
+                .unwrap();
+            assert_eq!(filled.filled_quantity, dec!(10));
+        }
     }
 
     #[tokio::test]
@@ -626,6 +753,11 @@ mod tests {
         assert_eq!(fills[0].1[0].order_id, order.id);
         assert_eq!(fills[0].1[0].price, dec!(64990));
         assert!(!executor.open_orders().await.contains_key(&order.id));
+        assert!(executor.take_simulated_trigger_terminals().is_empty());
+        let complete = executor.take_simulated_completions();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].id, order.id);
+        assert_eq!(complete[0].filled_quantity, order.quantity);
     }
 
     #[tokio::test]

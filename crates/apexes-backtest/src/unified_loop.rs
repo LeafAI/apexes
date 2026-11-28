@@ -477,6 +477,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 for order in executor.take_simulated_completions() {
                     strategy.on_order_terminal(&TerminalOutcome { intent_id: correlation.order(order.id), at: timestamp, kind: TerminalKind::Filled { order: &order } });
                 }
+                for evidence in executor.take_simulated_trigger_terminals() {
+                    strategy.on_order_terminal(&TerminalOutcome { intent_id: correlation.order(evidence.order.id), at: timestamp, kind: TerminalKind::Triggered { evidence: &evidence } });
+                }
 
                 let mut checked_child_fills = HashSet::new();
                 let ems_result = if let Some(queue) = &mut arrivals {

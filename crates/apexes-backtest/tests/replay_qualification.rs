@@ -1675,3 +1675,100 @@ async fn transit_expiry_notifies_only_unsubmitted_direct_intents_at_observed_end
     assert_eq!(report.event_latency.unwrap().expired_at_end, 1);
     assert_eq!(evidence.lock().unwrap().expired, vec![(at(200), dec!(2))]);
 }
+
+#[test]
+fn trigger_expiry_callback_follows_committed_fills_and_drives_repeatable_drift_decision() {
+    use apexes_strategy::{
+        FillOutcome, FillSource, OrderOutcome, TerminalKind, TerminalOutcome,
+        TriggerTerminalReason, drift_dsl::DriftScriptStrategy,
+    };
+    type Evidence = Vec<(DateTime<Utc>, apexes_core::OrderId, Decimal)>;
+    struct Probe {
+        script: DriftScriptStrategy,
+        fills: Arc<std::sync::Mutex<Vec<apexes_core::Fill>>>,
+        terminals: Arc<std::sync::Mutex<Evidence>>,
+    }
+    impl Strategy for Probe {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            self.script.on_market_event(event, ctx)
+        }
+        fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            self.script.on_order_outcome(outcome);
+        }
+        fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+            if outcome.intent_id == Some(apexes_strategy::IntentId(1)) {
+                assert_eq!(outcome.source, FillSource::Resting);
+            }
+            self.fills.lock().unwrap().push(outcome.fill.clone());
+            self.script.on_fill(outcome);
+        }
+        fn on_order_terminal(&mut self, outcome: &TerminalOutcome<'_>) {
+            let TerminalKind::Triggered { evidence } = outcome.kind else {
+                panic!("unexpected terminal");
+            };
+            assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(1)));
+            assert_eq!(evidence.reason, TriggerTerminalReason::IocRemainderExpired);
+            assert_eq!(evidence.order.order_type, OrderType::Stop);
+            assert_eq!(evidence.order.status, apexes_core::OrderStatus::Cancelled);
+            assert_eq!(evidence.order.stop_price, Some(dec!(101)));
+            assert_eq!(evidence.order.quantity, dec!(15));
+            assert_eq!(evidence.order.filled_quantity, dec!(10));
+            let fills = self.fills.lock().unwrap();
+            assert_eq!(fills.iter().map(|f| f.quantity).sum::<Decimal>(), dec!(10));
+            assert!(fills.iter().all(|f| f.order_id == evidence.order.id));
+            self.terminals.lock().unwrap().push((
+                outcome.at,
+                evidence.order.id,
+                evidence.order.filled_quantity,
+            ));
+            self.script.on_order_terminal(outcome);
+        }
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/trigger_callbacks.drift");
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(100, dec!(100), "admit"),
+        trade(200, dec!(101), "trigger"),
+        tick(300),
+        trade(400, dec!(102), "repeat"),
+    ];
+    let mut prior = None;
+    for _ in 0..2 {
+        let r = registry(&events, "trigger-callbacks");
+        let fills = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let report = futures::executor::block_on(run_backtest(
+            configuration(AssetClass::Spot, None),
+            &r,
+            InMemoryMarketDataSource::new(events.clone()),
+            Probe {
+                script: DriftScriptStrategy::from_file(&path).unwrap(),
+                fills: fills.clone(),
+                terminals: terminals.clone(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(report.trades.len(), 2);
+        assert_eq!(report.trades[0].quantity, dec!(10));
+        assert_eq!(report.trades[1].side, Side::Sell);
+        assert_eq!(report.trades[1].quantity, dec!(1));
+        assert_eq!(*fills.lock().unwrap(), report.trades);
+        let observed = terminals.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![(at(200), report.trades[0].order_id, dec!(10))]
+        );
+        let digest = canonical_report_sha256(&report).unwrap();
+        if let Some(previous) = &prior {
+            assert_eq!(previous, &(observed.clone(), digest.clone()));
+        }
+        prior = Some((observed, digest));
+    }
+}

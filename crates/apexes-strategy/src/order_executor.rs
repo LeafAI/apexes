@@ -164,6 +164,12 @@ pub trait OrderExecutor: Send + Sync {
         Vec::new()
     }
 
+    /// Consume explicit failed-conversion/IOC-remainder evidence from the
+    /// last simulated event. No evidence is inferred from absent orders.
+    fn take_simulated_trigger_terminals(&self) -> Vec<crate::SimulatedTriggerTerminal> {
+        Vec::new()
+    }
+
     /// Every currently open (unfilled or partially-filled) order,
     /// keyed by `OrderId` — feeds `StrategyContext::open_orders`.
     /// Returns an owned `HashMap` (a clone each call); see this

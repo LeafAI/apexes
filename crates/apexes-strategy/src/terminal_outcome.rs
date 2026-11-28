@@ -21,12 +21,32 @@ pub struct LiveTerminalEvidence {
     pub link: PersistedFillLink,
 }
 
+/// A simulator's explicit result of activating an admitted stop order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTerminalReason {
+    /// Stop-market execution completed with an unexecuted IOC remainder.
+    IocRemainderExpired,
+    /// The converted market or limit order was refused before execution.
+    ConversionRejected,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulatedTriggerTerminal {
+    /// Original admitted stop order, not the temporary converted order.
+    pub order: Order,
+    pub reason: TriggerTerminalReason,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TerminalKind<'a> {
     /// Previously working order whose recorded fill quantity reached its quantity.
     Filled { order: &'a Order },
     /// Actual ID returned by the simulator's successful cancellation operation.
     Cancelled { order_id: OrderId },
+    /// Explicit simulator trigger result, after all committed fills.
+    Triggered {
+        evidence: &'a SimulatedTriggerTerminal,
+    },
     /// Positive durable exchange evidence, after its locally applied fills.
     Live {
         order: &'a Order,
