@@ -65,3 +65,7 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Explicit simulated trigger terminal evidence](2026-11-28-apexes-trigger-terminal-evidence-design.md) separates an actual stop-market IOC remainder from a rejected stop conversion. Both preserve original order identity and notify after committed fills; disappearance due to invalid depth is not terminal evidence. Live exchange terminal normalization remains unchanged.
 
 [Lifecycle recovery qualification](2026-11-28-apexes-lifecycle-recovery-qualification-design.md) verifies the restart boundaries of managed fill and terminal delivery and the actual live loop after inventory recovery. Recovered baselines are not callback receipts; a running manager may not reset them. Durable strategy-state restore and callback atomicity remain separate work.
+
+## Strategy state and warm-up (F04.05)
+
+[Versioned strategy state contract](2026-11-28-apexes-strategy-state-contract-design.md) validates a bounded checkpoint against an independently selected identity, schema and observation cursor before invoking opt-in strategy restore. It does not provide durable publication, automatic runner integration or atomic callback recovery.

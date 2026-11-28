@@ -34,6 +34,25 @@ pub trait Strategy: Send {
     /// Notification-only EMS parent submission and observed phase changes.
     fn on_parent_outcome(&mut self, _outcome: &crate::ParentOutcome<'_>) {}
 
+    /// Schema version owned by the strategy. None means checkpointing is unsupported.
+    fn checkpoint_schema_version(&self) -> Option<u32> {
+        None
+    }
+
+    /// Opt-in state serialization. Never include credentials or exchange secrets.
+    fn checkpoint_payload(&self) -> Result<String, crate::checkpoint::CheckpointError> {
+        Err(crate::checkpoint::CheckpointError::Unsupported)
+    }
+
+    /// Restore a validated envelope on a fresh isolated candidate. Implementations
+    /// must validate the entire payload and avoid external side effects.
+    fn restore_checkpoint(
+        &mut self,
+        _state: &crate::checkpoint::ValidatedState<'_>,
+    ) -> Result<(), crate::checkpoint::CheckpointError> {
+        Err(crate::checkpoint::CheckpointError::Unsupported)
+    }
+
     /// Reads all currently-tunable parameter values, for monitoring/
     /// snapshot display. Default: no tunable parameters (empty map) --
     /// existing `Strategy` implementations need no changes to keep
@@ -91,6 +110,21 @@ impl Strategy for Box<dyn Strategy> {
 
     fn on_parent_outcome(&mut self, outcome: &crate::ParentOutcome<'_>) {
         (**self).on_parent_outcome(outcome);
+    }
+
+    fn checkpoint_schema_version(&self) -> Option<u32> {
+        (**self).checkpoint_schema_version()
+    }
+
+    fn checkpoint_payload(&self) -> Result<String, crate::checkpoint::CheckpointError> {
+        (**self).checkpoint_payload()
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        state: &crate::checkpoint::ValidatedState<'_>,
+    ) -> Result<(), crate::checkpoint::CheckpointError> {
+        (**self).restore_checkpoint(state)
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {
