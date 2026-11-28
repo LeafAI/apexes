@@ -17,7 +17,8 @@ pub use terminal_evidence::TerminalEvidence;
 
 #[path = "checkpoint_store.rs"]
 mod checkpoint_store;
-pub use checkpoint_store::CheckpointStoreError;
+pub(crate) use checkpoint_store::CompletedPrefix;
+pub use checkpoint_store::{CheckpointStoreError, CoherentCheckpointReceipt};
 
 #[path = "fill_reconciliation.rs"]
 mod fill_reconciliation;
@@ -216,10 +217,13 @@ impl OrderStore {
                 } else {
                     false
                 };
-                let has_checkpoints: bool =
-                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_checkpoint_head)")
-                        .fetch_one(&mut connection)
-                        .await?;
+                let has_checkpoints: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM strategy_checkpoint_head)
+                        OR EXISTS(SELECT 1 FROM strategy_checkpoint_startup_claim)
+                        OR EXISTS(SELECT 1 FROM strategy_checkpoint_boundary)",
+                )
+                .fetch_one(&mut connection)
+                .await?;
                 if has_orders || has_parent_rows || has_checkpoints {
                     return Err(OmsError::InvalidRow { reason: "legacy unbound inventory history requires audited migration; no automatic adoption".into() });
                 }

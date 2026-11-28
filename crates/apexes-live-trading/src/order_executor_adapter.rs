@@ -25,6 +25,12 @@ use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 
+/// Internal, single-run opt-in and acknowledged stop receipt.
+pub(crate) struct StopCheckpoint {
+    pub(crate) previous: apexes_strategy::checkpoint::CheckpointReceipt,
+    pub(crate) published: std::sync::Mutex<Option<apexes_oms::CoherentCheckpointReceipt>>,
+}
+
 /// Adapts `OrderManager` (live trading's real, asynchronous order
 /// submission/tracking backend) to `OrderExecutor`. Wraps the SAME
 /// `Arc<tokio::sync::Mutex<OrderManager>>` `run_live_trading` already
@@ -40,6 +46,7 @@ pub struct OrderManagerExecutor {
     /// Served when the lock is busy, so the trading loop never stalls behind a
     /// slow exchange query (see [`OrderManagerExecutor::open_orders`]).
     last_open_orders: std::sync::Mutex<HashMap<OrderId, Order>>,
+    stop_checkpoint: Option<Arc<StopCheckpoint>>,
 }
 
 /// How long the loop waits for the order manager before using its last known
@@ -58,7 +65,13 @@ impl OrderManagerExecutor {
             submission_gate,
             intent_scope: uuid::Uuid::new_v4(),
             last_open_orders: std::sync::Mutex::new(HashMap::new()),
+            stop_checkpoint: None,
         }
+    }
+
+    pub(crate) fn with_stop_checkpoint(mut self, checkpoint: Option<Arc<StopCheckpoint>>) -> Self {
+        self.stop_checkpoint = checkpoint;
+        self
     }
 
     /// Scope of the live executor's session-local strategy intent ordinals.
@@ -77,6 +90,7 @@ impl OrderManagerExecutor {
             submission_gate,
             intent_scope: uuid::Uuid::new_v4(),
             last_open_orders: std::sync::Mutex::new(HashMap::new()),
+            stop_checkpoint: None,
         }
     }
 }
@@ -108,6 +122,45 @@ where
 
 #[async_trait]
 impl OrderExecutor for OrderManagerExecutor {
+    fn checkpoint_predecessor(&self) -> Option<apexes_strategy::checkpoint::CheckpointReceipt> {
+        self.stop_checkpoint
+            .as_ref()
+            .map(|request| request.previous.clone())
+    }
+
+    async fn publish_completed_checkpoint(
+        &self,
+        previous: &apexes_strategy::checkpoint::CheckpointReceipt,
+        cursor: apexes_strategy::checkpoint::StateCursor,
+        last_intent: u64,
+        envelope: &[u8],
+    ) -> Result<(), ApexesError> {
+        let failure = |reason: String| ApexesError::InvalidBacktestConfig { reason };
+        let request = self
+            .stop_checkpoint
+            .as_ref()
+            .filter(|r| &r.previous == previous)
+            .ok_or_else(|| failure("missing explicit stop checkpoint request".into()))?;
+        let mut manager = tokio::time::timeout(Duration::from_secs(2), self.order_manager.lock())
+            .await
+            .map_err(|_| failure("checkpoint boundary could not obtain the OMS lease".into()))?;
+        let receipt = manager
+            .publish_coherent_strategy_checkpoint(
+                previous,
+                cursor,
+                self.intent_scope,
+                last_intent,
+                envelope,
+            )
+            .await
+            .map_err(|error| failure(format!("coherent strategy checkpoint: {error}")))?;
+        *request
+            .published
+            .lock()
+            .map_err(|_| failure("checkpoint receipt lock poisoned".into()))? = Some(receipt);
+        Ok(())
+    }
+
     fn intent_run_scope(&self) -> Option<uuid::Uuid> {
         Some(self.intent_scope)
     }

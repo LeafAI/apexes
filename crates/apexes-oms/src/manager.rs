@@ -114,6 +114,7 @@ pub struct OrderManager {
     // Process-local acknowledgement watermark; startup rebuilds from all
     // durable history before establishing a new watermark.
     fill_delivery: Option<FillDelivery>,
+    claimed_checkpoint: Option<apexes_strategy::checkpoint::CheckpointReceipt>,
     terminal_wakeup: Arc<tokio::sync::Notify>,
     spot_scope: Option<HashMap<String, (String, String)>>,
     // Retain the full spend reservation until authoritative terminal state.
@@ -160,6 +161,7 @@ impl OrderManager {
             open_orders,
             kill_switch: None,
             fill_delivery: None,
+            claimed_checkpoint: None,
             terminal_wakeup: Arc::new(tokio::sync::Notify::new()),
             spot_scope: None,
             spot_reservations,
@@ -269,8 +271,74 @@ impl OrderManager {
         } else {
             Err(CheckpointStoreError::StartupPhase)
         };
-        if result.is_err() {
+        if result.is_ok() {
+            self.claimed_checkpoint = Some(expected.clone());
+        } else {
             self.report_health_fault("live strategy checkpoint startup refused");
+        }
+        result
+    }
+
+    /// Publish state captured by the unified loop at a completed, quiescent
+    /// direct-only boundary. Never treat recovered baselines as callback
+    /// returns. The durable transaction independently verifies the journal.
+    pub async fn publish_coherent_strategy_checkpoint(
+        &mut self,
+        previous: &apexes_strategy::checkpoint::CheckpointReceipt,
+        cursor: apexes_strategy::checkpoint::StateCursor,
+        run_scope: Uuid,
+        last_intent: u64,
+        envelope: &[u8],
+    ) -> Result<crate::CoherentCheckpointReceipt, crate::CheckpointStoreError> {
+        use crate::{CheckpointStoreError, store::CompletedPrefix};
+        let healthy = self.kill_switch.as_ref().is_some_and(|gate| {
+            gate.phase() == Some(crate::SessionPhase::Running) && !gate.is_engaged()
+        });
+        // The existing preflight prunes cached reservations for orders
+        // which have left the working set. Do the same here; the durable
+        // witness independently refuses every unresolved/working order.
+        self.spot_reservations
+            .retain(|id, _| self.open_orders.contains_key(id));
+        let prefix = self
+            .fill_delivery
+            .as_ref()
+            .filter(|d| {
+                healthy
+                    && self.claimed_checkpoint.as_ref() == Some(previous)
+                    && self.open_orders.is_empty()
+                    && self.spot_reservations.is_empty()
+                    && !self.reservation_breached
+                    && self.spot_scope.is_some()
+                    && d.recovered_checkpoint == 0
+                    && d.recovered_terminal_checkpoint == 0
+                    && d.checkpoint == d.notification_checkpoint
+                    && !d.failed
+                    && !d.notification_failed
+                    && !d.terminal_failed
+                    && !d.dirty
+                    && d.pending.is_none()
+                    && d.notification_pending.is_none()
+                    && d.terminal_pending.is_none()
+            })
+            .map(|d| CompletedPrefix {
+                run_scope,
+                last_intent,
+                fill_sequence: d.notification_checkpoint,
+                terminal_sequence: d.terminal_checkpoint,
+            });
+        let result = match prefix {
+            Some(prefix) => {
+                self.store
+                    .publish_coherent_boundary(previous, cursor, envelope, prefix)
+                    .await
+            }
+            None => Err(CheckpointStoreError::Boundary),
+        };
+        // One publication attempt per claimed manager, even after an
+        // uncertain result. The independent verifier can inspect evidence.
+        self.claimed_checkpoint = None;
+        if result.is_err() {
+            self.report_health_fault("coherent strategy checkpoint publication refused");
         }
         result
     }

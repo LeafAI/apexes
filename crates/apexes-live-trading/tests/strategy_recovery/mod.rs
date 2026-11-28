@@ -445,3 +445,5 @@ async fn runner_refuses_durable_parent_history_without_orders_or_fills() {
     assert_eq!(fixture.claim_count().await, 0);
     fixture.cleanup().await;
 }
+
+mod coherent;

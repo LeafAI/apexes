@@ -207,6 +207,27 @@ pub trait OrderExecutor: Send + Sync {
     /// Advance the current-process receipt only after callbacks return.
     async fn acknowledge_live_terminals(&self, _ids: &[OrderId]) {}
 
+    /// Explicit, opt-in publication at the completed unified-loop stop
+    /// boundary. Legacy/simulated backends never request a checkpoint.
+    fn checkpoint_predecessor(&self) -> Option<crate::checkpoint::CheckpointReceipt> {
+        None
+    }
+
+    /// The loop calls this only after all synchronous callbacks for its
+    /// completed observations and supplemental batches returned. The
+    /// backend must independently verify the durable execution prefix.
+    async fn publish_completed_checkpoint(
+        &self,
+        _previous: &crate::checkpoint::CheckpointReceipt,
+        _cursor: crate::checkpoint::StateCursor,
+        _last_intent: u64,
+        _envelope: &[u8],
+    ) -> Result<(), ApexesError> {
+        Err(ApexesError::InvalidBacktestConfig {
+            reason: "checkpoint publication backend is unsupported".into(),
+        })
+    }
+
     /// Observe returns from the callbacks for a fully applied supplemental batch.
     /// This does not persist strategy state or replay callbacks after restart.
     async fn acknowledge_supplemental_notifications(&self, _fills: &[Fill], _returned: bool) {}
