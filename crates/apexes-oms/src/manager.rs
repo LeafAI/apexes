@@ -1292,6 +1292,21 @@ impl OrderManager {
         report
     }
 
+    /// Inspect a persisted client ID using this manager's bound gateway.
+    /// Unknown local IDs never cause a gateway call. No mutation, release
+    /// of reservations, or retry authorization follows from this observation.
+    pub async fn inspect_client_identity(
+        &self,
+        id: OrderId,
+    ) -> Result<Option<crate::IdentityEvidence>, OmsError> {
+        let Some((order, state)) = self.store.identity_snapshot(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::identity_evidence::observe(self.gateway.as_ref(), order, state).await,
+        ))
+    }
+
     /// Durable lookup for background EMS reconciliation, including terminal children.
     pub async fn persisted_order(&self, id: OrderId) -> Result<Option<Order>, OmsError> {
         self.store.get_order(id).await
@@ -1900,6 +1915,32 @@ mod tests {
             OrderManager::new(OrderStore::new(POSTGRES_URL).await.unwrap(), &registry)
                 .await
                 .unwrap();
+        let evidence = recovered
+            .inspect_client_identity(order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.local.id, order_id);
+        assert_eq!(evidence.submission_state, SubmissionState::Submitting);
+        assert_eq!(evidence.local.exchange_order_id, None);
+        assert_eq!(
+            evidence.remote,
+            crate::RemoteIdentity::Found {
+                exchange_order_id: "EX-INTERRUPTED".into(),
+                status: OrderStatus::New
+            }
+        );
+        assert_eq!(
+            store.get_submission_state(order_id).await.unwrap(),
+            Some(SubmissionState::Submitting)
+        );
+        assert!(
+            recovered
+                .inspect_client_identity(OrderId(Uuid::new_v4()))
+                .await
+                .unwrap()
+                .is_none()
+        );
         recovered.reconcile().await.unwrap();
         assert_eq!(
             store.get_submission_state(order_id).await.unwrap(),
