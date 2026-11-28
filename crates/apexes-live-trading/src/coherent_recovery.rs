@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("offline ledger continuity refused: {0}")]
+    Ledger(#[from] crate::LedgerContinuityError),
     #[error("supplied wallet evidence refused: {0}")]
     Wallet(#[from] crate::WalletEvidenceError),
     #[error("supplied recovery evidence window refused: {0}")]
@@ -250,6 +252,61 @@ impl CoherentRecoverySelection {
             strategies.1,
             instruments,
             &wallet.balances,
+        )
+        .await
+    }
+
+    /// Offline closed-account accounting check. The opening balance is
+    /// independently supplied and tied to the original claim receipt.
+    /// This is not proof of an exchange snapshot or startup permission.
+    pub async fn inspect_ledger_continuity<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    ) -> Result<CoherentRecoveryPreview, CoherentInspectionError> {
+        let (opening, evidence, wallet, inspected_at) = observations;
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .iter()
+            .cloned()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        crate::recovery_ledger::validate_ledger_continuity(
+            opening,
+            wallet,
+            (
+                self.predecessor.receipt(),
+                self.predecessor.owner_fingerprint(),
+            ),
+            evidence,
+            &snapshot,
+            instruments,
+            &fills,
+        )?;
+        self.inspect_wallet_continuity(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            (evidence, wallet, inspected_at),
         )
         .await
     }
