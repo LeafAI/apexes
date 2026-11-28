@@ -31,6 +31,9 @@ pub trait Strategy: Send {
     /// Notification-only explicit simulated terminal evidence.
     fn on_order_terminal(&mut self, _outcome: &crate::TerminalOutcome<'_>) {}
 
+    /// Notification-only EMS parent submission and observed phase changes.
+    fn on_parent_outcome(&mut self, _outcome: &crate::ParentOutcome<'_>) {}
+
     /// Reads all currently-tunable parameter values, for monitoring/
     /// snapshot display. Default: no tunable parameters (empty map) --
     /// existing `Strategy` implementations need no changes to keep
@@ -84,6 +87,10 @@ impl Strategy for Box<dyn Strategy> {
 
     fn on_order_terminal(&mut self, outcome: &crate::TerminalOutcome<'_>) {
         (**self).on_order_terminal(outcome);
+    }
+
+    fn on_parent_outcome(&mut self, outcome: &crate::ParentOutcome<'_>) {
+        (**self).on_parent_outcome(outcome);
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {

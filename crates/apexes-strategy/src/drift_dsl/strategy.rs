@@ -31,6 +31,7 @@ pub struct DriftScriptStrategy {
     on_order_outcome_fn: Option<DriftValue>,
     on_fill_fn: Option<DriftValue>,
     on_order_terminal_fn: Option<DriftValue>,
+    on_parent_outcome_fn: Option<DriftValue>,
     params: Arc<ParamStore>,
     symbol_state: super::symbol_state::ScriptState,
 }
@@ -118,8 +119,17 @@ impl DriftScriptStrategy {
             return Err(StrategyError::TerminalCallbackNotCallable);
         }
 
+        let on_parent_outcome_fn = interpreter.env().get("on_parent_outcome");
+        if on_parent_outcome_fn
+            .as_ref()
+            .is_some_and(|f| !matches!(f, DriftValue::Function(_)))
+        {
+            return Err(StrategyError::ParentCallbackNotCallable);
+        }
+
         Ok(Self {
             interpreter,
+            on_parent_outcome_fn,
             on_order_terminal_fn,
             on_fill_fn,
             on_order_outcome_fn,
@@ -218,6 +228,21 @@ impl Strategy for DriftScriptStrategy {
                 .is_err()
             {
                 tracing::error!("on_order_terminal script error");
+            }
+        }
+    }
+
+    fn on_parent_outcome(&mut self, outcome: &crate::ParentOutcome<'_>) {
+        if let Some(callback) = &self.on_parent_outcome_fn {
+            let handle = tokio::runtime::Handle::current();
+            if handle
+                .block_on(self.interpreter.call(
+                    callback.clone(),
+                    vec![super::parent_outcome::to_value(outcome)],
+                ))
+                .is_err()
+            {
+                tracing::error!("on_parent_outcome script error");
             }
         }
     }

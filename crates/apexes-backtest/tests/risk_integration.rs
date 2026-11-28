@@ -1293,6 +1293,8 @@ async fn leveraged_resting_sell_reserves_margin_until_terminal_fill() {
 /// first EMS child would otherwise execute.
 #[derive(Default)]
 struct EmergencyEvidence {
+    parent: Option<apexes_strategy::ParentOrderId>,
+    parent_cancelled: Vec<(chrono::DateTime<Utc>, apexes_strategy::ParentOrderId)>,
     resting: Option<apexes_core::OrderId>,
     terminals: Vec<(chrono::DateTime<Utc>, Option<apexes_core::OrderId>)>,
 }
@@ -1302,6 +1304,25 @@ struct EmergencyCompetition {
 }
 
 impl Strategy for EmergencyCompetition {
+    fn on_parent_outcome(&mut self, outcome: &apexes_strategy::ParentOutcome<'_>) {
+        use apexes_strategy::{ParentOutcomeKind, ParentPhase};
+        let mut e = self.evidence.lock().unwrap();
+        match outcome.kind {
+            ParentOutcomeKind::Submitted { id, .. } => {
+                assert!(e.parent.replace(id).is_none());
+            }
+            ParentOutcomeKind::StatusChanged {
+                id,
+                previous: ParentPhase::Scheduling,
+                current: ParentPhase::Cancelled,
+            } => {
+                assert_eq!(Some(id), e.parent);
+                e.parent_cancelled.push((outcome.at, id));
+            }
+            _ => panic!("unexpected parent outcome {outcome:?}"),
+        }
+    }
+
     fn on_order_outcome(&mut self, outcome: &apexes_strategy::OrderOutcome<'_>) {
         if let apexes_strategy::OrderOutcomeKind::Returned { order } = outcome.kind
             && order.status == apexes_core::OrderStatus::New
@@ -1457,6 +1478,7 @@ async fn assert_emergency_preempts_competing_orders(jump: bool) {
         let at = start + chrono::Duration::milliseconds(1600);
         assert!(seen.resting.is_some());
         assert_eq!(seen.terminals, vec![(at, None), (at, seen.resting)]);
+        assert_eq!(seen.parent_cancelled, vec![(at, seen.parent.unwrap())]);
     }
     assert_eq!(report.trades.len(), 2, "{:?}", report.trades);
     assert_eq!(report.trades[0].side, apexes_core::Side::Buy);
@@ -1750,13 +1772,40 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         DatasetDefinition, DatasetStream, StreamKind, seal_dataset,
     };
     use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
-    use apexes_strategy::ParentOrderId;
+    use apexes_strategy::{ParentOrderId, ParentOutcome, ParentOutcomeKind, ParentPhase};
+    type Lifecycle = Vec<(chrono::DateTime<Utc>, ParentOrderId, Option<ParentPhase>)>;
     use std::sync::{Arc, Mutex};
     struct Parents {
         sent: bool,
         observed: Arc<Mutex<Vec<ParentOrderId>>>,
+        lifecycle: Arc<Mutex<Lifecycle>>,
+        failures: Arc<Mutex<Vec<String>>>,
     }
     impl Strategy for Parents {
+        fn on_parent_outcome(&mut self, outcome: &ParentOutcome<'_>) {
+            let (id, phase) = match outcome.kind {
+                ParentOutcomeKind::Submitted { id, intent } => {
+                    assert!(intent.execution_algo.is_some());
+                    (id, None)
+                }
+                ParentOutcomeKind::StatusChanged {
+                    id,
+                    previous,
+                    current,
+                } => {
+                    assert_eq!(previous, ParentPhase::Scheduling);
+                    assert_eq!(current, ParentPhase::Completed);
+                    (id, Some(current))
+                }
+                ParentOutcomeKind::SubmissionFailed { intent } => {
+                    self.failures.lock().unwrap().push(intent.symbol.clone());
+                    return;
+                }
+                _ => panic!("unexpected parent outcome {outcome:?}"),
+            };
+            self.lifecycle.lock().unwrap().push((outcome.at, id, phase));
+        }
+
         fn on_market_event(
             &mut self,
             event: &MarketEvent,
@@ -1877,6 +1926,8 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     let mut expected = None;
     for _ in 0..10 {
         let observed = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let failures = Arc::new(Mutex::new(Vec::new()));
         let report = run_backtest(
             config(),
             &registry,
@@ -1884,6 +1935,8 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
             Parents {
                 sent: false,
                 observed: observed.clone(),
+                lifecycle: lifecycle.clone(),
+                failures: failures.clone(),
             },
         )
         .await
@@ -1924,7 +1977,27 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
                 .any(|id| id.0 == fill.id.0 || id.0 == fill.order_id.0)
         }));
         let fingerprint = canonical_report_sha256(&report).unwrap();
-        let result = (ids, fingerprint);
+        assert!(failures.lock().unwrap().is_empty());
+        let lifecycle = lifecycle.lock().unwrap().clone();
+        assert_eq!(lifecycle.len(), 4);
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|(_, _, phase)| phase.is_none())
+                .count(),
+            2
+        );
+        for id in ids.iter().collect::<HashSet<_>>() {
+            let parent: Vec<_> = lifecycle
+                .iter()
+                .filter(|(_, parent, _)| parent == id)
+                .collect();
+            assert_eq!(parent.len(), 2);
+            assert_eq!(parent[0].2, None);
+            assert_eq!(parent[1].2, Some(ParentPhase::Completed));
+            assert!(parent[0].0 <= parent[1].0);
+        }
+        let result = (ids, fingerprint, lifecycle);
         if let Some(previous) = &expected {
             assert_eq!(&result, previous);
         }
@@ -1934,6 +2007,8 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     registry.register::<_, ()>((), manifest).unwrap();
     registry.register::<_, ()>((), policy).unwrap();
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(Mutex::new(Vec::new()));
+    let failures = Arc::new(Mutex::new(Vec::new()));
     let report = run_backtest(
         config(),
         &registry,
@@ -1941,10 +2016,14 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         Parents {
             sent: false,
             observed: observed.clone(),
+            lifecycle: lifecycle.clone(),
+            failures: failures.clone(),
         },
     )
     .await
     .unwrap();
     assert!(report.trades.is_empty());
     assert!(observed.lock().unwrap().is_empty());
+    assert!(lifecycle.lock().unwrap().is_empty());
+    assert_eq!(*failures.lock().unwrap(), vec!["BTCUSDT", "ETHUSDT"]);
 }
