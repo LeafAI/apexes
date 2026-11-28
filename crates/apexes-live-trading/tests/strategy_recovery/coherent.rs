@@ -2871,7 +2871,7 @@ async fn dual_handoff_qualifies_nonzero_registered_risk_and_rejects_reset() {
 
 // Test-only initial historical risk state, constructed through built-in
 // callbacks rather than checkpoint DTO mutation.
-fn risk_pair_checker(seed: bool) -> Arc<apexes_risk::CompositeRiskChecker> {
+fn risk_pair_checker(seed: bool, previous_events: usize) -> Arc<apexes_risk::CompositeRiskChecker> {
     use apexes_risk::{
         CircuitBreaker, CompositeRiskChecker, LimitChecker, MarketConditionConfig,
         MarketConditionMonitor, PriceSource, RiskLimits,
@@ -2923,7 +2923,10 @@ fn risk_pair_checker(seed: bool) -> Arc<apexes_risk::CompositeRiskChecker> {
                 .is_err()
         );
         let mut event = sample_events().pop().unwrap();
-        for price in [dec!(90), dec!(95), dec!(100)] {
+        for price in [dec!(90), dec!(95)]
+            .into_iter()
+            .chain(std::iter::repeat_n(dec!(100), previous_events))
+        {
             let MarketEvent::Trade(trade) = &mut event else {
                 panic!("trade fixture")
             };
@@ -2978,9 +2981,12 @@ async fn exercise_receipt_bound_successor(mode: RiskPairMode) {
         .unwrap();
     drop(first_store);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let pristine = (mode != RiskPairMode::Absent)
-        .then(|| risk_pair_checker(false).inspect_registered_state().unwrap());
-    let a_checker = (mode != RiskPairMode::Absent).then(|| risk_pair_checker(true));
+    let pristine = (mode != RiskPairMode::Absent).then(|| {
+        risk_pair_checker(false, 0)
+            .inspect_registered_state()
+            .unwrap()
+    });
+    let a_checker = (mode != RiskPairMode::Absent).then(|| risk_pair_checker(true, 0));
     let mut a = flat_boundary_with_checker(&first, previous, Utc::now(), a_checker).await;
     let mut first_store = first.store().await;
     let ac = a
@@ -3038,8 +3044,8 @@ async fn exercise_receipt_bound_successor(mode: RiskPairMode) {
         .unwrap();
     drop(second_store);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let b_checker =
-        (mode != RiskPairMode::Absent).then(|| risk_pair_checker(mode == RiskPairMode::Retained));
+    let b_checker = (mode != RiskPairMode::Absent)
+        .then(|| risk_pair_checker(mode == RiskPairMode::Retained, 1));
     let mut b = flat_boundary_with_checker(&second, previous, Utc::now(), b_checker).await;
     let mut second_store = second.store().await;
     let bc = b
@@ -3195,6 +3201,21 @@ async fn exercise_receipt_bound_successor(mode: RiskPairMode) {
             )
             .await
             .unwrap();
+        let prior_opening = a
+            .selection
+            .inspect_opening_risk_receipt(
+                &mut first_store,
+                &first.url,
+                &a.opening_risk_receipt,
+                &a.opening_risk_digest,
+            )
+            .await
+            .unwrap();
+        let prior_opening = prior_opening.registered_risk.as_ref().unwrap();
+        assert!(
+            matches!(&prior_opening.pre_trade[2], RegisteredRiskState::MarketCondition(s)
+            if s.symbols[0].last_price == dec!(95) && s.symbols[0].volatility.sample_count() == 2)
+        );
         let retained = closing.registered_risk.as_ref().unwrap();
         assert!(
             matches!(&retained.pre_trade[0], RegisteredRiskState::Limits(s) if s.trade_count == 1 && s.traded_volume == dec!(1))
@@ -3210,6 +3231,29 @@ async fn exercise_receipt_bound_successor(mode: RiskPairMode) {
             retained.market_condition.as_ref().unwrap()[0],
             retained.pre_trade[2]
         );
+        assert_ne!(prior_opening.pre_trade[2], retained.pre_trade[2]);
+        assert!(
+            matches!(&retained.pre_trade[2], RegisteredRiskState::MarketCondition(s)
+            if s.symbols[0].last_price == dec!(100))
+        );
+        let next_closing = b
+            .selection
+            .inspect_closing_risk_receipt(
+                &mut second_store,
+                &second.url,
+                &b.closing_risk_receipt,
+                &b.closing_risk_digest,
+            )
+            .await
+            .unwrap();
+        assert_ne!(next_closing.registered_risk, independent.registered_risk);
+        if mode == RiskPairMode::Reset {
+            assert!(
+                matches!(&next_closing.registered_risk.as_ref().unwrap().pre_trade[2],
+                RegisteredRiskState::MarketCondition(s)
+                if s.symbols.len() == 1 && s.symbols[0].volatility.sample_count() == 1)
+            );
+        }
         let opening = independent.registered_risk.as_ref().unwrap();
         if mode == RiskPairMode::Retained {
             assert_eq!(opening, retained);

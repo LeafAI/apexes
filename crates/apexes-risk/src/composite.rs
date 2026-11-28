@@ -264,7 +264,8 @@ impl CompositeRiskChecker {
         }
     }
 
-    /// Runs every registered `MarketConditionEventMonitor::on_market_event`,
+    /// Runs each distinct actual shared market monitor once and each
+    /// independently registered nonshared event monitor once,
     /// collecting every violation from every monitor into one combined
     /// result. Called once per event-loop event (not once per tick like
     /// `on_tick`, since market-condition detection needs the raw event
@@ -277,11 +278,20 @@ impl CompositeRiskChecker {
             .market_condition_monitors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let violations: Vec<RiskViolation> = monitors
-            .iter_mut()
-            .filter_map(|monitor| monitor.on_market_event(event).err())
-            .flatten()
-            .collect();
+        // Use actual ephemeral handle identity, not matching configuration
+        // or serialized alias numbers. Custom nonshared slots each run.
+        let mut seen = std::collections::HashSet::new();
+        let mut violations = Vec::new();
+        for monitor in monitors.iter_mut() {
+            if let Some(shared) = monitor.shared_monitor()
+                && !seen.insert(shared.key())
+            {
+                continue;
+            }
+            if let Err(errors) = monitor.on_market_event(event) {
+                violations.extend(errors);
+            }
+        }
 
         if violations.is_empty() {
             Ok(())
@@ -808,5 +818,51 @@ mod tests {
 
         let result = composite.on_market_event(&event);
         assert_eq!(result.unwrap_err().len(), 2);
+    }
+    #[test]
+    fn market_dispatch_deduplicates_actual_shared_handle_not_configuration() {
+        use crate::market_condition_monitor::MarketConditionEventAdapter;
+        use crate::{
+            MarketConditionConfig, MarketConditionMonitor, PriceSource, RegisteredRiskState,
+        };
+        let config = MarketConditionConfig {
+            volatility_window: 3,
+            volatility_threshold: dec!(1),
+            jump_threshold_pct: dec!(0.05),
+            sensitivity: dec!(1),
+            price_source: PriceSource::Trade,
+            account_equity_volatility_threshold: None,
+            include_spot: true,
+        };
+        let (pre, event, _) = MarketConditionMonitor::new(config.clone()).split();
+        let duplicate = MarketConditionEventAdapter(event.0.clone());
+        let (other_pre, other_event, _) = MarketConditionMonitor::new(config).split();
+        let composite = CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(pre))
+            .with_pre_trade_check(Box::new(other_pre))
+            .with_market_condition_monitor(Box::new(event))
+            .with_market_condition_monitor(Box::new(duplicate))
+            .with_market_condition_monitor(Box::new(other_event));
+        let event = apexes_core::MarketEvent::Trade(apexes_core::TradeEvent {
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            price: dec!(100),
+            quantity: dec!(1),
+            side: None,
+            trade_id: None,
+            timestamp: Utc::now(),
+        });
+        composite.on_market_event(&event).unwrap();
+        let snapshot = composite.inspect_registered_state().unwrap();
+        let aliases = snapshot.aliases.as_ref().unwrap();
+        assert_eq!(aliases.market_condition[0], aliases.market_condition[1]);
+        assert_ne!(aliases.market_condition[0], aliases.market_condition[2]);
+        let states = snapshot.market_condition.as_ref().unwrap();
+        assert_eq!(states[0], snapshot.pre_trade[0]);
+        assert_eq!(states[2], snapshot.pre_trade[1]);
+        for state in states {
+            assert!(matches!(state, RegisteredRiskState::MarketCondition(s)
+                if s.symbols.len() == 1 && s.symbols[0].volatility.sample_count() == 1));
+        }
     }
 }

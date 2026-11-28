@@ -443,6 +443,16 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 diagnostics.next_event();
                 clock.wait_for_next_event(timestamp).await;
 
+                // Registered market monitors are distinct from the
+                // loop-local monitor constructed above. Dispatch before
+                // strategy evaluation; shared registered adapters are
+                // deduplicated by their actual monitor identity.
+                if let Some(checker) = &risk_checker
+                    && let Err(violations) = checker.on_market_event(&event)
+                {
+                    tracing::warn!(?violations, "registered market condition monitor flagged a violation");
+                }
+
                 // Feed every event to the local `MarketConditionMonitor` (a
                 // no-op for events that don't match its configured
                 // `PriceSource`) so its per-symbol volatility/jump state -- and
