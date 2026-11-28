@@ -38,3 +38,6 @@ pub use book_context::{BookIntegrity, BookObservation};
 
 pub mod cost_context;
 pub use cost_context::{CostObservation, FeeRole};
+
+pub mod capital_context;
+pub use capital_context::CapitalObservation;

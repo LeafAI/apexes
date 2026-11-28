@@ -56,6 +56,7 @@ fn step(
         );
     }
     let ctx = StrategyContext {
+        capital: None,
         costs: None,
         book: None,
         market: None,
