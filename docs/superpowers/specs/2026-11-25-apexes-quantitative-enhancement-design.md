@@ -129,3 +129,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent local external-fee classification](2026-11-28-apexes-external-fee-evidence-design.md) compares independently retained opening tracked asset allocation, actual per-fill local classification and tracked closing balances against the qualified account journal.
 
 [Independent closing fee mark revaluation](2026-11-28-apexes-fee-mark-evidence-design.md) compares independently supplied closing fee marks and revaluation totals against exact retained price observations and qualified historical fees.
+
+[Combined read-only fee evidence](2026-11-28-apexes-combined-fee-evidence-design.md) combines classification, historical decisions, realized P&L and closing marks without changing account or owned-position recovery restrictions. Nonzero external-fee end-to-end qualification remains open.

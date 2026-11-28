@@ -801,6 +801,82 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Combine the local fee classification, historical fee decisions,
+    /// realized attribution and closing fee marks. The existing account
+    /// and owned-position restrictions remain mandatory.
+    pub async fn inspect_combined_fee_evidence<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::OpeningTrackedAssetEvidence,
+            &crate::ThirdAssetFeeEvidence,
+            &crate::ClosingFeeMarkEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_closing_position_evidence(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            evidence.0,
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        evidence.2.compare_with_ownership(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            ledger,
+            instruments,
+            &fills,
+            (evidence.1, observations.0, observations.2),
+        )?;
+        crate::recovery_pnl::compare_fee_bearing_pnl(ledger, instruments, &fills)?;
+        evidence.3.compare(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            ledger,
+            instruments,
+        )?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(
