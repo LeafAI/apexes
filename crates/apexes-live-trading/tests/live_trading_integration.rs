@@ -1021,6 +1021,7 @@ async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
     config.kill_switch = Some(health.clone());
     let (stop, receiver) = oneshot::channel();
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = tokio::time::timeout(
         Duration::from_secs(12),
         run_live_trading(
@@ -1029,6 +1030,7 @@ async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
             ManagedCallbackProbe {
                 stage: 0,
                 observed: observed.clone(),
+                terminals: terminals.clone(),
                 stop: Some(stop),
             },
             manager,
@@ -1055,6 +1057,26 @@ async fn managed_live_callbacks_use_persisted_scope_and_dispatch() {
         ]
     );
     assert_eq!(report.trades.len(), 3);
+    let terminals = terminals.lock().unwrap().clone();
+    assert_eq!(terminals.len(), 3);
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|t| (t.0, t.1, t.2, t.4))
+            .collect::<Vec<_>>(),
+        observed
+            .iter()
+            .map(|f| (f.0, f.1, f.2, dec!(1)))
+            .collect::<Vec<_>>()
+    );
+    let dispatch: uuid::Uuid = sqlx::query_scalar("SELECT ems_dispatch_id FROM orders WHERE id=$1")
+        .bind(child.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(terminals[0].3, None);
+    assert_eq!(terminals[1].3, None);
+    assert_eq!(terminals[2].3, Some(dispatch));
     assert!(!health.is_engaged(), "{:?}", health.reason());
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
@@ -1141,9 +1163,18 @@ type CallbackObservation = (
     Option<rust_decimal::Decimal>,
 );
 
+type TerminalObservation = (
+    OrderId,
+    Option<apexes_strategy::IntentId>,
+    Option<apexes_strategy::ParentOrderId>,
+    Option<uuid::Uuid>,
+    rust_decimal::Decimal,
+);
+
 struct ManagedCallbackProbe {
     stage: u8,
     observed: Arc<std::sync::Mutex<Vec<CallbackObservation>>>,
+    terminals: Arc<std::sync::Mutex<Vec<TerminalObservation>>>,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -1169,9 +1200,168 @@ impl Strategy for ManagedCallbackProbe {
         if outcome.intent_id == Some(apexes_strategy::IntentId(1)) && self.stage == 1 {
             self.stage = 2;
         }
-        if observed.len() == 3
+    }
+
+    fn on_order_terminal(&mut self, outcome: &apexes_strategy::TerminalOutcome<'_>) {
+        use apexes_strategy::{LiveTerminalStatus, TerminalKind};
+        let TerminalKind::Live {
+            order,
+            status,
+            parent_id,
+            dispatch_id,
+        } = outcome.kind
+        else {
+            panic!("unexpected simulated terminal in live loop");
+        };
+        assert_eq!(status, LiveTerminalStatus::Filled);
+        assert!(
+            self.observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|fill| fill.0 == order.id),
+            "terminal callback must follow the fill callback"
+        );
+        let mut terminals = self.terminals.lock().unwrap();
+        terminals.push((
+            order.id,
+            outcome.intent_id,
+            parent_id,
+            dispatch_id,
+            order.filled_quantity,
+        ));
+        if terminals.len() == 3
             && let Some(stop) = self.stop.take()
         {
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// Terminal-only work must wake an idle loop without a market event or
+/// artificial fill/equity observation.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn managed_zero_fill_terminal_wakes_idle_loop() {
+    let admin = sqlx::PgPool::connect(POSTGRES_URL).await.unwrap();
+    let schema = format!("live_terminal_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let url = format!("{POSTGRES_URL}?options[search_path]={schema}");
+    let gateway = Arc::new(MockExecutionGateway::new());
+    let provider = Arc::new(MockMarketDataProvider {
+        events: vec![],
+        keep_open: true,
+    });
+    let registry = registry_with(gateway.clone(), provider);
+    let health = Arc::new(apexes_oms::KillSwitch::managed());
+    let mut store = OrderStore::new(&url).await.unwrap();
+    store
+        .bind_spot_inventory("managed-live-terminal-test")
+        .await
+        .unwrap();
+    let mut manager = OrderManager::new(store, &registry)
+        .await
+        .unwrap()
+        .with_kill_switch(health.clone());
+    manager.spot_inventory_fills().await.unwrap();
+    health.begin_reconciliation();
+    health.startup_ready();
+    let order_id = manager
+        .submit_correlated_order(
+            callback_probe_intent(false),
+            &HashMap::new(),
+            &HashMap::new(),
+            apexes_oms::IntentLink {
+                run_scope: uuid::Uuid::new_v4(),
+                intent_id: apexes_strategy::IntentId(1),
+            },
+        )
+        .await
+        .unwrap();
+    let exchange_id = manager
+        .open_orders()
+        .get(&order_id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    let (updates, stream) = futures::channel::mpsc::unbounded();
+    let (stop, receiver) = oneshot::channel();
+    let driver = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        gateway.set_exchange_state(order_id, OrderStatus::Cancelled);
+        updates
+            .unbounded_send(ExchangeUpdate {
+                client_order_id: order_id,
+                exchange_order_id: exchange_id,
+                status: OrderStatus::Cancelled,
+            })
+            .unwrap();
+    });
+    let mut config = base_config();
+    config.ems_postgres_url = url.clone();
+    config.kill_switch = Some(health.clone());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_live_trading(
+            config,
+            &registry,
+            IdleTerminalProbe {
+                observed: observed.clone(),
+                stop: Some(stop),
+            },
+            manager,
+            stream,
+            receiver,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    driver.await.unwrap();
+    assert!(report.trades.is_empty());
+    assert_eq!(*observed.lock().unwrap(), vec![order_id]);
+    assert!(!health.is_engaged(), "{:?}", health.reason());
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+struct IdleTerminalProbe {
+    observed: Arc<std::sync::Mutex<Vec<OrderId>>>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl Strategy for IdleTerminalProbe {
+    fn on_market_event(&mut self, _: &MarketEvent, _: &StrategyContext) -> Vec<OrderIntent> {
+        panic!("no market event expected");
+    }
+    fn on_fill(&mut self, _: &apexes_strategy::FillOutcome<'_>) {
+        panic!("zero-fill cancellation must not manufacture a fill");
+    }
+    fn on_order_terminal(&mut self, outcome: &apexes_strategy::TerminalOutcome<'_>) {
+        use apexes_strategy::{LiveTerminalStatus, TerminalKind};
+        let TerminalKind::Live {
+            order,
+            status,
+            parent_id,
+            dispatch_id,
+        } = outcome.kind
+        else {
+            panic!("unexpected simulated terminal");
+        };
+        assert_eq!(status, LiveTerminalStatus::Cancelled);
+        assert_eq!(order.filled_quantity, dec!(0));
+        assert_eq!(
+            (outcome.intent_id, parent_id, dispatch_id),
+            (None, None, None)
+        );
+        self.observed.lock().unwrap().push(order.id);
+        if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
     }

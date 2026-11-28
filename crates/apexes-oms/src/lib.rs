@@ -32,7 +32,7 @@ pub use gateway::{
 pub use kill_switch::{KillSwitch, SessionPhase};
 pub use manager::{CancelAllReport, FillDeliveryProgress, OrderManager};
 pub use mock_gateway::MockExecutionGateway;
-pub use store::{OrderStore, SubmissionState};
+pub use store::{OrderStore, SubmissionState, TerminalEvidence};
 
 pub mod identity_evidence;
 pub use identity_evidence::{

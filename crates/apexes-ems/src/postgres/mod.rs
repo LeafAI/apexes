@@ -837,6 +837,20 @@ impl Ems for PostgresEms {
         })?
     }
 
+    async fn inspect_live_terminal_parents(
+        &self,
+        ids: &[apexes_core::OrderId],
+    ) -> Result<Vec<FillParentEvidence>, EmsError> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fill_attribution::inspect_terminal_parents(&self.pool, ids),
+        )
+        .await
+        .map_err(|_| EmsError::QueryFailed {
+            reason: "live terminal attribution snapshot timed out".into(),
+        })?
+    }
+
     async fn parent_order_status(
         &self,
         id: ParentOrderId,

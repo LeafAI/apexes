@@ -84,6 +84,14 @@ pub trait Ems: Send + Sync {
         Ok(vec![FillParentEvidence::Unavailable; ids.len()])
     }
 
+    /// Explicit durable child ownership for terminal orders, even without fills.
+    async fn inspect_live_terminal_parents(
+        &self,
+        ids: &[OrderId],
+    ) -> Result<Vec<FillParentEvidence>, EmsError> {
+        Ok(vec![FillParentEvidence::Unavailable; ids.len()])
+    }
+
     /// Returns the current aggregate status of a parent order, or
     /// `Ok(None)` if unknown to this `Ems` instance.
     async fn parent_order_status(

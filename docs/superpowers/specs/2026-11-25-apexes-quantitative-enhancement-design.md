@@ -58,3 +58,6 @@ production data, fees and execution assumptions are evaluated in Phase 3.
 ## Managed live lifecycle evidence (F04.04)
 
 See [managed live fill attribution and notification progress](2026-11-28-apexes-live-fill-attribution-design.md). The existing durable execution journal remains authoritative; inventory replay is not a receipt for strategy callback execution or an atomic strategy-state checkpoint.
+
+
+See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-terminal-callbacks-design.md): a terminal delivery marker shares the existing authoritative status/fill transaction; live terminal callbacks wait for the fill notification prefix and never infer terminal state from disappearance. Startup inventory and terminal baselines are not durable strategy receipts.

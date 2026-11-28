@@ -73,6 +73,9 @@ struct FillDelivery {
     notification_checkpoint: i64,
     notification_pending: Option<(i64, Vec<FillId>)>,
     notification_failed: bool,
+    terminal_checkpoint: i64,
+    terminal_pending: Option<Vec<crate::TerminalEvidence>>,
+    terminal_failed: bool,
     pending: Option<(i64, Vec<FillId>)>,
     dirty: bool,
     failed: bool,
@@ -98,6 +101,7 @@ pub struct OrderManager {
     // Process-local acknowledgement watermark; startup rebuilds from all
     // durable history before establishing a new watermark.
     fill_delivery: Option<FillDelivery>,
+    terminal_wakeup: Arc<tokio::sync::Notify>,
     spot_scope: Option<HashMap<String, (String, String)>>,
     // Retain the full spend reservation until authoritative terminal state.
     // Recovery remains quiescent; unknown recovered reservations refuse orders.
@@ -143,6 +147,7 @@ impl OrderManager {
             open_orders,
             kill_switch: None,
             fill_delivery: None,
+            terminal_wakeup: Arc::new(tokio::sync::Notify::new()),
             spot_scope: None,
             spot_reservations,
             reservation_breached,
@@ -175,12 +180,16 @@ impl OrderManager {
         // Before any background task or new submission is allowed, all
         // persisted fills are represented by the recovered ledger.
         let checkpoint = self.store.latest_fill_sequence().await?;
+        let terminal_checkpoint = self.store.latest_terminal_sequence().await?;
         self.fill_delivery = Some(FillDelivery {
             recovered_checkpoint: checkpoint,
             checkpoint,
             notification_checkpoint: checkpoint,
             notification_pending: None,
             notification_failed: false,
+            terminal_checkpoint,
+            terminal_pending: None,
+            terminal_failed: false,
             pending: None,
             dirty: false,
             failed: false,
@@ -262,6 +271,7 @@ impl OrderManager {
         match delivery.notification_pending.take() {
             Some((high, pending)) if returned && pending == ids => {
                 delivery.notification_checkpoint = high;
+                self.terminal_wakeup.notify_one();
             }
             _ => {
                 // Notification receipt errors cannot invalidate a correctly
@@ -285,6 +295,97 @@ impl OrderManager {
                 ledger_failed: delivery.failed,
                 notification_failed: delivery.notification_failed,
             })
+    }
+
+    /// Wake the supplemental source independently of market ticks.
+    pub fn terminal_wakeup(&self) -> Arc<tokio::sync::Notify> {
+        self.terminal_wakeup.clone()
+    }
+
+    pub async fn has_ready_terminal_batch(&mut self) -> bool {
+        !self.read_ready_terminal_batch().await.is_empty()
+    }
+
+    async fn read_ready_terminal_batch(&mut self) -> Vec<crate::TerminalEvidence> {
+        let Some(delivery) = &self.fill_delivery else {
+            return Vec::new();
+        };
+        if delivery.failed || delivery.notification_failed || delivery.terminal_failed {
+            return Vec::new();
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.store.terminals_after(
+                delivery.terminal_checkpoint,
+                delivery.notification_checkpoint,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(batch)) => batch,
+            _ => {
+                self.fail_terminal_delivery();
+                Vec::new()
+            }
+        }
+    }
+
+    /// Stage an ordered terminal prefix only after all required fills have
+    /// been represented in the ledger and their current-run callbacks returned.
+    pub async fn ready_terminal_batch(&mut self) -> Vec<crate::TerminalEvidence> {
+        if self
+            .fill_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.terminal_pending.is_some())
+        {
+            self.fail_terminal_delivery();
+            return Vec::new();
+        }
+        let batch = self.read_ready_terminal_batch().await;
+        if !batch.is_empty()
+            && let Some(delivery) = &mut self.fill_delivery
+        {
+            delivery.terminal_pending = Some(batch.clone());
+        }
+        batch
+    }
+
+    /// Advance only after the exact ordered terminal callback batch returns.
+    /// This receipt, like fill notification progress, is process-local.
+    pub fn acknowledge_terminal_batch(&mut self, ids: &[OrderId]) {
+        let Some(delivery) = &mut self.fill_delivery else {
+            return;
+        };
+        if delivery.failed || delivery.notification_failed || delivery.terminal_failed {
+            delivery.terminal_pending = None;
+            return;
+        }
+        let Some(batch) = delivery.terminal_pending.take() else {
+            self.fail_terminal_delivery();
+            return;
+        };
+        if batch.iter().map(|e| e.order.id).ne(ids.iter().copied()) {
+            self.fail_terminal_delivery();
+            return;
+        }
+        if let Some(last) = batch.last() {
+            delivery.terminal_checkpoint = last.sequence;
+            self.terminal_wakeup.notify_one();
+        }
+    }
+
+    fn fail_terminal_delivery(&mut self) {
+        if let Some(delivery) = &mut self.fill_delivery {
+            delivery.terminal_failed = true;
+        }
+        self.report_health_fault("live terminal delivery evidence discrepancy");
+    }
+
+    pub async fn terminal_evidence(
+        &self,
+        id: OrderId,
+    ) -> Result<Option<crate::TerminalEvidence>, OmsError> {
+        self.store.terminal_evidence(id).await
     }
 
     /// Local read-only execution attribution, including terminal orders.
@@ -561,7 +662,9 @@ impl OrderManager {
             });
         }
         if let Some(delivery) = &self.fill_delivery {
-            let reason = if delivery.notification_failed {
+            let reason = if delivery.terminal_failed {
+                Some("live terminal notification progress requires recovery")
+            } else if delivery.notification_failed {
                 Some("live fill notification progress requires recovery")
             } else if delivery.dirty || delivery.failed {
                 Some("durable executions await ledger acknowledgement")
@@ -1105,6 +1208,7 @@ impl OrderManager {
             return Ok(Vec::new());
         };
         let previous_status = candidate.status;
+        let previous_filled_quantity = candidate.filled_quantity;
         let was_terminal = matches!(
             previous_status,
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
@@ -1172,6 +1276,13 @@ impl OrderManager {
             .store
             .commit_exchange_update(&mut candidate, executions, expected)
             .await?;
+        if managed && was_terminal && candidate.filled_quantity != previous_filled_quantity {
+            // A later authoritative execution must reach the ledger, even
+            // when it contradicts an earlier terminal quantity. Never emit
+            // a second terminal as though the first callback had not run.
+            self.report_health_fault("exchange revised terminal execution quantity");
+            self.terminal_wakeup.notify_one();
+        }
         if managed && breached {
             self.reservation_breached = true;
             tracing::error!(order_id = %client_order_id.0, "actual execution spend exceeded durable reservation");
@@ -1184,6 +1295,9 @@ impl OrderManager {
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
         ) {
             self.open_orders.remove(&client_order_id);
+            if managed && !was_terminal {
+                self.terminal_wakeup.notify_one();
+            }
         } else {
             self.open_orders.insert(client_order_id, candidate);
         }

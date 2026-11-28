@@ -52,7 +52,9 @@ pub mod fill_outcome;
 pub use fill_outcome::{FillOutcome, FillSource, PersistedFillLink};
 
 pub mod terminal_outcome;
-pub use terminal_outcome::{TerminalKind, TerminalOutcome};
+pub use terminal_outcome::{
+    LiveTerminalEvidence, LiveTerminalStatus, TerminalKind, TerminalOutcome,
+};
 
 pub mod parent_outcome;
 pub use parent_outcome::{ParentOutcome, ParentOutcomeKind, ParentPhase};

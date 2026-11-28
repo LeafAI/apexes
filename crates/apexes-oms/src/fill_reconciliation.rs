@@ -135,7 +135,14 @@ impl OrderStore {
         }
         let result = sqlx::query(
             "UPDATE orders SET exchange_order_id=$2, status=$3, filled_quantity=$4,
-              updated_at=$5, submission_state=$6 WHERE id=$1",
+              updated_at=$5, submission_state=$6,
+              terminal_delivery_seq=CASE
+                WHEN $7 AND status IN ('New','PartiallyFilled')
+                  AND $3 IN ('Filled','Cancelled','Rejected')
+                  AND NULLIF(btrim($2),'') IS NOT NULL
+                THEN COALESCE(terminal_delivery_seq,nextval('oms_terminal_delivery_seq'))
+                ELSE terminal_delivery_seq END
+              WHERE id=$1",
         )
         .bind(candidate.id.0)
         .bind(&candidate.exchange_order_id)
@@ -143,6 +150,7 @@ impl OrderStore {
         .bind(total)
         .bind(candidate.updated_at)
         .bind(SubmissionState::from_order(candidate).as_str())
+        .bind(expected.is_some())
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
