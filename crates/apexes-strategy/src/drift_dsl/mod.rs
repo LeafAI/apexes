@@ -18,3 +18,5 @@ mod scoped_indicators;
 mod context_market;
 
 mod order_outcome;
+
+mod fill_outcome;

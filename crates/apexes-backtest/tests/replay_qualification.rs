@@ -735,8 +735,15 @@ async fn extreme_market_exit_is_attributed_to_derisk_not_strategy() {
     use apexes_backtest::{
         execution_performance::SymbolExecutionPerformance, exit_attribution::ExitReason,
     };
-    struct BuyOnce;
+    use apexes_strategy::{FillOutcome, FillSource};
+    struct BuyOnce(Arc<std::sync::Mutex<Vec<(FillSource, apexes_core::FillId)>>>);
     impl Strategy for BuyOnce {
+        fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((outcome.source, outcome.fill.id));
+        }
         fn on_market_event(
             &mut self,
             event: &MarketEvent,
@@ -764,15 +771,24 @@ async fn extreme_market_exit_is_attributed_to_derisk_not_strategy() {
         account_equity_volatility_threshold: None,
         include_spot: true,
     });
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = run_backtest(
         config,
         &Registry::new(),
         InMemoryMarketDataSource::new(events),
-        BuyOnce,
+        BuyOnce(seen.clone()),
     )
     .await
     .unwrap();
     assert_eq!(report.trades.len(), 2);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [FillSource::Direct, FillSource::Derisk]
+            .into_iter()
+            .zip(report.trades.iter().map(|f| f.id))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(seen.lock().unwrap().len(), report.trades.len());
     let SymbolExecutionPerformance::Available(metrics) =
         &report.execution_performance.as_ref().unwrap().per_symbol[SYMBOL]
     else {
@@ -793,8 +809,15 @@ async fn resting_limit_and_ems_closing_fills_keep_distinct_origins() {
     use apexes_backtest::{
         execution_performance::SymbolExecutionPerformance, exit_attribution::ExitReason,
     };
-    struct ExitStrategy;
+    use apexes_strategy::{FillOutcome, FillSource};
+    struct ExitStrategy(Arc<std::sync::Mutex<Vec<(FillSource, apexes_core::FillId)>>>);
     impl Strategy for ExitStrategy {
+        fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((outcome.source, outcome.fill.id));
+        }
         fn on_market_event(
             &mut self,
             event: &MarketEvent,
@@ -845,14 +868,28 @@ async fn resting_limit_and_ems_closing_fills_keep_distinct_origins() {
     registry
         .register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
         .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = run_backtest(
         configuration(AssetClass::Spot, None),
         &registry,
         InMemoryMarketDataSource::new(events),
-        ExitStrategy,
+        ExitStrategy(seen.clone()),
     )
     .await
     .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            FillSource::Direct,
+            FillSource::Resting,
+            FillSource::Ems,
+            FillSource::Ems
+        ]
+        .into_iter()
+        .zip(report.trades.iter().map(|f| f.id))
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(seen.lock().unwrap().len(), report.trades.len());
     let SymbolExecutionPerformance::Available(metrics) =
         &report.execution_performance.as_ref().unwrap().per_symbol[SYMBOL]
     else {
@@ -1368,5 +1405,90 @@ async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
             assert_eq!(seen[0].0, "cancelled");
             assert!(seen[0].1.is_some());
         }
+    }
+}
+
+#[test]
+fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_fills() {
+    use apexes_strategy::{FillOutcome, FillSource, OrderOutcome, drift_dsl::DriftScriptStrategy};
+    type Evidence = Vec<(DateTime<Utc>, FillSource, apexes_core::Fill)>;
+    struct Probe {
+        script: DriftScriptStrategy,
+        seen: Arc<std::sync::Mutex<Evidence>>,
+    }
+    impl Strategy for Probe {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            self.script.on_market_event(event, ctx)
+        }
+        fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            self.script.on_order_outcome(outcome);
+        }
+        fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((outcome.at, outcome.source, outcome.fill.clone()));
+            self.script.on_fill(outcome);
+        }
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fill_callbacks.drift");
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(0, dec!(100), "entry"),
+        tick(500),
+        tick(1000),
+        trade(1500, dec!(99), "partial"),
+        trade(2000, dec!(99), "complete"),
+        tick(2500),
+        tick(3000),
+    ];
+    let mut prior = None;
+    for _ in 0..2 {
+        let r = registry(&events, "fill-callbacks");
+        r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let strategy: Box<dyn Strategy> = Box::new(Probe {
+            script: DriftScriptStrategy::from_file(&path).unwrap(),
+            seen: seen.clone(),
+        });
+        let report = futures::executor::block_on(run_backtest(
+            configuration(AssetClass::Spot, None),
+            &r,
+            InMemoryMarketDataSource::new(events.clone()),
+            strategy,
+        ))
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|(at, source, f)| (*at, *source, f.quantity))
+                .collect::<Vec<_>>(),
+            vec![
+                (at(500), FillSource::Direct, dec!(1)),
+                (at(1500), FillSource::Resting, dec!(2)),
+                (at(2000), FillSource::Resting, dec!(1)),
+                (at(3000), FillSource::Direct, dec!(1)),
+            ]
+        );
+        assert_eq!(seen[1].2.order_id, seen[2].2.order_id);
+        assert_ne!(seen[1].2.id, seen[2].2.id);
+        assert_eq!(
+            seen.iter().map(|(_, _, f)| f.clone()).collect::<Vec<_>>(),
+            report.trades
+        );
+        let digest = canonical_report_sha256(&report).unwrap();
+        if let Some((prior_seen, prior_digest)) = &prior {
+            assert_eq!(&*seen, prior_seen);
+            assert_eq!(&digest, prior_digest);
+        }
+        prior = Some((seen.clone(), digest));
     }
 }

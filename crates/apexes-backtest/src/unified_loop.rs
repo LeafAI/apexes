@@ -242,6 +242,8 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     let mut last_funding_settlement: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut supplemental_seen = HashSet::new();
+    let mut notifications = crate::fill_notifications::FillNotifications::default();
+    use apexes_strategy::FillSource;
     let mut recorded_initial_equity = false;
     let mut diagnostics = Diagnostics::new();
     let mut risk_checker = config.risk_checker;
@@ -462,6 +464,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             }
                         }
                     }
+                    notifications.deliver(&mut strategy, timestamp, FillSource::Resting, &fills);
                 }
 
                 let mut checked_child_fills = HashSet::new();
@@ -546,6 +549,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             }
                         }
                     }
+                    notifications.deliver(&mut strategy, timestamp, FillSource::Ems, &ems_fills);
                 }
                 refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
                 if let Some(queue) = &mut arrivals {
@@ -645,6 +649,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 &fills,
                                 config.risk_free_return,
                             )?;
+                            notifications.deliver(&mut strategy, timestamp, FillSource::Liquidation, &fills);
                         }
                         Err(error) => {
                             trace.outcome("submission_failed", error_code(&error));
@@ -738,6 +743,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                     &fills,
                                     config.risk_free_return,
                                 )?;
+                                notifications.deliver(&mut strategy, timestamp, FillSource::Derisk, &fills);
                             }
                             Err(error) => {
                                 trace.outcome("submission_failed", error_code(&error));
@@ -1031,6 +1037,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 }
                             }
                             notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Returned { order: &order });
+                            notifications.deliver(&mut strategy, timestamp, FillSource::Direct, &fills);
                         }
                         Err(error) => {
                             trace.outcome("submission_failed", error_code(&error));
@@ -1206,6 +1213,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 }
                 let equity = ledger.equity(&last_prices)?;
                 let now = chrono::Utc::now();
+                notifications.deliver(&mut strategy, now, FillSource::Supplemental, &all_fills[before..]);
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {
                     tracker.observe_fills(&all_fills);
@@ -1790,6 +1798,38 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
         assert_eq!(ledger.balances()["USDT"], dec!(70000));
+    }
+
+    #[test]
+    fn supplemental_notifications_only_deliver_applied_fills_and_suppress_repeats() {
+        use apexes_strategy::{FillOutcome, FillSource};
+        #[derive(Default)]
+        struct Probe(Vec<(FillSource, Fill)>);
+        impl Strategy for Probe {
+            fn on_market_event(
+                &mut self,
+                _: &MarketEvent,
+                _: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                vec![]
+            }
+            fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+                self.0.push((outcome.source, outcome.fill.clone()));
+            }
+        }
+        let accepted = live_fill(Side::Buy, dec!(0.5), Decimal::ZERO, "USDT");
+        let refused = live_fill(Side::Buy, dec!(10), Decimal::ZERO, "USDT");
+        let (_, applied) = apply_live_fills(
+            &[("USDT", dec!(100000))],
+            vec![accepted.clone(), accepted.clone(), refused],
+        );
+        assert_eq!(applied, vec![accepted.clone()]);
+        let mut notifications = crate::fill_notifications::FillNotifications::default();
+        let mut probe = Probe::default();
+        notifications.deliver(&mut probe, Utc::now(), FillSource::Supplemental, &applied);
+        // Re-delivery through another path must not notify twice.
+        notifications.deliver(&mut probe, Utc::now(), FillSource::Direct, &applied);
+        assert_eq!(probe.0, vec![(FillSource::Supplemental, accepted)]);
     }
 
     #[test]
