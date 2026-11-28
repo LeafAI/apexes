@@ -91,6 +91,63 @@ impl ConversionScopeEvidence {
         Ok(())
     }
 
+    /// Compare final retained conversion windows to the verified completed
+    /// observations, without reconstructing fill-time availability.
+    pub(crate) fn compare_prices(
+        &self,
+        captured: &LedgerEvidence,
+        records: &[apexes_backtest::observation_receipt::CompletedObservation],
+    ) -> Result<(), E> {
+        use apexes_core::MarketEvent;
+        use rust_decimal::Decimal;
+        if records.len() > 8192 {
+            return Err(E::Execution);
+        }
+        let fees = captured.fee_valuation.as_ref().ok_or(E::FeeMismatch)?;
+        let roles = self
+            .instruments
+            .iter()
+            .map(|r| (r.symbol.as_str(), r))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected =
+            BTreeMap::<(&str, &str), BTreeMap<chrono::DateTime<chrono::Utc>, Decimal>>::new();
+        for record in records {
+            let MarketEvent::Trade(trade) = &record.event else {
+                continue;
+            };
+            let role = roles.get(trade.symbol.as_str()).ok_or(E::Execution)?;
+            if role.venue != trade.venue {
+                return Err(E::Execution);
+            }
+            if trade.price <= Decimal::ZERO {
+                continue;
+            }
+            let history = expected.entry((&role.base, &role.quote)).or_default();
+            history.insert(trade.timestamp, trade.price);
+            // The accounting window retains the newest 2,048 source times.
+            while history.len() > 2048 {
+                history.pop_first();
+            }
+        }
+        if expected.len() != fees.prices.len() {
+            return Err(E::FeeMismatch);
+        }
+        for p in &fees.prices {
+            let history = expected
+                .remove(&(p.base.as_str(), p.quote.as_str()))
+                .ok_or(E::FeeMismatch)?;
+            if p.venue != Venue::Binance
+                || p.observations
+                    .iter()
+                    .map(|(t, v)| (t, v))
+                    .ne(history.iter())
+            {
+                return Err(E::FeeMismatch);
+            }
+        }
+        Ok(())
+    }
+
     fn match_instruments<'a>(
         &'a self,
         instruments: &[Instrument],
@@ -294,6 +351,80 @@ mod tests {
                 .collect(),
         };
         (evidence, captured, instruments, order, fill)
+    }
+
+    fn trade(
+        symbol: &str,
+        source: i64,
+        ordinal: u64,
+        price: rust_decimal::Decimal,
+    ) -> apexes_backtest::observation_receipt::CompletedObservation {
+        apexes_backtest::observation_receipt::CompletedObservation {
+            cursor: StateCursor {
+                ordinal,
+                observed_at: at(5000 + ordinal as i64),
+            },
+            event: apexes_core::MarketEvent::Trade(apexes_core::TradeEvent {
+                symbol: symbol.into(),
+                venue: Venue::Binance,
+                price,
+                quantity: dec!(1),
+                side: None,
+                trade_id: None,
+                timestamp: at(source),
+            }),
+        }
+    }
+
+    #[test]
+    fn conversion_price_provenance_requires_exact_final_windows() {
+        let (e, c, _, _, _) = fixture();
+        let records = vec![
+            trade("BNBUSDT", 1, 2, dec!(250)),
+            trade("BNBUSDT", 3, 3, dec!(400)),
+            trade("BNBUSDT", 1, 4, dec!(300)),
+            trade("BNBUSDT", 2, 5, dec!(0)),
+        ];
+        e.compare_prices(&c, &records).unwrap();
+        let mut changed = records.clone();
+        changed[2] = trade("BNBUSDT", 1, 4, dec!(301));
+        assert_eq!(e.compare_prices(&c, &changed), Err(E::FeeMismatch));
+        let mut changed = records.clone();
+        changed.push(trade("BTCUSDT", 3, 6, dec!(100)));
+        assert_eq!(e.compare_prices(&c, &changed), Err(E::FeeMismatch));
+        assert_eq!(e.compare_prices(&c, &records[..1]), Err(E::FeeMismatch));
+        let mut changed = records.clone();
+        changed[0] = trade("UNKNOWN", 1, 2, dec!(300));
+        assert_eq!(e.compare_prices(&c, &changed), Err(E::Execution));
+    }
+
+    #[test]
+    fn conversion_price_provenance_reproduces_bounded_source_time_eviction() {
+        let (e, _, instruments, _, _) = fixture();
+        let mut ledger = PortfolioLedger::new(
+            instruments
+                .iter()
+                .map(|i| (i.symbol.clone(), i.clone()))
+                .collect(),
+            [("USDT".into(), dec!(1000))].into_iter().collect(),
+        );
+        let mut records = Vec::new();
+        for t in 1..=2050 {
+            ledger.observe_spot_price("BNBUSDT", at(t), dec!(300));
+            records.push(trade("BNBUSDT", t, t as u64 + 1, dec!(300)));
+        }
+        ledger.observe_spot_price("BNBUSDT", at(1), dec!(999));
+        records.push(trade("BNBUSDT", 1, 2052, dec!(999)));
+        let captured = ledger.inspect_evidence().unwrap();
+        let observations = &captured.fee_valuation.as_ref().unwrap().prices[0].observations;
+        assert_eq!(observations.len(), 2048);
+        assert_eq!(observations[0], (at(3), dec!(300)));
+        e.compare_prices(&captured, &records).unwrap();
+        let mut altered = captured.clone();
+        altered.fee_valuation.as_mut().unwrap().prices[0]
+            .observations
+            .remove(0);
+        assert_eq!(e.compare_prices(&altered, &records), Err(E::FeeMismatch));
     }
 
     #[test]

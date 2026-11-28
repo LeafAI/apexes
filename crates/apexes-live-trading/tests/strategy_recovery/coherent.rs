@@ -532,6 +532,7 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert!(retained.write_new(&observation_path).is_err());
     let retained =
         apexes_live_trading::ObservationBoundaryEvidence::read(&observation_path).unwrap();
+    let independent_observation_receipt = retained.clone();
     coherent
         .inspect_observation_evidence(&mut store, &fixture.url, &retained, &scope, &records)
         .await
@@ -923,6 +924,15 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     };
     coherent
         .inspect_conversion_scope_evidence(&mut store, &fixture.url, &instruments, &scope)
+        .await
+        .unwrap();
+    coherent
+        .inspect_conversion_price_provenance(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            (&scope, &independent_observation_receipt),
+        )
         .await
         .unwrap();
     let mut changed = retained.clone();
