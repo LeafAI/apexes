@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MAX_RECEIPT_FILE_BYTES: usize = 64 * 1024;
+pub(super) const MAX_RECEIPT_FILE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StrategyRecoveryError {
@@ -45,7 +45,7 @@ pub struct RecoverySelection {
     initial_params: Vec<(String, Decimal)>,
 }
 
-fn digest_valid(s: &str) -> bool {
+pub(super) fn digest_valid(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -69,7 +69,7 @@ impl RecoverySelection {
         Ok(selection)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self.version != 1
             || !digest_valid(&self.inventory_owner_sha256)
             || !digest_valid(&self.receipt.envelope_sha256)
@@ -102,49 +102,12 @@ impl RecoverySelection {
     /// selects this exact file for recovery; no latest-file discovery.
     pub fn write_new(&self, path: &Path) -> Result<()> {
         let bytes = self.encode()?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(path)
-            .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| StrategyRecoveryError::ReceiptIo)
+        write_receipt_file(path, &bytes)
     }
 
     /// Read only the explicitly selected, bounded regular file.
     pub fn read(path: &Path) -> Result<Self> {
-        let meta = std::fs::metadata(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-        if !meta.is_file() || meta.len() > MAX_RECEIPT_FILE_BYTES as u64 {
-            return Err(StrategyRecoveryError::InvalidReceipt);
-        }
-        let file = File::open(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-        if !file
-            .metadata()
-            .map_err(|_| StrategyRecoveryError::ReceiptIo)?
-            .is_file()
-        {
-            return Err(StrategyRecoveryError::InvalidReceipt);
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_RECEIPT_FILE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
-        if bytes.len() > MAX_RECEIPT_FILE_BYTES {
-            return Err(StrategyRecoveryError::InvalidReceipt);
-        }
+        let bytes = read_receipt_file(path)?;
         let selection: Self =
             serde_json::from_slice(&bytes).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
         // Refuse altered or ambiguous encodings (including duplicate fields).
@@ -158,9 +121,59 @@ impl RecoverySelection {
         self.initial_params.iter().cloned().collect()
     }
 
+    pub(super) fn owner_fingerprint(&self) -> &str {
+        &self.inventory_owner_sha256
+    }
+
     pub fn receipt(&self) -> &CheckpointReceipt {
         &self.receipt
     }
+}
+
+pub(super) fn write_receipt_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| StrategyRecoveryError::ReceiptIo)
+}
+
+pub(super) fn read_receipt_file(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::metadata(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
+    if !meta.is_file() || meta.len() > MAX_RECEIPT_FILE_BYTES as u64 {
+        return Err(StrategyRecoveryError::InvalidReceipt);
+    }
+    let file = File::open(path).map_err(|_| StrategyRecoveryError::ReceiptIo)?;
+    if !file
+        .metadata()
+        .map_err(|_| StrategyRecoveryError::ReceiptIo)?
+        .is_file()
+    {
+        return Err(StrategyRecoveryError::InvalidReceipt);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| StrategyRecoveryError::ReceiptIo)?;
+    if bytes.len() > MAX_RECEIPT_FILE_BYTES {
+        return Err(StrategyRecoveryError::InvalidReceipt);
+    }
+    Ok(bytes)
 }
 
 /// A caller constructs the candidate independently using the original

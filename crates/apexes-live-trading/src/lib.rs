@@ -13,6 +13,7 @@
 //! temporary position/balance tracking, pending sub-project #11
 //! (account & fund management), which will supersede it.
 
+pub mod coherent_recovery;
 pub mod flatten;
 pub mod halt;
 pub mod order_executor_adapter;
@@ -34,3 +35,7 @@ pub use startup_recovery::{
     ExchangeSnapshot, RecoveredState, RecoveryError, RecoveryOrders, recover_live_state,
 };
 pub use strategy_recovery::{RecoverySelection, StrategyRecoveryError, StrategyStartup};
+
+pub use coherent_recovery::{
+    CoherentInspectionError, CoherentRecoveryPreview, CoherentRecoverySelection,
+};

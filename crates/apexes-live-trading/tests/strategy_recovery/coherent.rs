@@ -227,6 +227,166 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             .await
             .is_err()
     );
+    // Select the actual acknowledged coherent receipt independently
+    // of the database and verify a post-execution preview after reopening.
+    let coherent =
+        apexes_live_trading::CoherentRecoverySelection::new(selection.clone(), receipt.clone())
+            .unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "apexes-coherent-selection-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("coherent.json");
+    coherent.write_new(&path).unwrap();
+    let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
+    let wallet = HashMap::from([
+        (
+            "BTC".into(),
+            apexes_live_trading::spot_recovery::SpotWalletBalance {
+                free: dec!(5),
+                locked: dec!(0),
+            },
+        ),
+        (
+            "USDT".into(),
+            apexes_live_trading::spot_recovery::SpotWalletBalance {
+                free: dec!(99900),
+                locked: dec!(0),
+            },
+        ),
+    ]);
+    let instruments = base_config().instruments;
+    let candidate = Probe::new(0);
+    let observed = candidate.observed.clone();
+    let preview = coherent
+        .inspect(
+            &mut store,
+            &fixture.url,
+            Probe::new(999),
+            candidate,
+            &instruments,
+            &wallet,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.cursor, receipt.checkpoint.cursor);
+    assert_eq!(
+        (
+            preview.historical_order_count,
+            preview.historical_fill_count
+        ),
+        (1, 1)
+    );
+    assert_eq!(preview.owned_positions["BTCUSDT"].quantity, dec!(1));
+    assert_eq!(
+        preview.owned_positions["BTCUSDT"].average_entry_price,
+        dec!(100)
+    );
+    assert_eq!(preview.wallet_balances["BTC"].free, dec!(5));
+    assert!(observed.lock().unwrap().is_empty());
+    assert_eq!(fixture.claim_count().await, 1);
+
+    let mut short = wallet.clone();
+    short.get_mut("BTC").unwrap().free = dec!(0.5);
+    assert!(matches!(
+        coherent
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                Probe::new(0),
+                &instruments,
+                &short
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Inventory(_))
+    ));
+    let mut invalid_candidate = Probe::new(0);
+    invalid_candidate.fail_restore = true;
+    assert!(matches!(
+        coherent
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                invalid_candidate,
+                &instruments,
+                &wallet
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Restore(_))
+    ));
+    assert!(
+        coherent
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                Probe::new(0),
+                &[],
+                &wallet
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        coherent
+            .inspect(
+                &mut store,
+                "different database selection",
+                Probe::new(0),
+                Probe::new(0),
+                &instruments,
+                &wallet
+            )
+            .await
+            .is_err()
+    );
+    let wrong_owner =
+        RecoverySelection::new("0".repeat(64), selection.receipt().clone(), HashMap::new())
+            .unwrap();
+    let wrong =
+        apexes_live_trading::CoherentRecoverySelection::new(wrong_owner, receipt.clone()).unwrap();
+    assert!(matches!(
+        wrong
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                Probe::new(0),
+                &instruments,
+                &wallet
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Store(
+            apexes_oms::CheckpointStoreError::Owner
+        ))
+    ));
+    let mut other_receipt = selection.receipt().clone();
+    other_receipt.envelope_sha256 = "0".repeat(64);
+    let wrong_predecessor =
+        RecoverySelection::new(OWNER_SHA256.into(), other_receipt, HashMap::new()).unwrap();
+    let wrong =
+        apexes_live_trading::CoherentRecoverySelection::new(wrong_predecessor, receipt.clone())
+            .unwrap();
+    assert!(matches!(
+        wrong
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                Probe::new(0),
+                &instruments,
+                &wallet
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Store(
+            apexes_oms::CheckpointStoreError::Conflict
+        ))
+    ));
+    // A preview never enables a repeatable live startup.
+    std::fs::remove_dir_all(dir).unwrap();
     // Modification with unchanged row counts and marker watermarks must
     // still invalidate the exact witness.
     sqlx::query("UPDATE orders SET updated_at=updated_at+interval '1 second' WHERE id=$1")
@@ -238,6 +398,19 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         store.verify_coherent_boundary(&receipt).await,
         Err(apexes_oms::CheckpointStoreError::JournalChanged)
     ));
+    assert!(
+        coherent
+            .inspect(
+                &mut store,
+                &fixture.url,
+                Probe::new(0),
+                Probe::new(0),
+                &instruments,
+                &wallet
+            )
+            .await
+            .is_err()
+    );
     drop(store);
     pool.close().await;
     fixture.cleanup().await;
