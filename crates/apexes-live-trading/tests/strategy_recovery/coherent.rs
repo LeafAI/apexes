@@ -156,6 +156,12 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
         .unwrap();
     let (manager, mut config, health) = fixture.manager(&registry).await;
+    let mut independent_opening_balances = config
+        .initial_balances
+        .iter()
+        .map(|(a, v)| (a.clone(), *v))
+        .collect::<Vec<_>>();
+    independent_opening_balances.sort_by(|a, b| a.0.cmp(&b.0));
     let mut expected_ledger_balances = config.initial_balances.clone();
     *expected_ledger_balances.entry("BTC".into()).or_default() += dec!(1);
     *expected_ledger_balances.entry("USDT".into()).or_default() -= dec!(100);
@@ -352,6 +358,17 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert_eq!(account.missing_execution_valuations, 0);
     assert!(account.fees.is_empty());
     assert!(account.external_fees.is_empty());
+    let decisions = attribution.decisions.as_ref().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].symbol, "BTCUSDT");
+    assert_eq!(decisions[0].price, dec!(100));
+    assert_eq!(decisions[0].fee, dec!(0));
+    assert_eq!(decisions[0].value, Some(dec!(0)));
+    assert_eq!(
+        decisions[0].source,
+        apexes_backtest::fee_evidence::FeeDecisionSource::Zero
+    );
+
     assert_eq!(attribution.prices.len(), 1);
     assert_eq!(attribution.prices[0].observations.len(), 1);
     assert_eq!(attribution.prices[0].observations[0].1, dec!(100));
@@ -815,6 +832,46 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             &instruments,
             (&exact_opening, &window, &exact_wallet, wallet_at),
             (&retained, &third_asset_rates),
+        )
+        .await
+        .unwrap();
+    coherent
+        .inspect_captured_fee_decisions(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &third_asset_rates),
+        )
+        .await
+        .unwrap();
+    coherent
+        .inspect_captured_fee_bearing_pnl(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &third_asset_rates),
+        )
+        .await
+        .unwrap();
+    let allocation = apexes_live_trading::OpeningTrackedAssetEvidence {
+        version: 1,
+        predecessor: exact_opening.predecessor.clone(),
+        owner_fingerprint: exact_opening.wallet.owner_fingerprint.clone(),
+        captured_at: exact_opening.wallet.window.finished_at,
+        balances: independent_opening_balances,
+    };
+    coherent
+        .inspect_external_fee_ownership(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &allocation),
         )
         .await
         .unwrap();

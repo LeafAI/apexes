@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+enum FeeComparison {
+    Aggregates,
+    Decisions,
+    RealizedPnl,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoherentRecoverySelection {
@@ -530,7 +537,98 @@ impl CoherentRecoverySelection {
             &crate::ThirdAssetFeeEvidence,
         ),
     ) -> Result<(), CoherentInspectionError> {
-        let (retained, rates) = evidence;
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, FeeComparison::Aggregates),
+        )
+        .await
+    }
+
+    /// Require exact actual retained decisions as well as fee aggregates.
+    /// Does not establish historical provenance or execution authorization.
+    pub async fn inspect_captured_fee_decisions<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::ThirdAssetFeeEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, FeeComparison::Decisions),
+        )
+        .await
+    }
+
+    /// Require independent fee-bearing realized P&L and exact valuation decisions.
+    /// Does not establish historical provenance or execution authorization.
+    pub async fn inspect_captured_fee_bearing_pnl<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::ThirdAssetFeeEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, FeeComparison::RealizedPnl),
+        )
+        .await
+    }
+
+    async fn inspect_fee_comparison<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        comparison: (
+            (
+                &crate::ClosingPositionEvidence,
+                &crate::ThirdAssetFeeEvidence,
+            ),
+            FeeComparison,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        let ((retained, rates), mode) = comparison;
         self.inspect_captured_ledger_reconciliation(
             store,
             ems_postgres_url,
@@ -567,9 +665,89 @@ impl CoherentRecoverySelection {
             .ledger
             .as_ref()
             .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
-        rates.compare(
-            &self.boundary,
-            self.predecessor.owner_fingerprint(),
+        if !matches!(mode, FeeComparison::Aggregates) {
+            rates.compare_decisions(
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ledger,
+                instruments,
+                &fills,
+            )?;
+        } else {
+            rates.compare(
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ledger,
+                instruments,
+                &fills,
+            )?;
+        }
+        if matches!(mode, FeeComparison::RealizedPnl) {
+            crate::recovery_pnl::compare_fee_bearing_pnl(ledger, instruments, &fills)?;
+        }
+        Ok(())
+    }
+
+    /// Compare local fee classification and tracked balances against a
+    /// separately retained opening allocation and the exact account journal.
+    /// No fee conversion or external funding provenance is authenticated.
+    pub async fn inspect_external_fee_ownership<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        retained: (
+            &crate::ClosingPositionEvidence,
+            &crate::OpeningTrackedAssetEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_closing_position_evidence(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            retained.0,
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        crate::recovery_fee_ownership::compare_external_fee_ownership(
+            retained.1,
+            observations.0,
+            observations.2,
             ledger,
             instruments,
             &fills,
