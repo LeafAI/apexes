@@ -149,3 +149,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Isolated cold-start Spot ledger application](2026-11-28-apexes-isolated-ledger-application-design.md) applies an independently qualified exact journal at actual retained observation prefixes to a private ledger and compares all captured closing maps and fee attribution; no runnable state or startup authority is exposed.
 
 [Durable offline transition witness](2026-11-28-apexes-offline-transition-witness-design.md) binds the exact selected coherent journal/capture and independently qualified accounting, observation and risk inputs; durable canonical historical evidence, not startup authority.
+
+[Offline successor-boundary continuity](2026-11-29-apexes-offline-successor-boundary-design.md) independently requalifies consecutive historical boundaries and verifies flat-inventory accounting and disjoint execution identities without changing startup authority.

@@ -1747,3 +1747,318 @@ async fn zero_fill_terminal_callback_is_included_in_the_coherent_boundary() {
     drop(store);
     fixture.cleanup().await;
 }
+
+struct FlatTransitionFixture {
+    selection: apexes_live_trading::CoherentRecoverySelection,
+    instruments: Vec<Instrument>,
+    opening: apexes_live_trading::OpeningWalletEvidence,
+    window: apexes_live_trading::RecoveryEvidenceWindow,
+    closing: apexes_live_trading::WalletEvidence,
+    positions: apexes_live_trading::ClosingPositionEvidence,
+    allocation: apexes_live_trading::OpeningTrackedAssetEvidence,
+    fees: apexes_live_trading::ThirdAssetFeeEvidence,
+    marks: apexes_live_trading::ClosingFeeMarkEvidence,
+    conversion: apexes_live_trading::ConversionScopeEvidence,
+    observations: apexes_live_trading::ObservationBoundaryEvidence,
+}
+
+impl FlatTransitionFixture {
+    fn evidence(&self) -> apexes_live_trading::TransitionEvidence<'_> {
+        apexes_live_trading::TransitionEvidence {
+            instruments: &self.instruments,
+            opening: &self.opening,
+            window: &self.window,
+            closing: &self.closing,
+            inspected_at: self.closing.window.finished_at,
+            positions: &self.positions,
+            allocation: &self.allocation,
+            fees: &self.fees,
+            marks: &self.marks,
+            conversion: &self.conversion,
+            observations: &self.observations,
+            registered_risk: None,
+            market_monitor: None,
+            margin_tiers: None,
+        }
+    }
+}
+
+async fn flat_boundary(fixture: &Fixture, previous: RecoverySelection) -> FlatTransitionFixture {
+    use apexes_backtest::observation_receipt::{
+        CompletedObservation, ObservationClock, ObservationReceipt,
+    };
+    use apexes_live_trading as live;
+    let start = previous.receipt().cursor.observed_at;
+    let at = start + chrono::TimeDelta::seconds(10);
+    let mut event = sample_events().pop().unwrap();
+    if let MarketEvent::Trade(trade) = &mut event {
+        trade.timestamp = at;
+    } else {
+        panic!("trade fixture expected");
+    }
+    let registry = registry_with(
+        Arc::new(MockExecutionGateway::new()),
+        Arc::new(MockMarketDataProvider {
+            events: vec![event.clone()],
+            keep_open: true,
+        }),
+    );
+    let (manager, mut config, _) = fixture.manager(&registry).await;
+    config.initial_balances.insert("BTC".into(), dec!(0));
+    let instruments = config.instruments.clone();
+    let (stop, receiver) = oneshot::channel();
+    let driver = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = stop.send(());
+    });
+    let (_, boundary, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        live::run_live_trading_with_observation_capture_on_stop(
+            config,
+            &registry,
+            restore_startup(previous.clone(), Probe::new(0)),
+            manager,
+            futures::stream::empty(),
+            receiver,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    driver.await.unwrap();
+    let expected_cursor = StateCursor {
+        ordinal: previous.receipt().cursor.ordinal + 1,
+        observed_at: at,
+    };
+    assert_eq!(boundary.checkpoint.cursor, expected_cursor);
+    assert_eq!((boundary.order_count, boundary.fill_count), (0, 0));
+    let point = |at| live::EvidenceWindow {
+        started_at: at,
+        finished_at: at,
+    };
+    let wallet = |at| live::WalletEvidence {
+        window: point(at),
+        owner_fingerprint: OWNER_SHA256.into(),
+        venue: Venue::Binance,
+        asset_class: AssetClass::Spot,
+        account_wide_complete: true,
+        balances: HashMap::from([
+            (
+                "BTC".into(),
+                live::spot_recovery::SpotWalletBalance {
+                    free: dec!(0),
+                    locked: dec!(0),
+                },
+            ),
+            (
+                "USDT".into(),
+                live::spot_recovery::SpotWalletBalance {
+                    free: dec!(100000),
+                    locked: dec!(0),
+                },
+            ),
+        ]),
+    };
+    let opening_at = start + chrono::TimeDelta::seconds(3);
+    let closing_at = at + chrono::TimeDelta::seconds(2);
+    let opening = live::OpeningWalletEvidence {
+        predecessor: previous.receipt().clone(),
+        wallet: wallet(opening_at),
+    };
+    let window = live::RecoveryEvidenceWindow {
+        terminal_window: point(at),
+        terminal_owner_fingerprint: OWNER_SHA256.into(),
+        terminal_evidence_complete: true,
+        terminal_orders: vec![],
+        open_orders: live::OpenOrderCoverage {
+            window: point(at + chrono::TimeDelta::seconds(1)),
+            venue: Venue::Binance,
+            asset_class: AssetClass::Spot,
+            owner_fingerprint: OWNER_SHA256.into(),
+            account_wide_complete: true,
+            open_order_count: 0,
+            foreign_order_count: 0,
+        },
+    };
+    let scope = vec![(Venue::Binance, "BTCUSDT".into())];
+    let history = ObservationReceipt::build(
+        previous.receipt().cursor,
+        expected_cursor,
+        ObservationClock::SourceAvailability,
+        &scope,
+        &[CompletedObservation {
+            cursor: expected_cursor,
+            event,
+        }],
+    )
+    .unwrap();
+    FlatTransitionFixture {
+        selection: live::CoherentRecoverySelection::new(previous.clone(), boundary.clone())
+            .unwrap(),
+        instruments,
+        opening,
+        window,
+        closing: wallet(closing_at),
+        positions: live::ClosingPositionEvidence {
+            version: 1,
+            owner_fingerprint: OWNER_SHA256.into(),
+            boundary: boundary.clone(),
+            captured_at: closing_at,
+            symbols: vec!["BTCUSDT".into()],
+            positions: vec![],
+        },
+        allocation: live::OpeningTrackedAssetEvidence {
+            version: 1,
+            predecessor: previous.receipt().clone(),
+            owner_fingerprint: OWNER_SHA256.into(),
+            captured_at: opening_at,
+            balances: vec![("BTC".into(), dec!(0)), ("USDT".into(), dec!(100000))],
+        },
+        fees: live::ThirdAssetFeeEvidence {
+            version: 1,
+            boundary: boundary.clone(),
+            owner_fingerprint: OWNER_SHA256.into(),
+            rates: vec![],
+        },
+        marks: live::ClosingFeeMarkEvidence {
+            version: 1,
+            boundary: boundary.clone(),
+            owner_fingerprint: OWNER_SHA256.into(),
+            rates: vec![],
+            symbols: vec![],
+        },
+        conversion: live::ConversionScopeEvidence {
+            version: 1,
+            boundary: boundary.clone(),
+            owner_fingerprint: OWNER_SHA256.into(),
+            instruments: vec![live::EvidenceInstrumentScope {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                base: "BTC".into(),
+                quote: "USDT".into(),
+                role: live::EvidenceInstrumentRole::StrategyInventory,
+            }],
+        },
+        observations: live::ObservationBoundaryEvidence::new(
+            OWNER_SHA256.into(),
+            previous.receipt().clone(),
+            boundary,
+            history,
+        )
+        .unwrap(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn independently_preserved_flat_successor_boundaries_requalify_without_claim_mutation() {
+    use apexes_live_trading as live;
+    let first = Fixture::new().await;
+    let second = Fixture::new().await;
+    let a = flat_boundary(&first, first.seed().await).await;
+    let mut first_store = first.store().await;
+    let boundary = a.selection.receipt();
+    let bytes = first_store
+        .load_strategy_checkpoint(Some(&boundary.checkpoint))
+        .await
+        .unwrap()
+        .unwrap();
+    // Seed a separate disposable test store, not a second claim in the first.
+    let mut second_store = second.store().await;
+    let receipt = second_store
+        .publish_strategy_checkpoint(
+            None,
+            &boundary.checkpoint.identity,
+            boundary.checkpoint.cursor,
+            &bytes,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt, boundary.checkpoint);
+    drop(second_store);
+    let b = flat_boundary(
+        &second,
+        RecoverySelection::new(OWNER_SHA256.into(), receipt, HashMap::new()).unwrap(),
+    )
+    .await;
+    let mut second_store = second.store().await;
+    let ae = a.evidence();
+    let be = b.evidence();
+    let aw = a
+        .selection
+        .inspect_offline_transition(
+            &mut first_store,
+            &first.url,
+            (Probe::new(0), Probe::new(0)),
+            &ae,
+        )
+        .await
+        .unwrap();
+    let bw = b
+        .selection
+        .inspect_offline_transition(
+            &mut second_store,
+            &second.url,
+            (Probe::new(0), Probe::new(0)),
+            &be,
+        )
+        .await
+        .unwrap();
+    live::inspect_offline_successor(
+        live::SuccessorRun {
+            selection: &a.selection,
+            store: &mut first_store,
+            ems_postgres_url: &first.url,
+            strategies: (Probe::new(0), Probe::new(0)),
+            evidence: &ae,
+            witness: &aw,
+        },
+        live::SuccessorRun {
+            selection: &b.selection,
+            store: &mut second_store,
+            ems_postgres_url: &second.url,
+            strategies: (Probe::new(0), Probe::new(0)),
+            evidence: &be,
+            witness: &bw,
+        },
+    )
+    .await
+    .unwrap();
+    // Even an otherwise valid witness from the other run cannot substitute.
+    assert!(
+        live::inspect_offline_successor(
+            live::SuccessorRun {
+                selection: &a.selection,
+                store: &mut first_store,
+                ems_postgres_url: &first.url,
+                strategies: (Probe::new(0), Probe::new(0)),
+                evidence: &ae,
+                witness: &aw,
+            },
+            live::SuccessorRun {
+                selection: &b.selection,
+                store: &mut second_store,
+                ems_postgres_url: &second.url,
+                strategies: (Probe::new(0), Probe::new(0)),
+                evidence: &be,
+                witness: &aw,
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(first.claim_count().await, 1);
+    assert_eq!(second.claim_count().await, 1);
+    first_store
+        .verify_coherent_boundary(a.selection.receipt())
+        .await
+        .unwrap();
+    second_store
+        .verify_coherent_boundary(b.selection.receipt())
+        .await
+        .unwrap();
+    drop(first_store);
+    drop(second_store);
+    first.cleanup().await;
+    second.cleanup().await;
+}

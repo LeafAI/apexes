@@ -25,7 +25,7 @@ enum FeeComparison {
 #[serde(deny_unknown_fields)]
 pub struct CoherentRecoverySelection {
     version: u32,
-    predecessor: RecoverySelection,
+    pub(crate) predecessor: RecoverySelection,
     boundary: CoherentCheckpointReceipt,
 }
 
