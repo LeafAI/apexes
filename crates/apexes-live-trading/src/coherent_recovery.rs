@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("offline observation evidence refused: {0}")]
+    Observation(#[from] crate::ObservationEvidenceError),
     #[error("offline risk evidence refused: {0}")]
     Risk(#[from] crate::RiskEvidenceError),
     #[error("offline ledger continuity refused: {0}")]
@@ -341,6 +343,44 @@ impl CoherentRecoverySelection {
             &self.boundary,
             inspected_at,
             observed,
+        )?;
+        store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Compare independent completed observation records to the retained
+    /// receipt and exact selected durable journal. No replay or source
+    /// completeness claim is made.
+    pub async fn inspect_observation_evidence(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        retained: &crate::ObservationBoundaryEvidence,
+        scope: &[(apexes_core::Venue, String)],
+        records: &[apexes_backtest::observation_receipt::CompletedObservation],
+    ) -> Result<(), CoherentInspectionError> {
+        self.encode()?;
+        store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        retained.compare(
+            self.predecessor.owner_fingerprint(),
+            self.predecessor.receipt(),
+            &self.boundary,
+            scope,
+            records,
         )?;
         store
             .inspect_coherent_recovery(

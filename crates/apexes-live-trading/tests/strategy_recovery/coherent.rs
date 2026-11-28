@@ -275,6 +275,61 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let path = dir.join("coherent.json");
     coherent.write_new(&path).unwrap();
     let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
+    // Retain independently supplied mock-source records, not a claim of
+    // atomic runtime history capture. The first depth event was filtered.
+    use apexes_backtest::observation_receipt::{
+        CompletedObservation, ObservationClock, ObservationReceipt,
+    };
+    let records = vec![CompletedObservation {
+        cursor: receipt.checkpoint.cursor,
+        event: sample_events().pop().unwrap(),
+    }];
+    let scope = vec![(Venue::Binance, "BTCUSDT".to_string())];
+    let history = ObservationReceipt::build(
+        selection.receipt().cursor,
+        receipt.checkpoint.cursor,
+        ObservationClock::SourceAvailability,
+        &scope,
+        &records,
+    )
+    .unwrap();
+    let retained = apexes_live_trading::ObservationBoundaryEvidence::new(
+        OWNER_SHA256.into(),
+        selection.receipt().clone(),
+        receipt.clone(),
+        history,
+    )
+    .unwrap();
+    let observation_path = dir.join("observation.json");
+    retained.write_new(&observation_path).unwrap();
+    assert!(retained.write_new(&observation_path).is_err());
+    let retained =
+        apexes_live_trading::ObservationBoundaryEvidence::read(&observation_path).unwrap();
+    coherent
+        .inspect_observation_evidence(&mut store, &fixture.url, &retained, &scope, &records)
+        .await
+        .unwrap();
+    let mut altered = records.clone();
+    if let MarketEvent::Trade(t) = &mut altered[0].event {
+        t.price = dec!(101);
+    }
+    assert!(matches!(
+        coherent
+            .inspect_observation_evidence(&mut store, &fixture.url, &retained, &scope, &altered)
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Observation(
+            apexes_live_trading::ObservationEvidenceError::History(
+                apexes_backtest::observation_receipt::ObservationError::Mismatch
+            )
+        ))
+    ));
+    assert!(
+        coherent
+            .inspect_observation_evidence(&mut store, &fixture.url, &retained, &scope, &[])
+            .await
+            .is_err()
+    );
+
     // Synthetic independent risk evidence; the current stop path does
     // not yet atomically capture its actual registered risk monitors.
     let captured_at = Utc::now();
