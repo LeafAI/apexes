@@ -32,11 +32,11 @@ impl From<&apexes_core::Bar> for AtrInput {
 /// crate that needs more than a single price per update.
 #[derive(Clone)]
 pub struct Atr {
-    period: usize,
-    prev_close: Option<Decimal>,
-    avg_tr: Option<Decimal>,
+    pub(crate) period: usize,
+    pub(crate) prev_close: Option<Decimal>,
+    pub(crate) avg_tr: Option<Decimal>,
     /// Number of true-range values folded into `avg_tr` so far.
-    count: usize,
+    pub(crate) count: usize,
 }
 
 impl Atr {

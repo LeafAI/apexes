@@ -9,9 +9,9 @@ use crate::indicator::Indicator;
 /// Simple Moving Average over a fixed-size trailing window.
 #[derive(Clone)]
 pub struct Sma {
-    period: usize,
-    window: VecDeque<Decimal>,
-    sum: Decimal,
+    pub(crate) period: usize,
+    pub(crate) window: VecDeque<Decimal>,
+    pub(crate) sum: Decimal,
 }
 
 impl Sma {

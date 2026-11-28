@@ -19,9 +19,9 @@ pub struct BollingerOutput {
 /// `num_std` rolling standard deviations, over the same trailing window.
 #[derive(Clone)]
 pub struct Bollinger {
-    sma: Sma,
-    stddev: RollingStdDev,
-    num_std: Decimal,
+    pub(crate) sma: Sma,
+    pub(crate) stddev: RollingStdDev,
+    pub(crate) num_std: Decimal,
 }
 
 impl Bollinger {

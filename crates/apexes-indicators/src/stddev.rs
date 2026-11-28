@@ -10,10 +10,10 @@ use crate::indicator::Indicator;
 /// over the current trailing window, updated in O(1) via running sums.
 #[derive(Clone)]
 pub struct RollingStdDev {
-    period: usize,
-    window: VecDeque<Decimal>,
-    sum: Decimal,
-    sum_sq: Decimal,
+    pub(crate) period: usize,
+    pub(crate) window: VecDeque<Decimal>,
+    pub(crate) sum: Decimal,
+    pub(crate) sum_sq: Decimal,
 }
 
 impl RollingStdDev {

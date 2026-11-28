@@ -22,3 +22,6 @@ pub use macd::{Macd, MacdOutput};
 pub use rsi::Rsi;
 pub use sma::Sma;
 pub use stddev::RollingStdDev;
+
+/// Validated snapshots for bounded positive-price scoped indicators.
+pub mod checkpoint;

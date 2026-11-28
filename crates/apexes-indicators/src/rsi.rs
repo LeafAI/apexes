@@ -12,14 +12,14 @@ use crate::indicator::Indicator;
 /// defined as `100` to avoid division by zero.
 #[derive(Clone)]
 pub struct Rsi {
-    period: usize,
-    prev_price: Option<Decimal>,
-    avg_gain: Decimal,
-    avg_loss: Decimal,
+    pub(crate) period: usize,
+    pub(crate) prev_price: Option<Decimal>,
+    pub(crate) avg_gain: Decimal,
+    pub(crate) avg_loss: Decimal,
     /// Number of price *changes* folded into `avg_gain`/`avg_loss` so far
     /// (not the number of prices seen -- the first price has no prior
     /// price to diff against).
-    change_count: usize,
+    pub(crate) change_count: usize,
 }
 
 impl Rsi {

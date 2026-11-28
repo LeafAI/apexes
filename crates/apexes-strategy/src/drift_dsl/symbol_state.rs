@@ -585,3 +585,6 @@ mod tests {
         assert!(state.finish(&event, stage, true));
     }
 }
+
+mod checkpoint;
+pub(super) use checkpoint::{InstrumentKey, ScriptCheckpoint};

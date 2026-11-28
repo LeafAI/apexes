@@ -69,3 +69,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 ## Strategy state and warm-up (F04.05)
 
 [Versioned strategy state contract](2026-11-28-apexes-strategy-state-contract-design.md) validates a bounded checkpoint against an independently selected identity, schema and observation cursor before invoking opt-in strategy restore. It does not provide durable publication, automatic runner integration or atomic callback recovery.
+
+[Scoped Drift checkpoint codecs](2026-11-28-apexes-drift-state-codec-design.md) extend the versioned checkpoint contract with explicit scoped-only opt-in, exact bounded native indicator accumulators, state values, causal time gates and parameter state. No arbitrary interpreter globals or automatic runner restoration are claimed. Durable publication and warm-up remain separate slices.

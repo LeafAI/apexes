@@ -22,9 +22,9 @@ pub struct MacdOutput {
 /// all warmed up.
 #[derive(Clone)]
 pub struct Macd {
-    fast_ema: Ema,
-    slow_ema: Ema,
-    signal_ema: Ema,
+    pub(crate) fast_ema: Ema,
+    pub(crate) slow_ema: Ema,
+    pub(crate) signal_ema: Ema,
 }
 
 impl Macd {

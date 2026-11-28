@@ -3,8 +3,12 @@
 //! logic, so researchers can iterate on strategy behavior without a Rust
 //! compile cycle.
 
+use super::params::ParamCheckpoint;
+use super::symbol_state::{InstrumentKey, ScriptCheckpoint};
+use crate::checkpoint::{CheckpointError, ValidatedState};
 use drift_script::{DriftValue, Interpreter, ScriptParser};
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +18,22 @@ use crate::drift_dsl::convert::{market_event_to_drift_value, order_intents_from_
 use crate::drift_dsl::params::ParamStore;
 use crate::error::StrategyError;
 use crate::strategy::{OrderIntent, Strategy, StrategyContext};
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedConfig {
+    source_sha256: String,
+    instruments: Vec<InstrumentKey>,
+    initial_params: ParamCheckpoint,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedPayload {
+    config: ScopedConfig,
+    params: ParamCheckpoint,
+    state: ScriptCheckpoint,
+}
 
 /// Runs a `.drift` script's top-level `on_market_event(event, ctx)`
 /// function as a [`Strategy`] implementation. The script is parsed and its
@@ -25,6 +45,7 @@ use crate::strategy::{OrderIntent, Strategy, StrategyContext};
 /// A script's `param(name, default)` calls read/write a shared
 /// [`ParamStore`] (`self.params`) -- see `crate::drift_dsl::params` for
 /// the full top-level-vs-inside-`on_market_event` hot-reload semantics.
+/// Scoped checkpointing is explicitly opt-in.
 pub struct DriftScriptStrategy {
     interpreter: Interpreter,
     on_market_event_fn: DriftValue,
@@ -34,6 +55,7 @@ pub struct DriftScriptStrategy {
     on_parent_outcome_fn: Option<DriftValue>,
     params: Arc<ParamStore>,
     symbol_state: super::symbol_state::ScriptState,
+    checkpoint_config: Option<ScopedConfig>,
 }
 
 impl DriftScriptStrategy {
@@ -45,7 +67,7 @@ impl DriftScriptStrategy {
     /// level -- construction fails closed, never producing a
     /// partially-usable instance.
     pub fn from_file(path: &Path) -> Result<Self, StrategyError> {
-        Self::from_file_inner(path, std::collections::HashMap::new())
+        Self::from_file_inner(path, std::collections::HashMap::new(), None)
     }
 
     /// Like `from_file`, but registers a `param(name, default)` native
@@ -58,12 +80,28 @@ impl DriftScriptStrategy {
         path: &Path,
         overrides: std::collections::HashMap<String, rust_decimal::Decimal>,
     ) -> Result<Self, StrategyError> {
-        Self::from_file_inner(path, overrides)
+        Self::from_file_inner(path, overrides, None)
+    }
+
+    /// Explicitly opt in for a script whose complete risk-relevant mutable
+    /// state is confined to ctx.state_*, ctx.indicators and ctx.time, plus
+    /// the parameter store. Top-level initialization must be deterministic;
+    /// arbitrary interpreter globals, closures and legacy global indicators
+    /// are NOT checkpointed. The caller must qualify that restriction before
+    /// opting in. Existing constructors retain their legacy behavior.
+    pub fn from_file_with_scoped_checkpoints(
+        path: &Path,
+        overrides: HashMap<String, Decimal>,
+        instruments: &[apexes_core::Instrument],
+    ) -> Result<Self, StrategyError> {
+        let scope = InstrumentKey::from_instruments(instruments)?;
+        Self::from_file_inner(path, overrides, Some(scope))
     }
 
     fn from_file_inner(
         path: &Path,
         overrides: std::collections::HashMap<String, rust_decimal::Decimal>,
+        checkpoint_scope: Option<Vec<InstrumentKey>>,
     ) -> Result<Self, StrategyError> {
         let source = std::fs::read_to_string(path).map_err(|source| StrategyError::Io {
             path: PathBuf::from(path),
@@ -127,6 +165,14 @@ impl DriftScriptStrategy {
             return Err(StrategyError::ParentCallbackNotCallable);
         }
 
+        let checkpoint_config = match checkpoint_scope {
+            Some(instruments) => Some(ScopedConfig {
+                source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+                instruments,
+                initial_params: params.checkpoint()?,
+            }),
+            None => None,
+        };
         Ok(Self {
             interpreter,
             on_parent_outcome_fn,
@@ -136,6 +182,7 @@ impl DriftScriptStrategy {
             on_market_event_fn,
             params,
             symbol_state: Default::default(),
+            checkpoint_config,
         })
     }
 }
@@ -146,6 +193,17 @@ impl Strategy for DriftScriptStrategy {
         event: &apexes_core::MarketEvent,
         ctx: &StrategyContext,
     ) -> Vec<OrderIntent> {
+        if self
+            .checkpoint_config
+            .as_ref()
+            .is_some_and(|config| !config.instruments.iter().any(|key| key.matches(event)))
+        {
+            tracing::error!(
+                symbol = event.symbol(),
+                "event outside scoped checkpoint universe"
+            );
+            return Vec::new();
+        }
         let mut ctx_value = build_ctx_drift_value(
             ctx.positions.clone(),
             ctx.balances.clone(),
@@ -245,6 +303,46 @@ impl Strategy for DriftScriptStrategy {
                 tracing::error!("on_parent_outcome script error");
             }
         }
+    }
+
+    fn checkpoint_schema_version(&self) -> Option<u32> {
+        self.checkpoint_config.as_ref().map(|_| 1)
+    }
+
+    fn checkpoint_payload(&self) -> Result<String, CheckpointError> {
+        let config = self
+            .checkpoint_config
+            .as_ref()
+            .ok_or(CheckpointError::Unsupported)?;
+        let payload = ScopedPayload {
+            config: config.clone(),
+            params: self.params.checkpoint()?,
+            state: self.symbol_state.checkpoint()?,
+        };
+        serde_json::to_string(&payload).map_err(|_| CheckpointError::Payload)
+    }
+
+    fn restore_checkpoint(&mut self, state: &ValidatedState<'_>) -> Result<(), CheckpointError> {
+        let config = self
+            .checkpoint_config
+            .as_ref()
+            .ok_or(CheckpointError::Unsupported)?;
+        let payload: ScopedPayload =
+            serde_json::from_str(state.payload()).map_err(|_| CheckpointError::Payload)?;
+        if serde_json::to_string(&payload).map_err(|_| CheckpointError::Payload)? != state.payload()
+        {
+            return Err(CheckpointError::Payload);
+        }
+        if &payload.config != config {
+            return Err(CheckpointError::Identity);
+        }
+        let restored = payload
+            .state
+            .restore(&config.instruments, state.cursor().observed_at)?;
+        self.params
+            .restore_checkpoint(payload.params, &config.initial_params)?;
+        self.symbol_state = restored;
+        Ok(())
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {

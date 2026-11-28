@@ -985,3 +985,6 @@ fn parent_callback_distinguishes_submission_status_failure_and_missing() {
         }
     });
 }
+
+#[path = "checkpoint_scoped/mod.rs"]
+mod checkpoint_scoped;
