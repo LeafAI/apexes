@@ -221,6 +221,9 @@ impl CapturedObservations {
         self.receipt.verify(&self.scope, &self.records)?;
         if let Some(ledger) = &self.ledger {
             ledger.validate(&self.scope)?;
+            if let Some(fees) = &ledger.fee_valuation {
+                fees.validate_through(self.receipt.through.observed_at)?;
+            }
         }
 
         if let Some(market) = &self.market_monitor {

@@ -62,7 +62,7 @@ impl PortfolioLedger {
     }
 
     /// Capture the actual basic Spot ledger maps without modifying them.
-    /// Fee-valuation history and external balance provenance are not covered.
+    /// Retained attribution evidence does not establish external provenance.
     pub fn inspect_evidence(
         &self,
     ) -> Result<crate::ledger_evidence::LedgerEvidence, crate::observation_receipt::ObservationError>
@@ -103,11 +103,13 @@ impl PortfolioLedger {
             .map(|(s, v)| (s.clone(), *v))
             .collect::<Vec<_>>();
         realized_pnl.sort_by(|a, b| a.0.cmp(&b.0));
+        let fee_valuation = Some(self.spot_accounting.inspect_evidence(&scope)?);
         let snapshot = crate::ledger_evidence::LedgerEvidence {
             version: 1,
             scope,
             balances,
             positions,
+            fee_valuation,
             realized_pnl,
         };
         snapshot.validate(&snapshot.scope)?;

@@ -338,6 +338,24 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert_eq!(ledger_evidence.positions[0].quantity, dec!(1));
     assert_eq!(ledger_evidence.positions[0].average_entry_price, dec!(100));
     assert!(ledger_evidence.realized_pnl.is_empty());
+    let attribution = ledger_evidence.fee_valuation.as_ref().unwrap();
+    assert_eq!(attribution.accounts.len(), 1);
+    let account = &attribution.accounts[0];
+    assert_eq!(account.symbol, "BTCUSDT");
+    assert_eq!(account.venue, Venue::Binance);
+    assert_eq!(account.base, "BTC");
+    assert_eq!(account.quote, "USDT");
+    assert_eq!(account.gross_quantity, dec!(1));
+    assert_eq!(account.entry, dec!(100));
+    assert_eq!(account.gross_realized, dec!(0));
+    assert_eq!(account.historical_fee, dec!(0));
+    assert_eq!(account.missing_execution_valuations, 0);
+    assert!(account.fees.is_empty());
+    assert!(account.external_fees.is_empty());
+    assert_eq!(attribution.prices.len(), 1);
+    assert_eq!(attribution.prices[0].observations.len(), 1);
+    assert_eq!(attribution.prices[0].observations[0].1, dec!(100));
+
     let registered = captured.registered_risk.as_ref().unwrap();
     assert!(!registered.has_unsupported_slots());
     let aliases = registered.aliases.as_ref().unwrap();

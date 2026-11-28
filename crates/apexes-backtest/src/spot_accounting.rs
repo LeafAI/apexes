@@ -67,6 +67,82 @@ pub struct SpotAccounting {
 }
 
 impl SpotAccounting {
+    /// Inspect actual retained attribution aggregates and price windows.
+    /// Does not claim that evicted observations can be recovered.
+    pub(crate) fn inspect_evidence(
+        &self,
+        scope: &[(Venue, String)],
+    ) -> Result<
+        crate::fee_evidence::FeeValuationEvidence,
+        crate::observation_receipt::ObservationError,
+    > {
+        use crate::fee_evidence::{
+            ConversionPriceEvidence, FeeAccountEvidence, FeeValuationEvidence, MAX_FEE_ASSETS,
+            MAX_PRICE_ROWS, pair_key,
+        };
+        use crate::observation_receipt::ObservationError as E;
+        if self.accounts.len() > 128
+            || self.prices.len() > 128
+            || self
+                .prices
+                .values()
+                .map(|p| p.len())
+                .try_fold(0usize, usize::checked_add)
+                .is_none_or(|n| n > MAX_PRICE_ROWS)
+            || self
+                .accounts
+                .values()
+                .any(|a| a.fees.len() > MAX_FEE_ASSETS || a.external_fees.len() > MAX_FEE_ASSETS)
+        {
+            return Err(E::Capacity);
+        }
+        let sorted = |m: &HashMap<String, Decimal>| {
+            let mut values = m.iter().map(|(a, v)| (a.clone(), *v)).collect::<Vec<_>>();
+            values.sort_by(|a, b| a.0.cmp(&b.0));
+            values
+        };
+        let mut accounts = self
+            .accounts
+            .iter()
+            .map(|(symbol, a)| {
+                Ok(FeeAccountEvidence {
+                    symbol: symbol.clone(),
+                    venue: a.venue.ok_or(E::Encoding)?,
+                    base: a.base.clone(),
+                    quote: a.quote.clone(),
+                    gross_quantity: a.gross_quantity,
+                    entry: a.entry,
+                    gross_realized: a.gross_realized,
+                    fees: sorted(&a.fees),
+                    external_fees: sorted(&a.external_fees),
+                    historical_fee: a.historical_fee,
+                    missing_execution_valuations: a.missing,
+                })
+            })
+            .collect::<Result<Vec<_>, E>>()?;
+        accounts.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        let mut prices = self
+            .prices
+            .iter()
+            .map(|((venue, base, quote), p)| ConversionPriceEvidence {
+                venue: *venue,
+                base: base.clone(),
+                quote: quote.clone(),
+                observations: p.iter().map(|(t, v)| (*t, *v)).collect(),
+            })
+            .collect::<Vec<_>>();
+        prices.sort_by(|a, b| {
+            pair_key(a.venue, &a.base, &a.quote).cmp(&pair_key(b.venue, &b.base, &b.quote))
+        });
+        let evidence = FeeValuationEvidence {
+            version: 1,
+            accounts,
+            prices,
+        };
+        evidence.validate(scope)?;
+        Ok(evidence)
+    }
+
     pub fn observe(
         &mut self,
         venue: Venue,
@@ -262,6 +338,75 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn inspect_retains_known_subtotal_missing_valuations_and_price_windows() {
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut accounting = SpotAccounting::default();
+        accounting.observe(Venue::Binance, "BNB", "USDT", at, dec!(300));
+        accounting.record(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0.01), "BNB", at),
+            "BTC",
+            "USDT",
+            true,
+        );
+        accounting.record(
+            &fill(Side::Buy, dec!(1), dec!(100), dec!(0.02), "BTC", at),
+            "BTC",
+            "USDT",
+            false,
+        );
+        accounting.record(
+            &fill(Side::Sell, dec!(1), dec!(110), dec!(0.01), "OTHER", at),
+            "BTC",
+            "USDT",
+            true,
+        );
+        accounting.observe(
+            Venue::Binance,
+            "BNB",
+            "USDT",
+            at + TimeDelta::seconds(1),
+            dec!(310),
+        );
+        let scope = vec![(Venue::Binance, "BTCUSDT".into())];
+        let state = accounting.inspect_evidence(&scope).unwrap();
+        let account = &state.accounts[0];
+        assert_eq!(account.gross_quantity, dec!(1));
+        assert_eq!(account.entry, dec!(100));
+        assert_eq!(account.gross_realized, dec!(10));
+        assert_eq!(account.historical_fee, dec!(5));
+        assert_eq!(account.missing_execution_valuations, 1);
+        assert_eq!(
+            account.fees,
+            vec![
+                ("BNB".into(), dec!(0.01)),
+                ("BTC".into(), dec!(0.02)),
+                ("OTHER".into(), dec!(0.01))
+            ]
+        );
+        assert_eq!(
+            account.external_fees,
+            vec![("BNB".into(), dec!(0.01)), ("OTHER".into(), dec!(0.01))]
+        );
+        assert_eq!(
+            state.prices[0].observations,
+            vec![(at, dec!(300)), (at + TimeDelta::seconds(1), dec!(310))]
+        );
+        assert!(state.validate_through(at).is_err());
+        state.validate_through(at + TimeDelta::seconds(1)).unwrap();
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: crate::fee_evidence::FeeValuationEvidence =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(state, decoded);
+        assert_eq!(state, accounting.inspect_evidence(&scope).unwrap());
+        let mut invalid = state.clone();
+        invalid.accounts[0].external_fees[0].1 = dec!(1);
+        assert!(invalid.validate(&scope).is_err());
+        let mut invalid = state;
+        invalid.prices[0].observations.reverse();
+        assert!(invalid.validate(&scope).is_err());
     }
 
     #[test]

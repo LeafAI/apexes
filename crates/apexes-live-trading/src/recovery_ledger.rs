@@ -575,6 +575,7 @@ mod tests {
             balances: vec![],
             positions: vec![],
             realized_pnl: vec![("BTCUSDT".into(), dec!(10))],
+            fee_valuation: None,
         };
         compare_realized_pnl(&captured, &instruments, &fills).unwrap();
         captured.realized_pnl[0].1 = dec!(11);
@@ -599,6 +600,7 @@ mod tests {
             balances: vec![],
             positions: vec![],
             realized_pnl: vec![],
+            fee_valuation: None,
         };
         assert_eq!(
             compare_realized_pnl(&captured, &instruments, &fills),
