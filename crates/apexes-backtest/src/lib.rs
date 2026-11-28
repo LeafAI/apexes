@@ -51,6 +51,7 @@ pub use execution_policy::SimulatedExecution;
 pub mod mark_price_source;
 
 // Populated in Task 7.
+pub mod fee_evidence;
 pub mod ledger;
 pub mod ledger_evidence;
 pub mod spot_accounting;

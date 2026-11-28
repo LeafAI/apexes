@@ -1,5 +1,5 @@
 //! F04.05: bounded read-only evidence of actual loop-local ledger state.
-//! Deliberately excludes fee-valuation history and is not a restore format.
+//! Partial retained attribution evidence, not a restore format.
 use apexes_core::Venue;
 use apexes_strategy::Position;
 use rust_decimal::Decimal;
@@ -16,6 +16,9 @@ pub struct LedgerEvidence {
     /// Includes actual flat entries retained by the ledger.
     pub positions: Vec<Position>,
     pub realized_pnl: Vec<(String, Decimal)>,
+    /// Absent on legacy captures. Retained windows are not complete history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_valuation: Option<crate::fee_evidence::FeeValuationEvidence>,
 }
 
 fn valid_key(s: &str, limit: usize) -> bool {
@@ -66,6 +69,9 @@ impl LedgerEvidence {
             || self.realized_pnl.iter().any(|(s, _)| !known(s))
         {
             return Err(E::Encoding);
+        }
+        if let Some(fees) = &self.fee_valuation {
+            fees.validate(scope)?;
         }
         Ok(())
     }
