@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("terminal execution evidence comparison refused: {0}")]
+    Terminal(#[from] apexes_oms::TerminalAuditError),
     #[error("Spot inventory preview refused: {0}")]
     Inventory(#[from] SpotRecoveryError),
 }
@@ -120,6 +122,37 @@ pub struct CoherentRecoveryPreview {
 }
 
 impl CoherentRecoverySelection {
+    /// Compare caller-supplied, independently collected terminal evidence
+    /// against this exact selected journal. This is an offline inspection,
+    /// not proof of freshness or an authoritative exchange query. No
+    /// callback receipts, startup claims, or order state are changed.
+    pub async fn inspect_terminal_evidence(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        evidence: &[apexes_oms::TerminalOrderEvidence],
+    ) -> Result<(), CoherentInspectionError> {
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        apexes_oms::compare_terminal_evidence(&snapshot, evidence)?;
+        store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Reconstruct owned inventory from the exact locked journal using
     /// caller-supplied wallet evidence and verify isolated strategy
     /// restoration. The supplied wallet is not fetched or authenticated
