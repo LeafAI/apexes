@@ -121,3 +121,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent per-fill third-asset valuation evidence](2026-11-28-apexes-third-asset-fee-evidence-design.md) compares the exact selected journal and supplied causal per-fill rates against retained fee totals and valuation subtotals; actual runtime conversion decisions and provenance remain unqualified.
 
 [Actual per-fill valuation decision evidence](2026-11-28-apexes-per-fill-valuation-evidence-design.md) retains bounded actual attribution decisions and validates local aggregate consistency; independent per-fill reconciliation and external provenance remain open.
+
+[Exact retained per-fill valuation reconciliation](2026-11-28-apexes-decision-reconciliation-design.md) compares the actual retained decisions with complete selected-journal fill identity and independently supplied conversion observations, refusing aggregate-only matches.

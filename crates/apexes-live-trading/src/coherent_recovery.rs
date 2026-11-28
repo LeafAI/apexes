@@ -530,7 +530,68 @@ impl CoherentRecoverySelection {
             &crate::ThirdAssetFeeEvidence,
         ),
     ) -> Result<(), CoherentInspectionError> {
-        let (retained, rates) = evidence;
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, false),
+        )
+        .await
+    }
+
+    /// Require exact actual retained decisions as well as fee aggregates.
+    /// Does not establish historical provenance or execution authorization.
+    pub async fn inspect_captured_fee_decisions<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::ThirdAssetFeeEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, true),
+        )
+        .await
+    }
+
+    async fn inspect_fee_comparison<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        comparison: (
+            (
+                &crate::ClosingPositionEvidence,
+                &crate::ThirdAssetFeeEvidence,
+            ),
+            bool,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        let ((retained, rates), require_decisions) = comparison;
         self.inspect_captured_ledger_reconciliation(
             store,
             ems_postgres_url,
@@ -567,13 +628,23 @@ impl CoherentRecoverySelection {
             .ledger
             .as_ref()
             .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
-        rates.compare(
-            &self.boundary,
-            self.predecessor.owner_fingerprint(),
-            ledger,
-            instruments,
-            &fills,
-        )?;
+        if require_decisions {
+            rates.compare_decisions(
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ledger,
+                instruments,
+                &fills,
+            )?;
+        } else {
+            rates.compare(
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ledger,
+                instruments,
+                &fills,
+            )?;
+        }
         Ok(())
     }
 

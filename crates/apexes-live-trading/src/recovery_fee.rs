@@ -1,6 +1,7 @@
 //! Independent read-only reconciliation of Spot fee valuations.
 //! Third-asset rates must be independently supplied for exact fills.
 use crate::recovery_ledger::{LedgerContinuityError as E, exact_add, exact_mul};
+use apexes_backtest::fee_evidence::{FeeDecisionEvidence, FeeDecisionSource};
 use apexes_backtest::ledger_evidence::LedgerEvidence;
 use apexes_core::{AssetClass, Fill, FillId, Instrument, Venue};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -56,6 +57,92 @@ impl ThirdAssetFeeEvidence {
         let rates = self.rates.iter().map(|r| (r.fill_id, r)).collect();
         compare_fees(captured, instruments, fills, rates)
     }
+
+    /// Stronger comparison: require every actual retained valuation decision
+    /// to match the independently supplied evidence for its exact fill ID.
+    pub(crate) fn compare_decisions(
+        &self,
+        boundary: &apexes_oms::CoherentCheckpointReceipt,
+        owner: &str,
+        captured: &LedgerEvidence,
+        instruments: &[Instrument],
+        fills: &[Fill],
+    ) -> Result<(), E> {
+        self.compare(boundary, owner, captured, instruments, fills)?;
+        let decisions = captured
+            .fee_valuation
+            .as_ref()
+            .and_then(|e| e.decisions.as_deref())
+            .ok_or(E::FeeMismatch)?;
+        if decisions.len() != fills.len() {
+            return Err(E::FeeMismatch);
+        }
+        let mut journal = fills.iter().map(|f| (f.id, f)).collect::<HashMap<_, _>>();
+        if journal.len() != fills.len() {
+            return Err(E::FeeMismatch);
+        }
+        let instruments = instruments
+            .iter()
+            .map(|i| (i.symbol.as_str(), i))
+            .collect::<HashMap<_, _>>();
+        let rates = self
+            .rates
+            .iter()
+            .map(|r| (r.fill_id, r))
+            .collect::<HashMap<_, _>>();
+        for decision in decisions {
+            let fill = journal.remove(&decision.fill_id).ok_or(E::FeeMismatch)?;
+            let instrument = instruments
+                .get(fill.symbol.as_str())
+                .ok_or(E::FeeMismatch)?;
+            compare_decision(decision, fill, instrument, rates.get(&fill.id).copied())?;
+        }
+        if !journal.is_empty() {
+            return Err(E::FeeMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn compare_decision(
+    decision: &FeeDecisionEvidence,
+    fill: &Fill,
+    instrument: &Instrument,
+    rate: Option<&ThirdAssetFeeRate>,
+) -> Result<(), E> {
+    let base = instrument.base_currency.as_deref().ok_or(E::Execution)?;
+    let quote = instrument.quote_currency.as_deref().ok_or(E::Execution)?;
+    let asset = fill.fee_currency.as_deref().unwrap_or(quote);
+    if decision.venue != fill.venue
+        || decision.symbol != fill.symbol
+        || decision.asset != asset
+        || decision.filled_at != fill.filled_at
+        || decision.price != fill.price
+        || decision.fee != fill.fee
+        || decision.external_fee
+    {
+        return Err(E::FeeMismatch);
+    }
+    let (source, value) = if fill.fee.is_zero() {
+        (FeeDecisionSource::Zero, Decimal::ZERO)
+    } else if asset == base {
+        (FeeDecisionSource::Base, exact_mul(fill.fee, fill.price)?)
+    } else if asset == quote {
+        (FeeDecisionSource::Quote, fill.fee)
+    } else {
+        let rate = rate.ok_or(E::FeeMismatch)?;
+        (
+            FeeDecisionSource::Observed {
+                observed_at: rate.observed_at,
+                rate: rate.rate,
+            },
+            exact_mul(fill.fee, rate.rate)?,
+        )
+    };
+    if decision.source != source || decision.value != Some(value) {
+        return Err(E::FeeMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Default)]
