@@ -33,7 +33,8 @@ pub use kill_switch::{KillSwitch, SessionPhase};
 pub use manager::{CancelAllReport, FillDeliveryProgress, OrderManager, TerminalDeliveryProgress};
 pub use mock_gateway::MockExecutionGateway;
 pub use store::{
-    CheckpointStoreError, CoherentCheckpointReceipt, OrderStore, SubmissionState, TerminalEvidence,
+    CheckpointStoreError, CoherentCheckpointReceipt, CoherentRecoverySnapshot, OrderStore,
+    SubmissionState, TerminalEvidence,
 };
 
 pub mod identity_evidence;

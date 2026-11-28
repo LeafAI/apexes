@@ -256,34 +256,108 @@ impl OrderStore {
     ) -> Result<()> {
         let (owner, connection) = self.checkpoint_connection()?;
         let mut tx = connection.begin().await?;
-        let result = async {
-            if expected.version != 1 {
-                return Err(CheckpointStoreError::Corrupt);
-            }
-            select_head(&mut tx, owner, Some(&expected.checkpoint)).await?;
-            let row: Option<(String, String)> = sqlx::query_as(
-                "SELECT owner, receipt FROM strategy_checkpoint_boundary WHERE singleton",
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            let encoded =
-                serde_json::to_string(expected).map_err(|_| CheckpointStoreError::Corrupt)?;
-            if row != Some((owner.to_owned(), encoded)) {
-                return Err(CheckpointStoreError::Conflict);
-            }
-            let prefix = CompletedPrefix {
-                run_scope: expected.run_scope,
-                last_intent: expected.last_intent,
-                fill_sequence: expected.fill_sequence,
-                terminal_sequence: expected.terminal_sequence,
-            };
-            let actual = witness(&mut tx, prefix, expected.checkpoint.clone()).await?;
-            if &actual != expected {
-                return Err(CheckpointStoreError::JournalChanged);
-            }
-            Ok(())
-        }
-        .await;
+        let result = verify_boundary(&mut tx, owner, expected).await.map(|_| ());
         finish(tx, result).await
     }
+
+    /// Bounded locked snapshot of the independently selected boundary.
+    pub async fn inspect_coherent_recovery(
+        &mut self,
+        previous: &CheckpointReceipt,
+        expected: &CoherentCheckpointReceipt,
+        owner_sha256: &str,
+        ems_postgres_url: &str,
+    ) -> Result<CoherentRecoverySnapshot> {
+        let url_hash: [u8; 32] = Sha256::digest(ems_postgres_url.as_bytes()).into();
+        if self.checkpoint_database_sha256 != url_hash {
+            return Err(CheckpointStoreError::DatabaseScope);
+        }
+        let (owner, connection) = self.checkpoint_connection()?;
+        if format!("{:x}", Sha256::digest(owner.as_bytes())) != owner_sha256 {
+            return Err(CheckpointStoreError::Owner);
+        }
+        let mut tx = connection.begin().await?;
+        let result = async {
+            if !(0..=2048).contains(&expected.order_count)
+                || !(0..=8192).contains(&expected.fill_count) {
+                return Err(CheckpointStoreError::Boundary);
+            }
+            validate_transition(Some(previous), &expected.checkpoint)?;
+            let claim: Option<(String, String)> = sqlx::query_as(
+                "SELECT owner, receipt FROM strategy_checkpoint_startup_claim WHERE singleton FOR SHARE",
+            ).fetch_optional(&mut *tx).await?;
+            let encoded = serde_json::to_string(previous).map_err(|_| CheckpointStoreError::Corrupt)?;
+            if claim != Some((owner.to_owned(),encoded)) {
+                return Err(CheckpointStoreError::Conflict);
+            }
+            let envelope = verify_boundary(&mut tx, owner, expected).await?;
+            let inconsistent: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM orders o WHERE
+                 o.leverage IS NOT NULL OR o.margin_mode IS NOT NULL OR o.quantity<=0
+                 OR o.filled_quantity<0 OR o.filled_quantity>o.quantity
+                 OR (o.status='Filled' AND o.filled_quantity<>o.quantity))
+                 OR EXISTS(SELECT 1 FROM fills f JOIN orders o ON f.order_id=o.id
+                   WHERE f.symbol<>o.symbol OR f.venue<>o.venue OR f.side<>o.side
+                   OR f.price<=0 OR f.fee<0)"
+            ).fetch_one(&mut *tx).await?;
+            if inconsistent {
+                return Err(CheckpointStoreError::Corrupt);
+            }
+            let orders: Vec<crate::schema::OrderRow> = sqlx::query_as(
+                "SELECT * FROM orders ORDER BY id",
+            ).fetch_all(&mut *tx).await?;
+            // Match the existing fee-aware Spot recovery ordering.
+            let fills: Vec<crate::schema::FillRow> = sqlx::query_as(
+                "SELECT * FROM fills ORDER BY filled_at, venue, symbol, length(exchange_trade_id), exchange_trade_id, id",
+            ).fetch_all(&mut *tx).await?;
+            if orders.len() as i64 != expected.order_count || fills.len() as i64 != expected.fill_count {
+                return Err(CheckpointStoreError::Corrupt);
+            }
+            let orders = orders.into_iter().map(apexes_core::Order::try_from)
+                .collect::<std::result::Result<Vec<_>,_>>().map_err(|_| CheckpointStoreError::Corrupt)?;
+            Ok(CoherentRecoverySnapshot { envelope, orders, fills })
+        }.await;
+        finish(tx, result).await
+    }
+}
+
+/// Exact journal and envelope selected by a read-only inspection.
+/// Not an exchange reconciliation result or permission to trade.
+pub struct CoherentRecoverySnapshot {
+    pub envelope: Vec<u8>,
+    pub orders: Vec<apexes_core::Order>,
+    pub fills: Vec<crate::schema::FillRow>,
+}
+
+async fn verify_boundary(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &str,
+    expected: &CoherentCheckpointReceipt,
+) -> Result<Vec<u8>> {
+    if expected.version != 1 {
+        return Err(CheckpointStoreError::Corrupt);
+    }
+    let envelope = select_head(tx, owner, Some(&expected.checkpoint))
+        .await?
+        .ok_or(CheckpointStoreError::Missing)?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT owner, receipt FROM strategy_checkpoint_boundary WHERE singleton FOR SHARE",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let encoded = serde_json::to_string(expected).map_err(|_| CheckpointStoreError::Corrupt)?;
+    if row != Some((owner.to_owned(), encoded)) {
+        return Err(CheckpointStoreError::Conflict);
+    }
+    let prefix = CompletedPrefix {
+        run_scope: expected.run_scope,
+        last_intent: expected.last_intent,
+        fill_sequence: expected.fill_sequence,
+        terminal_sequence: expected.terminal_sequence,
+    };
+    let actual = witness(tx, prefix, expected.checkpoint.clone()).await?;
+    if &actual != expected {
+        return Err(CheckpointStoreError::JournalChanged);
+    }
+    Ok(envelope)
 }

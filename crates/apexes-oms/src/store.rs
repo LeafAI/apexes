@@ -18,7 +18,9 @@ pub use terminal_evidence::TerminalEvidence;
 #[path = "checkpoint_store.rs"]
 mod checkpoint_store;
 pub(crate) use checkpoint_store::CompletedPrefix;
-pub use checkpoint_store::{CheckpointStoreError, CoherentCheckpointReceipt};
+pub use checkpoint_store::{
+    CheckpointStoreError, CoherentCheckpointReceipt, CoherentRecoverySnapshot,
+};
 
 #[path = "fill_reconciliation.rs"]
 mod fill_reconciliation;

@@ -12,6 +12,7 @@ use super::OrderStore;
 mod coherent_checkpoint;
 use crate::OmsError;
 pub use coherent_checkpoint::CoherentCheckpointReceipt;
+pub use coherent_checkpoint::CoherentRecoverySnapshot;
 pub(crate) use coherent_checkpoint::CompletedPrefix;
 
 #[derive(Debug, thiserror::Error)]
