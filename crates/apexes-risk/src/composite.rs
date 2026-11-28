@@ -392,6 +392,62 @@ mod tests {
     }
 
     #[test]
+    fn offline_candidate_requires_pristine_exact_configuration_and_topology() {
+        use crate::{CircuitBreaker, LimitChecker, RiskLimits};
+        let limits = RiskLimits {
+            max_daily_trade_count: Some(2),
+            min_account_equity: Some(dec!(100)),
+            ..Default::default()
+        };
+        let make = |limits: RiskLimits, split: bool| {
+            let (pre, monitor) = CircuitBreaker::new(limits.clone()).split();
+            let mut checker = CompositeRiskChecker::new()
+                .with_pre_trade_check(Box::new(LimitChecker::new(limits.clone())))
+                .with_pre_trade_check(Box::new(pre));
+            if split {
+                checker = checker.with_in_trade_monitor(Box::new(monitor));
+            } else {
+                checker = checker.with_in_trade_monitor(Box::new(CircuitBreaker::new(limits)));
+            }
+            checker
+        };
+        let active = make(limits.clone(), true);
+        active.on_order_accepted(&sample_intent(), now());
+        active
+            .on_fill(&sample_fill(), &HashMap::new(), &HashMap::new())
+            .unwrap_err();
+        let retained = active.inspect_registered_state().unwrap();
+        let fresh = make(limits.clone(), true);
+        let before = fresh.inspect_registered_state().unwrap();
+        retained.qualify_offline_candidate(&before).unwrap();
+        assert_eq!(before, fresh.inspect_registered_state().unwrap());
+        assert_eq!(retained, active.inspect_registered_state().unwrap());
+        assert!(retained.qualify_offline_candidate(&retained).is_err());
+        assert!(
+            retained
+                .qualify_offline_candidate(
+                    &make(limits.clone(), false)
+                        .inspect_registered_state()
+                        .unwrap()
+                )
+                .is_err()
+        );
+        let mut changed = limits;
+        changed.max_daily_trade_count = Some(3);
+        assert!(
+            retained
+                .qualify_offline_candidate(&make(changed, true).inspect_registered_state().unwrap())
+                .is_err()
+        );
+        let mut legacy = retained.clone();
+        legacy.aliases = None;
+        assert!(legacy.qualify_offline_candidate(&before).is_err());
+        let mut unsupported = retained;
+        unsupported.pre_trade[0] = crate::RegisteredRiskState::Unsupported;
+        assert!(unsupported.qualify_offline_candidate(&before).is_err());
+    }
+
+    #[test]
     fn registered_aliases_distinguish_identical_independent_monitors() {
         use crate::MarginMonitor;
         let (first_pre, first_position) = MarginMonitor::new(dec!(1.5)).split();

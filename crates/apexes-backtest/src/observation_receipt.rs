@@ -258,6 +258,41 @@ impl CapturedObservations {
         Ok(())
     }
 
+    /// Compare an independently configured pristine offline candidate
+    /// to the captured risk configuration and instrument scope. This is
+    /// an evidence-only compatibility check, not a restore operation.
+    pub fn qualify_offline_risk_candidate(
+        &self,
+        scope: &[(Venue, String)],
+        registered: Option<&apexes_risk::RegisteredRiskSnapshot>,
+        market: Option<&apexes_risk::MarketConditionSnapshot>,
+        margin_tiers: Option<&[(String, apexes_strategy::MarginTierTable)]>,
+    ) -> Result<(), ObservationError> {
+        self.validate()?;
+        self.receipt.verify(scope, &self.records)?;
+        if self.market_monitor_unqualified || self.margin_monitor_unqualified {
+            return Err(ObservationError::Mismatch);
+        }
+        match (&self.registered_risk, registered) {
+            (Some(a), Some(b)) => a
+                .qualify_offline_candidate(b)
+                .map_err(|_| ObservationError::Mismatch)?,
+            (None, None) => {}
+            _ => return Err(ObservationError::Mismatch),
+        }
+        match (&self.market_monitor, market) {
+            (Some(a), Some(b)) => a
+                .qualify_offline_candidate(b)
+                .map_err(|_| ObservationError::Mismatch)?,
+            (None, None) => {}
+            _ => return Err(ObservationError::Mismatch),
+        }
+        if self.margin_tiers.as_deref() != margin_tiers {
+            return Err(ObservationError::Mismatch);
+        }
+        Ok(())
+    }
+
     /// Canonical bounded inspection bytes, including unsupported coverage.
     pub fn encode_durable(&self) -> Result<Vec<u8>, ObservationError> {
         self.validate()?;
