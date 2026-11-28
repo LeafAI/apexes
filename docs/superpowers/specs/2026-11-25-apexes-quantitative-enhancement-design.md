@@ -87,3 +87,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Offline wallet continuity preview](2026-11-28-apexes-wallet-continuity-design.md) qualifies supplied wallet balances within the existing terminal/open-order evidence window and previews fee-aware owned Spot inventory. It does not prove actual exchange provenance or authorize a restart.
 
 [Offline closed-account ledger continuity](2026-11-28-apexes-ledger-continuity-design.md) checks independently supplied opening and closing wallet evidence against exact durable Spot cash flows and fees without authorizing a restart. Full valuation, risk state, observation continuity and authoritative evidence provenance remain unqualified.
+
+[Offline risk-state inspection contract](2026-11-28-apexes-risk-state-inspection-design.md) retains versioned accepted-order budget and circuit-breaker state evidence independently for comparison with the selected coherent checkpoint. Atomic risk capture, runnable restoration, observation continuity and authoritative evidence collection remain open.

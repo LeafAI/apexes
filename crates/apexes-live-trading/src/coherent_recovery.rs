@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("offline risk evidence refused: {0}")]
+    Risk(#[from] crate::RiskEvidenceError),
     #[error("offline ledger continuity refused: {0}")]
     Ledger(#[from] crate::LedgerContinuityError),
     #[error("supplied wallet evidence refused: {0}")]
@@ -309,6 +311,46 @@ impl CoherentRecoverySelection {
             (evidence, wallet, inspected_at),
         )
         .await
+    }
+
+    /// Read-only comparison with independently retained risk evidence.
+    /// Snapshot equality cannot prove atomic capture or restore a checker.
+    pub async fn inspect_risk_evidence(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        retained: &crate::RiskBoundaryEvidence,
+        inspected_at: chrono::DateTime<chrono::Utc>,
+        observed: (
+            &apexes_risk::LimitStateSnapshot,
+            Option<&apexes_risk::CircuitStateSnapshot>,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        retained.compare(
+            &snapshot,
+            self.predecessor.owner_fingerprint(),
+            &self.boundary,
+            inspected_at,
+            observed,
+        )?;
+        store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Reconstruct owned inventory from the exact locked journal using

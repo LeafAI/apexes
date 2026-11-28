@@ -275,6 +275,49 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let path = dir.join("coherent.json");
     coherent.write_new(&path).unwrap();
     let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
+    // Synthetic independent risk evidence; the current stop path does
+    // not yet atomically capture its actual registered risk monitors.
+    let captured_at = Utc::now();
+    let limit = apexes_risk::LimitStateSnapshot {
+        version: 1,
+        limits: apexes_risk::RiskLimits {
+            max_daily_trade_count: Some(1),
+            ..Default::default()
+        },
+        day: Some(captured_at.date_naive()),
+        trade_count: 1,
+        traded_volume: dec!(1),
+    };
+    let risk = apexes_live_trading::RiskBoundaryEvidence::new(
+        OWNER_SHA256.into(),
+        receipt.clone(),
+        captured_at,
+        limit.clone(),
+        None,
+    )
+    .unwrap();
+    let risk_path = dir.join("risk.json");
+    risk.write_new(&risk_path).unwrap();
+    let risk = apexes_live_trading::RiskBoundaryEvidence::read(&risk_path).unwrap();
+    coherent
+        .inspect_risk_evidence(&mut store, &fixture.url, &risk, captured_at, (&limit, None))
+        .await
+        .unwrap();
+    let reset = apexes_risk::LimitStateSnapshot {
+        day: None,
+        trade_count: 0,
+        traded_volume: dec!(0),
+        ..limit.clone()
+    };
+    assert!(matches!(
+        coherent
+            .inspect_risk_evidence(&mut store, &fixture.url, &risk, captured_at, (&reset, None))
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Risk(
+            apexes_live_trading::RiskEvidenceError::State(apexes_risk::RiskStateError::Mismatch)
+        ))
+    ));
+
     // Independently supplied synthetic coverage for the offline preview.
     // No live exchange lookup is performed by the inspection API.
     let started = Utc::now();
