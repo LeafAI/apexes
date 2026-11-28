@@ -10,6 +10,7 @@ apexes-risk = { path = "../apexes-risk" }
 apexes-strategy = { path = "../apexes-strategy" }
 apexes-telemetry = { path = "../apexes-telemetry" }
 sqlx = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }

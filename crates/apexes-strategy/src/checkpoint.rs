@@ -67,6 +67,17 @@ pub struct StateCursor {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Exact evidence for an acknowledged publication. This is not a durable
+/// callback receipt or authentication token. Recovery must obtain it from
+/// independently established trusted metadata, not from the checkpoint head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointReceipt {
+    pub identity: StateIdentity,
+    pub cursor: StateCursor,
+    pub envelope_sha256: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Body {
@@ -153,18 +164,28 @@ pub fn capture(
     Ok(bytes)
 }
 
-/// Verify before calling any strategy restore hook. Restore into a newly
-/// constructed, isolated candidate, then replace the active strategy only on
-/// success. The caller must ensure the candidate shares no mutable strategy
-/// state or external side effects with the active instance. Expected identity
-/// and cursor must come from trusted recovery metadata, not this checkpoint.
-pub fn restore<S: Strategy>(
-    strategy: &mut S,
-    mut candidate: S,
+/// Validate a bounded canonical envelope without constructing or calling a
+/// strategy. The supplied identity/cursor are independently selected; the
+/// returned receipt identifies the exact encoded bytes, not semantic state
+/// validity or proof that a strategy callback executed.
+pub fn verify_checkpoint(
     bytes: &[u8],
     expected_identity: &StateIdentity,
     expected_cursor: StateCursor,
-) -> Result<(), CheckpointError> {
+) -> Result<CheckpointReceipt, CheckpointError> {
+    let envelope = verify_envelope(bytes, expected_identity, expected_cursor)?;
+    Ok(CheckpointReceipt {
+        identity: envelope.body.identity,
+        cursor: envelope.body.cursor,
+        envelope_sha256: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+fn verify_envelope(
+    bytes: &[u8],
+    expected_identity: &StateIdentity,
+    expected_cursor: StateCursor,
+) -> Result<Envelope, CheckpointError> {
     if bytes.len() > MAX_ENVELOPE_BYTES {
         return Err(CheckpointError::TooLarge);
     }
@@ -185,6 +206,23 @@ pub fn restore<S: Strategy>(
     if body.cursor != expected_cursor {
         return Err(CheckpointError::Cursor);
     }
+    Ok(envelope)
+}
+
+/// Verify before calling any strategy restore hook. Restore into a newly
+/// constructed, isolated candidate, then replace the active strategy only on
+/// success. The caller must ensure the candidate shares no mutable strategy
+/// state or external side effects with the active instance. Expected identity
+/// and cursor must come from trusted recovery metadata, not this checkpoint.
+pub fn restore<S: Strategy>(
+    strategy: &mut S,
+    mut candidate: S,
+    bytes: &[u8],
+    expected_identity: &StateIdentity,
+    expected_cursor: StateCursor,
+) -> Result<(), CheckpointError> {
+    let envelope = verify_envelope(bytes, expected_identity, expected_cursor)?;
+    let body = &envelope.body;
     verify_schema(strategy, &body.identity)?;
     verify_schema(&candidate, &body.identity)?;
     candidate.restore_checkpoint(&ValidatedState { body })?;

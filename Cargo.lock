@@ -645,6 +645,7 @@ dependencies = [
  "chrono",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.19",
  "tokio",

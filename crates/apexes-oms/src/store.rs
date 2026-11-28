@@ -14,6 +14,10 @@ use std::collections::HashMap;
 mod terminal_evidence;
 pub use terminal_evidence::TerminalEvidence;
 
+#[path = "checkpoint_store.rs"]
+mod checkpoint_store;
+pub use checkpoint_store::CheckpointStoreError;
+
 #[path = "fill_reconciliation.rs"]
 mod fill_reconciliation;
 #[path = "parent_capital.rs"]
@@ -70,6 +74,7 @@ pub struct OrderStore {
     // A detached connection owns the schema-scoped advisory lock for the
     // lifetime of the managed order store, rather than returning it to a pool.
     inventory_lease: Option<sqlx::PgConnection>,
+    inventory_owner: Option<String>,
 }
 
 impl OrderStore {
@@ -130,6 +135,7 @@ impl OrderStore {
             .execute(&pool).await?;
 
         crate::FeeJournal::migrate(&pool).await?;
+        Self::migrate_strategy_checkpoints(&pool).await?;
         sqlx::query(
             "ALTER TABLE orders
             ADD COLUMN IF NOT EXISTS reserved_spend_asset TEXT,
@@ -149,6 +155,7 @@ impl OrderStore {
         Ok(Self {
             pool,
             inventory_lease: None,
+            inventory_owner: None,
         })
     }
 
@@ -206,7 +213,11 @@ impl OrderStore {
                 } else {
                     false
                 };
-                if has_orders || has_parent_rows {
+                let has_checkpoints: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM strategy_checkpoint_head)")
+                        .fetch_one(&mut connection)
+                        .await?;
+                if has_orders || has_parent_rows || has_checkpoints {
                     return Err(OmsError::InvalidRow { reason: "legacy unbound inventory history requires audited migration; no automatic adoption".into() });
                 }
                 sqlx::query(
@@ -218,6 +229,7 @@ impl OrderStore {
             }
         }
         self.inventory_lease = Some(connection);
+        self.inventory_owner = Some(owner.to_owned());
         Ok(())
     }
 
