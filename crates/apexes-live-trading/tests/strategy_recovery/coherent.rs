@@ -776,6 +776,58 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         balances: wallet.clone(),
     };
     let wallet_at = wallet_evidence.window.finished_at;
+    let source = CollectionSource {
+        terminal: Some(evidence.clone()),
+        owner: OWNER_SHA256.into(),
+        open: 0,
+        wallet: Some(
+            wallet
+                .iter()
+                .map(|(asset, balance)| {
+                    (
+                        asset.clone(),
+                        apexes_oms::SpotEvidenceBalance {
+                            free: balance.free,
+                            locked: balance.locked,
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        calls: Default::default(),
+    };
+    let collection_strategy = serde_json::json!({"RustNative":{"name":"fixture"}});
+    let collected_receipt = coherent
+        .collect_spot_evidence_receipt(
+            &mut store,
+            &fixture.url,
+            &source,
+            &collection_strategy,
+            &instruments,
+        )
+        .await
+        .unwrap();
+    let path = dir.join("filled-collection.json");
+    collected_receipt.write_new(&path).unwrap();
+    let reopened =
+        apexes_live_trading::SpotCollectionReceipt::read(&path, collected_receipt.sha256())
+            .unwrap();
+    let historical = coherent
+        .inspect_spot_collection_receipt(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            &reopened,
+            collected_receipt.sha256(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.window.terminal_orders.len(), 1);
+    assert_eq!(historical.wallet.balances, wallet);
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        vec!["terminal", "open", "wallet"]
+    );
     let mut opening_wallet = wallet_evidence.clone();
     opening_wallet.window = apexes_live_trading::EvidenceWindow {
         started_at: cursor().observed_at,
@@ -2064,6 +2116,7 @@ async fn independently_preserved_flat_successor_boundaries_requalify_without_cla
 }
 
 struct CollectionSource {
+    terminal: Option<apexes_oms::TerminalOrderEvidence>,
     owner: String,
     open: usize,
     wallet: Option<HashMap<String, apexes_oms::SpotEvidenceBalance>>,
@@ -2077,7 +2130,9 @@ impl apexes_oms::SpotEvidenceSource for CollectionSource {
     }
     async fn terminal_order(&self, _: &Order) -> Result<apexes_oms::TerminalOrderEvidence, String> {
         self.calls.lock().unwrap().push("terminal");
-        Err("unexpected terminal lookup".into())
+        self.terminal
+            .clone()
+            .ok_or("unexpected terminal lookup".into())
     }
     async fn account_open_order_count(&self) -> Result<usize, String> {
         self.calls.lock().unwrap().push("open");
@@ -2117,6 +2172,7 @@ async fn read_only_collection_refuses_owner_mismatch_open_orders_and_incomplete_
         ),
     ]);
     let mut source = CollectionSource {
+        terminal: None,
         owner: "0".repeat(64),
         open: 0,
         wallet: Some(balances.clone()),
@@ -2162,6 +2218,62 @@ async fn read_only_collection_refuses_owner_mismatch_open_orders_and_incomplete_
         .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
         .await
         .unwrap();
+    let receipt = a
+        .selection
+        .collect_spot_evidence_receipt(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+        .await
+        .unwrap();
+    let digest = receipt.sha256().to_owned();
+    let dir = std::env::temp_dir().join(format!("apexes-spot-collection-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("collection.json");
+    receipt.write_new(&path).unwrap();
+    assert!(receipt.write_new(&path).is_err());
+    assert!(live::SpotCollectionReceipt::read(&path, &"0".repeat(64)).is_err());
+    let reopened = live::SpotCollectionReceipt::read(&path, &digest).unwrap();
+    let historical = a
+        .selection
+        .inspect_spot_collection_receipt(
+            &mut store,
+            &fixture.url,
+            &a.instruments,
+            &reopened,
+            &digest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.inspected_at, receipt.collected_at());
+    assert_eq!(historical.wallet.balances, result.wallet.balances);
+    assert!(
+        a.selection
+            .inspect_spot_collection_receipt(&mut store, &fixture.url, &[], &reopened, &digest,)
+            .await
+            .is_err()
+    );
+    assert!(
+        a.selection
+            .inspect_spot_collection_receipt(
+                &mut store,
+                &fixture.url,
+                &a.instruments,
+                &reopened,
+                &"0".repeat(64),
+            )
+            .await
+            .is_err()
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    changed["body"]["wallet"]["balances"][0][1]["free"] = serde_json::json!("123");
+    let altered = dir.join("altered.json");
+    std::fs::write(&altered, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(live::SpotCollectionReceipt::read(&altered, &digest).is_err());
+    let noncanonical = dir.join("noncanonical.json");
+    let mut padded = bytes;
+    padded.push(b' ');
+    std::fs::write(&noncanonical, padded).unwrap();
+    assert!(live::SpotCollectionReceipt::read(&noncanonical, &digest).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
     assert!(result.window.terminal_orders.is_empty());
     assert_eq!(result.wallet.balances["BTC"].free, dec!(0));
     assert!(result.window.open_orders.window.finished_at <= result.wallet.window.started_at);

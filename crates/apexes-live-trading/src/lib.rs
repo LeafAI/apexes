@@ -93,3 +93,6 @@ pub use recovery_successor::{
 
 mod recovery_collection;
 pub use recovery_collection::{CollectedSpotEvidence, SpotCollectionError};
+
+mod recovery_collection_receipt;
+pub use recovery_collection_receipt::SpotCollectionReceipt;
