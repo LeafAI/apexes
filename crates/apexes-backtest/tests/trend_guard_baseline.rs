@@ -67,11 +67,20 @@ fn replay_with_registry(
     taker_bps: Decimal,
     registry: &Registry,
 ) -> BacktestReport {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/strategy.trend_guard.drift");
-    let strategy = DriftScriptStrategy::from_file(&script).unwrap();
+    replay_with_script(prices, taker_bps, registry, &script)
+}
+
+fn replay_with_script(
+    prices: &[Decimal],
+    taker_bps: Decimal,
+    registry: &Registry,
+    script: &Path,
+) -> BacktestReport {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let strategy = DriftScriptStrategy::from_file(script).unwrap();
     let config = BacktestConfig {
         instruments: vec![
             Instrument::new(
@@ -476,4 +485,79 @@ fn decision_trace_correlates_risk_refusal_without_a_submission() {
             .iter()
             .any(|r| r["stage"] == "order_result" || r["stage"] == "fill")
     );
+}
+
+fn retained_research_experiment(
+    store: &apexes_research::ResearchStore,
+) -> apexes_research::Experiment {
+    use apexes_research::{Artifact, ArtifactKind, Experiment};
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    let retain = |kind, name, bytes| {
+        store
+            .put(&Artifact::new(kind, name, "1", BTreeMap::new(), bytes).unwrap())
+            .unwrap()
+    };
+    let strategy = retain(
+        ArtifactKind::Strategy,
+        "trend-guard-v1",
+        include_bytes!("../../../deploy/strategy.trend_guard.drift").to_vec(),
+    );
+    let dataset = retain(
+        ArtifactKind::Dataset,
+        "synthetic-prices",
+        serde_json::to_vec(&trending_prices()).unwrap(),
+    );
+    let hypothesis = retain(
+        ArtifactKind::Hypothesis,
+        "fixture-hypothesis",
+        b"The fixed V1 script produces identical economic results on replay".to_vec(),
+    );
+    // All remaining constants and fixture expansion are pinned by the harness
+    // source hash; this is not a portable generic BacktestConfig schema.
+    let configuration = retain(
+        ArtifactKind::Configuration,
+        "baseline-costs",
+        serde_json::to_vec(&dec!(10)).unwrap(),
+    );
+    let executable = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    let runtime = format!(
+        "executor:{:x};baseline-harness:{:x};dependencies:{:x}",
+        Sha256::digest(executable),
+        Sha256::digest(include_bytes!("trend_guard_baseline.rs")),
+        Sha256::digest(include_bytes!("../../../Cargo.lock")),
+    );
+    Experiment::new(strategy, dataset, hypothesis, configuration, &runtime, 0).unwrap()
+}
+
+/// F05.01: retain and replay a real Drift strategy through the unchanged
+/// unified loop. Synthetic prices demonstrate reproducibility, not profitability.
+#[test]
+fn research_receipt_replays_retained_strategy_dataset_and_costs() {
+    use apexes_research::ResearchStore;
+
+    let root = std::env::temp_dir().join(format!("apexes-research-e2e-{}", uuid::Uuid::new_v4()));
+    let store = ResearchStore::new(root.join("artifacts")).unwrap();
+    let experiment = retained_research_experiment(&store);
+    let runtime = experiment.runtime();
+    let execute = |resolved: &apexes_research::ResolvedExperiment| {
+        assert_eq!(resolved.runtime, runtime);
+        assert_eq!(resolved.seed, 0);
+        let script = root.join("retained.drift");
+        std::fs::write(&script, resolved.strategy.content()).unwrap();
+        let prices: Vec<Decimal> = serde_json::from_slice(resolved.dataset.content()).unwrap();
+        let fee = serde_json::from_slice(resolved.configuration.content()).unwrap();
+        let report = replay_with_script(&prices, fee, &Registry::new(), &script);
+        assert!(!report.trades.is_empty());
+        assert!(report.trades.iter().all(|fill| fill.fee > Decimal::ZERO));
+        serde_json::to_vec(&economic_report(&report)).map_err(|e| e.to_string())
+    };
+    let result = store.run(&experiment, execute).unwrap();
+    // A newly opened store must resolve retained inputs rather than relying on
+    // an in-memory cache or mutable deployment script/current-version pointer.
+    let reopened = ResearchStore::new(root.join("artifacts")).unwrap();
+    reopened.verify(&result, execute).unwrap();
+    assert_eq!(reopened.run(&experiment, execute).unwrap(), result);
+    std::fs::remove_dir_all(root).unwrap();
 }
