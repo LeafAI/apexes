@@ -41,3 +41,6 @@ pub use cost_context::{CostObservation, FeeRole};
 
 pub mod capital_context;
 pub use capital_context::CapitalObservation;
+
+pub mod health_context;
+pub use health_context::{HealthObservation, HealthPhase};

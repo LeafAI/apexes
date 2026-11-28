@@ -34,6 +34,7 @@ use rust_decimal::Decimal;
 /// shared `MatchingEngine`.
 pub struct OrderManagerExecutor {
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
+    submission_gate: Option<Arc<apexes_oms::KillSwitch>>,
     /// The open orders as of the last time the manager's lock was obtained.
     /// Served when the lock is busy, so the trading loop never stalls behind a
     /// slow exchange query (see [`OrderManagerExecutor::open_orders`]).
@@ -47,8 +48,26 @@ const OPEN_ORDERS_LOCK_WAIT: Duration = Duration::from_millis(50);
 
 impl OrderManagerExecutor {
     pub fn new(order_manager: Arc<tokio::sync::Mutex<OrderManager>>) -> Self {
+        let submission_gate = order_manager
+            .try_lock()
+            .ok()
+            .and_then(|manager| manager.submission_gate());
         Self {
             order_manager,
+            submission_gate,
+            last_open_orders: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Construct before the manager is shared with async exchange tasks,
+    /// ensuring the executor sees the actual OMS gate without lock contention.
+    pub(crate) fn with_submission_gate(
+        order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
+        submission_gate: Option<Arc<apexes_oms::KillSwitch>>,
+    ) -> Self {
+        Self {
+            order_manager,
+            submission_gate,
             last_open_orders: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -81,6 +100,19 @@ where
 
 #[async_trait]
 impl OrderExecutor for OrderManagerExecutor {
+    fn health_observation(&self) -> Option<apexes_strategy::HealthObservation> {
+        if let Some(gate) = &self.submission_gate {
+            return Some(gate.health_observation());
+        }
+        // Standalone adapter callers may have constructed the executor
+        // while the manager was locked. Never wait on a network-held lock.
+        self.order_manager
+            .try_lock()
+            .ok()
+            .and_then(|manager| manager.submission_gate())
+            .map(|gate| gate.health_observation())
+    }
+
     async fn submit(
         &self,
         intent: &OrderIntent,
@@ -413,6 +445,46 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL"]
+    async fn health_observation_uses_actual_oms_gate_even_while_manager_locked() {
+        use apexes_strategy::HealthPhase;
+        let gate = Arc::new(apexes_oms::KillSwitch::managed());
+        let manager = fresh_order_manager(Arc::new(MockExecutionGateway::new()))
+            .await
+            .with_kill_switch(gate.clone());
+        let captured = manager.submission_gate();
+        let shared = Arc::new(tokio::sync::Mutex::new(manager));
+        let executor = OrderManagerExecutor::with_submission_gate(shared.clone(), captured);
+        let locked = shared.lock().await;
+        assert_eq!(
+            executor.health_observation().unwrap().phase,
+            Some(HealthPhase::Initializing)
+        );
+        gate.begin_reconciliation();
+        gate.startup_ready();
+        assert!(!executor.health_observation().unwrap().blocks_submissions);
+        gate.fault("test fault");
+        assert!(executor.health_observation().unwrap().blocks_submissions);
+        gate.cancel_sweep_complete();
+        assert_eq!(
+            executor.health_observation().unwrap().phase,
+            Some(HealthPhase::Halted)
+        );
+        drop(locked);
+        assert!(
+            executor
+                .submit(
+                    &sample_intent(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    Utc::now()
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

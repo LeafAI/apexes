@@ -1,0 +1,9 @@
+function on_market_event(event, ctx) {
+    let h = ctx.health;
+    if (h == null || h.source != "oms_submission_gate" ||
+        h.phase != "running" || h.kill_switch_engaged || h.blocks_submissions) {
+        return [];
+    }
+    return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 1 }];
+}
