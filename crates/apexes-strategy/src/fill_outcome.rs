@@ -30,6 +30,10 @@ impl FillSource {
 pub struct FillOutcome<'a> {
     /// Known local decision identity; absent for uncorrelated evidence.
     pub intent_id: Option<crate::IntentId>,
+    /// Explicit EMS ownership, if known. Not inferred from delivery path.
+    pub parent_id: Option<crate::ParentOrderId>,
+    /// Cumulative locally notified quantity for this parent, not scheduled quantity.
+    pub parent_executed_quantity: Option<rust_decimal::Decimal>,
     /// Local delivery/decision clock; not the execution timestamp.
     pub at: DateTime<Utc>,
     pub source: FillSource,

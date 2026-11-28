@@ -51,6 +51,12 @@ pub trait Ems: Send + Sync {
         id: ParentOrderId,
     ) -> Result<Option<ParentOrderStatus>, EmsError>;
 
+    /// Drain newly recorded child ownership for the single trading-loop
+    /// consumer. Unsupported backends publish no associations.
+    fn take_child_associations(&self) -> Vec<(apexes_core::OrderId, ParentOrderId)> {
+        Vec::new()
+    }
+
     /// Cancels a parent order: stops scheduling any not-yet-submitted
     /// slices, and cancels any still-active child orders already
     /// submitted (via the implementation's own `ChildOrderSink`/
