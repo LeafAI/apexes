@@ -1231,3 +1231,6 @@ async fn immediate_submission_refusal_is_not_reconciled_terminal_evidence() {
     pool.close().await;
     fixture.cleanup().await;
 }
+
+#[path = "lifecycle_recovery/mod.rs"]
+mod lifecycle_recovery;

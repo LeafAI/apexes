@@ -30,7 +30,7 @@ pub use gateway::{
     SpotPreflight,
 };
 pub use kill_switch::{KillSwitch, SessionPhase};
-pub use manager::{CancelAllReport, FillDeliveryProgress, OrderManager};
+pub use manager::{CancelAllReport, FillDeliveryProgress, OrderManager, TerminalDeliveryProgress};
 pub use mock_gateway::MockExecutionGateway;
 pub use store::{OrderStore, SubmissionState, TerminalEvidence};
 

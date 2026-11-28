@@ -1366,3 +1366,6 @@ impl Strategy for IdleTerminalProbe {
         }
     }
 }
+
+#[path = "lifecycle_recovery/mod.rs"]
+mod lifecycle_recovery;
