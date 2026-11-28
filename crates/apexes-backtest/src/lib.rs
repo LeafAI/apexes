@@ -107,3 +107,5 @@ pub mod exit_attribution;
 mod fill_notifications;
 
 mod lifecycle_correlation;
+
+pub mod lifecycle_archive;

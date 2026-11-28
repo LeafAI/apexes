@@ -1771,6 +1771,7 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     use apexes_backtest::historical_dataset::{
         DatasetDefinition, DatasetStream, StreamKind, seal_dataset,
     };
+    use apexes_backtest::lifecycle_archive::{LifecycleArchive, LifecycleArchivePolicy};
     use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
     use apexes_strategy::{ParentOrderId, ParentOutcome, ParentOutcomeKind, ParentPhase};
     type Lifecycle = Vec<(
@@ -1927,12 +1928,26 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     let policy = ReplayIdentityPolicy {
         namespace: uuid::Uuid::from_u128(77),
     };
-    let registry = apexes_core::registry::Registry::new();
-    registry.register::<_, ()>((), manifest.clone()).unwrap();
-    registry.register::<_, ()>((), policy).unwrap();
-    registry
-        .register::<_, ()>((), apexes_backtest::EventLatencyPolicy { delay_ms: 500 })
-        .unwrap();
+    let registry_for = || {
+        let registry = apexes_core::registry::Registry::new();
+        registry.register::<_, ()>((), manifest.clone()).unwrap();
+        registry.register::<_, ()>((), policy).unwrap();
+        registry
+            .register::<_, ()>((), apexes_backtest::EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        registry
+    };
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory =
+        Temp(std::env::temp_dir().join(format!("apexes-lifecycle-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&directory.0).unwrap();
+    let mut archive_bytes = None;
+
     let config = || {
         let mut cfg = base_config(end);
         cfg.instruments.push(
@@ -1952,7 +1967,15 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         cfg
     };
     let mut expected = None;
-    for _ in 0..10 {
+    for index in 0..10 {
+        let registry = registry_for();
+        let path = directory.0.join(format!("run-{index}.json"));
+        if index != 0 {
+            registry
+                .register::<_, ()>((), LifecycleArchivePolicy { path: path.clone() })
+                .unwrap();
+        }
+
         let observed = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
@@ -2052,6 +2075,65 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
             assert_eq!(*parent, submitted[index % 2]);
             assert_eq!(intent.0, (index % 2 + 1) as u64);
             assert_eq!(*total, [dec!(1), dec!(2), dec!(2), dec!(4)][index]);
+        }
+        if index != 0 {
+            let recovered = LifecycleArchive::load_verified(&path, &report).unwrap();
+            assert_eq!(recovered.last_intent_ordinal(), 2);
+            for (fill_id, order_id, parent, intent, _) in &executions {
+                assert_eq!(recovered.child_parent(*order_id), Some(*parent));
+                assert_eq!(recovered.order_intent(*order_id), Some(*intent));
+                assert_eq!(recovered.parent_intent(*parent), Some(*intent));
+                assert!(recovered.was_fill_notified(*fill_id));
+            }
+            assert_eq!(
+                recovered.parent_executed_quantity(submitted[0]),
+                Some(dec!(2))
+            );
+            assert_eq!(
+                recovered.parent_executed_quantity(submitted[1]),
+                Some(dec!(4))
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(prior) = &archive_bytes {
+                assert_eq!(&bytes, prior);
+            }
+            if index == 1 {
+                let recovered_report =
+                    serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+                assert!(LifecycleArchive::load_verified(&path, &recovered_report).is_ok());
+                let tampered = directory.0.join("tampered.json");
+                let mut altered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                altered["payload"]["evidence"]["last_intent"] = serde_json::json!(99);
+                std::fs::write(&tampered, serde_json::to_vec(&altered).unwrap()).unwrap();
+                assert!(LifecycleArchive::load_verified(&tampered, &report).is_err());
+                std::fs::write(&tampered, &bytes[..bytes.len() / 2]).unwrap();
+                assert!(LifecycleArchive::load_verified(&tampered, &report).is_err());
+                let mut other = report.clone();
+                other.trades.clear();
+                assert!(LifecycleArchive::load_verified(&path, &other).is_err());
+                let existing = registry_for();
+                existing
+                    .register::<_, ()>((), LifecycleArchivePolicy { path: path.clone() })
+                    .unwrap();
+                let rejected = run_backtest(
+                    config(),
+                    &existing,
+                    InMemoryMarketDataSource::new(events.clone()),
+                    Parents {
+                        sent: false,
+                        observed: Arc::new(Mutex::new(Vec::new())),
+                        lifecycle: Arc::new(Mutex::new(Vec::new())),
+                        failures: Arc::new(Mutex::new(Vec::new())),
+                        executions: Arc::new(Mutex::new(Vec::new())),
+                    },
+                )
+                .await;
+                assert!(rejected.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+            archive_bytes = Some(bytes);
+        } else {
+            assert!(!path.exists());
         }
         let result = (ids, fingerprint, lifecycle, executions);
         if let Some(previous) = &expected {

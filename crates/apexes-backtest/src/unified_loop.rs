@@ -187,6 +187,7 @@ pub async fn run_unified_event_loop(
         latency_model,
         None,
         None,
+        None,
     )
     .await
 }
@@ -205,6 +206,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     latency_model: Option<LatencyModel>,
     mut funding_report: Option<crate::funding_attribution::FundingReport>,
     mut fill_origins: Option<&mut Vec<ExitReason>>,
+    lifecycle_evidence: Option<&mut crate::lifecycle_archive::Evidence>,
 ) -> Result<BacktestReport, ApexesError> {
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
@@ -1250,6 +1252,10 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
 
     if let Some(queue) = &arrivals {
         queue.notify_expiry(&mut strategy);
+    }
+
+    if let Some(evidence) = lifecycle_evidence {
+        *evidence = notifications.archive_evidence(&correlation);
     }
 
     Ok(BacktestReport {
