@@ -386,6 +386,7 @@ pub async fn run_backtest(
         Some(&mut fill_origins),
         lifecycle_evidence.as_mut(),
         submission_journal.as_mut(),
+        None,
     )
     .await?;
     if fill_origins.len() != report.trades.len() {

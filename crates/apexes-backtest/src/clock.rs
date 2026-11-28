@@ -61,6 +61,15 @@ impl BacktestClock {
         clock
     }
 
+    pub(crate) fn observation_receipt_clock(&self) -> crate::observation_receipt::ObservationClock {
+        use crate::observation_receipt::ObservationClock;
+        if self.live_source.is_some() {
+            ObservationClock::ConsumerUtc
+        } else {
+            ObservationClock::SourceAvailability
+        }
+    }
+
     pub(crate) fn logical_timestamp(
         &mut self,
         event: &MarketEvent,

@@ -189,6 +189,44 @@ pub async fn run_unified_event_loop(
         None,
         None,
         None,
+        None,
+    )
+    .await
+}
+
+/// Same unified loop, with an explicit output slot for bounded actual
+/// completed market observations. A nonempty slot is never accepted.
+/// The output is assigned only after acknowledged checkpoint publication.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_unified_event_loop_with_observation_capture(
+    config: UnifiedLoopConfig,
+    market_events: impl Stream<Item = MarketEvent> + Unpin,
+    clock: BacktestClock,
+    executor: Arc<dyn OrderExecutor>,
+    liquidation_policy: Arc<dyn LiquidationPolicy>,
+    supplemental_fills: impl SupplementalFillSource,
+    ems: Arc<dyn Ems>,
+    strategy: impl Strategy,
+    stop_signal: Option<tokio::sync::oneshot::Receiver<()>>,
+    latency_model: Option<LatencyModel>,
+    observations: Option<&mut Option<crate::observation_receipt::CapturedObservations>>,
+) -> Result<BacktestReport, ApexesError> {
+    run_unified_event_loop_with_attribution(
+        config,
+        market_events,
+        clock,
+        executor,
+        liquidation_policy,
+        supplemental_fills,
+        ems,
+        strategy,
+        stop_signal,
+        latency_model,
+        None,
+        None,
+        None,
+        None,
+        observations,
     )
     .await
 }
@@ -209,6 +247,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     mut fill_origins: Option<&mut Vec<ExitReason>>,
     lifecycle_evidence: Option<&mut crate::lifecycle_archive::Evidence>,
     mut submission_journal: Option<&mut crate::submission_journal::Journal>,
+    observations: Option<&mut Option<crate::observation_receipt::CapturedObservations>>,
 ) -> Result<BacktestReport, ApexesError> {
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
@@ -312,6 +351,26 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     let checkpoint_predecessor = executor.checkpoint_predecessor();
     let mut checkpoint_cursor = checkpoint_predecessor.as_ref().map(|p| p.cursor);
     let mut checkpoint_invalid = arrivals.is_some() || latency_model.is_some();
+    let mut observation_capture = if let Some(output) = observations.as_ref() {
+        let previous = checkpoint_predecessor
+            .as_ref()
+            .filter(|_| output.is_none())
+            .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                reason: "observation capture requires an explicit checkpoint and empty output"
+                    .into(),
+            })?;
+        Some(crate::observation_receipt::ObservationCapture::new(
+            previous.cursor,
+            clock.observation_receipt_clock(),
+            config
+                .instruments
+                .iter()
+                .map(|i| (i.venue, i.symbol.clone()))
+                .collect(),
+        ))
+    } else {
+        None
+    };
 
     loop {
         // Polled at the top of each iteration -- NOT as a
@@ -1125,6 +1184,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     if let Some(ordinal) = cursor.ordinal.checked_add(1) {
                         cursor.ordinal = ordinal;
                         cursor.observed_at = timestamp;
+                        if let Some(capture) = &mut observation_capture {
+                            capture.record(*cursor, &event).map_err(|error| ApexesError::InvalidBacktestConfig {
+                                reason: format!("completed observation capture refused: {error}"),
+                            })?;
+                        }
                     } else {
                         checkpoint_invalid = true;
                     }
@@ -1297,9 +1361,18 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 .map_err(|error| ApexesError::InvalidBacktestConfig {
                     reason: format!("completed strategy checkpoint capture refused: {error}"),
                 })?;
+        let captured = observation_capture
+            .map(|capture| capture.finish(cursor))
+            .transpose()
+            .map_err(|error| ApexesError::InvalidBacktestConfig {
+                reason: format!("completed observation receipt refused: {error}"),
+            })?;
         executor
             .publish_completed_checkpoint(&previous, cursor, correlation.last_intent(), &envelope)
             .await?;
+        if let Some(output) = observations {
+            *output = captured;
+        }
     }
 
     if let Some(evidence) = lifecycle_evidence {

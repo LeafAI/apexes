@@ -176,9 +176,9 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
     });
     let (stop, receiver) = oneshot::channel();
-    let (report, receipt) = tokio::time::timeout(
+    let (report, receipt, captured) = tokio::time::timeout(
         Duration::from_secs(10),
-        run_live_trading_with_checkpoint_on_stop(
+        apexes_live_trading::run_live_trading_with_observation_capture_on_stop(
             config,
             &registry,
             execution_startup(selection.clone(), stop, false),
@@ -275,24 +275,22 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let path = dir.join("coherent.json");
     coherent.write_new(&path).unwrap();
     let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
-    // Retain independently supplied mock-source records, not a claim of
-    // atomic runtime history capture. The first depth event was filtered.
-    use apexes_backtest::observation_receipt::{
-        CompletedObservation, ObservationClock, ObservationReceipt,
-    };
-    let records = vec![CompletedObservation {
+    // Actual completed iteration capture, compared to independent
+    // mock-source fixtures. The first depth event was filtered.
+    use apexes_backtest::observation_receipt::{CompletedObservation, ObservationClock};
+    assert_eq!(captured.receipt.clock, ObservationClock::SourceAvailability);
+    assert_eq!(captured.receipt.predecessor, selection.receipt().cursor);
+    assert_eq!(captured.receipt.through, receipt.checkpoint.cursor);
+    let expected_records = vec![CompletedObservation {
         cursor: receipt.checkpoint.cursor,
         event: sample_events().pop().unwrap(),
     }];
     let scope = vec![(Venue::Binance, "BTCUSDT".to_string())];
-    let history = ObservationReceipt::build(
-        selection.receipt().cursor,
-        receipt.checkpoint.cursor,
-        ObservationClock::SourceAvailability,
-        &scope,
-        &records,
-    )
-    .unwrap();
+    assert_eq!(captured.scope, scope);
+    assert_eq!(captured.records, expected_records);
+    captured.receipt.verify(&scope, &expected_records).unwrap();
+    let records = captured.records;
+    let history = captured.receipt;
     let retained = apexes_live_trading::ObservationBoundaryEvidence::new(
         OWNER_SHA256.into(),
         selection.receipt().clone(),
@@ -791,7 +789,7 @@ async fn commit_failure_rolls_back_both_head_and_boundary_receipt() {
     });
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        run_live_trading_with_checkpoint_on_stop(
+        apexes_live_trading::run_live_trading_with_observation_capture_on_stop(
             config,
             &reg,
             restore_startup(selection.clone(), candidate),
@@ -834,7 +832,7 @@ async fn no_completed_market_observation_does_not_publish_a_checkpoint() {
     });
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        run_live_trading_with_checkpoint_on_stop(
+        apexes_live_trading::run_live_trading_with_observation_capture_on_stop(
             config,
             &reg,
             restore_startup(selection.clone(), Probe::new(0)),

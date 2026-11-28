@@ -18,7 +18,10 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use apexes_backtest::clock::BacktestClock;
-use apexes_backtest::unified_loop::{UnifiedLoopConfig, run_unified_event_loop};
+use apexes_backtest::observation_receipt::CapturedObservations;
+use apexes_backtest::unified_loop::{
+    UnifiedLoopConfig, run_unified_event_loop_with_observation_capture,
+};
 use apexes_backtest::{CostModel, PerformanceSummary, ReplaySpeed};
 use apexes_core::registry::Registry;
 use apexes_core::{ApexesError, Fill, Instrument, MarketEvent, Venue};
@@ -224,6 +227,7 @@ pub async fn run_live_trading_with_startup<S: Strategy>(
         exchange_updates,
         stop_signal,
         None,
+        None,
     )
     .await
 }
@@ -239,6 +243,62 @@ pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
     order_manager: OrderManager,
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
     stop_signal: oneshot::Receiver<()>,
+) -> Result<(LiveTradingReport, apexes_oms::CoherentCheckpointReceipt), ApexesError> {
+    run_checkpoint_on_stop(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        None,
+    )
+    .await
+}
+
+/// Like the existing single-use stop checkpoint path, with actual
+/// completed observation records retained in memory until acknowledgement.
+/// The returned evidence is not persisted atomically in PostgreSQL.
+pub async fn run_live_trading_with_observation_capture_on_stop<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+) -> Result<
+    (
+        LiveTradingReport,
+        apexes_oms::CoherentCheckpointReceipt,
+        CapturedObservations,
+    ),
+    ApexesError,
+> {
+    let mut observations = None;
+    let (report, receipt) = run_checkpoint_on_stop(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        Some(&mut observations),
+    )
+    .await?;
+    let observations = observations.ok_or_else(|| ApexesError::InvalidBacktestConfig {
+        reason: "no acknowledged completed observation capture".into(),
+    })?;
+    Ok((report, receipt, observations))
+}
+
+async fn run_checkpoint_on_stop<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+    observations: Option<&mut Option<CapturedObservations>>,
 ) -> Result<(LiveTradingReport, apexes_oms::CoherentCheckpointReceipt), ApexesError> {
     let StrategyStartup::Restore { selection, .. } = &startup else {
         return Err(ApexesError::InvalidBacktestConfig {
@@ -258,6 +318,7 @@ pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
         exchange_updates,
         stop_signal,
         Some(request.clone()),
+        observations,
     )
     .await;
     if result.is_err()
@@ -279,6 +340,7 @@ pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
     Ok((report, receipt))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_live_trading_inner<S: Strategy>(
     config: LiveTradingConfig,
     registry: &Registry,
@@ -287,6 +349,7 @@ async fn run_live_trading_inner<S: Strategy>(
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
     stop_signal: oneshot::Receiver<()>,
     stop_checkpoint: Option<Arc<StopCheckpoint>>,
+    observations: Option<&mut Option<CapturedObservations>>,
 ) -> Result<LiveTradingReport, ApexesError> {
     if config.reconcile_interval.is_zero() {
         return Err(ApexesError::InvalidBacktestConfig {
@@ -502,7 +565,7 @@ async fn run_live_trading_inner<S: Strategy>(
         symbol_rules: config.symbol_rules,
     };
 
-    let report = run_unified_event_loop(
+    let report = run_unified_event_loop_with_observation_capture(
         unified_loop_config,
         market_events,
         clock,
@@ -513,6 +576,7 @@ async fn run_live_trading_inner<S: Strategy>(
         strategy,
         None,
         None,
+        observations,
     )
     .await;
     halt_tasks.shutdown().await;
