@@ -97,3 +97,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Actual registered risk-monitor inspection](2026-11-28-apexes-registered-risk-capture-design.md) captures supported registered slots with explicit unsupported coverage before coherent checkpoint publication. The acknowledged in-memory result is not an atomic durable or complete risk witness.
 
 [Atomic durable observation and partial-risk evidence](2026-11-28-apexes-durable-capture-design.md) persists the actual opt-in capture in the same coherent checkpoint transaction, binds its digest to the independently selected receipt, and exposes read-only validation after reopening. Complete monitor coverage, external shared-state atomicity and restoration remain open.
+
+[Additional registered monitor evidence](2026-11-28-apexes-monitor-coverage-design.md) retains list configuration, self-trade prevention version and margin-monitor threshold/trip state with explicit legacy and unsupported position coverage. Market-condition and margin-tier evidence remain open.

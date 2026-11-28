@@ -34,6 +34,75 @@ pub struct CircuitStateSnapshot {
     pub account_tripped: bool,
 }
 
+/// Canonical evidence of the configured list, including disabled and
+/// empty whitelist/blacklist distinctions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ListState<T> {
+    Disabled,
+    Blacklist(Vec<T>),
+    Whitelist(Vec<T>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolVenueListSnapshot {
+    pub version: u32,
+    pub symbols: ListState<String>,
+    pub venues: ListState<apexes_core::Venue>,
+}
+
+fn canonical_symbols(values: &[String]) -> bool {
+    values.len() <= 128
+        && values
+            .iter()
+            .all(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+        && values.windows(2).all(|w| w[0] < w[1])
+}
+
+pub(crate) fn venue_key(venue: &apexes_core::Venue) -> String {
+    format!("{venue:?}")
+}
+
+impl SymbolVenueListSnapshot {
+    pub fn validate(&self) -> Result<(), RiskStateError> {
+        let symbols_valid = match &self.symbols {
+            ListState::Disabled => true,
+            ListState::Blacklist(v) | ListState::Whitelist(v) => canonical_symbols(v),
+        };
+        let venues_valid = match &self.venues {
+            ListState::Disabled => true,
+            ListState::Blacklist(v) | ListState::Whitelist(v) => {
+                v.len() <= 128 && v.windows(2).all(|w| venue_key(&w[0]) < venue_key(&w[1]))
+            }
+        };
+        if self.version != 1 || !symbols_valid || !venues_valid {
+            return Err(RiskStateError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarginStateSnapshot {
+    pub version: u32,
+    pub warning_threshold: Decimal,
+    pub tripped_symbols: Vec<String>,
+}
+
+impl MarginStateSnapshot {
+    pub fn validate(&self) -> Result<(), RiskStateError> {
+        if self.version != 1
+            || self.warning_threshold <= Decimal::ZERO
+            || !canonical_symbols(&self.tripped_symbols)
+        {
+            return Err(RiskStateError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 /// Evidence for one registered slot. Unsupported monitors are explicit,
 /// not treated as stateless or as a successfully captured empty state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +110,9 @@ pub struct CircuitStateSnapshot {
 pub enum RegisteredRiskState {
     Limits(LimitStateSnapshot),
     Circuit(CircuitStateSnapshot),
+    SymbolVenueList(SymbolVenueListSnapshot),
+    SelfTradePreventer { version: u32 },
+    Margin(MarginStateSnapshot),
     Unsupported,
 }
 
@@ -53,6 +125,9 @@ pub struct RegisteredRiskSnapshot {
     pub pre_trade: Vec<RegisteredRiskState>,
     pub in_trade: Vec<RegisteredRiskState>,
     pub position_monitor_count: usize,
+    /// Absent on legacy receipts: those slots were not inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Vec<RegisteredRiskState>>,
     pub market_condition_monitor_count: usize,
 }
 
@@ -75,6 +150,12 @@ impl RegisteredRiskSnapshot {
             match state {
                 RegisteredRiskState::Limits(s) => s.validate()?,
                 RegisteredRiskState::Circuit(s) => s.validate()?,
+                RegisteredRiskState::SymbolVenueList(s) => s.validate()?,
+                RegisteredRiskState::SelfTradePreventer { version: 1 } => {}
+                RegisteredRiskState::SelfTradePreventer { .. } => {
+                    return Err(RiskStateError::Invalid);
+                }
+                RegisteredRiskState::Margin(s) => s.validate()?,
                 RegisteredRiskState::Unsupported => {}
             }
         }
@@ -82,7 +163,19 @@ impl RegisteredRiskSnapshot {
             match state {
                 RegisteredRiskState::Circuit(s) => s.validate()?,
                 RegisteredRiskState::Unsupported => {}
-                RegisteredRiskState::Limits(_) => return Err(RiskStateError::Invalid),
+                _ => return Err(RiskStateError::Invalid),
+            }
+        }
+        if let Some(position) = &self.position {
+            if position.len() != self.position_monitor_count {
+                return Err(RiskStateError::Invalid);
+            }
+            for state in position {
+                match state {
+                    RegisteredRiskState::Margin(s) => s.validate()?,
+                    RegisteredRiskState::Unsupported => {}
+                    _ => return Err(RiskStateError::Invalid),
+                }
             }
         }
         Ok(())
@@ -91,7 +184,14 @@ impl RegisteredRiskSnapshot {
     /// Only the supported slot kinds have captured state. This is
     /// coverage information, not a recovery or trading authorization.
     pub fn has_unsupported_slots(&self) -> bool {
-        self.position_monitor_count != 0
+        self.position
+            .as_ref()
+            .map_or(self.position_monitor_count != 0, |slots| {
+                slots.len() != self.position_monitor_count
+                    || slots
+                        .iter()
+                        .any(|s| matches!(s, RegisteredRiskState::Unsupported))
+            })
             || self.market_condition_monitor_count != 0
             || self
                 .pre_trade
@@ -173,6 +273,36 @@ impl CircuitStateSnapshot {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn list_and_margin_evidence_refuse_noncanonical_state() {
+        use apexes_core::Venue;
+        let mut list = SymbolVenueListSnapshot {
+            version: 1,
+            symbols: ListState::Whitelist(vec![]),
+            venues: ListState::Disabled,
+        };
+        list.validate().unwrap();
+        let mut other = list.clone();
+        other.symbols = ListState::Disabled;
+        assert_ne!(list, other);
+        list.symbols = ListState::Blacklist(vec!["ETH".into(), "BTC".into()]);
+        assert!(list.validate().is_err());
+        list.symbols = ListState::Disabled;
+        list.venues = ListState::Whitelist(vec![Venue::Binance, Venue::Binance]);
+        assert!(list.validate().is_err());
+        let mut margin = MarginStateSnapshot {
+            version: 1,
+            warning_threshold: dec!(1.5),
+            tripped_symbols: vec!["BTC".into()],
+        };
+        margin.validate().unwrap();
+        margin.tripped_symbols.push("BTC".into());
+        assert!(margin.validate().is_err());
+        margin.tripped_symbols.clear();
+        margin.warning_threshold = Decimal::ZERO;
+        assert!(margin.validate().is_err());
+    }
 
     #[test]
     fn invalid_daily_state_refuses_saturation_and_inconsistent_day_or_volume() {

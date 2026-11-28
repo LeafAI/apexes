@@ -35,6 +35,40 @@ impl SymbolVenueList {
 }
 
 impl PreTradeCheck for SymbolVenueList {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        fn snapshot<T: Clone + Eq + std::hash::Hash>(
+            mode: &ListMode<T>,
+            sort: impl Fn(&mut Vec<T>),
+        ) -> Result<crate::ListState<T>, crate::RiskStateError> {
+            let (set, whitelist) = match mode {
+                ListMode::Disabled => return Ok(crate::ListState::Disabled),
+                ListMode::Blacklist(s) => (s, false),
+                ListMode::Whitelist(s) => (s, true),
+            };
+            if set.len() > 128 {
+                return Err(crate::RiskStateError::Invalid);
+            }
+            let mut values = set.iter().cloned().collect::<Vec<_>>();
+            sort(&mut values);
+            Ok(if whitelist {
+                crate::ListState::Whitelist(values)
+            } else {
+                crate::ListState::Blacklist(values)
+            })
+        }
+        let state = crate::SymbolVenueListSnapshot {
+            version: 1,
+            symbols: snapshot(&self.symbols, |s| s.sort())?,
+            venues: snapshot(&self.venues, |v| {
+                v.sort_by_key(crate::state_inspection::venue_key)
+            })?,
+        };
+        state.validate()?;
+        Ok(crate::RegisteredRiskState::SymbolVenueList(state))
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,
