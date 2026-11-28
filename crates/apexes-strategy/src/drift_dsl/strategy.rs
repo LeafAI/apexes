@@ -30,6 +30,7 @@ pub struct DriftScriptStrategy {
     on_market_event_fn: DriftValue,
     on_order_outcome_fn: Option<DriftValue>,
     on_fill_fn: Option<DriftValue>,
+    on_order_terminal_fn: Option<DriftValue>,
     params: Arc<ParamStore>,
     symbol_state: super::symbol_state::ScriptState,
 }
@@ -109,8 +110,17 @@ impl DriftScriptStrategy {
             return Err(StrategyError::FillCallbackNotCallable);
         }
 
+        let on_order_terminal_fn = interpreter.env().get("on_order_terminal");
+        if on_order_terminal_fn
+            .as_ref()
+            .is_some_and(|f| !matches!(f, DriftValue::Function(_)))
+        {
+            return Err(StrategyError::TerminalCallbackNotCallable);
+        }
+
         Ok(Self {
             interpreter,
+            on_order_terminal_fn,
             on_fill_fn,
             on_order_outcome_fn,
             on_market_event_fn,
@@ -193,6 +203,21 @@ impl Strategy for DriftScriptStrategy {
                 .is_err()
             {
                 tracing::error!("on_fill script error");
+            }
+        }
+    }
+
+    fn on_order_terminal(&mut self, outcome: &crate::TerminalOutcome<'_>) {
+        if let Some(callback) = &self.on_order_terminal_fn {
+            let handle = tokio::runtime::Handle::current();
+            if handle
+                .block_on(self.interpreter.call(
+                    callback.clone(),
+                    vec![super::terminal_outcome::to_value(outcome)],
+                ))
+                .is_err()
+            {
+                tracing::error!("on_order_terminal script error");
             }
         }
     }

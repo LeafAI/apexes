@@ -140,6 +140,13 @@ pub trait OrderExecutor: Send + Sync {
     /// no local resting-order simulation to react to market data with.
     fn on_market_event(&self, event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)>;
 
+    /// Consume explicit completion evidence from the last market-event
+    /// processing pass, after its fills have been applied. Unsupported
+    /// backends never infer completion from open-order disappearance.
+    fn take_simulated_completions(&self) -> Vec<Order> {
+        Vec::new()
+    }
+
     /// Every currently open (unfilled or partially-filled) order,
     /// keyed by `OrderId` — feeds `StrategyContext::open_orders`.
     /// Returns an owned `HashMap` (a clone each call); see this

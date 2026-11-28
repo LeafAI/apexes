@@ -243,7 +243,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut supplemental_seen = HashSet::new();
     let mut notifications = crate::fill_notifications::FillNotifications::default();
-    use apexes_strategy::FillSource;
+    use apexes_strategy::{FillSource, TerminalKind, TerminalOutcome};
     let mut recorded_initial_equity = false;
     let mut diagnostics = Diagnostics::new();
     let mut risk_checker = config.risk_checker;
@@ -400,7 +400,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             !ledger.check_de_risking(&monitor.reduce_fractions(&symbols), market_condition_include_spot).is_empty()
                         });
                     if margin_breach || extreme {
-                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
                         emergency_event = true;
                     }
                 }
@@ -465,6 +465,10 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         }
                     }
                     notifications.deliver(&mut strategy, timestamp, FillSource::Resting, &fills);
+                }
+
+                for order in executor.take_simulated_completions() {
+                    strategy.on_order_terminal(&TerminalOutcome { at: timestamp, kind: TerminalKind::Filled { order: &order } });
                 }
 
                 let mut checked_child_fills = HashSet::new();
@@ -628,7 +632,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         margin_mode: position.margin_mode,
                     };
                     if !emergency_event && let Some(queue) = &mut arrivals {
-                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
                         emergency_event = true;
                     }
                     let trace = diagnostics.intent(&liquidation_intent, "liquidation", timestamp);
@@ -722,7 +726,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             margin_mode: position.margin_mode,
                         };
                         if !emergency_event && let Some(queue) = &mut arrivals {
-                            preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders).await;
+                            preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
                             emergency_event = true;
                         }
                         let trace = diagnostics.intent(&de_risk_intent, "derisk", timestamp);
@@ -1236,6 +1240,10 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         }
     }
 
+    if let Some(queue) = &arrivals {
+        queue.notify_expiry(&mut strategy);
+    }
+
     Ok(BacktestReport {
         overall: overall_tracker.summary().into(),
         per_symbol: per_symbol_trackers
@@ -1657,13 +1665,18 @@ async fn preempt_simulated_orders(
     executor: &dyn OrderExecutor,
     ems: &dyn Ems,
     parents: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+    strategy: &mut impl Strategy,
+    at: chrono::DateTime<chrono::Utc>,
 ) {
+    use apexes_strategy::{TerminalKind, TerminalOutcome};
     queue.report.emergency_events += 1;
-    queue.cancel_transit_for_emergency();
+    let cancelled_transit = queue.cancel_transit_for_emergency();
+    let mut cancelled_ids = Vec::new();
     match executor.cancel_simulated_working() {
         Ok(ids) => {
             queue.report.emergency_resting_cancelled += ids.len() as u64;
             queue.reconcile_resting(&executor.open_orders().await);
+            cancelled_ids = ids;
         }
         Err(error) => {
             queue.report.emergency_cancel_failures += 1;
@@ -1688,6 +1701,20 @@ async fn preempt_simulated_orders(
         }
     }
     queue.reconcile_parents(parents);
+    for intent in &cancelled_transit {
+        if intent.execution_algo.is_none() {
+            strategy.on_order_terminal(&TerminalOutcome {
+                at,
+                kind: TerminalKind::TransitCancelled { intent },
+            });
+        }
+    }
+    for order_id in cancelled_ids {
+        strategy.on_order_terminal(&TerminalOutcome {
+            at,
+            kind: TerminalKind::Cancelled { order_id },
+        });
+    }
 }
 
 async fn refresh_open_parent_orders(

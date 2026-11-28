@@ -941,6 +941,18 @@ async fn resting_limit_reserves_quote_through_partial_fill_and_completion() {
     );
 }
 
+// A disappearing trigger or an end-of-replay working remainder is
+// not explicit cancellation, expiry or completion evidence.
+struct NoTerminal(RestingThenDirect);
+impl Strategy for NoTerminal {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        self.0.on_market_event(event, ctx)
+    }
+    fn on_order_terminal(&mut self, outcome: &apexes_strategy::TerminalOutcome<'_>) {
+        panic!("unexpected terminal evidence {outcome:?}");
+    }
+}
+
 #[tokio::test]
 async fn gapped_stop_cannot_spend_pending_direct_order_hold() {
     let (config, _) = shared_quote_fixture(dec!(12), dec!(6));
@@ -949,11 +961,11 @@ async fn gapped_stop_cannot_spend_pending_direct_order_hold() {
         config,
         &registry,
         InMemoryMarketDataSource::new(resting_capital_events(true)),
-        RestingThenDirect {
+        NoTerminal(RestingThenDirect {
             first: false,
             second: false,
             stop: true,
-        },
+        }),
     )
     .await
     .unwrap();
@@ -980,11 +992,11 @@ async fn resting_remainder_reservation_released_at_replay_end() {
         config,
         &registry,
         InMemoryMarketDataSource::new(events),
-        RestingThenDirect {
+        NoTerminal(RestingThenDirect {
             first: false,
             second: false,
             stop: false,
-        },
+        }),
     )
     .await
     .unwrap();
@@ -1279,11 +1291,41 @@ async fn leveraged_resting_sell_reserves_margin_until_terminal_fill() {
 /// Admit a long, an EMS parent, a resting order, and a pending direct
 /// order in successive events. The emergency arrives exactly when the
 /// first EMS child would otherwise execute.
+#[derive(Default)]
+struct EmergencyEvidence {
+    resting: Option<apexes_core::OrderId>,
+    terminals: Vec<(chrono::DateTime<Utc>, Option<apexes_core::OrderId>)>,
+}
 struct EmergencyCompetition {
     start: chrono::DateTime<Utc>,
+    evidence: std::sync::Arc<std::sync::Mutex<EmergencyEvidence>>,
 }
 
 impl Strategy for EmergencyCompetition {
+    fn on_order_outcome(&mut self, outcome: &apexes_strategy::OrderOutcome<'_>) {
+        if let apexes_strategy::OrderOutcomeKind::Returned { order } = outcome.kind
+            && order.status == apexes_core::OrderStatus::New
+        {
+            self.evidence.lock().unwrap().resting = Some(order.id);
+        }
+    }
+    fn on_order_terminal(&mut self, outcome: &apexes_strategy::TerminalOutcome<'_>) {
+        use apexes_strategy::TerminalKind;
+        let mut evidence = self.evidence.lock().unwrap();
+        let id = match outcome.kind {
+            TerminalKind::TransitCancelled { intent } => {
+                assert_eq!(intent.quantity, dec!(1));
+                None
+            }
+            TerminalKind::Cancelled { order_id } => {
+                assert_eq!(Some(order_id), evidence.resting);
+                Some(order_id)
+            }
+            _ => panic!("unexpected terminal"),
+        };
+        evidence.terminals.push((outcome.at, id));
+    }
+
     fn on_market_event(&mut self, event: &MarketEvent, ctx: &StrategyContext) -> Vec<OrderIntent> {
         let offset = (ctx.now - self.start).num_milliseconds();
         if !matches!(offset, 0 | 500 | 1000 | 1500 | 1600) {
@@ -1398,14 +1440,24 @@ fn emergency_competition_fixture(
 async fn assert_emergency_preempts_competing_orders(jump: bool) {
     let (config, events, start) = emergency_competition_fixture(jump);
     let registry = child_risk_registry(Default::default());
+    let evidence = std::sync::Arc::new(std::sync::Mutex::new(EmergencyEvidence::default()));
     let report = run_backtest(
         config,
         &registry,
         InMemoryMarketDataSource::new(events),
-        EmergencyCompetition { start },
+        EmergencyCompetition {
+            start,
+            evidence: evidence.clone(),
+        },
     )
     .await
     .unwrap();
+    {
+        let seen = evidence.lock().unwrap();
+        let at = start + chrono::Duration::milliseconds(1600);
+        assert!(seen.resting.is_some());
+        assert_eq!(seen.terminals, vec![(at, None), (at, seen.resting)]);
+    }
     assert_eq!(report.trades.len(), 2, "{:?}", report.trades);
     assert_eq!(report.trades[0].side, apexes_core::Side::Buy);
     assert_eq!(report.trades[1].side, apexes_core::Side::Sell);

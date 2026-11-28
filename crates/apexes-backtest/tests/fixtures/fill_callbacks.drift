@@ -1,6 +1,17 @@
 let returned_id = null;
 let direct_quantity = 0;
 let resting_quantity = 0;
+let resting_completed = false;
+
+function on_order_terminal(outcome) {
+    if (outcome.kind == "filled" && outcome.symbol == "BTCUSDT" &&
+        outcome.quantity == 3 && outcome.filled_quantity == 3 &&
+        outcome.order_id != null && resting_quantity == 3) {
+        resting_completed = true;
+    }
+    return [{ symbol: outcome.symbol, venue: outcome.venue, asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 999 }];
+}
 
 function on_order_outcome(outcome) {
     if (outcome.kind == "returned" && outcome.order_status == "filled") {
@@ -31,7 +42,7 @@ function on_market_event(event, ctx) {
         return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
             side: "buy", order_type: "limit", quantity: 3, price: 99 }];
     }
-    if (event.type == "tick" && resting_quantity == 3) {
+    if (event.type == "tick" && resting_quantity == 3 && resting_completed) {
         resting_quantity = 4;
         return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
             side: "sell", order_type: "market", quantity: 1 }];

@@ -35,6 +35,9 @@ pub enum StrategyError {
     #[error("`on_fill` is defined but is not a function")]
     FillCallbackNotCallable,
 
+    #[error("`on_order_terminal` is defined but is not a function")]
+    TerminalCallbackNotCallable,
+
     #[error("unknown parameter: {name}")]
     UnknownParam { name: String },
 }

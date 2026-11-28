@@ -28,6 +28,9 @@ pub trait Strategy: Send {
     /// Notification of a locally applied execution. No recursive orders.
     fn on_fill(&mut self, _outcome: &crate::FillOutcome<'_>) {}
 
+    /// Notification-only explicit simulated terminal evidence.
+    fn on_order_terminal(&mut self, _outcome: &crate::TerminalOutcome<'_>) {}
+
     /// Reads all currently-tunable parameter values, for monitoring/
     /// snapshot display. Default: no tunable parameters (empty map) --
     /// existing `Strategy` implementations need no changes to keep
@@ -77,6 +80,10 @@ impl Strategy for Box<dyn Strategy> {
 
     fn on_fill(&mut self, outcome: &crate::FillOutcome<'_>) {
         (**self).on_fill(outcome);
+    }
+
+    fn on_order_terminal(&mut self, outcome: &crate::TerminalOutcome<'_>) {
+        (**self).on_order_terminal(outcome);
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {
