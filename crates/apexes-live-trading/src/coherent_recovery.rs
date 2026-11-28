@@ -755,6 +755,52 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Qualify independent closing fee marks after exact historical fee and
+    /// P&L reconciliation. Marks are bounded by the market cursor, not wall
+    /// clock time; no current price acquisition or state application.
+    pub async fn inspect_captured_fee_revaluation<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::ThirdAssetFeeEvidence,
+            &crate::ClosingFeeMarkEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_captured_fee_bearing_pnl(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence.0, evidence.1),
+        )
+        .await?;
+        let capture = self
+            .inspect_durable_capture(store, ems_postgres_url)
+            .await?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        evidence.2.compare(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            ledger,
+            instruments,
+        )?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(

@@ -127,3 +127,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent fee-bearing realized P&L](2026-11-28-apexes-fee-bearing-pnl-design.md) verifies owned cost basis and realized ledger entries separately from gross shadow attribution and execution-valued fee expense.
 
 [Independent local external-fee classification](2026-11-28-apexes-external-fee-evidence-design.md) compares independently retained opening tracked asset allocation, actual per-fill local classification and tracked closing balances against the qualified account journal.
+
+[Independent closing fee mark revaluation](2026-11-28-apexes-fee-mark-evidence-design.md) compares independently supplied closing fee marks and revaluation totals against exact retained price observations and qualified historical fees.
