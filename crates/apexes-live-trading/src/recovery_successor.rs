@@ -190,6 +190,86 @@ pub async fn inspect_offline_successor<S: Strategy, T: Strategy>(
     Ok(())
 }
 
+/// One historical run with independently selected opening and closing
+/// collection receipts, and a separately retained receipt-bound witness.
+pub struct ReceiptBoundSuccessorRun<'a, S> {
+    pub selection: &'a CoherentRecoverySelection,
+    pub store: &'a mut OrderStore,
+    pub ems_postgres_url: &'a str,
+    pub strategies: (S, S),
+    pub evidence: &'a crate::ReceiptTransitionEvidence<'a>,
+    pub witness: &'a crate::ReceiptBoundTransitionWitness,
+    pub witness_sha256: &'a str,
+}
+
+/// Requalify both receipt-bound runs and compare the exact historical
+/// linkage. In addition to wallet equality, require the entire next
+/// opening collection to follow the prior closing inspection. No live
+/// state, risk carryover, funding proof or startup authority is issued.
+pub async fn inspect_receipt_bound_successor<S: Strategy, T: Strategy>(
+    prior: ReceiptBoundSuccessorRun<'_, S>,
+    next: ReceiptBoundSuccessorRun<'_, T>,
+) -> Result<(), SuccessorInspectionError> {
+    use SuccessorContinuityError as E;
+    compare_selection(prior.selection, next.selection)?;
+    if prior.witness.sha256() != prior.witness_sha256
+        || next.witness.sha256() != next.witness_sha256
+        || prior.witness_sha256 == next.witness_sha256
+    {
+        return Err(crate::StrategyRecoveryError::InvalidReceipt.into());
+    }
+    let a = prior.evidence;
+    let b = next.evidence;
+    if a.instruments != b.instruments
+        || a.conversion.instruments != b.conversion.instruments
+        || a.registered_risk != b.registered_risk
+        || a.market_monitor != b.market_monitor
+        || a.margin_tiers != b.margin_tiers
+    {
+        return Err(E::Identity.into());
+    }
+    let (qualified_prior, _, prior_closing) = prior
+        .selection
+        .qualify_receipt_bound_transition(prior.store, prior.ems_postgres_url, prior.strategies, a)
+        .await?;
+    prior.witness.compare(&qualified_prior)?;
+    let (qualified_next, next_opening, next_closing) = next
+        .selection
+        .qualify_receipt_bound_transition(next.store, next.ems_postgres_url, next.strategies, b)
+        .await?;
+    next.witness.compare(&qualified_next)?;
+    if prior_closing.inspected_at > next_opening.open_before.started_at {
+        return Err(E::Interval.into());
+    }
+    compare_wallets(
+        &prior_closing.wallet,
+        &next_opening.opening.wallet,
+        prior_closing.inspected_at,
+    )?;
+    compare_execution(
+        &prior_closing.window.terminal_orders,
+        &next_closing.window.terminal_orders,
+    )?;
+    let capture = prior
+        .selection
+        .inspect_durable_capture(prior.store, prior.ems_postgres_url)
+        .await?;
+    let ledger = capture.ledger.as_ref().ok_or(E::Inventory)?;
+    compare_inventory(ledger, a.positions, &next_opening.allocation)?;
+    let next_capture = next
+        .selection
+        .inspect_durable_capture(next.store, next.ems_postgres_url)
+        .await?;
+    if next_capture
+        .records
+        .first()
+        .is_none_or(|record| record.cursor.observed_at <= next_opening.inspected_at)
+    {
+        return Err(E::Interval.into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

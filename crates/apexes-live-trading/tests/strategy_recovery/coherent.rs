@@ -1866,26 +1866,35 @@ async fn flat_boundary_at(
     let (manager, mut config, _) = fixture.manager(&registry).await;
     config.initial_balances.insert("BTC".into(), dec!(0));
     let instruments = config.instruments.clone();
+    let candidate = Probe::new(0);
+    let observed = candidate.observed.clone();
     let (stop, receiver) = oneshot::channel();
+    // Wait for the restored strategy to process the actual market event.
+    // The unified loop completes its current iteration before honoring
+    // stop; sleeping for a fixed time can stop during slow CI startup.
     let driver = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = stop.send(());
+        loop {
+            if !observed.lock().unwrap().is_empty() {
+                let _ = stop.send(());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     });
-    let (_, boundary, _) = tokio::time::timeout(
-        Duration::from_secs(5),
+    let boundary_result = tokio::time::timeout(
+        Duration::from_secs(20),
         live::run_live_trading_with_observation_capture_on_stop(
             config,
             &registry,
-            restore_startup(previous.clone(), Probe::new(0)),
+            restore_startup(previous.clone(), candidate),
             manager,
             futures::stream::empty(),
             receiver,
         ),
     )
-    .await
-    .unwrap()
-    .unwrap();
-    driver.await.unwrap();
+    .await;
+    driver.abort();
+    let (_, boundary, _) = boundary_result.unwrap().unwrap();
     let expected_cursor = StateCursor {
         ordinal: previous.receipt().cursor.ordinal + 1,
         observed_at: at,
@@ -2746,4 +2755,272 @@ async fn receipt_bound_transition_requires_both_selected_collections_and_full_qu
     std::fs::remove_dir_all(dir).unwrap();
     drop(store);
     fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late_closing() {
+    use apexes_live_trading as live;
+    use apexes_oms::SpotEvidenceBalance;
+    let first = Fixture::new().await;
+    let second = Fixture::new().await;
+    let instruments = base_config().instruments;
+    let strategy = serde_json::json!({"RustNative":{"name":"fixture"}});
+    let tracked: Vec<(String, rust_decimal::Decimal)> =
+        vec![("BTC".into(), dec!(0)), ("USDT".into(), dec!(100000))];
+    let source = CollectionSource {
+        terminal: None,
+        owner: OWNER_SHA256.into(),
+        open: 0,
+        wallet: Some(
+            tracked
+                .iter()
+                .map(|(asset, free)| {
+                    (
+                        asset.clone(),
+                        SpotEvidenceBalance {
+                            free: *free,
+                            locked: dec!(0),
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        calls: Default::default(),
+    };
+    let previous = first.seed().await;
+    let mut first_store = first.store().await;
+    let ao = previous
+        .collect_opening_spot_receipt(
+            &mut first_store,
+            &first.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    drop(first_store);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut a = flat_boundary_at(&first, previous, Utc::now()).await;
+    let mut first_store = first.store().await;
+    let ac = a
+        .selection
+        .collect_spot_evidence_receipt(
+            &mut first_store,
+            &first.url,
+            &source,
+            &strategy,
+            &instruments,
+        )
+        .await
+        .unwrap();
+    let retained = a
+        .selection
+        .inspect_spot_collection_receipt(
+            &mut first_store,
+            &first.url,
+            &instruments,
+            &ac,
+            ac.sha256(),
+        )
+        .await
+        .unwrap();
+    a.positions.captured_at = retained.wallet.window.finished_at;
+
+    let boundary = a.selection.receipt();
+    let bytes = first_store
+        .load_strategy_checkpoint(Some(&boundary.checkpoint))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut second_store = second.store().await;
+    let receipt = second_store
+        .publish_strategy_checkpoint(
+            None,
+            &boundary.checkpoint.identity,
+            boundary.checkpoint.cursor,
+            &bytes,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt, boundary.checkpoint);
+    let previous = RecoverySelection::new(OWNER_SHA256.into(), receipt, HashMap::new()).unwrap();
+    let bo = previous
+        .collect_opening_spot_receipt(
+            &mut second_store,
+            &second.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    drop(second_store);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut b = flat_boundary_at(&second, previous, Utc::now()).await;
+    let mut second_store = second.store().await;
+    let bc = b
+        .selection
+        .collect_spot_evidence_receipt(
+            &mut second_store,
+            &second.url,
+            &source,
+            &strategy,
+            &instruments,
+        )
+        .await
+        .unwrap();
+    let retained = b
+        .selection
+        .inspect_spot_collection_receipt(
+            &mut second_store,
+            &second.url,
+            &instruments,
+            &bc,
+            bc.sha256(),
+        )
+        .await
+        .unwrap();
+    b.positions.captured_at = retained.wallet.window.finished_at;
+    fn inputs<'a>(
+        run: &'a FlatTransitionFixture,
+        opening: &'a live::OpeningCollectionReceipt,
+        closing: &'a live::SpotCollectionReceipt,
+        tracked: &'a [(String, rust_decimal::Decimal)],
+    ) -> live::ReceiptTransitionEvidence<'a> {
+        live::ReceiptTransitionEvidence {
+            instruments: &run.instruments,
+            collections: live::OpeningClosingEvidenceSelection {
+                opening,
+                opening_sha256: opening.sha256(),
+                tracked_balances: tracked,
+                closing,
+                closing_sha256: closing.sha256(),
+            },
+            positions: &run.positions,
+            fees: &run.fees,
+            marks: &run.marks,
+            conversion: &run.conversion,
+            observations: &run.observations,
+            registered_risk: None,
+            market_monitor: None,
+            margin_tiers: None,
+        }
+    }
+    let ae = inputs(&a, &ao, &ac, &tracked);
+    let be = inputs(&b, &bo, &bc, &tracked);
+    let aw = a
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut first_store,
+            &first.url,
+            (Probe::new(0), Probe::new(0)),
+            &ae,
+        )
+        .await
+        .unwrap();
+    let bw = b
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut second_store,
+            &second.url,
+            (Probe::new(0), Probe::new(0)),
+            &be,
+        )
+        .await
+        .unwrap();
+    macro_rules! check_pair {
+        ($a:expr, $aw:expr, $ad:expr, $bw:expr, $bd:expr) => {
+            live::inspect_receipt_bound_successor(
+                live::ReceiptBoundSuccessorRun {
+                    selection: &a.selection,
+                    store: &mut first_store,
+                    ems_postgres_url: &first.url,
+                    strategies: (Probe::new(0), Probe::new(0)),
+                    evidence: $a,
+                    witness: $aw,
+                    witness_sha256: $ad,
+                },
+                live::ReceiptBoundSuccessorRun {
+                    selection: &b.selection,
+                    store: &mut second_store,
+                    ems_postgres_url: &second.url,
+                    strategies: (Probe::new(0), Probe::new(0)),
+                    evidence: &be,
+                    witness: $bw,
+                    witness_sha256: $bd,
+                },
+            )
+            .await
+        };
+    }
+    check_pair!(&ae, &aw, aw.sha256(), &bw, bw.sha256()).unwrap();
+    assert!(check_pair!(&ae, &aw, &"0".repeat(64), &bw, bw.sha256()).is_err());
+    assert!(check_pair!(&ae, &aw, aw.sha256(), &aw, aw.sha256()).is_err());
+
+    // A later valid collection of the prior boundary cannot prove
+    // continuity into the already completed successor opening interval.
+    let late = a
+        .selection
+        .collect_spot_evidence_receipt(
+            &mut first_store,
+            &first.url,
+            &source,
+            &strategy,
+            &instruments,
+        )
+        .await
+        .unwrap();
+    let retained = a
+        .selection
+        .inspect_spot_collection_receipt(
+            &mut first_store,
+            &first.url,
+            &instruments,
+            &late,
+            late.sha256(),
+        )
+        .await
+        .unwrap();
+    a.positions.captured_at = retained.wallet.window.finished_at;
+    let late_inputs = inputs(&a, &ao, &late, &tracked);
+    let late_witness = a
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut first_store,
+            &first.url,
+            (Probe::new(0), Probe::new(0)),
+            &late_inputs,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        check_pair!(
+            &late_inputs,
+            &late_witness,
+            late_witness.sha256(),
+            &bw,
+            bw.sha256()
+        ),
+        Err(live::SuccessorInspectionError::Link(
+            live::SuccessorContinuityError::Interval
+        ))
+    ));
+    assert_eq!(first.claim_count().await, 1);
+    assert_eq!(second.claim_count().await, 1);
+    first_store
+        .verify_coherent_boundary(a.selection.receipt())
+        .await
+        .unwrap();
+    second_store
+        .verify_coherent_boundary(b.selection.receipt())
+        .await
+        .unwrap();
+    drop(first_store);
+    drop(second_store);
+    first.cleanup().await;
+    second.cleanup().await;
 }
