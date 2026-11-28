@@ -552,6 +552,169 @@ mod tests {
     }
 
     #[test]
+    fn external_fee_classification_matches_independent_opening_asset_coverage() {
+        use crate::OpeningTrackedAssetEvidence;
+        use crate::recovery_fee_ownership::compare_external_fee_ownership;
+        use apexes_backtest::ledger::PortfolioLedger;
+        let (opening, closing, _, _, instruments, fills) = fixture();
+        let mut allocation = OpeningTrackedAssetEvidence {
+            version: 1,
+            predecessor: opening.predecessor.clone(),
+            owner_fingerprint: "owner".into(),
+            captured_at: opening.wallet.window.finished_at,
+            balances: vec![("BTC".into(), dec!(4)), ("USDT".into(), dec!(1000))],
+        };
+        let capture = |a: &OpeningTrackedAssetEvidence| {
+            let mut ledger = PortfolioLedger::new(
+                instruments
+                    .iter()
+                    .map(|i| (i.symbol.clone(), i.clone()))
+                    .collect(),
+                a.balances.iter().cloned().collect(),
+            );
+            for fill in &fills {
+                ledger.apply_fill(fill).unwrap();
+            }
+            ledger.inspect_evidence().unwrap()
+        };
+        let external = capture(&allocation);
+        assert_eq!(
+            external.balances,
+            vec![("BTC".into(), dec!(4.50)), ("USDT".into(), dec!(958))]
+        );
+        let fees = external.fee_valuation.as_ref().unwrap();
+        assert!(fees.decisions.as_ref().unwrap()[2].external_fee);
+        assert_eq!(
+            fees.accounts[0].external_fees,
+            vec![("BNB".into(), dec!(0.01))]
+        );
+        compare_external_fee_ownership(
+            &allocation,
+            &opening,
+            &closing,
+            &external,
+            &instruments,
+            &fills,
+        )
+        .unwrap();
+        // A syntactically self-consistent alteration still fails independent
+        // classification even when the underlying fee quantity is unchanged.
+        let mut altered = external.clone();
+        let fees = altered.fee_valuation.as_mut().unwrap();
+        fees.accounts[0].external_fees.clear();
+        fees.decisions.as_mut().unwrap()[2].external_fee = false;
+        assert_eq!(
+            compare_external_fee_ownership(
+                &allocation,
+                &opening,
+                &closing,
+                &altered,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut altered = external.clone();
+        altered.fee_valuation.as_mut().unwrap().decisions = None;
+        assert_eq!(
+            compare_external_fee_ownership(
+                &allocation,
+                &opening,
+                &closing,
+                &altered,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut wrong = allocation.clone();
+        wrong.owner_fingerprint = "wrong".into();
+        assert_eq!(
+            compare_external_fee_ownership(
+                &wrong,
+                &opening,
+                &closing,
+                &external,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::Identity)
+        );
+        wrong = allocation.clone();
+        wrong.captured_at = at(2);
+        assert_eq!(
+            compare_external_fee_ownership(
+                &wrong,
+                &opening,
+                &closing,
+                &external,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::Interval)
+        );
+        wrong = allocation.clone();
+        wrong.balances[1].1 = dec!(999);
+        assert_eq!(
+            compare_external_fee_ownership(
+                &wrong,
+                &opening,
+                &closing,
+                &external,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::Balance)
+        );
+        let mut tied = fills.clone();
+        tied[2].filled_at = tied[1].filled_at;
+        assert_eq!(
+            compare_external_fee_ownership(
+                &allocation,
+                &opening,
+                &closing,
+                &external,
+                &instruments,
+                &tied
+            ),
+            Err(LedgerContinuityError::Execution)
+        );
+        allocation.balances.insert(0, ("BNB".into(), dec!(1)));
+        assert_eq!(
+            compare_external_fee_ownership(
+                &allocation,
+                &opening,
+                &closing,
+                &external,
+                &instruments,
+                &fills
+            ),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let internal = capture(&allocation);
+        assert_eq!(internal.balances[0], ("BNB".into(), dec!(0.99)));
+        assert!(
+            !internal
+                .fee_valuation
+                .as_ref()
+                .unwrap()
+                .decisions
+                .as_ref()
+                .unwrap()[2]
+                .external_fee
+        );
+        compare_external_fee_ownership(
+            &allocation,
+            &opening,
+            &closing,
+            &internal,
+            &instruments,
+            &fills,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn third_asset_fee_evidence_requires_exact_causal_complete_rates() {
         use crate::{ThirdAssetFeeEvidence, ThirdAssetFeeRate};
         use apexes_backtest::fee_evidence::{FeeAccountEvidence, FeeValuationEvidence};
