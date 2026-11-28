@@ -115,3 +115,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent fee-free gross realized P&L reconciliation](2026-11-28-apexes-realized-pnl-evidence-design.md) checks the actual captured gross realized map against the exact selected restricted Spot journal, without modifying accounting state.
 
 [Retained Spot fee-valuation evidence](2026-11-28-apexes-fee-valuation-evidence-design.md) captures actual bounded attribution aggregates and retained conversion windows, preserving missing-valuation counts without applying state.
+
+[Independent direct Spot fee reconciliation](2026-11-28-apexes-direct-fee-reconciliation-design.md) verifies direct base/quote fee quantities and historical valuation subtotals against the exact selected journal; third-asset valuations remain unqualified.
