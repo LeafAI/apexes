@@ -106,6 +106,7 @@ pub mod exit_attribution;
 
 mod fill_notifications;
 mod live_fill_attribution;
+mod live_terminal_notifications;
 
 mod lifecycle_correlation;
 

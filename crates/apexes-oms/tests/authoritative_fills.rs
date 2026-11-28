@@ -942,3 +942,292 @@ async fn mismatched_notification_receipt_does_not_advance_and_latches_health() {
     drop(manager);
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn terminal_evidence_waits_for_fill_callbacks_and_survives_restart_without_replay() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let link = apexes_oms::IntentLink {
+        run_scope: Uuid::new_v4(),
+        intent_id: apexes_strategy::IntentId(42),
+    };
+    let first = manager
+        .submit_correlated_order(intent(), &HashMap::new(), &HashMap::new(), link)
+        .await
+        .unwrap();
+    assert!(manager.terminal_evidence(first).await.unwrap().is_none());
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    fixture
+        .gateway
+        .set_exchange_state(first, OrderStatus::Cancelled);
+    fixture
+        .gateway
+        .set_fills_for_order(first, vec![fill("1", dec!(1), 0)]);
+    let exchange_id = manager
+        .open_orders()
+        .get(&first)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    manager
+        .apply_exchange_update(first, exchange_id.clone(), OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    let evidence = manager.terminal_evidence(first).await.unwrap().unwrap();
+    assert_eq!(evidence.order.filled_quantity, dec!(1));
+    assert_eq!(evidence.order.status, OrderStatus::Cancelled);
+    assert_eq!(evidence.intent_link, Some(link));
+    let fills = manager.durable_fill_batch().await.unwrap();
+    let ids = fills.iter().map(|f| f.id).collect::<Vec<_>>();
+    assert_eq!(ids.len(), 1);
+    manager.acknowledge_fill_batch(&ids, true).await;
+    let second = submit(&mut manager).await;
+    fixture
+        .gateway
+        .set_exchange_state(second, OrderStatus::Rejected);
+    let exchange_second = manager
+        .open_orders()
+        .get(&second)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    manager
+        .apply_exchange_update(second, exchange_second, OrderStatus::Rejected)
+        .await
+        .unwrap();
+    let rejected = manager.terminal_evidence(second).await.unwrap().unwrap();
+    assert_eq!(rejected.order.status, OrderStatus::Rejected);
+    assert_eq!(rejected.required_fill_sequence, 0);
+    assert!(rejected.sequence > evidence.sequence);
+    assert!(
+        manager.ready_terminal_batch().await.is_empty(),
+        "do not overtake first terminal"
+    );
+    assert!(
+        manager.ready_terminal_batch().await.is_empty(),
+        "ledger alone is not notification evidence"
+    );
+    manager.acknowledge_fill_notifications(&ids, true);
+    let batch = manager.ready_terminal_batch().await;
+    assert_eq!(
+        batch.iter().map(|e| e.order.id).collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    manager.acknowledge_terminal_batch(&[first, second]);
+    manager
+        .apply_exchange_update(first, exchange_id, OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    assert_eq!(
+        manager
+            .terminal_evidence(first)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        evidence.sequence
+    );
+    drop(manager);
+    let mut reopened = fixture.manager().await;
+    assert!(
+        reopened.ready_terminal_batch().await.is_empty(),
+        "startup baseline is not callback replay"
+    );
+    assert_eq!(
+        reopened
+            .terminal_evidence(first)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        evidence.sequence
+    );
+    assert_eq!(
+        reopened
+            .terminal_evidence(second)
+            .await
+            .unwrap()
+            .unwrap()
+            .sequence,
+        rejected.sequence
+    );
+    drop(reopened);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn terminal_marker_requires_successful_authoritative_execution_commit() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    let exchange_id = manager
+        .open_orders()
+        .get(&id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    // An unverified terminal push cannot supersede a positive open snapshot.
+    manager
+        .apply_exchange_update(id, exchange_id.clone(), OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    assert!(manager.terminal_evidence(id).await.unwrap().is_none());
+    assert!(manager.open_orders().contains_key(&id));
+    // A missing execution page prevents retirement and the terminal marker.
+    fixture.gateway.set_exchange_state(id, OrderStatus::Filled);
+    fixture
+        .gateway
+        .set_fills_for_order(id, vec![fill("1", dec!(3), 0)]);
+    fixture.gateway.fail_next_fill_queries(1);
+    manager
+        .apply_exchange_update(id, exchange_id.clone(), OrderStatus::Filled)
+        .await
+        .unwrap();
+    assert!(manager.terminal_evidence(id).await.unwrap().is_none());
+    assert!(manager.open_orders().contains_key(&id));
+    manager
+        .apply_exchange_update(id, exchange_id, OrderStatus::Filled)
+        .await
+        .unwrap();
+    assert!(manager.terminal_evidence(id).await.unwrap().is_some());
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn terminal_receipt_failure_halts_new_orders_but_preserves_fill_delivery() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let first = submit(&mut manager).await;
+    fixture
+        .gateway
+        .set_exchange_state(first, OrderStatus::Cancelled);
+    let exchange = manager
+        .open_orders()
+        .get(&first)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    manager
+        .apply_exchange_update(first, exchange, OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    let second = submit(&mut manager).await;
+    assert_eq!(manager.ready_terminal_batch().await.len(), 1);
+    manager.acknowledge_terminal_batch(&[second]);
+    assert!(fixture.health.is_engaged());
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    fixture
+        .gateway
+        .set_exchange_state(second, OrderStatus::Filled);
+    fixture
+        .gateway
+        .set_fills_for_order(second, vec![fill("2", dec!(3), 0)]);
+    let exchange = manager
+        .open_orders()
+        .get(&second)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    manager
+        .apply_exchange_update(second, exchange, OrderStatus::Filled)
+        .await
+        .unwrap();
+    let batch = manager.durable_fill_batch().await.unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].order_id, second);
+    manager.acknowledge_fill_batch(&[batch[0].id], true).await;
+    manager.acknowledge_fill_notifications(&[batch[0].id], true);
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    assert!(matches!(
+        manager
+            .submit_order(intent(), &HashMap::new(), &HashMap::new())
+            .await,
+        Err(OmsError::TradingHalted { .. })
+    ));
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn revised_terminal_quantity_delivers_fill_without_second_terminal() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    let id = submit(&mut manager).await;
+    let exchange = manager
+        .open_orders()
+        .get(&id)
+        .unwrap()
+        .exchange_order_id
+        .clone();
+    fixture
+        .gateway
+        .set_exchange_state(id, OrderStatus::Cancelled);
+    manager
+        .apply_exchange_update(id, exchange.clone(), OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    let batch = manager.ready_terminal_batch().await;
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].order.filled_quantity, dec!(0));
+    let sequence = batch[0].sequence;
+    manager.acknowledge_terminal_batch(&[id]);
+    fixture
+        .gateway
+        .set_fills_for_order(id, vec![fill("late", dec!(1), 0)]);
+    manager
+        .apply_exchange_update(id, exchange, OrderStatus::Cancelled)
+        .await
+        .unwrap();
+    assert!(fixture.health.is_engaged());
+    let batch = manager.durable_fill_batch().await.unwrap();
+    assert_eq!(batch.len(), 1);
+    manager.acknowledge_fill_batch(&[batch[0].id], true).await;
+    manager.acknowledge_fill_notifications(&[batch[0].id], true);
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    let evidence = manager.terminal_evidence(id).await.unwrap().unwrap();
+    assert_eq!(evidence.sequence, sequence);
+    assert_eq!(evidence.order.filled_quantity, dec!(1));
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn immediate_submission_refusal_is_not_reconciled_terminal_evidence() {
+    let fixture = Fixture::new().await;
+    let mut manager = fixture.manager().await;
+    fixture
+        .gateway
+        .program_next_submit_outcome(apexes_oms::GatewayOutcome::Rejected {
+            reason: "mock definite submission refusal".into(),
+        });
+    assert!(matches!(
+        manager
+            .submit_order(intent(), &HashMap::new(), &HashMap::new())
+            .await,
+        Err(OmsError::OrderRejected { .. })
+    ));
+    let pool = PgPool::connect(&fixture.url).await.unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM orders WHERE status='Rejected'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .terminal_evidence(apexes_core::OrderId(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(manager.ready_terminal_batch().await.is_empty());
+    drop(manager);
+    pool.close().await;
+    fixture.cleanup().await;
+}

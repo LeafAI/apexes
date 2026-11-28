@@ -192,6 +192,15 @@ pub trait OrderExecutor: Send + Sync {
     /// of non-execution. The ledger still receives the authoritative fill.
     fn report_live_fill_attribution_fault(&self) {}
 
+    /// Only managed live executors supply positively reconciled terminal
+    /// snapshots. Empty means no evidence ready, not a terminal inference.
+    async fn ready_live_terminals(&self) -> Vec<crate::LiveTerminalEvidence> {
+        Vec::new()
+    }
+
+    /// Advance the current-process receipt only after callbacks return.
+    async fn acknowledge_live_terminals(&self, _ids: &[OrderId]) {}
+
     /// Observe returns from the callbacks for a fully applied supplemental batch.
     /// This does not persist strategy state or replay callbacks after restart.
     async fn acknowledge_supplemental_notifications(&self, _fills: &[Fill], _returned: bool) {}

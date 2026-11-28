@@ -83,6 +83,40 @@ pub(crate) async fn inspect_fill_parents(
     Ok(evidence)
 }
 
+/// Resolve child ownership for a positively reconciled terminal order,
+/// including a zero-fill cancellation. Same classifier as fill evidence.
+pub(crate) async fn inspect_terminal_parents(
+    pool: &PgPool,
+    order_ids: &[OrderId],
+) -> Result<Vec<FillParentEvidence>, EmsError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '2000ms'")
+        .execute(&mut *tx)
+        .await?;
+    let mut evidence = Vec::with_capacity(order_ids.len());
+    for id in order_ids {
+        let child: Option<Child> = sqlx::query_as(
+            "SELECT o.id AS order_id,o.ems_parent_id,o.ems_dispatch_id,o.symbol,o.venue,o.side,
+             o.asset_class,o.quantity,
+             (o.filled_quantity>=0 AND o.filled_quantity<=o.quantity) AS matching_fill,
+             (o.intent_scope IS NOT NULL OR o.intent_ordinal IS NOT NULL) AS has_direct_intent
+             FROM orders o WHERE o.id=$1 AND o.terminal_delivery_seq IS NOT NULL",
+        )
+        .bind(id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        evidence.push(match child {
+            Some(child) => inspect_child(&mut tx, child).await?,
+            None => FillParentEvidence::Unavailable,
+        });
+    }
+    tx.commit().await?;
+    Ok(evidence)
+}
+
 async fn inspect_fill_parent_in(
     tx: &mut Transaction<'_, Postgres>,
     fill_id: FillId,

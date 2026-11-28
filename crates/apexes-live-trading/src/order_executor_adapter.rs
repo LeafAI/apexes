@@ -257,6 +257,49 @@ impl OrderExecutor for OrderManagerExecutor {
             .acknowledge_fill_notifications(&ids, returned);
     }
 
+    async fn ready_live_terminals(&self) -> Vec<apexes_strategy::LiveTerminalEvidence> {
+        use apexes_core::OrderStatus;
+        use apexes_strategy::{LiveTerminalEvidence, LiveTerminalStatus, PersistedFillLink};
+        let mut manager = self.order_manager.lock().await;
+        manager
+            .ready_terminal_batch()
+            .await
+            .into_iter()
+            .filter_map(|e| {
+                let status = match e.order.status {
+                    OrderStatus::Filled => LiveTerminalStatus::Filled,
+                    OrderStatus::Cancelled => LiveTerminalStatus::Cancelled,
+                    OrderStatus::Rejected => LiveTerminalStatus::Rejected,
+                    _ => return None,
+                };
+                let link = match (e.intent_link, e.child_link) {
+                    (Some(link), None) => PersistedFillLink::Direct {
+                        run_scope: link.run_scope,
+                        intent_id: link.intent_id,
+                    },
+                    (None, Some(link)) => PersistedFillLink::Child {
+                        parent_id: link.parent_id,
+                        dispatch_id: link.dispatch_id,
+                    },
+                    (None, None) => PersistedFillLink::Unlinked,
+                    _ => PersistedFillLink::Unavailable,
+                };
+                Some(LiveTerminalEvidence {
+                    order: e.order,
+                    status,
+                    link,
+                })
+            })
+            .collect()
+    }
+
+    async fn acknowledge_live_terminals(&self, ids: &[OrderId]) {
+        self.order_manager
+            .lock()
+            .await
+            .acknowledge_terminal_batch(ids);
+    }
+
     fn on_market_event(&self, _event: &MarketEvent) -> Vec<(OrderId, Vec<Fill>)> {
         // Live trading holds no local resting-order simulation to react
         // to market data with -- all fills come from the exchange via
@@ -368,12 +411,8 @@ async fn reconcile_detached(
 /// stream ends too (rather than risk busy-looping), which is a
 /// defensive fallback, not the expected steady-state path.
 ///
-/// Only genuinely non-empty fill batches are yielded -- an
-/// `exchange_updates` item or `reconcile()` tick that produced no new
-/// fills is silently skipped (the merge loop continues to the next
-/// event) rather than yielding an empty `Vec`, matching today's
-/// `run_live_trading`'s existing `Ok(new_fills) if !new_fills.is_empty()`
-/// handling of both sources.
+/// Empty batches are yielded only as an explicit managed terminal
+/// notification wake. They never add an equity point or synthesize a fill.
 pub struct LiveSupplementalFillSource<S> {
     order_manager: Arc<tokio::sync::Mutex<OrderManager>>,
     exchange_updates: S,
@@ -381,6 +420,7 @@ pub struct LiveSupplementalFillSource<S> {
     /// Optional "the push stream just (re)connected" signal: triggers an
     /// immediate `reconcile()` instead of waiting for the next tick.
     resync: Option<Arc<tokio::sync::Notify>>,
+    terminal_wakeup: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<S> LiveSupplementalFillSource<S>
@@ -397,7 +437,14 @@ where
             exchange_updates,
             reconcile_interval: tokio::time::interval(reconcile_interval),
             resync: None,
+            terminal_wakeup: None,
         }
+    }
+
+    /// Wake for committed terminal evidence from OMS/background tasks.
+    pub fn with_terminal_wakeup(mut self, wakeup: Arc<tokio::sync::Notify>) -> Self {
+        self.terminal_wakeup = Some(wakeup);
+        self
     }
 
     /// Reconcile immediately whenever `resync` is notified (see
@@ -418,6 +465,7 @@ where
             &mut self.exchange_updates,
             &mut self.reconcile_interval,
             self.resync.clone(),
+            self.terminal_wakeup.clone(),
         );
 
         // Boxed so the resulting stream is unconditionally `Unpin`
@@ -426,7 +474,7 @@ where
         // the boxed value, satisfying this trait method's signature).
         Box::pin(futures::stream::unfold(
             state,
-            |(order_manager, exchange_updates, reconcile_interval, resync)| async move {
+            |(order_manager, exchange_updates, reconcile_interval, resync, terminal_wakeup)| async move {
                 loop {
                     let legacy_fills = tokio::select! {
                         update = exchange_updates.next() => {
@@ -452,6 +500,12 @@ where
                         } => {
                             reconcile_detached(&order_manager, "resync").await
                         }
+                        _ = async {
+                            match &terminal_wakeup {
+                                Some(notify) => notify.notified().await,
+                                None => futures::future::pending::<()>().await,
+                            }
+                        } => Vec::new(),
                         _ = reconcile_interval.tick() => {
                             reconcile_detached(&order_manager, "periodic").await
                         }
@@ -470,11 +524,28 @@ where
                         None => Vec::new(),
                     };
                     if fills.is_empty() {
-                        continue;
+                        let ready =
+                            run_detached({
+                                let order_manager = Arc::clone(&order_manager);
+                                async move {
+                                    order_manager.lock().await.has_ready_terminal_batch().await
+                                }
+                            })
+                            .await
+                            .unwrap_or(false);
+                        if !ready {
+                            continue;
+                        }
                     }
                     return Some((
                         fills,
-                        (order_manager, exchange_updates, reconcile_interval, resync),
+                        (
+                            order_manager,
+                            exchange_updates,
+                            reconcile_interval,
+                            resync,
+                            terminal_wakeup,
+                        ),
                     ));
                 }
             },

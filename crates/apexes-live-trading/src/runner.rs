@@ -190,6 +190,7 @@ pub async fn run_live_trading(
     // awaits `OrderManager`'s async methods while holding the guard, so
     // a `std::sync::Mutex` would be wrong here.
     let submission_gate = order_manager.submission_gate();
+    let terminal_wakeup = order_manager.terminal_wakeup();
     let order_manager = Arc::new(tokio::sync::Mutex::new(order_manager));
     let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> =
         Arc::new(OrderManagerChildOrderSink::new(Arc::clone(&order_manager)));
@@ -313,7 +314,8 @@ pub async fn run_live_trading(
         Arc::clone(&order_manager),
         exchange_updates,
         config.reconcile_interval,
-    );
+    )
+    .with_terminal_wakeup(terminal_wakeup);
     if let Some(resync) = config.resync.clone() {
         supplemental_fills = supplemental_fills.with_resync(resync);
     }

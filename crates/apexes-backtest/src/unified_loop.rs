@@ -1197,22 +1197,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 // `NeverFillSupplementalFillSource` never yields, so this arm
                 // is unreachable for them.
                 //
-                // An empty `Vec<Fill>` must NOT record an equity point --
-                // matching today's (pre-unification) `run_live_trading`,
-                // which only recorded equity when its exchange-update/
-                // reconcile arms actually produced at least one fill
-                // (`if !new_fills.is_empty()` / `any_fills`). This arm was
-                // unreachable until `apexes-live-trading`'s
-                // `LiveSupplementalFillSource` became this trait's first
-                // real implementation (Task 5), so this guard is a defensive
-                // fix for a dormant bug rather than a change in observed
-                // behavior for any existing caller: every
-                // `SupplementalFillSource` implementation to date already
-                // never yields an empty `Vec` in the first place (`stream`'s
-                // own internal loop `continue`s on empty results instead of
-                // yielding them) -- this is defense-in-depth against a
-                // future implementation that doesn't uphold that contract.
+                // An explicit terminal-only wake never records an equity point.
                 if fills.is_empty() {
+                    crate::live_terminal_notifications::deliver(&mut strategy, executor.as_ref(), ems.as_ref()).await;
                     continue;
                 }
                 let before = all_fills.len();
@@ -1244,6 +1231,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 };
                 if applied {
                     executor.acknowledge_supplemental_notifications(newly_applied, returned).await;
+                    if returned {
+                        crate::live_terminal_notifications::deliver(&mut strategy, executor.as_ref(), ems.as_ref()).await;
+                    }
                 }
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {

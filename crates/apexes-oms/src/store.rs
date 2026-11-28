@@ -10,6 +10,10 @@ use crate::error::OmsError;
 use crate::manager::SpotReservation;
 use std::collections::HashMap;
 
+#[path = "terminal_evidence.rs"]
+mod terminal_evidence;
+pub use terminal_evidence::TerminalEvidence;
+
 #[path = "fill_reconciliation.rs"]
 mod fill_reconciliation;
 #[path = "parent_capital.rs"]
@@ -98,6 +102,16 @@ impl OrderStore {
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_ems_dispatch ON orders(ems_dispatch_id) WHERE ems_dispatch_id IS NOT NULL")
             .execute(&pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_ems_parent ON orders(ems_parent_id) WHERE ems_parent_id IS NOT NULL")
+            .execute(&pool).await?;
+        // Null for legacy rows: migration cannot establish authoritative
+        // terminal evidence from a previously stored status alone.
+        sqlx::query("CREATE SEQUENCE IF NOT EXISTS oms_terminal_delivery_seq")
+            .execute(&pool)
+            .await?;
+        sqlx::query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS terminal_delivery_seq BIGINT")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_terminal_delivery_seq ON orders(terminal_delivery_seq) WHERE terminal_delivery_seq IS NOT NULL")
             .execute(&pool).await?;
         sqlx::query(ORDERS_EXCHANGE_ID_INDEX_DDL)
             .execute(&pool)
