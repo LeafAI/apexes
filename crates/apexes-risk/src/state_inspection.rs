@@ -34,6 +34,42 @@ pub struct CircuitStateSnapshot {
     pub account_tripped: bool,
 }
 
+/// Evidence for one registered slot. Unsupported monitors are explicit,
+/// not treated as stateless or as a successfully captured empty state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum RegisteredRiskState {
+    Limits(LimitStateSnapshot),
+    Circuit(CircuitStateSnapshot),
+    Unsupported,
+}
+
+/// Registration order and role are retained. Two split circuit-breaker
+/// slots can refer to one shared monitor; equality does not prove aliasing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredRiskSnapshot {
+    pub version: u32,
+    pub pre_trade: Vec<RegisteredRiskState>,
+    pub in_trade: Vec<RegisteredRiskState>,
+    pub position_monitor_count: usize,
+    pub market_condition_monitor_count: usize,
+}
+
+impl RegisteredRiskSnapshot {
+    /// Only the supported slot kinds have captured state. This is
+    /// coverage information, not a recovery or trading authorization.
+    pub fn has_unsupported_slots(&self) -> bool {
+        self.position_monitor_count != 0
+            || self.market_condition_monitor_count != 0
+            || self
+                .pre_trade
+                .iter()
+                .chain(&self.in_trade)
+                .any(|s| matches!(s, RegisteredRiskState::Unsupported))
+    }
+}
+
 fn limits_valid(limits: &RiskLimits) -> bool {
     [
         limits.max_order_quantity,

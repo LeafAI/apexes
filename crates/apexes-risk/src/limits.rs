@@ -272,6 +272,13 @@ impl LimitChecker {
 }
 
 impl PreTradeCheck for LimitChecker {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Limits)
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,

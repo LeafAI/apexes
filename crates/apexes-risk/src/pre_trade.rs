@@ -16,6 +16,14 @@ use std::collections::HashMap;
 use crate::error::RiskViolation;
 
 pub trait PreTradeCheck: Send + Sync {
+    /// Read-only inspection; custom implementations default to explicit
+    /// unsupported coverage rather than an inferred empty state.
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        Ok(crate::RegisteredRiskState::Unsupported)
+    }
+
     /// Returns `Ok(())` if `intent` passes this check, or
     /// `Err(violations)` with every rule this single check instance
     /// found violated (a single `PreTradeCheck` implementation may

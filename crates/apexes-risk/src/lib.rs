@@ -39,4 +39,7 @@ pub use pre_trade::PreTradeCheck;
 pub use self_trade::SelfTradePreventer;
 
 pub mod state_inspection;
-pub use state_inspection::{CircuitStateSnapshot, LimitStateSnapshot, RiskStateError};
+pub use state_inspection::{
+    CircuitStateSnapshot, LimitStateSnapshot, RegisteredRiskSnapshot, RegisteredRiskState,
+    RiskStateError,
+};

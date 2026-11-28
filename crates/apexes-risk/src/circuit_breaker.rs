@@ -164,6 +164,13 @@ impl CircuitBreaker {
 }
 
 impl InTradeMonitor for CircuitBreaker {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Circuit)
+    }
+
     fn on_fill(
         &mut self,
         fill: &Fill,
@@ -175,6 +182,13 @@ impl InTradeMonitor for CircuitBreaker {
 }
 
 impl PreTradeCheck for CircuitBreaker {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Circuit)
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,
@@ -201,6 +215,13 @@ impl CircuitBreakerPreTradeAdapter {
 }
 
 impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Circuit)
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,
@@ -222,6 +243,16 @@ impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
 pub struct CircuitBreakerInTradeAdapter(Arc<Mutex<CircuitBreaker>>);
 
 impl InTradeMonitor for CircuitBreakerInTradeAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Circuit)
+    }
+
     fn on_fill(
         &mut self,
         fill: &Fill,

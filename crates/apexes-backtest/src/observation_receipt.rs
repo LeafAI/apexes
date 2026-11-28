@@ -189,6 +189,12 @@ pub struct CapturedObservations {
     pub receipt: ObservationReceipt,
     pub scope: Vec<(Venue, String)>,
     pub records: Vec<CompletedObservation>,
+    /// Actual registered risk slots captured by the loop, if present.
+    pub registered_risk: Option<apexes_risk::RegisteredRiskSnapshot>,
+    /// Separately configured market monitor is not yet serialized.
+    pub market_monitor_unqualified: bool,
+    /// Margin-tier monitoring is outside the supported capture contract.
+    pub margin_monitor_unqualified: bool,
 }
 
 pub(crate) struct ObservationCapture {
@@ -259,6 +265,9 @@ impl ObservationCapture {
             receipt,
             scope: self.scope,
             records: self.records,
+            registered_risk: None,
+            market_monitor_unqualified: false,
+            margin_monitor_unqualified: false,
         })
     }
 }
