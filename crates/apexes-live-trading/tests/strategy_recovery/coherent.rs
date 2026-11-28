@@ -1863,6 +1863,15 @@ async fn flat_boundary_at(
     previous: RecoverySelection,
     at: chrono::DateTime<Utc>,
 ) -> FlatTransitionFixture {
+    flat_boundary_with_checker(fixture, previous, at, None).await
+}
+
+async fn flat_boundary_with_checker(
+    fixture: &Fixture,
+    previous: RecoverySelection,
+    at: chrono::DateTime<Utc>,
+    checker: Option<Arc<apexes_risk::CompositeRiskChecker>>,
+) -> FlatTransitionFixture {
     use apexes_backtest::observation_receipt::{
         CompletedObservation, ObservationClock, ObservationReceipt,
     };
@@ -1881,6 +1890,11 @@ async fn flat_boundary_at(
             keep_open: true,
         }),
     );
+    if let Some(checker) = checker {
+        registry
+            .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker)
+            .unwrap();
+    }
     let (manager, mut config, _) = fixture.manager(&registry).await;
     config.initial_balances.insert("BTC".into(), dec!(0));
     let instruments = config.instruments.clone();
@@ -2838,6 +2852,89 @@ async fn receipt_bound_transition_requires_both_selected_collections_and_full_qu
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
 async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late_closing() {
+    exercise_receipt_bound_successor(RiskPairMode::Absent).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RiskPairMode {
+    Absent,
+    Retained,
+    Reset,
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn dual_handoff_qualifies_nonzero_registered_risk_and_rejects_reset() {
+    exercise_receipt_bound_successor(RiskPairMode::Retained).await;
+    exercise_receipt_bound_successor(RiskPairMode::Reset).await;
+}
+
+// Test-only initial historical risk state, constructed through built-in
+// callbacks rather than checkpoint DTO mutation.
+fn risk_pair_checker(seed: bool) -> Arc<apexes_risk::CompositeRiskChecker> {
+    use apexes_risk::{
+        CircuitBreaker, CompositeRiskChecker, LimitChecker, MarketConditionConfig,
+        MarketConditionMonitor, PriceSource, RiskLimits,
+    };
+    let limits = RiskLimits {
+        max_daily_trade_count: Some(5),
+        min_account_equity: Some(dec!(10)),
+        ..Default::default()
+    };
+    let (cpre, cin) = CircuitBreaker::new(limits.clone()).split();
+    let (mpre, mevent, _) = MarketConditionMonitor::new(MarketConditionConfig {
+        volatility_window: 3,
+        volatility_threshold: dec!(1),
+        jump_threshold_pct: dec!(0.05),
+        sensitivity: dec!(1),
+        price_source: PriceSource::Trade,
+        account_equity_volatility_threshold: None,
+        include_spot: true,
+    })
+    .split();
+    let checker = Arc::new(
+        CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(LimitChecker::new(limits)))
+            .with_pre_trade_check(Box::new(cpre))
+            .with_pre_trade_check(Box::new(mpre))
+            .with_in_trade_monitor(Box::new(cin))
+            .with_market_condition_monitor(Box::new(mevent)),
+    );
+    if seed {
+        let at = cursor().observed_at;
+        checker.on_order_accepted(&callback_probe_intent(false), at);
+        let fill = apexes_core::Fill {
+            id: apexes_core::FillId(uuid::Uuid::new_v4()),
+            order_id: OrderId(uuid::Uuid::new_v4()),
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            side: Side::Buy,
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: at,
+            leverage: None,
+            margin_mode: None,
+        };
+        assert!(
+            checker
+                .on_fill(&fill, &HashMap::new(), &HashMap::new())
+                .is_err()
+        );
+        let mut event = sample_events().pop().unwrap();
+        for price in [dec!(90), dec!(95), dec!(100)] {
+            let MarketEvent::Trade(trade) = &mut event else {
+                panic!("trade fixture")
+            };
+            trade.price = price;
+            let _ = checker.on_market_event(&event);
+        }
+    }
+    checker
+}
+
+async fn exercise_receipt_bound_successor(mode: RiskPairMode) {
     use apexes_live_trading as live;
     use apexes_oms::SpotEvidenceBalance;
     let first = Fixture::new().await;
@@ -2881,7 +2978,10 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
         .unwrap();
     drop(first_store);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let mut a = flat_boundary_at(&first, previous, Utc::now()).await;
+    let pristine = (mode != RiskPairMode::Absent)
+        .then(|| risk_pair_checker(false).inspect_registered_state().unwrap());
+    let a_checker = (mode != RiskPairMode::Absent).then(|| risk_pair_checker(true));
+    let mut a = flat_boundary_with_checker(&first, previous, Utc::now(), a_checker).await;
     let mut first_store = first.store().await;
     let ac = a
         .selection
@@ -2938,7 +3038,9 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
         .unwrap();
     drop(second_store);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let mut b = flat_boundary_at(&second, previous, Utc::now()).await;
+    let b_checker =
+        (mode != RiskPairMode::Absent).then(|| risk_pair_checker(mode == RiskPairMode::Retained));
+    let mut b = flat_boundary_with_checker(&second, previous, Utc::now(), b_checker).await;
     let mut second_store = second.store().await;
     let bc = b
         .selection
@@ -2968,6 +3070,7 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
         opening: &'a live::OpeningCollectionReceipt,
         closing: &'a live::SpotCollectionReceipt,
         tracked: &'a [(String, rust_decimal::Decimal)],
+        pristine: Option<&'a apexes_risk::RegisteredRiskSnapshot>,
     ) -> live::ReceiptTransitionEvidence<'a> {
         live::ReceiptTransitionEvidence {
             instruments: &run.instruments,
@@ -2983,13 +3086,13 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
             marks: &run.marks,
             conversion: &run.conversion,
             observations: &run.observations,
-            registered_risk: None,
+            registered_risk: pristine,
             market_monitor: None,
             margin_tiers: None,
         }
     }
-    let ae = inputs(&a, &ao, &ac, &tracked);
-    let be = inputs(&b, &bo, &bc, &tracked);
+    let ae = inputs(&a, &ao, &ac, &tracked, pristine.as_ref());
+    let be = inputs(&b, &bo, &bc, &tracked, pristine.as_ref());
     let aw = a
         .selection
         .inspect_receipt_bound_transition(
@@ -3080,6 +3183,96 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
             .await
             .is_err()
     );
+    if mode != RiskPairMode::Absent {
+        use apexes_risk::RegisteredRiskState;
+        let closing = a
+            .selection
+            .inspect_closing_risk_receipt(
+                &mut first_store,
+                &first.url,
+                &a.closing_risk_receipt,
+                &a.closing_risk_digest,
+            )
+            .await
+            .unwrap();
+        let retained = closing.registered_risk.as_ref().unwrap();
+        assert!(
+            matches!(&retained.pre_trade[0], RegisteredRiskState::Limits(s) if s.trade_count == 1 && s.traded_volume == dec!(1))
+        );
+        assert!(
+            matches!(&retained.pre_trade[1], RegisteredRiskState::Circuit(s) if s.account_tripped)
+        );
+        assert!(
+            matches!(&retained.pre_trade[2], RegisteredRiskState::MarketCondition(s) if s.symbols.len() == 1 && s.symbols[0].volatility.sample_count() == 3)
+        );
+        assert_eq!(retained.in_trade[0], retained.pre_trade[1]);
+        assert_eq!(
+            retained.market_condition.as_ref().unwrap()[0],
+            retained.pre_trade[2]
+        );
+        let opening = independent.registered_risk.as_ref().unwrap();
+        if mode == RiskPairMode::Retained {
+            assert_eq!(opening, retained);
+        } else {
+            assert_eq!(Some(opening), pristine.as_ref());
+        }
+        let qualified = live::inspect_dual_risk_handoff_successor_receipt(
+            live::ReceiptBoundSuccessorRun {
+                selection: &a.selection,
+                store: &mut first_store,
+                ems_postgres_url: &first.url,
+                strategies: (Probe::new(0), Probe::new(0)),
+                evidence: &ae,
+                witness: &aw,
+                witness_sha256: aw.sha256(),
+            },
+            live::ReceiptBoundSuccessorRun {
+                selection: &b.selection,
+                store: &mut second_store,
+                ems_postgres_url: &second.url,
+                strategies: (Probe::new(0), Probe::new(0)),
+                evidence: &be,
+                witness: &bw,
+                witness_sha256: bw.sha256(),
+            },
+            live::DualRiskHandoffSelection {
+                prior_closing: live::ClosingRiskReceiptSelection {
+                    receipt: &a.closing_risk_receipt,
+                    sha256: &a.closing_risk_digest,
+                },
+                next_opening: live::OpeningRiskReceiptSelection {
+                    receipt: &b.opening_risk_receipt,
+                    sha256: &b.opening_risk_digest,
+                },
+            },
+        )
+        .await;
+        if mode == RiskPairMode::Retained {
+            qualified.unwrap();
+        } else {
+            assert!(matches!(
+                qualified,
+                Err(live::SuccessorInspectionError::Link(
+                    live::SuccessorContinuityError::RiskState
+                ))
+            ));
+        }
+        assert_eq!(first.claim_count().await, 1);
+        assert_eq!(second.claim_count().await, 1);
+        first_store
+            .verify_coherent_boundary(a.selection.receipt())
+            .await
+            .unwrap();
+        second_store
+            .verify_coherent_boundary(b.selection.receipt())
+            .await
+            .unwrap();
+        drop(first_store);
+        drop(second_store);
+        first.cleanup().await;
+        second.cleanup().await;
+        return;
+    }
     assert!(independent.registered_risk.is_none());
     assert!(independent.market_monitor.is_none());
     macro_rules! check_risk_pair {
@@ -3301,7 +3494,7 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
         .await
         .unwrap();
     a.positions.captured_at = retained.wallet.window.finished_at;
-    let late_inputs = inputs(&a, &ao, &late, &tracked);
+    let late_inputs = inputs(&a, &ao, &late, &tracked, pristine.as_ref());
     let late_witness = a
         .selection
         .inspect_receipt_bound_transition(
