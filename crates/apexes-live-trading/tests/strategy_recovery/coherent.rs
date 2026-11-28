@@ -1817,6 +1817,8 @@ async fn zero_fill_terminal_callback_is_included_in_the_coherent_boundary() {
 struct FlatTransitionFixture {
     selection: apexes_live_trading::CoherentRecoverySelection,
     instruments: Vec<Instrument>,
+    opening_risk_receipt: apexes_live_trading::OpeningRiskReceipt,
+    opening_risk_digest: String,
     opening: apexes_live_trading::OpeningWalletEvidence,
     window: apexes_live_trading::RecoveryEvidenceWindow,
     closing: apexes_live_trading::WalletEvidence,
@@ -1895,20 +1897,46 @@ async fn flat_boundary_at(
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     });
+    let dir = std::env::temp_dir().join(format!("apexes-risk-opening-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("opening.json");
+    let (digest_sender, digest_receiver) = oneshot::channel();
     let boundary_result = tokio::time::timeout(
         Duration::from_secs(20),
-        live::run_live_trading_with_observation_capture_on_stop(
+        live::run_live_trading_with_opening_risk_handoff_on_stop(
             config,
             &registry,
             restore_startup(previous.clone(), candidate),
             manager,
             futures::stream::empty(),
             receiver,
+            live::OpeningRiskHandoff {
+                path: path.clone(),
+                digest: digest_sender,
+            },
         ),
     )
     .await;
     driver.abort();
-    let (_, boundary, _) = boundary_result.unwrap().unwrap();
+    let (_, boundary, capture) = boundary_result.unwrap().unwrap();
+    let opening_risk_digest = digest_receiver.await.unwrap();
+    let opening_risk_receipt = live::OpeningRiskReceipt::read(&path, &opening_risk_digest).unwrap();
+    assert!(live::OpeningRiskReceipt::read(&path, &"0".repeat(64)).is_err());
+    let selection =
+        live::CoherentRecoverySelection::new(previous.clone(), boundary.clone()).unwrap();
+    let mut store = fixture.store().await;
+    let inspected = selection
+        .inspect_opening_risk_receipt(
+            &mut store,
+            &fixture.url,
+            &opening_risk_receipt,
+            &opening_risk_digest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(Some(inspected), capture.opening_risk);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
     let expected_cursor = StateCursor {
         ordinal: previous.receipt().cursor.ordinal + 1,
         observed_at: at,
@@ -1979,6 +2007,8 @@ async fn flat_boundary_at(
         selection: live::CoherentRecoverySelection::new(previous.clone(), boundary.clone())
             .unwrap(),
         instruments,
+        opening_risk_receipt,
+        opening_risk_digest,
         opening,
         window,
         closing: wallet(closing_at),
@@ -2975,12 +3005,27 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     assert!(check_pair!(&ae, &aw, &"0".repeat(64), &bw, bw.sha256()).is_err());
     assert!(check_pair!(&ae, &aw, aw.sha256(), &aw, aw.sha256()).is_err());
 
-    let capture = b
+    let independent = b
         .selection
-        .inspect_durable_capture(&mut second_store, &second.url)
+        .inspect_opening_risk_receipt(
+            &mut second_store,
+            &second.url,
+            &b.opening_risk_receipt,
+            &b.opening_risk_digest,
+        )
         .await
         .unwrap();
-    let independent = capture.opening_risk.as_ref().unwrap().clone();
+    assert!(
+        b.selection
+            .inspect_opening_risk_receipt(
+                &mut second_store,
+                &second.url,
+                &a.opening_risk_receipt,
+                &a.opening_risk_digest,
+            )
+            .await
+            .is_err()
+    );
     assert!(independent.registered_risk.is_none());
     assert!(independent.market_monitor.is_none());
     macro_rules! check_risk_pair {
@@ -3103,4 +3148,54 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     drop(second_store);
     first.cleanup().await;
     second.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn opening_risk_handoff_refuses_existing_file_before_callbacks() {
+    use apexes_live_trading as live;
+    let fixture = Fixture::new().await;
+    let selection = fixture.seed().await;
+    let registry = registry();
+    let (manager, config, health) = fixture.manager(&registry).await;
+    let candidate = Probe::new(0);
+    let observed = candidate.observed.clone();
+    let (_stop, receiver) = oneshot::channel();
+    let (digest, selected) = oneshot::channel();
+    let dir = std::env::temp_dir().join(format!(
+        "apexes-opening-risk-collision-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("opening.json");
+    std::fs::write(&path, b"independently retained").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        live::run_live_trading_with_opening_risk_handoff_on_stop(
+            config,
+            &registry,
+            restore_startup(selection.clone(), candidate),
+            manager,
+            futures::stream::empty(),
+            receiver,
+            live::OpeningRiskHandoff {
+                path: path.clone(),
+                digest,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(ApexesError::InvalidBacktestConfig { ref reason })
+        if reason.contains("opening risk handoff refused"))
+    );
+    assert!(selected.await.is_err());
+    assert!(observed.lock().unwrap().is_empty());
+    assert!(health.is_engaged());
+    assert_eq!(std::fs::read(&path).unwrap(), b"independently retained");
+    assert_old_head(&fixture, &selection).await;
+    assert_eq!(fixture.claim_count().await, 1);
+    std::fs::remove_dir_all(dir).unwrap();
+    fixture.cleanup().await;
 }

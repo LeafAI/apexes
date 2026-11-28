@@ -399,6 +399,14 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         None
     };
 
+    if let Some(snapshot) = &opening_risk {
+        let bytes =
+            serde_json::to_vec(snapshot).map_err(|_| ApexesError::InvalidBacktestConfig {
+                reason: "opening risk snapshot encoding refused".into(),
+            })?;
+        executor.retain_opening_risk_snapshot(&bytes)?;
+    }
+
     loop {
         // Polled at the top of each iteration -- NOT as a
         // `tokio::select!` arm. Both `run_paper_trading` and

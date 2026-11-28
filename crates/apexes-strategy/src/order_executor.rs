@@ -60,6 +60,12 @@ pub trait OrderExecutor: Send + Sync {
         None
     }
 
+    /// Optional pre-event handoff of canonical opening risk evidence.
+    /// Executors without an explicit handoff retain their existing behavior.
+    fn retain_opening_risk_snapshot(&self, _snapshot: &[u8]) -> Result<(), ApexesError> {
+        Ok(())
+    }
+
     async fn submit_correlated(
         &self,
         intent: &OrderIntent,
