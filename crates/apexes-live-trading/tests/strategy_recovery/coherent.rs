@@ -360,6 +360,7 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert!(account.external_fees.is_empty());
     let decisions = attribution.decisions.as_ref().unwrap();
     assert_eq!(decisions.len(), 1);
+    let observed_fill_id = decisions[0].fill_id;
     assert_eq!(decisions[0].symbol, "BTCUSDT");
     assert_eq!(decisions[0].price, dec!(100));
     assert_eq!(decisions[0].fee, dec!(0));
@@ -932,6 +933,24 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             &fixture.url,
             &instruments,
             (&scope, &independent_observation_receipt),
+        )
+        .await
+        .unwrap();
+    let prefix = apexes_live_trading::FillObservationAvailability {
+        version: 1,
+        boundary: receipt.clone(),
+        owner_fingerprint: exact_opening.wallet.owner_fingerprint.clone(),
+        prefixes: vec![apexes_live_trading::FillObservationPrefix {
+            fill_id: observed_fill_id,
+            observations: 1,
+        }],
+    };
+    coherent
+        .inspect_fill_observation_availability(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            (&scope, &independent_observation_receipt, &prefix),
         )
         .await
         .unwrap();
