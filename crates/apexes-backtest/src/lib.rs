@@ -109,3 +109,5 @@ mod fill_notifications;
 mod lifecycle_correlation;
 
 pub mod lifecycle_archive;
+
+pub mod submission_journal;

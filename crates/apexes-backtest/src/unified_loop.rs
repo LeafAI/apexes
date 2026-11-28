@@ -188,6 +188,7 @@ pub async fn run_unified_event_loop(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -207,6 +208,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     mut funding_report: Option<crate::funding_attribution::FundingReport>,
     mut fill_origins: Option<&mut Vec<ExitReason>>,
     lifecycle_evidence: Option<&mut crate::lifecycle_archive::Evidence>,
+    mut submission_journal: Option<&mut crate::submission_journal::Journal>,
 ) -> Result<BacktestReport, ApexesError> {
     let instruments_by_symbol: HashMap<String, Instrument> = config
         .instruments
@@ -948,6 +950,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         latency_model.apply().await;
                     }
 
+                    if let Some(journal)=submission_journal.as_deref_mut() {
+                        journal.begin(intent_id,timestamp,&intent)?;
+                    }
                     if let Some(execution_algo) = intent.execution_algo.clone() {
                         let request = apexes_ems::AlgoOrderRequest {
                             symbol: intent.symbol.clone(),
@@ -961,6 +966,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         };
                         match ems.submit_algo_order(request).await {
                             Ok(parent_id) => {
+                                if let Some(journal)=submission_journal.as_deref_mut() {journal.parent_returned(parent_id)?;}
                                 trace.parent_accepted(parent_id);
                                 if let (Some(queue), Some(hold)) = (&mut arrivals, admitted_hold) {
                                     queue.reserve_parent(parent_id, &intent, hold);
@@ -977,6 +983,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 strategy.on_parent_outcome(&ParentOutcome { intent_id, at: timestamp, kind: ParentOutcomeKind::Submitted { id: parent_id, intent: &intent } });
                             }
                             Err(_) => {
+                                if let Some(journal)=submission_journal.as_deref_mut() {journal.end(crate::submission_journal::SubmissionResult::UncertainError)?;}
                                 trace.outcome("parent_submission_failed", "ems_error");
                                 strategy.on_parent_outcome(&ParentOutcome { intent_id, at: timestamp, kind: ParentOutcomeKind::SubmissionFailed { intent: &intent } });
                                 tracing::warn!(reason = "ems_error", symbol = %intent.symbol, "algo order submission failed");
@@ -1005,6 +1012,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     };
                     match submission {
                         Ok((order, fills)) => {
+                            if let Some(journal)=submission_journal.as_deref_mut() {journal.order_returned(&order)?;}
                             trace.accepted(&order);
                             if let (Some(queue), Some(hold)) = (&mut arrivals, admitted_hold)
                                 && matches!(order.status, apexes_core::OrderStatus::New | apexes_core::OrderStatus::PartiallyFilled) {
@@ -1054,6 +1062,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             notifications.deliver(&mut strategy, timestamp, FillSource::Direct, &fills, &correlation);
                         }
                         Err(error) => {
+                            if let Some(journal)=submission_journal.as_deref_mut() {journal.end(crate::submission_journal::SubmissionResult::UncertainError)?;}
                             trace.outcome("submission_failed", error_code(&error));
                             notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::SubmissionFailed { code: error_code(&error) }, intent_id);
                             tracing::warn!(

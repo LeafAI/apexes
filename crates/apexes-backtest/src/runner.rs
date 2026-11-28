@@ -342,6 +342,32 @@ pub async fn run_backtest(
         symbol_rules: HashMap::new(),
     };
 
+    let journal_policy = registry
+        .try_one::<crate::submission_journal::SubmissionJournalPolicy>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?;
+    let mut submission_journal = journal_policy
+        .as_ref()
+        .map(|policy| {
+            let namespace = replay_identity
+                .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                    reason: "submission journal requires deterministic replay identity".into(),
+                })?
+                .namespace;
+            let dataset =
+                historical_dataset
+                    .as_ref()
+                    .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+                        reason: "submission journal requires verified dataset".into(),
+                    })?;
+            crate::submission_journal::Journal::create(
+                policy,
+                namespace,
+                dataset.manifest.replay_sha256.clone(),
+            )
+        })
+        .transpose()?;
     let mut fill_origins = Vec::new();
     let mut report = run_unified_event_loop_with_attribution(
         unified_loop_config,
@@ -359,6 +385,7 @@ pub async fn run_backtest(
         )),
         Some(&mut fill_origins),
         lifecycle_evidence.as_mut(),
+        submission_journal.as_mut(),
     )
     .await?;
     if fill_origins.len() != report.trades.len() {
@@ -388,6 +415,9 @@ pub async fn run_backtest(
     }
     if let (Some(policy), Some(evidence)) = (archive, lifecycle_evidence) {
         crate::lifecycle_archive::LifecycleArchive::publish(&policy.path, &report, evidence)?;
+    }
+    if let Some(journal) = submission_journal {
+        journal.finish(&report)?;
     }
     Ok(report)
 }
