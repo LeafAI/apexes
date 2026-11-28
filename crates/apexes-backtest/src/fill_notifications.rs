@@ -14,6 +14,31 @@ pub(crate) struct FillNotifications {
 }
 
 impl FillNotifications {
+    pub(crate) fn archive_evidence(
+        &self,
+        correlation: &crate::lifecycle_correlation::LifecycleCorrelation,
+    ) -> crate::lifecycle_archive::Evidence {
+        let mut evidence = correlation.archive_evidence();
+        evidence.seen_fills = self.seen.iter().map(|id| id.0).collect();
+        evidence.seen_fills.sort_unstable();
+        evidence.parent_executed = self
+            .parent_executed
+            .iter()
+            .map(|(id, total)| {
+                (
+                    id.0,
+                    if correlation.parent_progress_valid(*id) {
+                        *total
+                    } else {
+                        None
+                    },
+                )
+            })
+            .collect();
+        evidence.parent_executed.sort_unstable_by_key(|x| x.0);
+        evidence
+    }
+
     /// Caller supplies only newly applied fills, after bookkeeping.
     /// Preserve the batch order. Duplicate IDs never invoke the callback.
     pub(crate) fn deliver(

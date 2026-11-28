@@ -226,6 +226,23 @@ pub async fn run_backtest(
         });
     }
 
+    let archive = registry
+        .try_one::<crate::lifecycle_archive::LifecycleArchivePolicy>()
+        .map_err(|error| ApexesError::InvalidBacktestConfig {
+            reason: error.to_string(),
+        })?;
+    if archive.is_some() && replay_identity.is_none() {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "lifecycle archive requires deterministic replay identity".into(),
+        });
+    }
+    if let Some(policy) = &archive {
+        policy.validate_destination()?;
+    }
+    let mut lifecycle_evidence = archive
+        .as_ref()
+        .map(|_| crate::lifecycle_archive::Evidence::default());
+
     let observation_manifest = manifest
         .as_ref()
         .is_some_and(|m| m.schema_version == crate::historical_dataset::OBSERVATION_SCHEMA);
@@ -341,6 +358,7 @@ pub async fn run_backtest(
             funding_rate_bps,
         )),
         Some(&mut fill_origins),
+        lifecycle_evidence.as_mut(),
     )
     .await?;
     if fill_origins.len() != report.trades.len() {
@@ -367,6 +385,9 @@ pub async fn run_backtest(
     report.simulated_depth = depth;
     if let Some(report) = &mut report.event_latency {
         report.child_orders = child_order_sink.finish_child_latency();
+    }
+    if let (Some(policy), Some(evidence)) = (archive, lifecycle_evidence) {
+        crate::lifecycle_archive::LifecycleArchive::publish(&policy.path, &report, evidence)?;
     }
     Ok(report)
 }

@@ -32,6 +32,37 @@ fn link<K: Eq + Hash + std::fmt::Debug>(
 }
 
 impl LifecycleCorrelation {
+    pub(crate) fn archive_evidence(&self) -> crate::lifecycle_archive::Evidence {
+        let mut orders: Vec<_> = self
+            .orders
+            .iter()
+            .map(|(key, id)| (key.0, id.map(|i| i.0)))
+            .collect();
+        let mut parents: Vec<_> = self
+            .parents
+            .iter()
+            .map(|(key, id)| (key.0, id.map(|i| i.0)))
+            .collect();
+        let mut children: Vec<_> = self
+            .children
+            .iter()
+            .map(|(key, id)| (key.0, id.map(|i| i.0)))
+            .collect();
+        let mut ambiguous_parents: Vec<_> = self.ambiguous_parents.iter().map(|id| id.0).collect();
+        orders.sort_unstable_by_key(|x| x.0);
+        parents.sort_unstable_by_key(|x| x.0);
+        children.sort_unstable_by_key(|x| x.0);
+        ambiguous_parents.sort_unstable();
+        crate::lifecycle_archive::Evidence {
+            last_intent: self.next,
+            orders,
+            parents,
+            children,
+            ambiguous_parents,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn allocate(&mut self) -> Option<IntentId> {
         self.next = self.next.checked_add(1)?;
         Some(IntentId(self.next))
