@@ -123,3 +123,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Actual per-fill valuation decision evidence](2026-11-28-apexes-per-fill-valuation-evidence-design.md) retains bounded actual attribution decisions and validates local aggregate consistency; independent per-fill reconciliation and external provenance remain open.
 
 [Exact retained per-fill valuation reconciliation](2026-11-28-apexes-decision-reconciliation-design.md) compares the actual retained decisions with complete selected-journal fill identity and independently supplied conversion observations, refusing aggregate-only matches.
+
+[Independent fee-bearing realized P&L](2026-11-28-apexes-fee-bearing-pnl-design.md) verifies owned cost basis and realized ledger entries separately from gross shadow attribution and execution-valued fee expense.

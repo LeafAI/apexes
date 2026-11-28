@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+enum FeeComparison {
+    Aggregates,
+    Decisions,
+    RealizedPnl,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoherentRecoverySelection {
@@ -536,7 +543,7 @@ impl CoherentRecoverySelection {
             strategies,
             instruments,
             observations,
-            (evidence, false),
+            (evidence, FeeComparison::Aggregates),
         )
         .await
     }
@@ -566,7 +573,37 @@ impl CoherentRecoverySelection {
             strategies,
             instruments,
             observations,
-            (evidence, true),
+            (evidence, FeeComparison::Decisions),
+        )
+        .await
+    }
+
+    /// Require independent fee-bearing realized P&L and exact valuation decisions.
+    /// Does not establish historical provenance or execution authorization.
+    pub async fn inspect_captured_fee_bearing_pnl<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            &crate::ClosingPositionEvidence,
+            &crate::ThirdAssetFeeEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.inspect_fee_comparison(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            (evidence, FeeComparison::RealizedPnl),
         )
         .await
     }
@@ -588,10 +625,10 @@ impl CoherentRecoverySelection {
                 &crate::ClosingPositionEvidence,
                 &crate::ThirdAssetFeeEvidence,
             ),
-            bool,
+            FeeComparison,
         ),
     ) -> Result<(), CoherentInspectionError> {
-        let ((retained, rates), require_decisions) = comparison;
+        let ((retained, rates), mode) = comparison;
         self.inspect_captured_ledger_reconciliation(
             store,
             ems_postgres_url,
@@ -628,7 +665,7 @@ impl CoherentRecoverySelection {
             .ledger
             .as_ref()
             .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
-        if require_decisions {
+        if !matches!(mode, FeeComparison::Aggregates) {
             rates.compare_decisions(
                 &self.boundary,
                 self.predecessor.owner_fingerprint(),
@@ -644,6 +681,9 @@ impl CoherentRecoverySelection {
                 instruments,
                 &fills,
             )?;
+        }
+        if matches!(mode, FeeComparison::RealizedPnl) {
+            crate::recovery_pnl::compare_fee_bearing_pnl(ledger, instruments, &fills)?;
         }
         Ok(())
     }
