@@ -955,6 +955,62 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Issue only after isolated ledger and risk checks pass against the
+    /// same exact durable boundary. Never transition the startup claim.
+    pub async fn inspect_offline_transition<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        evidence: &crate::TransitionEvidence<'_>,
+    ) -> Result<crate::OfflineTransitionWitness, CoherentInspectionError> {
+        self.inspect_isolated_ledger_application(
+            store,
+            ems_postgres_url,
+            strategies,
+            evidence.instruments,
+            (
+                evidence.opening,
+                evidence.window,
+                evidence.closing,
+                evidence.inspected_at,
+            ),
+            (
+                (
+                    evidence.positions,
+                    evidence.allocation,
+                    evidence.fees,
+                    evidence.marks,
+                ),
+                (evidence.conversion, evidence.observations),
+            ),
+        )
+        .await?;
+        let capture = self
+            .inspect_durable_capture(store, ems_postgres_url)
+            .await?;
+        let scope = evidence
+            .instruments
+            .iter()
+            .map(|i| (i.venue, i.symbol.clone()))
+            .collect::<Vec<_>>();
+        capture
+            .qualify_isolated_risk_restoration(
+                &scope,
+                evidence.registered_risk,
+                evidence.market_monitor,
+                evidence.margin_tiers,
+            )
+            .map_err(crate::ObservationEvidenceError::History)?;
+        Ok(crate::OfflineTransitionWitness::issue(
+            self.predecessor.owner_fingerprint(),
+            self.predecessor.receipt(),
+            &self.boundary,
+            self,
+            evidence,
+        )?)
+    }
+
     /// Compare independently retained conversion-only scope to the exact
     /// selected journal and capture. Never filters a recovery allowlist
     /// or establishes ownership, market provenance, or startup authority.

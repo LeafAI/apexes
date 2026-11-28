@@ -147,3 +147,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Isolated built-in risk state restoration](2026-11-28-apexes-isolated-risk-restoration-design.md) reconstructs and reinspects private built-ins with exact alias topology after independent pristine configuration qualification; returns no runnable checker or startup authorization.
 
 [Isolated cold-start Spot ledger application](2026-11-28-apexes-isolated-ledger-application-design.md) applies an independently qualified exact journal at actual retained observation prefixes to a private ledger and compares all captured closing maps and fee attribution; no runnable state or startup authority is exposed.
+
+[Durable offline transition witness](2026-11-28-apexes-offline-transition-witness-design.md) binds the exact selected coherent journal/capture and independently qualified accounting, observation and risk inputs; durable canonical historical evidence, not startup authority.

@@ -38,7 +38,7 @@ pub enum GatewayOutcome {
 /// locally-assigned `FillId`, which `OrderManager` assigns only for
 /// genuinely-new trades (see `OrderStore::insert_fill`'s dedup logic,
 /// Task 10).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ExchangeFill {
     pub exchange_trade_id: String,
     pub price: Decimal,
@@ -50,7 +50,7 @@ pub struct ExchangeFill {
 
 /// Authoritative order state and cumulative executed base quantity from
 /// one exchange response (not inferred from the returned trade page).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct OrderExecutionSnapshot {
     pub status: OrderStatus,
     pub executed_quantity: Decimal,

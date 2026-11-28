@@ -1017,6 +1017,74 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    let mut transition = apexes_live_trading::TransitionEvidence {
+        instruments: &instruments,
+        opening: &exact_opening,
+        window: &window,
+        closing: &exact_wallet,
+        inspected_at: wallet_at,
+        positions: &retained,
+        allocation: &allocation,
+        fees: &third_asset_rates,
+        marks: &marks,
+        conversion: &scope,
+        observations: &independent_observation_receipt,
+        registered_risk: Some(&candidate_snapshot),
+        market_monitor: Some(&candidate_market),
+        margin_tiers: Some(&independent_tiers),
+    };
+    let witness = coherent
+        .inspect_offline_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &transition,
+        )
+        .await
+        .unwrap();
+    let witness_path = dir.join("offline-transition.json");
+    witness.write_new(&witness_path).unwrap();
+    assert!(witness.write_new(&witness_path).is_err());
+    let reopened = apexes_live_trading::OfflineTransitionWitness::read(&witness_path).unwrap();
+    let independently_requalified = coherent
+        .inspect_offline_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &transition,
+        )
+        .await
+        .unwrap();
+    reopened.compare(&independently_requalified).unwrap();
+    transition.inspected_at += chrono::TimeDelta::milliseconds(1);
+    let later = coherent
+        .inspect_offline_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &transition,
+        )
+        .await
+        .unwrap();
+    assert!(reopened.compare(&later).is_err());
+    transition.market_monitor = None;
+    assert!(
+        coherent
+            .inspect_offline_transition(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &transition,
+            )
+            .await
+            .is_err()
+    );
+    let mut changed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&witness_path).unwrap()).unwrap();
+    changed["body"]["evidence_sha256"] = serde_json::Value::String("0".repeat(64));
+    let changed_path = dir.join("altered-transition.json");
+    std::fs::write(&changed_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(apexes_live_trading::OfflineTransitionWitness::read(&changed_path).is_err());
     let mut wrong_allocation = allocation.clone();
     wrong_allocation.balances[0].1 += dec!(1);
     assert!(
