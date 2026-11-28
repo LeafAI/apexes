@@ -1779,14 +1779,34 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         Option<ParentPhase>,
         Option<apexes_strategy::IntentId>,
     )>;
+    use rust_decimal::Decimal;
+    type Executions = Vec<(
+        apexes_core::FillId,
+        apexes_core::OrderId,
+        ParentOrderId,
+        apexes_strategy::IntentId,
+        Decimal,
+    )>;
     use std::sync::{Arc, Mutex};
     struct Parents {
         sent: bool,
         observed: Arc<Mutex<Vec<ParentOrderId>>>,
         lifecycle: Arc<Mutex<Lifecycle>>,
         failures: Arc<Mutex<Vec<String>>>,
+        executions: Arc<Mutex<Executions>>,
     }
     impl Strategy for Parents {
+        fn on_fill(&mut self, outcome: &apexes_strategy::FillOutcome<'_>) {
+            assert_eq!(outcome.source, apexes_strategy::FillSource::Ems);
+            self.executions.lock().unwrap().push((
+                outcome.fill.id,
+                outcome.fill.order_id,
+                outcome.parent_id.unwrap(),
+                outcome.intent_id.unwrap(),
+                outcome.parent_executed_quantity.unwrap(),
+            ));
+        }
+
         fn on_parent_outcome(&mut self, outcome: &ParentOutcome<'_>) {
             let (id, phase) = match outcome.kind {
                 ParentOutcomeKind::Submitted { id, intent } => {
@@ -1936,6 +1956,7 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(Mutex::new(Vec::new()));
         let report = run_backtest(
             config(),
             &registry,
@@ -1945,6 +1966,7 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
                 observed: observed.clone(),
                 lifecycle: lifecycle.clone(),
                 failures: failures.clone(),
+                executions: executions.clone(),
             },
         )
         .await
@@ -2015,7 +2037,23 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let result = (ids, fingerprint, lifecycle);
+        let executions = executions.lock().unwrap().clone();
+        assert_eq!(executions.len(), 4);
+        let submitted: Vec<_> = lifecycle
+            .iter()
+            .filter(|x| x.2.is_none())
+            .map(|x| x.1)
+            .collect();
+        for (index, (fill_id, order_id, parent, intent, total)) in executions.iter().enumerate() {
+            assert_eq!(
+                (*fill_id, *order_id),
+                (report.trades[index].id, report.trades[index].order_id)
+            );
+            assert_eq!(*parent, submitted[index % 2]);
+            assert_eq!(intent.0, (index % 2 + 1) as u64);
+            assert_eq!(*total, [dec!(1), dec!(2), dec!(2), dec!(4)][index]);
+        }
+        let result = (ids, fingerprint, lifecycle, executions);
         if let Some(previous) = &expected {
             assert_eq!(&result, previous);
         }
@@ -2027,6 +2065,7 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let lifecycle = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
+    let executions = Arc::new(Mutex::new(Vec::new()));
     let report = run_backtest(
         config(),
         &registry,
@@ -2036,6 +2075,7 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
             observed: observed.clone(),
             lifecycle: lifecycle.clone(),
             failures: failures.clone(),
+            executions: executions.clone(),
         },
     )
     .await
@@ -2043,5 +2083,6 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     assert!(report.trades.is_empty());
     assert!(observed.lock().unwrap().is_empty());
     assert!(lifecycle.lock().unwrap().is_empty());
+    assert!(executions.lock().unwrap().is_empty());
     assert_eq!(*failures.lock().unwrap(), vec!["BTCUSDT", "ETHUSDT"]);
 }

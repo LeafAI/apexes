@@ -39,6 +39,7 @@ pub struct InMemoryEms {
     /// unaffected.
     volume_curve_provider: Option<Arc<dyn VolumeCurveProvider>>,
     parent_orders: Mutex<HashMap<ParentOrderId, ParentOrderState>>,
+    child_associations: Mutex<Vec<(apexes_core::OrderId, ParentOrderId)>>,
     market_state: Mutex<MarketStateTracker>,
     causal: bool,
     replay_parent_ids: Option<Mutex<replay_parent_ids::ReplayParentIds>>,
@@ -72,6 +73,7 @@ impl InMemoryEms {
             estimated_fee_bps,
             volume_curve_provider,
             parent_orders: Mutex::new(HashMap::new()),
+            child_associations: Mutex::new(Vec::new()),
             market_state: Mutex::new(MarketStateTracker::default()),
             causal: false,
             replay_parent_ids: None,
@@ -201,6 +203,10 @@ impl InMemoryEms {
                     .get_mut(&parent_id)
                 {
                     state.child_order_ids.push(*order_id);
+                    self.child_associations
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((*order_id, parent_id));
                 }
                 tracing::info!(target: "apexes::decision", stage = "ems_child_accepted", parent_id = %parent_id.0, order_id = %order_id.0)
             }
@@ -900,6 +906,15 @@ impl Ems for InMemoryEms {
         );
 
         Ok(parent_id)
+    }
+
+    fn take_child_associations(&self) -> Vec<(apexes_core::OrderId, ParentOrderId)> {
+        std::mem::take(
+            &mut *self
+                .child_associations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
     }
 
     async fn parent_order_status(

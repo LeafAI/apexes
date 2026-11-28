@@ -526,6 +526,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         reason: format!("ems.on_market_event failed: {error}"),
                     }
                 })?;
+                correlation.observe_children(ems.as_ref());
                 if !ems_fills.is_empty() {
                     if let Some(log) = &mut order_log {
                         log.filled(&ems_fills);
@@ -1959,6 +1960,62 @@ mod tests {
         assert_eq!(probe.0, vec![(id, Some(ParentPhase::Failed)), (id, None)]);
         refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default()).await;
         assert_eq!(probe.0.len(), 2);
+    }
+
+    #[test]
+    fn parent_execution_progress_deduplicates_and_fails_closed_on_overflow() {
+        use apexes_strategy::{FillOutcome, FillSource, IntentId, ParentOrderId};
+        #[derive(Default)]
+        struct Probe(Vec<(Option<ParentOrderId>, Option<IntentId>, Option<Decimal>)>);
+        impl Strategy for Probe {
+            fn on_market_event(
+                &mut self,
+                _: &MarketEvent,
+                _: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                vec![]
+            }
+            fn on_fill(&mut self, o: &FillOutcome<'_>) {
+                self.0
+                    .push((o.parent_id, o.intent_id, o.parent_executed_quantity));
+            }
+        }
+        let parent = ParentOrderId(uuid::Uuid::from_u128(1));
+        let intent = IntentId(1);
+        let mut c = crate::lifecycle_correlation::LifecycleCorrelation::default();
+        c.bind_parent(parent, Some(intent));
+        let first = live_fill(Side::Buy, Decimal::ONE, Decimal::ZERO, "USDT");
+        c.bind_child(first.order_id, parent);
+        let mut n = crate::fill_notifications::FillNotifications::default();
+        let mut probe = Probe::default();
+        let now = Utc::now();
+        n.deliver(
+            &mut probe,
+            now,
+            FillSource::Ems,
+            &[first.clone(), first],
+            &c,
+        );
+        assert_eq!(
+            probe.0,
+            vec![(Some(parent), Some(intent), Some(Decimal::ONE))]
+        );
+        let huge = live_fill(Side::Buy, Decimal::MAX, Decimal::ZERO, "USDT");
+        c.bind_child(huge.order_id, parent);
+        n.deliver(&mut probe, now, FillSource::Ems, &[huge], &c);
+        let after = live_fill(Side::Buy, Decimal::ONE, Decimal::ZERO, "USDT");
+        c.bind_child(after.order_id, parent);
+        n.deliver(&mut probe, now, FillSource::Ems, &[after], &c);
+        assert_eq!(
+            probe.0[1..],
+            [
+                (Some(parent), Some(intent), None),
+                (Some(parent), Some(intent), None)
+            ]
+        );
+        let unknown = live_fill(Side::Buy, Decimal::ONE, Decimal::ZERO, "USDT");
+        n.deliver(&mut probe, now, FillSource::Supplemental, &[unknown], &c);
+        assert_eq!(probe.0[3], (None, None, None));
     }
 
     #[test]
