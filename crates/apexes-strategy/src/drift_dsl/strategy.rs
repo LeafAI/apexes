@@ -187,6 +187,74 @@ impl DriftScriptStrategy {
     }
 }
 
+/// Explicit offline warm-up failure. A failed candidate must be discarded;
+/// interpreter globals and parameter writes are not transactional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WarmupError {
+    #[error("scoped checkpoints and a callable on_warmup_event are required")]
+    Unsupported,
+    #[error("warm-up observation is outside scope or not yet available")]
+    Observation,
+    #[error("warm-up callback failed")]
+    Callback,
+    #[error("warm-up callback must return an empty array")]
+    NonemptyReturn,
+    #[error("warm-up scoped state operation rejected")]
+    State,
+}
+
+impl DriftScriptStrategy {
+    /// Offline only, on an isolated candidate. No order, position, wallet,
+    /// risk, or execution context is supplied, and the ordinary strategy
+    /// callback is never invoked. The caller must verify the complete
+    /// ordered history before calling this hook and discard on any failure.
+    /// Trusted scoped scripts only; this is not an OS sandbox.
+    pub fn warmup_observation(
+        &mut self,
+        event: &apexes_core::MarketEvent,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), WarmupError> {
+        let config = self
+            .checkpoint_config
+            .as_ref()
+            .ok_or(WarmupError::Unsupported)?;
+        if !config.instruments.iter().any(|key| key.matches(event))
+            || crate::event_time::TimeObservation::new(event, observed_at).is_err()
+        {
+            return Err(WarmupError::Observation);
+        }
+        let callback = self
+            .interpreter
+            .env()
+            .get("on_warmup_event")
+            .filter(|f| matches!(f, DriftValue::Function(_)))
+            .ok_or(WarmupError::Unsupported)?;
+        let mut ctx = DriftValue::Object(HashMap::from([(
+            "now".into(),
+            DriftValue::String(Arc::new(observed_at.to_rfc3339())),
+        )]));
+        let state = self.symbol_state.begin(event);
+        state.attach(&mut ctx);
+        state.attach_time(&mut ctx, event, observed_at);
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| WarmupError::Callback)?;
+        let result = handle.block_on(
+            self.interpreter
+                .call(callback, vec![market_event_to_drift_value(event), ctx]),
+        );
+        let valid = match result {
+            Ok(DriftValue::Array(items)) if items.is_empty() => Ok(()),
+            Ok(_) => Err(WarmupError::NonemptyReturn),
+            Err(_) => Err(WarmupError::Callback),
+        };
+        let committed = self.symbol_state.finish(event, state, valid.is_ok());
+        valid?;
+        if !committed {
+            return Err(WarmupError::State);
+        }
+        Ok(())
+    }
+}
+
 impl Strategy for DriftScriptStrategy {
     fn on_market_event(
         &mut self,

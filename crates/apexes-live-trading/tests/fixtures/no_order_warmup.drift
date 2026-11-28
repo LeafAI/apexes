@@ -1,0 +1,22 @@
+// Shared causal indicator logic; no account state is needed during warm-up.
+let factor = param("factor", 2);
+function update_state(event, ctx) {
+    let count = ctx.state_get("count", 0) + 1;
+    ctx.state_set("count", count);
+    ctx.state_set("scaled", event.price * factor);
+    ctx.state_set("last_now", ctx.now);
+    ctx.indicators.sma("mean", 2, event.price);
+    ctx.time.try_cooldown("elapsed", 1000);
+}
+function on_market_event(event, ctx) {
+    update_state(event, ctx);
+    return [];
+}
+function on_warmup_event(event, ctx) {
+    if (event.price == 998) { return [1]; }
+    if (event.price == 999) { return 42; }
+    if (event.price == 997) { ctx.time.try_cooldown("", 0); return []; }
+    if (event.price == 996) { return ctx.get_balance("USDT"); }
+    update_state(event, ctx);
+    return [];
+}
