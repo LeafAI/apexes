@@ -23,7 +23,10 @@ pub use recovery_conversion_scope::{
     ConversionScopeEvidence, EvidenceInstrumentRole, EvidenceInstrumentScope,
 };
 mod recovery_fill_availability;
-pub use recovery_fill_availability::{FillObservationAvailability, FillObservationPrefix};
+pub use recovery_fill_availability::{
+    FillObservationAvailability, FillObservationPrefix, OpeningValuationDifference,
+    OpeningValuationPreview,
+};
 mod recovery_fee;
 mod recovery_fee_mark;
 pub use recovery_fee_mark::{ClosingFeeMarkEvidence, ClosingFeeMarkRate, ClosingFeeRevaluation};
@@ -71,4 +74,6 @@ pub use recovery_ledger::{
 
 pub use recovery_risk::{RiskBoundaryEvidence, RiskEvidenceError};
 
-pub use recovery_observation::{ObservationBoundaryEvidence, ObservationEvidenceError};
+pub use recovery_observation::{
+    ObservationBoundaryEvidence, ObservationEvidenceError, OpeningObservationEvidence,
+};

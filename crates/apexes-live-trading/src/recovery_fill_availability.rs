@@ -6,7 +6,7 @@ use apexes_backtest::{
     ledger_evidence::LedgerEvidence,
     observation_receipt::CompletedObservation,
 };
-use apexes_core::{Fill, MarketEvent, Venue};
+use apexes_core::{Fill, FillId, MarketEvent, Venue};
 use apexes_oms::CoherentCheckpointReceipt;
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -53,12 +53,12 @@ fn record_price<'a>(
     Ok(())
 }
 
-fn compare_decision(
+fn expected_decision(
     scope: &ConversionScopeEvidence,
     windows: &Windows<'_>,
     d: &FeeDecisionEvidence,
     f: &Fill,
-) -> Result<(), E> {
+) -> Result<(FeeDecisionSource, Option<Decimal>), E> {
     let role = scope
         .instruments
         .iter()
@@ -107,10 +107,25 @@ fn compare_decision(
     } else {
         (FeeDecisionSource::Missing, None)
     };
-    if d.source != source || d.value != value {
-        return Err(E::FeeMismatch);
-    }
-    Ok(())
+    Ok((source, value))
+}
+
+/// Differences under a supplied pre-start observation history. Neither
+/// the counterfactual nor unchanged decisions are runtime restore evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpeningValuationDifference {
+    pub fill_id: FillId,
+    pub retained_source: FeeDecisionSource,
+    pub retained_value: Option<Decimal>,
+    pub warmup_source: FeeDecisionSource,
+    pub warmup_value: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpeningValuationPreview {
+    pub compared_fills: usize,
+    pub missing_after_warmup: usize,
+    pub differences: Vec<OpeningValuationDifference>,
 }
 
 impl FillObservationAvailability {
@@ -125,6 +140,23 @@ impl FillObservationAvailability {
         records: &[CompletedObservation],
         fills: &[Fill],
     ) -> Result<(), E> {
+        self.compare_with_opening(boundary, owner, scope, captured, records, fills, &[])
+            .map(|_| ())
+    }
+
+    /// Verify the actual cold-start decision first; then independently
+    /// evaluate the same fills with the supplied opening windows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compare_with_opening(
+        &self,
+        boundary: &CoherentCheckpointReceipt,
+        owner: &str,
+        scope: &ConversionScopeEvidence,
+        captured: &LedgerEvidence,
+        records: &[CompletedObservation],
+        fills: &[Fill],
+        opening: &[CompletedObservation],
+    ) -> Result<OpeningValuationPreview, E> {
         if self.version != 1 || &self.boundary != boundary || self.owner_fingerprint != owner {
             return Err(E::Identity);
         }
@@ -134,6 +166,7 @@ impl FillObservationAvailability {
             .and_then(|f| f.decisions.as_deref())
             .ok_or(E::FeeMismatch)?;
         if records.len() > 8192
+            || opening.len() > 8192
             || fills.len() > 8192
             || self.prefixes.len() != fills.len()
             || decisions.len() != fills.len()
@@ -145,6 +178,15 @@ impl FillObservationAvailability {
             return Err(E::FeeMismatch);
         }
         let mut windows = Windows::new();
+        let mut warmed = Windows::new();
+        for record in opening {
+            record_price(&mut warmed, scope, record)?;
+        }
+        let mut preview = OpeningValuationPreview {
+            compared_fills: fills.len(),
+            missing_after_warmup: 0,
+            differences: Vec::new(),
+        };
         let mut consumed = 0;
         for (prefix, decision) in self.prefixes.iter().zip(decisions) {
             if prefix.fill_id != decision.fill_id
@@ -155,14 +197,31 @@ impl FillObservationAvailability {
             }
             for record in &records[consumed..prefix.observations] {
                 record_price(&mut windows, scope, record)?;
+                record_price(&mut warmed, scope, record)?;
             }
             consumed = prefix.observations;
             let fill = journal.remove(&prefix.fill_id).ok_or(E::FeeMismatch)?;
-            compare_decision(scope, &windows, decision, fill)?;
+            let (source, value) = expected_decision(scope, &windows, decision, fill)?;
+            if decision.source != source || decision.value != value {
+                return Err(E::FeeMismatch);
+            }
+            let (warmup_source, warmup_value) = expected_decision(scope, &warmed, decision, fill)?;
+            if warmup_value.is_none() {
+                preview.missing_after_warmup += 1;
+            }
+            if warmup_source != source || warmup_value != value {
+                preview.differences.push(OpeningValuationDifference {
+                    fill_id: fill.id,
+                    retained_source: source,
+                    retained_value: value,
+                    warmup_source,
+                    warmup_value,
+                });
+            }
         }
         if !journal.is_empty() {
             return Err(E::FeeMismatch);
         }
-        Ok(())
+        Ok(preview)
     }
 }

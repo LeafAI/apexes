@@ -446,6 +446,67 @@ mod tests {
     }
 
     #[test]
+    fn opening_history_preview_distinguishes_cold_start_and_causal_warmup() {
+        use crate::{FillObservationAvailability, FillObservationPrefix};
+        use apexes_backtest::fee_evidence::FeeDecisionSource as Source;
+        let (scope, mut captured, _, _, fill) = fixture();
+        let fees = captured.fee_valuation.as_mut().unwrap();
+        fees.accounts[0].historical_fee = dec!(0);
+        fees.accounts[0].missing_execution_valuations = 1;
+        let decision = &mut fees.decisions.as_mut().unwrap()[0];
+        decision.source = Source::Missing;
+        decision.value = None;
+        let evidence = FillObservationAvailability {
+            version: 1,
+            boundary: scope.boundary.clone(),
+            owner_fingerprint: "owner".into(),
+            prefixes: vec![FillObservationPrefix {
+                fill_id: fill.id,
+                observations: 0,
+            }],
+        };
+        let records = [trade("BNBUSDT", 1, 2, dec!(999))];
+        let check = |opening: &[apexes_backtest::observation_receipt::CompletedObservation]| {
+            evidence
+                .compare_with_opening(
+                    &scope.boundary,
+                    "owner",
+                    &scope,
+                    &captured,
+                    &records,
+                    std::slice::from_ref(&fill),
+                    opening,
+                )
+                .unwrap()
+        };
+        let opening = [
+            trade("BNBUSDT", 0, 1, dec!(250)),
+            trade("BNBUSDT", 0, 2, dec!(300)),
+            trade("BNBUSDT", 3, 3, dec!(900)),
+        ];
+        let result = check(&opening);
+        assert_eq!(result.compared_fills, 1);
+        assert_eq!(result.missing_after_warmup, 0);
+        assert_eq!(result.differences.len(), 1);
+        let row = &result.differences[0];
+        assert_eq!(row.fill_id, fill.id);
+        assert_eq!(row.retained_source, Source::Missing);
+        assert_eq!(row.retained_value, None);
+        assert_eq!(
+            row.warmup_source,
+            Source::Observed {
+                observed_at: at(0),
+                rate: dec!(300)
+            }
+        );
+        assert_eq!(row.warmup_value, Some(dec!(3)));
+        let stale = [trade("BNBUSDT", -299, 1, dec!(300))];
+        let result = check(&stale);
+        assert_eq!(result.missing_after_warmup, 1);
+        assert!(result.differences.is_empty());
+    }
+
+    #[test]
     fn fill_observation_prefix_rejects_regressing_order_and_duplicate_ids() {
         use crate::{FillObservationAvailability, FillObservationPrefix};
         let (scope, mut captured, _, _, fill) = fixture();
