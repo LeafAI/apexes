@@ -32,7 +32,7 @@ pub enum PriceSource {
 }
 
 /// Configuration for [`crate::market_condition_monitor::MarketConditionMonitor`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketConditionConfig {
     /// Absolute threshold for `apexes_indicators::RollingStdDev`'s
     /// output (same unit as price) -- a symbol's rolling volatility at

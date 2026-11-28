@@ -118,6 +118,16 @@ impl CompositeRiskChecker {
             },
 
             market_condition_monitor_count: market.len(),
+            market_condition: if market.is_empty() {
+                None
+            } else {
+                Some(
+                    market
+                        .iter()
+                        .map(|m| m.inspect_registered_state())
+                        .collect::<Result<_, _>>()?,
+                )
+            },
         };
         snapshot.validate()?;
         Ok(snapshot)

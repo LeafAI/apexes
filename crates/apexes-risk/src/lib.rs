@@ -41,5 +41,6 @@ pub use self_trade::SelfTradePreventer;
 pub mod state_inspection;
 pub use state_inspection::{
     CircuitStateSnapshot, LimitStateSnapshot, ListState, MarginStateSnapshot,
-    RegisteredRiskSnapshot, RegisteredRiskState, RiskStateError, SymbolVenueListSnapshot,
+    MarketConditionSnapshot, MarketSymbolSnapshot, RegisteredRiskSnapshot, RegisteredRiskState,
+    RiskStateError, SymbolVenueListSnapshot,
 };

@@ -103,6 +103,81 @@ impl MarginStateSnapshot {
     }
 }
 
+/// Actual price and volatility evidence keyed by the monitor's symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketSymbolSnapshot {
+    pub symbol: String,
+    pub last_price: Decimal,
+    pub volatility: apexes_indicators::checkpoint::StddevState,
+    pub reduce_fraction: Option<Decimal>,
+}
+
+/// Read-only evidence, not an instantiated monitor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketConditionSnapshot {
+    pub version: u32,
+    pub config: crate::MarketConditionConfig,
+    pub symbols: Vec<MarketSymbolSnapshot>,
+    pub equity_volatility: Option<apexes_indicators::checkpoint::StddevState>,
+    pub account_wide_reduce_fraction: Option<Decimal>,
+}
+
+impl MarketConditionSnapshot {
+    pub fn validate(&self) -> Result<(), RiskStateError> {
+        let c = &self.config;
+        let valid_fraction =
+            |f: Option<Decimal>| f.is_none_or(|v| v > Decimal::ZERO && v <= Decimal::ONE);
+        if self.version != 1
+            || !(1..=apexes_indicators::checkpoint::MAX_PERIOD).contains(&c.volatility_window)
+            || c.volatility_threshold <= Decimal::ZERO
+            || c.jump_threshold_pct <= Decimal::ZERO
+            || c.sensitivity < Decimal::ZERO
+            || c.account_equity_volatility_threshold
+                .is_some_and(|v| v <= Decimal::ZERO)
+            || self.symbols.len() > 128
+            || !canonical_symbols(
+                &self
+                    .symbols
+                    .iter()
+                    .map(|s| s.symbol.clone())
+                    .collect::<Vec<_>>(),
+            )
+            || self.equity_volatility.is_some() != c.account_equity_volatility_threshold.is_some()
+            || !valid_fraction(self.account_wide_reduce_fraction)
+            || (self.account_wide_reduce_fraction.is_some()
+                && self
+                    .equity_volatility
+                    .as_ref()
+                    .is_none_or(|v| v.sample_count() != c.volatility_window))
+        {
+            return Err(RiskStateError::Invalid);
+        }
+        for symbol in &self.symbols {
+            if symbol.last_price <= Decimal::ZERO
+                || symbol.volatility.last() != Some(symbol.last_price)
+                || !valid_fraction(symbol.reduce_fraction)
+            {
+                return Err(RiskStateError::Invalid);
+            }
+            // Existing bounded indicator validator; discard the isolated value.
+            symbol
+                .volatility
+                .clone()
+                .restore(c.volatility_window)
+                .map_err(|_| RiskStateError::Invalid)?;
+        }
+        if let Some(equity) = &self.equity_volatility {
+            equity
+                .clone()
+                .restore(c.volatility_window)
+                .map_err(|_| RiskStateError::Invalid)?;
+        }
+        Ok(())
+    }
+}
+
 /// Evidence for one registered slot. Unsupported monitors are explicit,
 /// not treated as stateless or as a successfully captured empty state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +188,7 @@ pub enum RegisteredRiskState {
     SymbolVenueList(SymbolVenueListSnapshot),
     SelfTradePreventer { version: u32 },
     Margin(MarginStateSnapshot),
+    MarketCondition(MarketConditionSnapshot),
     Unsupported,
 }
 
@@ -129,6 +205,8 @@ pub struct RegisteredRiskSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Vec<RegisteredRiskState>>,
     pub market_condition_monitor_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_condition: Option<Vec<RegisteredRiskState>>,
 }
 
 impl RegisteredRiskSnapshot {
@@ -156,6 +234,7 @@ impl RegisteredRiskSnapshot {
                     return Err(RiskStateError::Invalid);
                 }
                 RegisteredRiskState::Margin(s) => s.validate()?,
+                RegisteredRiskState::MarketCondition(s) => s.validate()?,
                 RegisteredRiskState::Unsupported => {}
             }
         }
@@ -178,6 +257,18 @@ impl RegisteredRiskSnapshot {
                 }
             }
         }
+        if let Some(market) = &self.market_condition {
+            if market.len() != self.market_condition_monitor_count {
+                return Err(RiskStateError::Invalid);
+            }
+            for state in market {
+                match state {
+                    RegisteredRiskState::MarketCondition(s) => s.validate()?,
+                    RegisteredRiskState::Unsupported => {}
+                    _ => return Err(RiskStateError::Invalid),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -192,7 +283,15 @@ impl RegisteredRiskSnapshot {
                         .iter()
                         .any(|s| matches!(s, RegisteredRiskState::Unsupported))
             })
-            || self.market_condition_monitor_count != 0
+            || self.market_condition.as_ref().map_or(
+                self.market_condition_monitor_count != 0,
+                |slots| {
+                    slots.len() != self.market_condition_monitor_count
+                        || slots
+                            .iter()
+                            .any(|s| matches!(s, RegisteredRiskState::Unsupported))
+                },
+            )
             || self
                 .pre_trade
                 .iter()
