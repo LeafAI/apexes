@@ -177,3 +177,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Dual risk handoff-bound successor qualification](2026-11-29-apexes-dual-risk-handoff-successor-design.md) binds independently selected prior closing and successor opening risk handoffs with exact state and local chronology into a durable historical qualification, without granting restart authority.
 
 [Nontrivial registered risk-state successor coverage](2026-11-29-apexes-nontrivial-risk-successor-design.md) qualifies matching nonzero historical risk state and refuses a pristine reset through actual handoffs and independent transition qualification, without production risk restoration or startup authority.
+
+[Registered market-condition event dispatch](2026-11-29-apexes-registered-market-dispatch-design.md) advances actual registered market state before strategy evaluation, deduplicates shared event adapters by actual handle identity and preserves the existing separate de-risking policy and startup restrictions.
