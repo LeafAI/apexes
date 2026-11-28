@@ -104,6 +104,8 @@ pub enum CoherentInspectionError {
     InstrumentScope,
     #[error("invalid persisted fill row")]
     Fill,
+    #[error("supplied wallet evidence refused: {0}")]
+    Wallet(#[from] crate::WalletEvidenceError),
     #[error("supplied recovery evidence window refused: {0}")]
     EvidenceWindow(#[from] crate::EvidenceWindowError),
     #[error("terminal execution evidence comparison refused: {0}")]
@@ -192,6 +194,64 @@ impl CoherentRecoverySelection {
             )
             .await?;
         Ok(())
+    }
+
+    /// Inspect a complete supplied terminal/open-order/wallet sequence
+    /// against the exact journal and restore an isolated strategy.
+    /// No trading authority is conferred by this offline preview.
+    pub async fn inspect_wallet_continuity<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    ) -> Result<CoherentRecoveryPreview, CoherentInspectionError> {
+        let (evidence, wallet, inspected_at) = observations;
+        self.encode()?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        crate::recovery_evidence_window::validate_evidence_window(
+            evidence,
+            &snapshot,
+            self.boundary.checkpoint.cursor.observed_at,
+            self.predecessor.owner_fingerprint(),
+            inspected_at,
+        )?;
+        apexes_oms::compare_terminal_evidence(&snapshot, &evidence.terminal_orders)?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        crate::recovery_wallet::validate_wallet_evidence(
+            wallet,
+            evidence,
+            self.predecessor.owner_fingerprint(),
+            inspected_at,
+            instruments,
+            &fills,
+        )?;
+        self.inspect(
+            store,
+            ems_postgres_url,
+            strategies.0,
+            strategies.1,
+            instruments,
+            &wallet.balances,
+        )
+        .await
     }
 
     /// Reconstruct owned inventory from the exact locked journal using
