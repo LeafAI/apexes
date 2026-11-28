@@ -352,6 +352,50 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Compare actual basic captured ledger maps with independently
+    /// supplied closing positions, wallet and exact selected journal.
+    /// Does not qualify realized P&L, fee history or state application.
+    pub async fn inspect_captured_ledger_reconciliation<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        retained: &crate::ClosingPositionEvidence,
+    ) -> Result<(), CoherentInspectionError> {
+        let preview = self
+            .inspect_ledger_continuity(
+                store,
+                ems_postgres_url,
+                strategies,
+                instruments,
+                observations,
+            )
+            .await?;
+        retained.compare(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            instruments,
+            observations.2,
+            &preview,
+        )?;
+        let capture = self
+            .inspect_durable_capture(store, ems_postgres_url)
+            .await?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        crate::recovery_ledger::compare_captured_ledger(ledger, instruments, &preview)?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(

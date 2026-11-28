@@ -728,6 +728,39 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    // The existing account fixture holds four BTC outside the session.
+    // It must not be accepted as an exact local-ledger reconciliation.
+    assert!(matches!(
+        coherent
+            .inspect_captured_ledger_reconciliation(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&opening, &window, &wallet_evidence, wallet_at),
+                &retained
+            )
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Ledger(
+            apexes_live_trading::LedgerContinuityError::CapturedLedgerMismatch
+        ))
+    ));
+    // Independent complete account fixture for the session-only case.
+    let mut exact_opening = opening.clone();
+    exact_opening.wallet.balances.get_mut("BTC").unwrap().free = dec!(0);
+    let mut exact_wallet = wallet_evidence.clone();
+    exact_wallet.balances.get_mut("BTC").unwrap().free = dec!(1);
+    coherent
+        .inspect_captured_ledger_reconciliation(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            &retained,
+        )
+        .await
+        .unwrap();
     let mut changed = retained.clone();
     changed.positions[0].average_entry_price = dec!(101);
     assert!(matches!(

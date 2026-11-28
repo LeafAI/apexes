@@ -31,6 +31,8 @@ pub enum LedgerContinuityError {
     Mismatch,
     #[error("independently retained position evidence differs from the journal preview")]
     PositionMismatch,
+    #[error("actual captured ledger is missing or differs from qualified independent evidence")]
+    CapturedLedgerMismatch,
 }
 
 /// Independently retained closing position evidence. Only a read-only
@@ -129,6 +131,43 @@ impl ClosingPositionEvidence {
         }
         Ok(())
     }
+}
+
+/// Compare only the supported basic maps. Exact asset coverage is
+/// required; unrelated account holdings must not be inferred as local
+/// ledger state. Realized P&L and fee history remain unqualified.
+pub(crate) fn compare_captured_ledger(
+    captured: &apexes_backtest::ledger_evidence::LedgerEvidence,
+    instruments: &[Instrument],
+    preview: &crate::CoherentRecoveryPreview,
+) -> Result<(), LedgerContinuityError> {
+    use LedgerContinuityError as E;
+    let scope = instruments
+        .iter()
+        .map(|i| (i.venue, i.symbol.clone()))
+        .collect::<Vec<_>>();
+    captured
+        .validate(&scope)
+        .map_err(|_| E::CapturedLedgerMismatch)?;
+    if captured.balances.len() != preview.wallet_balances.len()
+        || captured.balances.iter().any(|(asset, amount)| {
+            preview
+                .wallet_balances
+                .get(asset)
+                .is_none_or(|balance| balance.free != *amount || !balance.locked.is_zero())
+        })
+    {
+        return Err(E::CapturedLedgerMismatch);
+    }
+    let nonzero = captured.positions.iter().filter(|p| !p.quantity.is_zero());
+    if nonzero.clone().count() != preview.owned_positions.len()
+        || nonzero
+            .into_iter()
+            .any(|p| preview.owned_positions.get(&p.symbol) != Some(p))
+    {
+        return Err(E::CapturedLedgerMismatch);
+    }
+    Ok(())
 }
 
 fn exact_decimal(mut n: i128, mut scale: u32) -> Result<Decimal, LedgerContinuityError> {
