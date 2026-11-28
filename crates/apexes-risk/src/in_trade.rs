@@ -16,6 +16,12 @@ use crate::error::RiskViolation;
 pub trait InTradeMonitor: Send {
     /// Read-only inspection; custom implementations default to explicit
     /// unsupported coverage rather than an inferred empty state.
+    /// Actual built-in shared monitor, when supported. No serialized
+    /// address or caller-chosen identity is retained.
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        None
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {

@@ -101,3 +101,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Additional registered monitor evidence](2026-11-28-apexes-monitor-coverage-design.md) retains list configuration, self-trade prevention version and margin-monitor threshold/trip state with explicit legacy and unsupported position coverage. Market-condition and margin-tier evidence remain open.
 
 [Market-condition and margin-tier evidence](2026-11-28-apexes-market-risk-evidence-design.md) retains bounded actual volatility state and configured margin tables in the existing durable observation/risk attachment. Shared identity, atomicity and restoration remain unqualified.
+
+[Shared built-in monitor identity and simultaneous inspection](2026-11-28-apexes-monitor-identity-design.md) captures actual alias topology with all distinct registered built-in shared monitor locks held together. Full runtime/ledger atomicity and restoration remain unqualified.

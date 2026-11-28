@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum RiskStateError {
     #[error("risk state lock is poisoned")]
     Poisoned,
+    #[error("shared risk monitor is busy; coherent inspection refused")]
+    Busy,
     #[error("invalid or unsupported risk state evidence")]
     Invalid,
     #[error("risk configuration or retained state differs from independent evidence")]
@@ -192,6 +194,73 @@ pub enum RegisteredRiskState {
     Unsupported,
 }
 
+/// Canonical local alias identifiers, numbered by first encounter in
+/// pre-trade, in-trade, position and market-condition registration order.
+/// None means that slot did not expose an actual built-in shared handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredAliases {
+    pub pre_trade: Vec<Option<u16>>,
+    pub in_trade: Vec<Option<u16>>,
+    pub position: Vec<Option<u16>>,
+    pub market_condition: Vec<Option<u16>>,
+}
+
+impl RegisteredAliases {
+    fn validate(&self, snapshot: &RegisteredRiskSnapshot) -> Result<(), RiskStateError> {
+        let roles = [
+            (&self.pre_trade, snapshot.pre_trade.as_slice()),
+            (&self.in_trade, snapshot.in_trade.as_slice()),
+            (
+                &self.position,
+                snapshot.position.as_deref().unwrap_or_default(),
+            ),
+            (
+                &self.market_condition,
+                snapshot.market_condition.as_deref().unwrap_or_default(),
+            ),
+        ];
+        if self.position.len() != snapshot.position_monitor_count
+            || self.market_condition.len() != snapshot.market_condition_monitor_count
+        {
+            return Err(RiskStateError::Invalid);
+        }
+        let mut groups: Vec<&RegisteredRiskState> = Vec::new();
+        for (ids, states) in roles {
+            if ids.len() != states.len() {
+                return Err(RiskStateError::Invalid);
+            }
+            for (id, state) in ids.iter().zip(states) {
+                if id.is_none()
+                    && matches!(
+                        state,
+                        RegisteredRiskState::Margin(_) | RegisteredRiskState::MarketCondition(_)
+                    )
+                {
+                    return Err(RiskStateError::Invalid);
+                }
+                if let Some(id) = id {
+                    if !matches!(
+                        state,
+                        RegisteredRiskState::Circuit(_)
+                            | RegisteredRiskState::Margin(_)
+                            | RegisteredRiskState::MarketCondition(_)
+                    ) {
+                        return Err(RiskStateError::Invalid);
+                    }
+                    let index = usize::from(*id);
+                    if index == groups.len() {
+                        groups.push(state);
+                    } else if groups.get(index).copied() != Some(state) {
+                        return Err(RiskStateError::Invalid);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Registration order and role are retained. Two split circuit-breaker
 /// slots can refer to one shared monitor; equality does not prove aliasing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +276,9 @@ pub struct RegisteredRiskSnapshot {
     pub market_condition_monitor_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_condition: Option<Vec<RegisteredRiskState>>,
+    /// Absent for legacy receipts: alias topology was not qualified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<RegisteredAliases>,
 }
 
 impl RegisteredRiskSnapshot {
@@ -268,6 +340,9 @@ impl RegisteredRiskSnapshot {
                     _ => return Err(RiskStateError::Invalid),
                 }
             }
+        }
+        if let Some(aliases) = &self.aliases {
+            aliases.validate(self)?;
         }
         Ok(())
     }

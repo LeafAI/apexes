@@ -215,6 +215,12 @@ impl CircuitBreakerPreTradeAdapter {
 }
 
 impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Circuit(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
@@ -243,6 +249,12 @@ impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
 pub struct CircuitBreakerInTradeAdapter(Arc<Mutex<CircuitBreaker>>);
 
 impl InTradeMonitor for CircuitBreakerInTradeAdapter {
+    fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
+        Some(crate::SharedMonitorRef(
+            crate::shared_inspection::SharedMonitor::Circuit(&self.0),
+        ))
+    }
+
     fn inspect_registered_state(
         &self,
     ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
