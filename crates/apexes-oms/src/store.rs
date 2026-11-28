@@ -4,6 +4,7 @@
 //! layer built on top of this.
 
 use apexes_core::{Fill, Order, OrderId, OrderStatus};
+use sha2::Digest;
 use sqlx::PgPool;
 
 use crate::error::OmsError;
@@ -75,6 +76,7 @@ pub struct OrderStore {
     // lifetime of the managed order store, rather than returning it to a pool.
     inventory_lease: Option<sqlx::PgConnection>,
     inventory_owner: Option<String>,
+    checkpoint_database_sha256: [u8; 32],
 }
 
 impl OrderStore {
@@ -156,6 +158,7 @@ impl OrderStore {
             pool,
             inventory_lease: None,
             inventory_owner: None,
+            checkpoint_database_sha256: sha2::Sha256::digest(url.as_bytes()).into(),
         })
     }
 

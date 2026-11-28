@@ -221,6 +221,60 @@ impl OrderManager {
         Ok(fills)
     }
 
+    /// Legacy managed runners must not bypass an existing checkpoint or
+    /// a previous startup claim. Unbound standalone callers are unchanged.
+    pub async fn check_legacy_strategy_startup(
+        &mut self,
+    ) -> Result<(), crate::CheckpointStoreError> {
+        let result = self.store.check_legacy_checkpoint_startup().await;
+        if result.is_err() {
+            self.report_health_fault("live strategy checkpoint startup refused");
+        }
+        result
+    }
+
+    /// Only a fresh reconciled managed session with no execution history
+    /// may claim an explicitly selected checkpoint. The store checks the
+    /// durable journal (including zero-fill orders and EMS parents).
+    pub async fn claim_strategy_startup(
+        &mut self,
+        expected: &apexes_strategy::checkpoint::CheckpointReceipt,
+        owner_sha256: &str,
+        ems_postgres_url: &str,
+    ) -> Result<Vec<u8>, crate::CheckpointStoreError> {
+        use crate::CheckpointStoreError;
+        let ready = self.kill_switch.as_ref().is_some_and(|gate| {
+            gate.phase() == Some(crate::SessionPhase::Reconciling) && !gate.is_engaged()
+        }) && self.fill_delivery.as_ref().is_some_and(|d| {
+            d.recovered_checkpoint == 0
+                && d.checkpoint == 0
+                && d.notification_checkpoint == 0
+                && d.recovered_terminal_checkpoint == 0
+                && d.terminal_checkpoint == 0
+                && !d.failed
+                && !d.notification_failed
+                && !d.terminal_failed
+                && d.pending.is_none()
+                && d.notification_pending.is_none()
+                && d.terminal_pending.is_none()
+                && !d.dirty
+        }) && self.open_orders.is_empty()
+            && self.spot_reservations.is_empty()
+            && !self.reservation_breached
+            && self.spot_scope.is_some();
+        let result = if ready {
+            self.store
+                .claim_strategy_checkpoint_startup(expected, owner_sha256, ems_postgres_url)
+                .await
+        } else {
+            Err(CheckpointStoreError::StartupPhase)
+        };
+        if result.is_err() {
+            self.report_health_fault("live strategy checkpoint startup refused");
+        }
+        result
+    }
+
     /// Managed sessions deliver from the journal, not from return values of
     /// reconciliation/cancellation tasks. Legacy adapters use None.
     pub async fn durable_fill_batch(&mut self) -> Option<Vec<Fill>> {

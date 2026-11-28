@@ -44,7 +44,9 @@ use apexes_core::{ApexesError, Instrument, Venue};
 use apexes_engine::gateway_client::GatewayMarketDataProvider;
 use apexes_engine::launch_config::{LaunchConfig, SessionMode};
 use apexes_engine::{ServerSecurity, build_app_secured, credentials, resolve_binance_credentials};
-use apexes_live_trading::{LiveTradingConfig, run_live_trading};
+use apexes_live_trading::{
+    LiveTradingConfig, RecoverySelection, StrategyStartup, run_live_trading_with_startup,
+};
 use apexes_message_bus::MarketEventBus;
 use apexes_oms::{ExecutionGateway, OrderManager, OrderStore};
 use apexes_paper::{LatencyModel, PaperTradingConfig, run_paper_trading};
@@ -66,6 +68,10 @@ struct Cli {
     /// Path to a JSON-serialized `LaunchConfig` file.
     #[arg(long)]
     launch_config: PathBuf,
+    /// Explicit local receipt for a qualified, pre-execution scoped Drift
+    /// checkpoint. This is a one-time recovery, not automatic restart.
+    #[arg(long)]
+    strategy_recovery_receipt: Option<PathBuf>,
 }
 
 /// Errors specific to this binary's own startup sequence (CLI/config
@@ -83,6 +89,12 @@ enum EngineError {
     ParseLaunchConfig(#[from] serde_json::Error),
     #[error("failed to load strategy: {0}")]
     StrategyLoad(#[from] apexes_strategy_loader::StrategyLoadError),
+    #[error("strategy recovery requires a qualified live scoped Drift script")]
+    UnsupportedStrategyRecovery,
+    #[error("failed to select independent strategy recovery receipt: {0}")]
+    StrategyRecovery(#[from] apexes_live_trading::StrategyRecoveryError),
+    #[error("failed to construct scoped strategy for recovery: {0}")]
+    ScopedStrategy(#[from] apexes_strategy::StrategyError),
     #[error("invalid launch config: {0}")]
     InvalidLaunchConfig(#[from] apexes_engine::launch_config::LaunchConfigError),
     #[error("failed to resolve live-trading credentials: {0}")]
@@ -387,16 +399,64 @@ fn main() {
     // no knowledge of that marker, so a `Handle::block_on` call nested
     // underneath it no longer collides with anything.
     let _runtime_guard = runtime.enter();
-    let strategy = match apexes_strategy_loader::load_strategy(&launch_config.strategy_ref) {
-        Ok(strategy) => strategy,
-        Err(error) => {
-            eprintln!("apexes-engine: failed to load strategy: {error}");
-            std::process::exit(1);
-        }
-    };
+    let strategy =
+        match load_startup_strategy(&launch_config, cli.strategy_recovery_receipt.as_deref()) {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                eprintln!("apexes-engine: failed to load strategy: {error}");
+                std::process::exit(1);
+            }
+        };
 
     let exit_code = futures::executor::block_on(run(launch_config, strategy));
     std::process::exit(exit_code);
+}
+
+fn load_startup_strategy(
+    config: &LaunchConfig,
+    receipt_path: Option<&std::path::Path>,
+) -> Result<StrategyStartup<Box<dyn Strategy>>, EngineError> {
+    let Some(path) = receipt_path else {
+        return Ok(StrategyStartup::Legacy(
+            apexes_strategy_loader::load_strategy(&config.strategy_ref)?,
+        ));
+    };
+    if !matches!(config.mode, SessionMode::Live { .. }) {
+        return Err(EngineError::UnsupportedStrategyRecovery);
+    }
+    let apexes_strategy_loader::StrategyRef::DriftScript { path: script } = &config.strategy_ref
+    else {
+        return Err(EngineError::UnsupportedStrategyRecovery);
+    };
+    let selection = RecoverySelection::read(path)?;
+    let build = || -> Result<Box<dyn Strategy>, EngineError> {
+        Ok(Box::new(
+            apexes_strategy::drift_dsl::DriftScriptStrategy::from_file_with_scoped_checkpoints(
+                script,
+                selection.initial_params(),
+                &config.instruments,
+            )?,
+        ))
+    };
+    // Construct independent interpreters in the entered runtime, before
+    // any live gateway or server startup. Scoped-only qualification is an
+    // explicit operator prerequisite, not inferred from script contents.
+    let active = build()?;
+    let candidate = build()?;
+    Ok(StrategyStartup::Restore {
+        active,
+        candidate,
+        selection: Box::new(selection),
+    })
+}
+
+fn legacy_strategy(
+    startup: StrategyStartup<Box<dyn Strategy>>,
+) -> Result<Box<dyn Strategy>, EngineError> {
+    match startup {
+        StrategyStartup::Legacy(strategy) => Ok(strategy),
+        StrategyStartup::Restore { .. } => Err(EngineError::UnsupportedStrategyRecovery),
+    }
 }
 
 fn load_launch_config(path: &PathBuf) -> Result<LaunchConfig, EngineError> {
@@ -410,7 +470,7 @@ fn load_launch_config(path: &PathBuf) -> Result<LaunchConfig, EngineError> {
     Ok(launch_config)
 }
 
-async fn run(launch_config: LaunchConfig, strategy: Box<dyn Strategy>) -> i32 {
+async fn run(launch_config: LaunchConfig, strategy: StrategyStartup<Box<dyn Strategy>>) -> i32 {
     match run_inner(launch_config, strategy).await {
         Ok(()) => 0,
         Err(error) => {
@@ -437,7 +497,7 @@ async fn run(launch_config: LaunchConfig, strategy: Box<dyn Strategy>) -> i32 {
 /// but binding first is simplest to reason about and costs nothing).
 async fn run_inner(
     launch_config: LaunchConfig,
-    strategy: Box<dyn Strategy>,
+    strategy: StrategyStartup<Box<dyn Strategy>>,
 ) -> Result<(), EngineError> {
     let registry = Registry::new();
     if let Some(policy) = launch_config.simulated_execution.clone() {
@@ -537,7 +597,7 @@ async fn run_inner(
             run_backtest_mode(
                 &launch_config,
                 &registry,
-                strategy,
+                legacy_strategy(strategy)?,
                 control_handle,
                 date_range,
                 clickhouse_url,
@@ -545,7 +605,14 @@ async fn run_inner(
             .await
         }
         SessionMode::Paper => {
-            run_paper_mode(&launch_config, &registry, strategy, control_handle, stop_rx).await
+            run_paper_mode(
+                &launch_config,
+                &registry,
+                legacy_strategy(strategy)?,
+                control_handle,
+                stop_rx,
+            )
+            .await
         }
         SessionMode::Live {
             network,
@@ -798,7 +865,7 @@ struct LiveModeParams {
 async fn run_live_mode(
     launch_config: &LaunchConfig,
     registry: &Registry,
-    strategy: Box<dyn Strategy>,
+    strategy: StrategyStartup<Box<dyn Strategy>>,
     control_handle: apexes_backtest::ControlHandle,
     live_params: LiveModeParams,
     stop_signal: tokio::sync::oneshot::Receiver<()>,
@@ -997,7 +1064,7 @@ async fn run_live_mode(
             }
         }
     });
-    let result = run_live_trading(
+    let result = run_live_trading_with_startup(
         config,
         registry,
         strategy,
@@ -1147,6 +1214,87 @@ mod tests {
             live_observation: None,
             gateway_url: "ws://localhost:9001/market".to_string(),
         }
+    }
+
+    #[test]
+    fn explicit_recovery_loader_builds_two_independent_scoped_drift_instances() {
+        use apexes_core::binance_network::BinanceNetwork;
+        use apexes_strategy::checkpoint::{StateCursor, StateIdentity, capture, verify_checkpoint};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut config = sample_launch_config(SessionMode::Live {
+            network: BinanceNetwork::Testnet,
+            risk_limits: apexes_engine::LiveRiskLimits {
+                max_order_notional: dec!(100),
+                max_order_quantity: dec!(1),
+                max_position_per_symbol: dec!(2),
+                max_daily_trade_count: 10,
+                min_account_equity: None,
+                max_daily_volume: None,
+            },
+            credentials_ref: "unused-test".into(),
+            auto_derisk_live: false,
+            reconcile_interval: std::time::Duration::from_secs(1),
+            ems_postgres_url: "unused-test".into(),
+            stale_data_timeout_secs: None,
+        });
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../apexes-strategy/tests/fixtures/checkpoint_scoped.drift");
+        config.strategy_ref = apexes_engine::StrategyRef::DriftScript {
+            path: script.clone(),
+        };
+        let params = HashMap::from([("hot".into(), dec!(7))]);
+        let strategy =
+            apexes_strategy::drift_dsl::DriftScriptStrategy::from_file_with_scoped_checkpoints(
+                &script,
+                params.clone(),
+                &config.instruments,
+            )
+            .unwrap();
+        let identity = StateIdentity {
+            strategy: "scoped-drift".into(),
+            revision: "1".into(),
+            config_sha256: "a".repeat(64),
+            scope: "testnet:owner:BTCUSDT,ETHUSDT".into(),
+            payload_version: 1,
+        };
+        let cursor = StateCursor {
+            ordinal: 1,
+            observed_at: chrono::DateTime::from_timestamp(1_800_000_000, 123).unwrap(),
+        };
+        let bytes = capture(&strategy, identity.clone(), cursor).unwrap();
+        let receipt = verify_checkpoint(&bytes, &identity, cursor).unwrap();
+        let selection = RecoverySelection::new("b".repeat(64), receipt.clone(), params).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("apexes-engine-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("receipt.json");
+        selection.write_new(&path).unwrap();
+
+        let StrategyStartup::Restore {
+            mut active,
+            candidate,
+            selection: loaded,
+        } = load_startup_strategy(&config, Some(&path)).unwrap()
+        else {
+            panic!("explicit selection must not use a legacy strategy");
+        };
+        assert_eq!(loaded.receipt(), &receipt);
+        assert_eq!(active.checkpoint_schema_version(), Some(1));
+        assert_eq!(candidate.checkpoint_schema_version(), Some(1));
+        active.set_param("hot", dec!(99)).unwrap();
+        assert_eq!(candidate.current_params()["hot"], dec!(7));
+        assert_eq!(capture(&candidate, identity, cursor).unwrap(), bytes);
+        let StrategyStartup::Legacy(legacy) = load_startup_strategy(&config, None).unwrap() else {
+            panic!("absent selection must retain the legacy loader");
+        };
+        assert_eq!(legacy.checkpoint_schema_version(), None);
+        config.mode = SessionMode::Paper;
+        assert!(matches!(
+            load_startup_strategy(&config, Some(&path)),
+            Err(EngineError::UnsupportedStrategyRecovery)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
