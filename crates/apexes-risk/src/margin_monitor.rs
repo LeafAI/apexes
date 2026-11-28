@@ -37,6 +37,21 @@ impl MarginMonitor {
         }
     }
 
+    pub fn inspect_checkpoint(&self) -> Result<crate::MarginStateSnapshot, crate::RiskStateError> {
+        if self.tripped_symbols.len() > 128 {
+            return Err(crate::RiskStateError::Invalid);
+        }
+        let mut tripped_symbols = self.tripped_symbols.iter().cloned().collect::<Vec<_>>();
+        tripped_symbols.sort();
+        let snapshot = crate::MarginStateSnapshot {
+            version: 1,
+            warning_threshold: self.warning_threshold,
+            tripped_symbols,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     pub fn split(self) -> (MarginMonitorPreTradeAdapter, MarginMonitorPositionAdapter) {
         let shared = Arc::new(Mutex::new(self));
         (
@@ -95,6 +110,16 @@ impl MarginMonitor {
 pub struct MarginMonitorPreTradeAdapter(Arc<Mutex<MarginMonitor>>);
 
 impl PreTradeCheck for MarginMonitorPreTradeAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Margin)
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,
@@ -111,6 +136,16 @@ impl PreTradeCheck for MarginMonitorPreTradeAdapter {
 pub struct MarginMonitorPositionAdapter(Arc<Mutex<MarginMonitor>>);
 
 impl PositionMonitor for MarginMonitorPositionAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+            .map(crate::RegisteredRiskState::Margin)
+    }
+
     fn on_tick(
         &mut self,
         margin_status: &HashMap<String, PositionMarginStatus>,

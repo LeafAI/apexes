@@ -12,6 +12,12 @@ use apexes_strategy::PositionMarginStatus;
 use crate::error::RiskViolation;
 
 pub trait PositionMonitor: Send + Sync {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        Ok(crate::RegisteredRiskState::Unsupported)
+    }
+
     fn on_tick(
         &mut self,
         margin_status: &HashMap<String, PositionMarginStatus>,

@@ -18,6 +18,12 @@ use crate::pre_trade::PreTradeCheck;
 pub struct SelfTradePreventer;
 
 impl PreTradeCheck for SelfTradePreventer {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        Ok(crate::RegisteredRiskState::SelfTradePreventer { version: 1 })
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,

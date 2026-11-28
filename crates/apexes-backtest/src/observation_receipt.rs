@@ -396,6 +396,7 @@ mod tests {
             pre_trade: vec![],
             in_trade: vec![],
             position_monitor_count: 0,
+            position: None,
             market_condition_monitor_count: 0,
         });
         assert!(captured.encode_durable().is_err());

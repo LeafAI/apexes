@@ -134,10 +134,19 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         max_daily_trade_count: Some(2),
         ..Default::default()
     };
+    let (margin_pre, margin_position) = apexes_risk::MarginMonitor::new(dec!(1.5)).split();
     let checker = Arc::new(
-        apexes_risk::CompositeRiskChecker::new().with_pre_trade_check(Box::new(
-            apexes_risk::LimitChecker::new(risk_limits.clone()),
-        )),
+        apexes_risk::CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(apexes_risk::LimitChecker::new(
+                risk_limits.clone(),
+            )))
+            .with_pre_trade_check(Box::new(apexes_risk::SymbolVenueList::new(
+                apexes_risk::ListMode::Whitelist(["BTCUSDT".to_string()].into_iter().collect()),
+                apexes_risk::ListMode::Whitelist([Venue::Binance].into_iter().collect()),
+            )))
+            .with_pre_trade_check(Box::new(apexes_risk::SelfTradePreventer))
+            .with_pre_trade_check(Box::new(margin_pre))
+            .with_position_monitor(Box::new(margin_position)),
     );
     registry
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
@@ -296,8 +305,26 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert!(!captured.margin_monitor_unqualified);
     assert_eq!(registered, &checker.inspect_registered_state().unwrap());
     assert!(
-        matches!(&registered.pre_trade[..], [apexes_risk::RegisteredRiskState::Limits(s)]
+        matches!(&registered.pre_trade[0], apexes_risk::RegisteredRiskState::Limits(s)
         if s.trade_count==1 && s.traded_volume==dec!(1) && s.limits==risk_limits)
+    );
+    assert_eq!(registered.pre_trade.len(), 4);
+    assert!(
+        matches!(&registered.pre_trade[1], apexes_risk::RegisteredRiskState::SymbolVenueList(s)
+        if s.symbols == apexes_risk::ListState::Whitelist(vec!["BTCUSDT".into()])
+        && s.venues == apexes_risk::ListState::Whitelist(vec![Venue::Binance]))
+    );
+    assert_eq!(
+        registered.pre_trade[2],
+        apexes_risk::RegisteredRiskState::SelfTradePreventer { version: 1 }
+    );
+    assert!(
+        matches!(&registered.pre_trade[3], apexes_risk::RegisteredRiskState::Margin(s)
+        if s.warning_threshold == dec!(1.5) && s.tripped_symbols.is_empty())
+    );
+    assert_eq!(
+        registered.position.as_ref().unwrap(),
+        &vec![registered.pre_trade[3].clone()]
     );
     assert_eq!(captured.receipt.clock, ObservationClock::SourceAvailability);
     assert_eq!(captured.receipt.predecessor, selection.receipt().cursor);

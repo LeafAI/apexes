@@ -95,7 +95,7 @@ impl CompositeRiskChecker {
         {
             return Err(E::Invalid);
         }
-        Ok(crate::RegisteredRiskSnapshot {
+        let snapshot = crate::RegisteredRiskSnapshot {
             version: 1,
             pre_trade: pre
                 .iter()
@@ -106,8 +106,21 @@ impl CompositeRiskChecker {
                 .map(|m| m.inspect_registered_state())
                 .collect::<Result<_, _>>()?,
             position_monitor_count: position.len(),
+            position: if position.is_empty() {
+                None
+            } else {
+                Some(
+                    position
+                        .iter()
+                        .map(|m| m.inspect_registered_state())
+                        .collect::<Result<_, _>>()?,
+                )
+            },
+
             market_condition_monitor_count: market.len(),
-        })
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Runs every registered `PreTradeCheck`, collecting every
@@ -394,6 +407,75 @@ mod tests {
         );
         assert_eq!(captured.pre_trade[2], captured.in_trade[0]);
         assert_eq!(captured, composite.inspect_registered_state().unwrap());
+    }
+
+    #[test]
+    fn registered_capture_preserves_config_and_actual_margin_trips() {
+        use crate::{
+            ListMode, ListState, MarginMonitor, RegisteredRiskState, SelfTradePreventer,
+            SymbolVenueList,
+        };
+        let (pre, position) = MarginMonitor::new(dec!(1.5)).split();
+        let composite = CompositeRiskChecker::new()
+            .with_pre_trade_check(Box::new(SymbolVenueList::new(
+                ListMode::Whitelist(
+                    ["ETHUSDT".to_string(), "BTCUSDT".to_string()]
+                        .into_iter()
+                        .collect(),
+                ),
+                ListMode::Blacklist([Venue::Okx, Venue::Binance].into_iter().collect()),
+            )))
+            .with_pre_trade_check(Box::new(SelfTradePreventer))
+            .with_pre_trade_check(Box::new(pre))
+            .with_position_monitor(Box::new(position));
+        composite
+            .on_tick(&HashMap::from([
+                (
+                    "ETHUSDT".into(),
+                    PositionMarginStatus {
+                        margin_ratio: Some(dec!(1.1)),
+                        liquidation_price: None,
+                    },
+                ),
+                (
+                    "BTCUSDT".into(),
+                    PositionMarginStatus {
+                        margin_ratio: Some(dec!(1.4)),
+                        liquidation_price: None,
+                    },
+                ),
+            ]))
+            .unwrap_err();
+        let state = composite.inspect_registered_state().unwrap();
+        assert!(!state.has_unsupported_slots());
+        assert!(
+            matches!(&state.pre_trade[0], RegisteredRiskState::SymbolVenueList(s)
+            if s.symbols == ListState::Whitelist(vec!["BTCUSDT".into(),"ETHUSDT".into()])
+            && s.venues == ListState::Blacklist(vec![Venue::Binance,Venue::Okx]))
+        );
+        assert_eq!(
+            state.pre_trade[1],
+            RegisteredRiskState::SelfTradePreventer { version: 1 }
+        );
+        assert!(matches!(&state.pre_trade[2], RegisteredRiskState::Margin(s)
+            if s.warning_threshold==dec!(1.5) && s.tripped_symbols==vec!["BTCUSDT","ETHUSDT"]));
+        assert_eq!(
+            state.position.as_ref().unwrap(),
+            &vec![state.pre_trade[2].clone()]
+        );
+        assert_eq!(state, composite.inspect_registered_state().unwrap());
+        let mut old = state.clone();
+        old.position = None;
+        assert!(old.has_unsupported_slots());
+        old.validate().unwrap();
+        let mut invalid = state.clone();
+        invalid.position_monitor_count = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = state;
+        invalid
+            .in_trade
+            .push(RegisteredRiskState::SelfTradePreventer { version: 1 });
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
