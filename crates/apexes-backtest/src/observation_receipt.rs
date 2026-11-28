@@ -1,6 +1,6 @@
 //! Offline ordered observation receipt. A digest proves equality with
 //! independently retained records, not source completeness or capture.
-use apexes_core::{MarketEvent, Venue};
+use apexes_core::{Fill, FillId, MarketEvent, Venue};
 use apexes_strategy::checkpoint::StateCursor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -181,6 +181,15 @@ impl ObservationReceipt {
     }
 }
 
+/// Loop-local observation availability at successful ledger fill application.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillObservationPrefix {
+    pub fill_id: FillId,
+    /// Number of observations processed through price maintenance.
+    pub observations: usize,
+}
+
 /// Actual loop-local observations returned only after the existing
 /// checkpoint publication has acknowledged success. Coverage remains
 /// partial; this cannot prove upstream completeness or risk restoration.
@@ -205,6 +214,9 @@ pub struct CapturedObservations {
     /// Actual basic loop-local ledger maps; absent on legacy receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<crate::ledger_evidence::LedgerEvidence>,
+    /// Actual applied-fill order and observation prefix, absent on legacy captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_observation_prefixes: Option<Vec<FillObservationPrefix>>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
@@ -223,6 +235,27 @@ impl CapturedObservations {
             ledger.validate(&self.scope)?;
             if let Some(fees) = &ledger.fee_valuation {
                 fees.validate_through(self.receipt.through.observed_at)?;
+            }
+        }
+
+        if let Some(prefixes) = &self.fill_observation_prefixes {
+            let decisions = self
+                .ledger
+                .as_ref()
+                .and_then(|l| l.fee_valuation.as_ref())
+                .and_then(|f| f.decisions.as_deref())
+                .ok_or(ObservationError::Mismatch)?;
+            if prefixes.len() > crate::fee_evidence::MAX_DECISIONS
+                || prefixes.len() != decisions.len()
+                || prefixes
+                    .windows(2)
+                    .any(|w| w[0].observations > w[1].observations)
+                || prefixes
+                    .iter()
+                    .zip(decisions)
+                    .any(|(p, d)| p.fill_id != d.fill_id || p.observations > self.records.len())
+            {
+                return Err(ObservationError::Mismatch);
             }
         }
 
@@ -352,6 +385,7 @@ pub(crate) struct ObservationCapture {
     scope: Vec<(Venue, String)>,
     records: Vec<CompletedObservation>,
     bytes: usize,
+    fill_observation_prefixes: Option<Vec<FillObservationPrefix>>,
 }
 
 impl ObservationCapture {
@@ -366,6 +400,7 @@ impl ObservationCapture {
             scope,
             records: Vec::new(),
             bytes: 0,
+            fill_observation_prefixes: None,
         }
     }
 
@@ -399,6 +434,20 @@ impl ObservationCapture {
         Ok(())
     }
 
+    /// Called after every market or supplemental application path, before
+    /// another market event can update the ledger's conversion prices.
+    pub(crate) fn record_applied_fills(&mut self, fills: &[Fill]) -> Result<(), ObservationError> {
+        let prefixes = self.fill_observation_prefixes.get_or_insert_with(Vec::new);
+        if fills.len() > crate::fee_evidence::MAX_DECISIONS.saturating_sub(prefixes.len()) {
+            return Err(ObservationError::Capacity);
+        }
+        prefixes.extend(fills.iter().map(|fill| FillObservationPrefix {
+            fill_id: fill.id,
+            observations: self.records.len(),
+        }));
+        Ok(())
+    }
+
     pub(crate) fn finish(
         self,
         through: StateCursor,
@@ -420,6 +469,7 @@ impl ObservationCapture {
             market_monitor: None,
             margin_tiers: None,
             ledger: None,
+            fill_observation_prefixes: self.fill_observation_prefixes,
         })
     }
 }
@@ -536,6 +586,68 @@ mod tests {
             .verify(&captured.scope, &captured.records)
             .unwrap();
         assert_eq!(captured.receipt.clock, ObservationClock::ConsumerUtc);
+    }
+
+    #[test]
+    fn applied_fill_prefixes_track_completed_price_maintenance_not_fill_time() {
+        let mut capture =
+            ObservationCapture::new(cursor(10, 0), ObservationClock::SourceAvailability, scope());
+        let fill = |at_seconds| Fill {
+            id: FillId(uuid::Uuid::new_v4()),
+            order_id: apexes_core::OrderId(uuid::Uuid::new_v4()),
+            symbol: "BTCUSDT".into(),
+            venue: Venue::Binance,
+            side: apexes_core::Side::Buy,
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: at(at_seconds),
+            leverage: None,
+            margin_mode: None,
+        };
+        let before = fill(3);
+        capture
+            .record_applied_fills(std::slice::from_ref(&before))
+            .unwrap();
+        let first = trade(11, 1, 1);
+        capture.record(first.cursor, &first.event).unwrap();
+        let during = fill(1);
+        let supplemental = fill(0);
+        capture
+            .record_applied_fills(std::slice::from_ref(&during))
+            .unwrap();
+        capture
+            .record_applied_fills(std::slice::from_ref(&supplemental))
+            .unwrap();
+        let second = trade(12, 2, 2);
+        capture.record(second.cursor, &second.event).unwrap();
+        let later = fill(1);
+        capture
+            .record_applied_fills(std::slice::from_ref(&later))
+            .unwrap();
+        let captured = capture.finish(second.cursor).unwrap();
+        assert_eq!(
+            captured.fill_observation_prefixes.unwrap(),
+            vec![
+                FillObservationPrefix {
+                    fill_id: before.id,
+                    observations: 0
+                },
+                FillObservationPrefix {
+                    fill_id: during.id,
+                    observations: 1
+                },
+                FillObservationPrefix {
+                    fill_id: supplemental.id,
+                    observations: 1
+                },
+                FillObservationPrefix {
+                    fill_id: later.id,
+                    observations: 2
+                },
+            ]
+        );
     }
 
     #[test]

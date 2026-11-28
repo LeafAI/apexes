@@ -972,6 +972,50 @@ impl CoherentRecoverySelection {
             &crate::FillObservationAvailability,
         ),
     ) -> Result<(), CoherentInspectionError> {
+        self.compare_fill_observation_availability(
+            store,
+            ems_postgres_url,
+            instruments,
+            (evidence.0, evidence.1),
+            Some(evidence.2),
+        )
+        .await
+    }
+
+    /// Qualify the actual retained loop-local prefix against the selected
+    /// journal and independently selected scope and observation receipt.
+    /// Legacy captures are unqualified. This is not a callback receipt.
+    pub async fn inspect_retained_fill_observation_availability(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: (
+            &crate::ConversionScopeEvidence,
+            &crate::ObservationBoundaryEvidence,
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        self.compare_fill_observation_availability(
+            store,
+            ems_postgres_url,
+            instruments,
+            evidence,
+            None,
+        )
+        .await
+    }
+
+    async fn compare_fill_observation_availability(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: (
+            &crate::ConversionScopeEvidence,
+            &crate::ObservationBoundaryEvidence,
+        ),
+        supplied: Option<&crate::FillObservationAvailability>,
+    ) -> Result<(), CoherentInspectionError> {
         self.inspect_conversion_price_provenance(
             store,
             ems_postgres_url,
@@ -1006,7 +1050,22 @@ impl CoherentRecoverySelection {
             .ledger
             .as_ref()
             .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
-        evidence.2.compare(
+        let actual;
+        let witness = match supplied {
+            Some(witness) => witness,
+            None => {
+                actual = crate::FillObservationAvailability {
+                    version: 1,
+                    boundary: self.boundary.clone(),
+                    owner_fingerprint: self.predecessor.owner_fingerprint().into(),
+                    prefixes: capture
+                        .fill_observation_prefixes
+                        .ok_or(crate::LedgerContinuityError::FeeMismatch)?,
+                };
+                &actual
+            }
+        };
+        witness.compare(
             &self.boundary,
             self.predecessor.owner_fingerprint(),
             evidence.0,

@@ -361,6 +361,15 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let decisions = attribution.decisions.as_ref().unwrap();
     assert_eq!(decisions.len(), 1);
     let observed_fill_id = decisions[0].fill_id;
+    assert_eq!(
+        captured.fill_observation_prefixes.as_deref(),
+        Some(
+            &[apexes_live_trading::FillObservationPrefix {
+                fill_id: report.trades[0].id,
+                observations: 1,
+            }][..]
+        )
+    );
     assert_eq!(decisions[0].symbol, "BTCUSDT");
     assert_eq!(decisions[0].price, dec!(100));
     assert_eq!(decisions[0].fee, dec!(0));
@@ -492,6 +501,27 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             .is_err()
     );
 
+    let mut invalid_prefix = captured.clone();
+    invalid_prefix.fill_observation_prefixes.as_mut().unwrap()[0].observations = 2;
+    assert!(invalid_prefix.encode_durable().is_err());
+    invalid_prefix
+        .fill_observation_prefixes
+        .as_mut()
+        .unwrap()
+        .clear();
+    assert!(invalid_prefix.encode_durable().is_err());
+    let mut legacy = captured.clone();
+    legacy.fill_observation_prefixes = None;
+    let legacy_bytes = legacy.encode_durable().unwrap();
+    assert_eq!(
+        apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &legacy_bytes,
+            selection.receipt().cursor,
+            receipt.checkpoint.cursor,
+        )
+        .unwrap(),
+        legacy,
+    );
     let original = captured.encode_durable().unwrap();
     for damaged in [Some(vec![1u8]), None] {
         sqlx::query("UPDATE strategy_checkpoint_boundary SET capture=$1 WHERE singleton")
@@ -929,6 +959,15 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .unwrap();
     coherent
         .inspect_conversion_price_provenance(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            (&scope, &independent_observation_receipt),
+        )
+        .await
+        .unwrap();
+    coherent
+        .inspect_retained_fill_observation_availability(
             &mut store,
             &fixture.url,
             &instruments,
