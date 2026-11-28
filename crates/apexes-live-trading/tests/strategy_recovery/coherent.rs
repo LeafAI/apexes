@@ -1866,26 +1866,35 @@ async fn flat_boundary_at(
     let (manager, mut config, _) = fixture.manager(&registry).await;
     config.initial_balances.insert("BTC".into(), dec!(0));
     let instruments = config.instruments.clone();
+    let candidate = Probe::new(0);
+    let observed = candidate.observed.clone();
     let (stop, receiver) = oneshot::channel();
+    // Wait for the restored strategy to process the actual market event.
+    // The unified loop completes its current iteration before honoring
+    // stop; sleeping for a fixed time can stop during slow CI startup.
     let driver = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = stop.send(());
+        loop {
+            if !observed.lock().unwrap().is_empty() {
+                let _ = stop.send(());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     });
-    let (_, boundary, _) = tokio::time::timeout(
-        Duration::from_secs(5),
+    let boundary_result = tokio::time::timeout(
+        Duration::from_secs(20),
         live::run_live_trading_with_observation_capture_on_stop(
             config,
             &registry,
-            restore_startup(previous.clone(), Probe::new(0)),
+            restore_startup(previous.clone(), candidate),
             manager,
             futures::stream::empty(),
             receiver,
         ),
     )
-    .await
-    .unwrap()
-    .unwrap();
-    driver.await.unwrap();
+    .await;
+    driver.abort();
+    let (_, boundary, _) = boundary_result.unwrap().unwrap();
     let expected_cursor = StateCursor {
         ordinal: previous.receipt().cursor.ordinal + 1,
         observed_at: at,
