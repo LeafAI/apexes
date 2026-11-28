@@ -156,6 +156,12 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
         .unwrap();
     let (manager, mut config, health) = fixture.manager(&registry).await;
+    let mut independent_opening_balances = config
+        .initial_balances
+        .iter()
+        .map(|(a, v)| (a.clone(), *v))
+        .collect::<Vec<_>>();
+    independent_opening_balances.sort_by(|a, b| a.0.cmp(&b.0));
     let mut expected_ledger_balances = config.initial_balances.clone();
     *expected_ledger_balances.entry("BTC".into()).or_default() += dec!(1);
     *expected_ledger_balances.entry("USDT".into()).or_default() -= dec!(100);
@@ -848,6 +854,24 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             &instruments,
             (&exact_opening, &window, &exact_wallet, wallet_at),
             (&retained, &third_asset_rates),
+        )
+        .await
+        .unwrap();
+    let allocation = apexes_live_trading::OpeningTrackedAssetEvidence {
+        version: 1,
+        predecessor: exact_opening.predecessor.clone(),
+        owner_fingerprint: exact_opening.wallet.owner_fingerprint.clone(),
+        captured_at: exact_opening.wallet.window.finished_at,
+        balances: independent_opening_balances,
+    };
+    coherent
+        .inspect_external_fee_ownership(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &allocation),
         )
         .await
         .unwrap();
