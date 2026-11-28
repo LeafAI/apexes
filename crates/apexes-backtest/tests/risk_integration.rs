@@ -1773,6 +1773,9 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     };
     use apexes_backtest::lifecycle_archive::{LifecycleArchive, LifecycleArchivePolicy};
     use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
+    use apexes_backtest::submission_journal::{
+        RecoveredJournal, SubmissionJournalPolicy, SubmissionResult, SubmissionRoute,
+    };
     use apexes_strategy::{ParentOrderId, ParentOutcome, ParentOutcomeKind, ParentPhase};
     type Lifecycle = Vec<(
         chrono::DateTime<Utc>,
@@ -1970,6 +1973,17 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     for index in 0..10 {
         let registry = registry_for();
         let path = directory.0.join(format!("run-{index}.json"));
+        let journal_path = directory.0.join(format!("journal-{index}.jsonl"));
+        if index != 0 {
+            registry
+                .register::<_, ()>(
+                    (),
+                    SubmissionJournalPolicy {
+                        path: journal_path.clone(),
+                    },
+                )
+                .unwrap();
+        }
         if index != 0 {
             registry
                 .register::<_, ()>((), LifecycleArchivePolicy { path: path.clone() })
@@ -2077,6 +2091,20 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
             assert_eq!(*total, [dec!(1), dec!(2), dec!(2), dec!(4)][index]);
         }
         if index != 0 {
+            let journal = RecoveredJournal::load(&journal_path).unwrap();
+            assert!(journal.matches_report(&report).unwrap());
+            assert_eq!(journal.uncertain_attempts().count(), 0);
+            assert_eq!(journal.attempts.len(), 2);
+            for (index, row) in journal.attempts.iter().enumerate() {
+                assert_eq!(row.attempt.intent_id, index as u64 + 1);
+                assert_eq!(row.attempt.route, SubmissionRoute::EmsParent);
+                assert_eq!(
+                    row.result,
+                    Some(SubmissionResult::ParentReturned {
+                        parent_id: submitted[index].0
+                    })
+                );
+            }
             let recovered = LifecycleArchive::load_verified(&path, &report).unwrap();
             assert_eq!(recovered.last_intent_ordinal(), 2);
             for (fill_id, order_id, parent, intent, _) in &executions {
@@ -2144,6 +2172,15 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     let registry = apexes_core::registry::Registry::new();
     registry.register::<_, ()>((), manifest).unwrap();
     registry.register::<_, ()>((), policy).unwrap();
+    let failure_path = directory.0.join("failed-parents.jsonl");
+    registry
+        .register::<_, ()>(
+            (),
+            SubmissionJournalPolicy {
+                path: failure_path.clone(),
+            },
+        )
+        .unwrap();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let lifecycle = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
@@ -2166,5 +2203,16 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     assert!(observed.lock().unwrap().is_empty());
     assert!(lifecycle.lock().unwrap().is_empty());
     assert!(executions.lock().unwrap().is_empty());
+    let journal = RecoveredJournal::load(&failure_path).unwrap();
+    assert!(journal.matches_report(&report).unwrap());
+    assert_eq!(journal.attempts.len(), 2);
+    assert_eq!(journal.uncertain_attempts().count(), 2);
+    assert!(
+        journal
+            .attempts
+            .iter()
+            .all(|a| a.result == Some(SubmissionResult::UncertainError))
+    );
+
     assert_eq!(*failures.lock().unwrap(), vec!["BTCUSDT", "ETHUSDT"]);
 }

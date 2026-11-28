@@ -1293,9 +1293,26 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
         tick(1000),
         trade(1500, dec!(99), "maker"),
     ];
+    use apexes_backtest::submission_journal::{
+        RecoveredJournal, SubmissionJournalPolicy, SubmissionResult, SubmissionRoute,
+    };
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory =
+        Temp(std::env::temp_dir().join(format!("apexes-submit-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&directory.0).unwrap();
+    let path = directory.0.join("journal.jsonl");
     let mut previous = None;
-    for _ in 0..2 {
+    for index in 0..2 {
         let r = registry(&events, "direct-order-outcomes");
+        if index == 1 {
+            r.register::<_, ()>((), SubmissionJournalPolicy { path: path.clone() })
+                .unwrap();
+        }
         r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
             .unwrap();
         r.register::<Arc<CompositeRiskChecker>, ()>(
@@ -1346,6 +1363,41 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
         assert_eq!(report.trades.len(), 2);
         assert_eq!(seen[3].4, Some(report.trades[0].order_id));
         assert_eq!(seen[5].4, Some(report.trades[1].order_id));
+        if index == 1 {
+            let recovered = RecoveredJournal::load(&path).unwrap();
+            assert!(recovered.matches_report(&report).unwrap());
+            assert_eq!(recovered.uncertain_attempts().count(), 0);
+            assert_eq!(recovered.attempts.len(), 2);
+            for (attempt, expected_id, ms, status, trade) in [
+                (
+                    &recovered.attempts[0],
+                    1,
+                    500,
+                    OrderStatus::Filled,
+                    &report.trades[0],
+                ),
+                (
+                    &recovered.attempts[1],
+                    4,
+                    1000,
+                    OrderStatus::New,
+                    &report.trades[1],
+                ),
+            ] {
+                assert_eq!(attempt.attempt.intent_id, expected_id);
+                assert_eq!(attempt.attempt.at, at(ms));
+                assert_eq!(attempt.attempt.route, SubmissionRoute::Direct);
+                assert_eq!(
+                    attempt.result,
+                    Some(SubmissionResult::OrderReturned {
+                        order_id: trade.order_id.0,
+                        status
+                    })
+                );
+            }
+        } else {
+            assert!(!path.exists());
+        }
         let digest = canonical_report_sha256(&report).unwrap();
         if let Some((previous_seen, previous_digest)) = &previous {
             assert_eq!(&*seen, previous_seen);
@@ -1381,8 +1433,24 @@ async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
             self.seen.lock().unwrap().push(result);
         }
     }
+    use apexes_backtest::submission_journal::{
+        RecoveredJournal, SubmissionJournalPolicy, SubmissionResult,
+    };
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory =
+        Temp(std::env::temp_dir().join(format!("apexes-submit-errors-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&directory.0).unwrap();
+    let events = vec![trade(0, dec!(100), "no-book")];
     for strict in [false, true] {
-        let r = Registry::new();
+        let r = registry(&events, "direct-submission-evidence");
+        let path = directory.0.join(format!("{strict}.jsonl"));
+        r.register::<_, ()>((), SubmissionJournalPolicy { path: path.clone() })
+            .unwrap();
         if strict {
             r.register::<_, ()>(
                 (),
@@ -1397,7 +1465,7 @@ async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
         let report = run_backtest(
             configuration(AssetClass::Spot, None),
             &r,
-            InMemoryMarketDataSource::new(vec![trade(0, dec!(100), "no-book")]),
+            InMemoryMarketDataSource::new(events.clone()),
             Probe { seen: seen.clone() },
         )
         .await
@@ -1405,6 +1473,21 @@ async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
         assert!(report.trades.is_empty());
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
+        let recovered = RecoveredJournal::load(&path).unwrap();
+        assert!(recovered.matches_report(&report).unwrap());
+        assert_eq!(recovered.attempts.len(), 1);
+        assert_eq!(recovered.uncertain_attempts().count(), usize::from(strict));
+        assert_eq!(
+            recovered.attempts[0].result,
+            Some(if strict {
+                SubmissionResult::UncertainError
+            } else {
+                SubmissionResult::OrderReturned {
+                    order_id: seen[0].1.unwrap().0,
+                    status: OrderStatus::Cancelled,
+                }
+            })
+        );
         if strict {
             assert_eq!(seen[0], ("order_rejected".into(), None));
         } else {
