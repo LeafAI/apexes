@@ -7,7 +7,12 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 
 use super::OrderStore;
+
+#[path = "coherent_checkpoint.rs"]
+mod coherent_checkpoint;
 use crate::OmsError;
+pub use coherent_checkpoint::CoherentCheckpointReceipt;
+pub(crate) use coherent_checkpoint::CompletedPrefix;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointStoreError {
@@ -27,6 +32,10 @@ pub enum CheckpointStoreError {
     DatabaseScope,
     #[error("checkpoint startup requires a fresh reconciled managed session")]
     StartupPhase,
+    #[error("checkpoint boundary is not quiescent or has unverified lifecycle progress")]
+    Boundary,
+    #[error("checkpoint journal differs from its committed boundary")]
+    JournalChanged,
     #[error("checkpoint receipt does not match current head")]
     Conflict,
     #[error("checkpoint publication would change identity or regress the observation cursor")]
@@ -242,6 +251,7 @@ async fn claim_head(
         .await?
         .ok_or(CheckpointStoreError::Missing)?;
     require_unclaimed(tx).await?;
+    coherent_checkpoint::require_absent(tx).await?;
     require_empty_execution_history(tx).await?;
     let receipt = serde_json::to_string(expected).map_err(|_| CheckpointStoreError::Corrupt)?;
     let result = sqlx::query(
@@ -286,6 +296,7 @@ impl OrderStore {
         )
         .execute(pool)
         .await?;
+        coherent_checkpoint::migrate(pool).await?;
         Ok(())
     }
 
@@ -324,6 +335,7 @@ impl OrderStore {
         let mut tx = connection.begin().await?;
         let result = async {
             require_unclaimed(&mut tx).await?;
+            coherent_checkpoint::require_absent(&mut tx).await?;
             select_head(&mut tx, owner, None).await?;
             Ok(())
         }
@@ -371,7 +383,13 @@ impl OrderStore {
         let receipt = serde_json::to_string(&next).map_err(|_| CheckpointStoreError::Corrupt)?;
         let (owner, connection) = self.checkpoint_connection()?;
         let mut tx = connection.begin().await?;
-        let written = write_head(&mut tx, owner, previous, &next, &receipt, envelope).await;
+        let written = async {
+            // A plain publication must never detach a coherent execution
+            // receipt from its state. No downgrade/replacement API yet.
+            coherent_checkpoint::require_absent(&mut tx).await?;
+            write_head(&mut tx, owner, previous, &next, &receipt, envelope).await
+        }
+        .await;
         finish(tx, written).await?;
         Ok(next)
     }

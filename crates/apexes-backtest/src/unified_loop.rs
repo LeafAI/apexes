@@ -306,6 +306,13 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         _ => None,
     };
 
+    // This opt-in witness counts only market observations whose full
+    // synchronous decision/attempt path returned. Supplemental callback
+    // progress is independently checked by the managed executor.
+    let checkpoint_predecessor = executor.checkpoint_predecessor();
+    let mut checkpoint_cursor = checkpoint_predecessor.as_ref().map(|p| p.cursor);
+    let mut checkpoint_invalid = arrivals.is_some() || latency_model.is_some();
+
     loop {
         // Polled at the top of each iteration -- NOT as a
         // `tokio::select!` arm. Both `run_paper_trading` and
@@ -1108,6 +1115,21 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     }
                 }
 
+                if let Some(cursor) = &mut checkpoint_cursor {
+                    // No ambiguous regressions or pre-availability bars.
+                    // Equal logical times are legal for a later ordinal.
+                    if timestamp < cursor.observed_at
+                        || timestamp < crate::market_data_source::observation_timestamp(&event) {
+                        checkpoint_invalid = true;
+                    }
+                    if let Some(ordinal) = cursor.ordinal.checked_add(1) {
+                        cursor.ordinal = ordinal;
+                        cursor.observed_at = timestamp;
+                    } else {
+                        checkpoint_invalid = true;
+                    }
+                }
+
                 if let Some(handle) = &mut control {
                     let drain_result = handle.drain_commands(&mut strategy);
                     if drain_result.stop_requested {
@@ -1262,6 +1284,22 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
 
     if let Some(queue) = &arrivals {
         queue.notify_expiry(&mut strategy);
+    }
+
+    if let (Some(previous), Some(cursor)) = (checkpoint_predecessor, checkpoint_cursor) {
+        if checkpoint_invalid || cursor.ordinal <= previous.cursor.ordinal {
+            return Err(ApexesError::InvalidBacktestConfig {
+                reason: "no valid completed observation boundary for checkpoint publication".into(),
+            });
+        }
+        let envelope =
+            apexes_strategy::checkpoint::capture(&strategy, previous.identity.clone(), cursor)
+                .map_err(|error| ApexesError::InvalidBacktestConfig {
+                    reason: format!("completed strategy checkpoint capture refused: {error}"),
+                })?;
+        executor
+            .publish_completed_checkpoint(&previous, cursor, correlation.last_intent(), &envelope)
+            .await?;
     }
 
     if let Some(evidence) = lifecycle_evidence {

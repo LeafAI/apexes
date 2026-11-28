@@ -63,6 +63,10 @@ impl LifecycleCorrelation {
         }
     }
 
+    pub(crate) fn last_intent(&self) -> u64 {
+        self.next
+    }
+
     pub(crate) fn allocate(&mut self) -> Option<IntentId> {
         self.next = self.next.checked_add(1)?;
         Some(IntentId(self.next))

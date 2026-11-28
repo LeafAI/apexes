@@ -33,7 +33,7 @@ use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
 use crate::order_executor_adapter::{
-    LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor,
+    LiveLiquidationPolicy, LiveSupplementalFillSource, OrderManagerExecutor, StopCheckpoint,
 };
 use crate::strategy_recovery::{StrategyStartup, event_after_checkpoint};
 
@@ -212,9 +212,81 @@ pub async fn run_live_trading_with_startup<S: Strategy>(
     config: LiveTradingConfig,
     registry: &Registry,
     startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+) -> Result<LiveTradingReport, ApexesError> {
+    run_live_trading_inner(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        None,
+    )
+    .await
+}
+
+/// Explicit library-only opt-in to one coherent stop checkpoint after
+/// the existing single-use restoration. Refuses legacy startup and
+/// nonquiescent execution; no automatic repeatable recovery is enabled.
+/// Retain the returned receipt independently of the database.
+pub async fn run_live_trading_with_checkpoint_on_stop<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+) -> Result<(LiveTradingReport, apexes_oms::CoherentCheckpointReceipt), ApexesError> {
+    let StrategyStartup::Restore { selection, .. } = &startup else {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "coherent checkpoint requires explicit restored startup".into(),
+        });
+    };
+    let request = Arc::new(StopCheckpoint {
+        previous: selection.receipt().clone(),
+        published: Default::default(),
+    });
+    let gate = config.kill_switch.clone();
+    let result = run_live_trading_inner(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        Some(request.clone()),
+    )
+    .await;
+    if result.is_err()
+        && let Some(gate) = gate
+    {
+        gate.fault("coherent strategy checkpoint stop failed");
+    }
+    let report = result?;
+    let receipt = request
+        .published
+        .lock()
+        .map_err(|_| ApexesError::InvalidBacktestConfig {
+            reason: "coherent checkpoint receipt lock poisoned".into(),
+        })?
+        .take()
+        .ok_or_else(|| ApexesError::InvalidBacktestConfig {
+            reason: "no acknowledged coherent checkpoint".into(),
+        })?;
+    Ok((report, receipt))
+}
+
+async fn run_live_trading_inner<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
     mut order_manager: OrderManager,
     exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
     stop_signal: oneshot::Receiver<()>,
+    stop_checkpoint: Option<Arc<StopCheckpoint>>,
 ) -> Result<LiveTradingReport, ApexesError> {
     if config.reconcile_interval.is_zero() {
         return Err(ApexesError::InvalidBacktestConfig {
@@ -384,7 +456,8 @@ pub async fn run_live_trading_with_startup<S: Strategy>(
     let exchange_updates = exchange_updates.chain(futures::stream::pending());
 
     let live_executor =
-        OrderManagerExecutor::with_submission_gate(Arc::clone(&order_manager), submission_gate);
+        OrderManagerExecutor::with_submission_gate(Arc::clone(&order_manager), submission_gate)
+            .with_stop_checkpoint(stop_checkpoint);
     tracing::info!(intent_scope = %live_executor.intent_scope(), "live strategy intent correlation scope");
     let executor: Arc<dyn OrderExecutor> = Arc::new(live_executor);
     let liquidation_policy = Arc::new(LiveLiquidationPolicy::new(config.auto_derisk_live));
