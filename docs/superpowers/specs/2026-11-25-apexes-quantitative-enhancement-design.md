@@ -163,3 +163,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Receipt-bound offline transition witness](2026-11-29-apexes-receipt-bound-transition-design.md) independently reinspects opening and closing collection receipts, derives all wallet and allocation inputs from them, reruns the full offline accounting, observation and risk qualification, and binds both selected receipt digests without granting startup authority.
 
 [Receipt-bound successor continuity](2026-11-29-apexes-receipt-bound-successor-design.md) independently requalifies both linked historical runs and their receipt-bound witnesses before comparing exact wallets, flat tracked allocation, ordered complete collection intervals and disjoint execution identities. No startup authorization or risk carryover is inferred.
+
+[Cross-boundary risk state continuity](2026-11-29-apexes-cross-boundary-risk-continuity-design.md) retains actual pre-event registered and separate market risk state and independently compares the successor opening to exact prior closing state within the selected collection chronology. No live carryover or restart authority is inferred.

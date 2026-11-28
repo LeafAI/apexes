@@ -92,7 +92,8 @@ pub use recovery_transition::{
 mod recovery_successor;
 pub use recovery_successor::{
     ReceiptBoundSuccessorRun, SuccessorContinuityError, SuccessorInspectionError, SuccessorRun,
-    inspect_offline_successor, inspect_receipt_bound_successor,
+    inspect_offline_successor, inspect_receipt_bound_risk_successor,
+    inspect_receipt_bound_successor,
 };
 
 mod recovery_collection;

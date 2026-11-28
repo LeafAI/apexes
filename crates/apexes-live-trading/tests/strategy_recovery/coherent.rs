@@ -403,6 +403,20 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         &vec![("BTCUSDT".into(), table.clone())]
     );
 
+    let opening_risk = captured.opening_risk.as_ref().unwrap();
+    assert_eq!(
+        opening_risk.registered_risk.as_ref(),
+        Some(&candidate_snapshot)
+    );
+    assert_ne!(opening_risk.registered_risk.as_ref(), Some(registered));
+    assert!(
+        opening_risk
+            .market_monitor
+            .as_ref()
+            .unwrap()
+            .symbols
+            .is_empty()
+    );
     assert_eq!(registered, &checker.inspect_registered_state().unwrap());
     assert!(
         matches!(&registered.pre_trade[0], apexes_risk::RegisteredRiskState::Limits(s)
@@ -2961,6 +2975,49 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     assert!(check_pair!(&ae, &aw, &"0".repeat(64), &bw, bw.sha256()).is_err());
     assert!(check_pair!(&ae, &aw, aw.sha256(), &aw, aw.sha256()).is_err());
 
+    let capture = b
+        .selection
+        .inspect_durable_capture(&mut second_store, &second.url)
+        .await
+        .unwrap();
+    let independent = capture.opening_risk.as_ref().unwrap().clone();
+    assert!(independent.registered_risk.is_none());
+    assert!(independent.market_monitor.is_none());
+    macro_rules! check_risk_pair {
+        ($opening:expr) => {
+            live::inspect_receipt_bound_risk_successor(
+                live::ReceiptBoundSuccessorRun {
+                    selection: &a.selection,
+                    store: &mut first_store,
+                    ems_postgres_url: &first.url,
+                    strategies: (Probe::new(0), Probe::new(0)),
+                    evidence: &ae,
+                    witness: &aw,
+                    witness_sha256: aw.sha256(),
+                },
+                live::ReceiptBoundSuccessorRun {
+                    selection: &b.selection,
+                    store: &mut second_store,
+                    ems_postgres_url: &second.url,
+                    strategies: (Probe::new(0), Probe::new(0)),
+                    evidence: &be,
+                    witness: &bw,
+                    witness_sha256: bw.sha256(),
+                },
+                $opening,
+            )
+            .await
+        };
+    }
+    check_risk_pair!(&independent).unwrap();
+    let mut changed = independent.clone();
+    changed.captured_at += chrono::TimeDelta::milliseconds(1);
+    assert!(matches!(
+        check_risk_pair!(&changed),
+        Err(live::SuccessorInspectionError::Link(
+            live::SuccessorContinuityError::RiskState
+        ))
+    ));
     // A later valid collection of the prior boundary cannot prove
     // continuity into the already completed successor opening interval.
     let late = a
