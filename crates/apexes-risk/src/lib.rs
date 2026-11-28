@@ -47,3 +47,5 @@ pub use state_inspection::{
 
 mod shared_inspection;
 pub use shared_inspection::SharedMonitorRef;
+
+mod offline_qualification;

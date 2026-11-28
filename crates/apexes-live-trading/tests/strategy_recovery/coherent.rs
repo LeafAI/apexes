@@ -134,8 +134,9 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         max_daily_trade_count: Some(2),
         ..Default::default()
     };
-    let (margin_pre, margin_position) = apexes_risk::MarginMonitor::new(dec!(1.5)).split();
-    let checker = Arc::new(
+    let make_checker = || {
+        let (margin_pre, margin_position) = apexes_risk::MarginMonitor::new(dec!(1.5)).split();
+
         apexes_risk::CompositeRiskChecker::new()
             .with_pre_trade_check(Box::new(apexes_risk::LimitChecker::new(
                 risk_limits.clone(),
@@ -146,8 +147,11 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             )))
             .with_pre_trade_check(Box::new(apexes_risk::SelfTradePreventer))
             .with_pre_trade_check(Box::new(margin_pre))
-            .with_position_monitor(Box::new(margin_position)),
-    );
+            .with_position_monitor(Box::new(margin_position))
+    };
+    let checker = Arc::new(make_checker());
+    let candidate = make_checker();
+    let candidate_snapshot = candidate.inspect_registered_state().unwrap();
     registry
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
         .unwrap();
@@ -335,7 +339,7 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert_eq!(market.symbols[0].volatility.sample_count(), 1);
     assert_eq!(
         captured.margin_tiers.as_ref().unwrap(),
-        &vec![("BTCUSDT".into(), table)]
+        &vec![("BTCUSDT".into(), table.clone())]
     );
 
     assert_eq!(registered, &checker.inspect_registered_state().unwrap());
@@ -378,6 +382,64 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .await
         .unwrap();
     assert_eq!(recovered, captured);
+    let candidate_market = apexes_risk::MarketConditionMonitor::new(market_config.clone())
+        .inspect_checkpoint()
+        .unwrap();
+    let independent_scope = vec![(Venue::Binance, "BTCUSDT".to_string())];
+    let independent_tiers = vec![("BTCUSDT".to_string(), table)];
+    recovered
+        .qualify_offline_risk_candidate(
+            &independent_scope,
+            Some(&candidate_snapshot),
+            Some(&candidate_market),
+            Some(&independent_tiers),
+        )
+        .unwrap();
+    assert_eq!(
+        candidate_snapshot,
+        candidate.inspect_registered_state().unwrap()
+    );
+    assert!(
+        recovered
+            .qualify_offline_risk_candidate(
+                &independent_scope,
+                Some(registered),
+                Some(&candidate_market),
+                Some(&independent_tiers)
+            )
+            .is_err()
+    );
+    assert!(
+        recovered
+            .qualify_offline_risk_candidate(
+                &independent_scope,
+                Some(&candidate_snapshot),
+                None,
+                Some(&independent_tiers)
+            )
+            .is_err()
+    );
+    assert!(
+        recovered
+            .qualify_offline_risk_candidate(
+                &independent_scope,
+                Some(&candidate_snapshot),
+                Some(&candidate_market),
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        recovered
+            .qualify_offline_risk_candidate(
+                &[(Venue::Binance, "ETHUSDT".into())],
+                Some(&candidate_snapshot),
+                Some(&candidate_market),
+                Some(&independent_tiers)
+            )
+            .is_err()
+    );
+
     let original = captured.encode_durable().unwrap();
     for damaged in [Some(vec![1u8]), None] {
         sqlx::query("UPDATE strategy_checkpoint_boundary SET capture=$1 WHERE singleton")
