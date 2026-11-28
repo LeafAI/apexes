@@ -2984,8 +2984,8 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     assert!(independent.registered_risk.is_none());
     assert!(independent.market_monitor.is_none());
     macro_rules! check_risk_pair {
-        ($opening:expr) => {
-            live::inspect_receipt_bound_risk_successor(
+        ($function:ident, $opening:expr) => {
+            live::$function(
                 live::ReceiptBoundSuccessorRun {
                     selection: &a.selection,
                     store: &mut first_store,
@@ -3009,15 +3009,38 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
             .await
         };
     }
-    check_risk_pair!(&independent).unwrap();
+    check_risk_pair!(inspect_receipt_bound_risk_successor, &independent).unwrap();
     let mut changed = independent.clone();
     changed.captured_at += chrono::TimeDelta::milliseconds(1);
     assert!(matches!(
-        check_risk_pair!(&changed),
+        check_risk_pair!(inspect_receipt_bound_risk_successor, &changed),
         Err(live::SuccessorInspectionError::Link(
             live::SuccessorContinuityError::RiskState
         ))
     ));
+    let receipt = check_risk_pair!(inspect_risk_bound_successor_receipt, &independent).unwrap();
+    let dir = std::env::temp_dir().join(format!("apexes-risk-successor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("successor.json");
+    receipt.write_new(&path).unwrap();
+    assert!(receipt.write_new(&path).is_err());
+    assert!(live::RiskBoundSuccessorReceipt::read(&path, &"0".repeat(64)).is_err());
+    let reopened = live::RiskBoundSuccessorReceipt::read(&path, receipt.sha256()).unwrap();
+    let requalified = check_risk_pair!(inspect_risk_bound_successor_receipt, &independent).unwrap();
+    reopened.compare(&requalified).unwrap();
+    assert!(check_risk_pair!(inspect_risk_bound_successor_receipt, &changed).is_err());
+    let bytes = std::fs::read(&path).unwrap();
+    let mut altered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    altered["body"]["next_witness_sha256"] = serde_json::json!("f".repeat(64));
+    let altered_path = dir.join("altered.json");
+    std::fs::write(&altered_path, serde_json::to_vec(&altered).unwrap()).unwrap();
+    assert!(live::RiskBoundSuccessorReceipt::read(&altered_path, receipt.sha256()).is_err());
+    let mut padded = bytes;
+    padded.push(b' ');
+    let noncanonical = dir.join("noncanonical.json");
+    std::fs::write(&noncanonical, padded).unwrap();
+    assert!(live::RiskBoundSuccessorReceipt::read(&noncanonical, receipt.sha256()).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
     // A later valid collection of the prior boundary cannot prove
     // continuity into the already completed successor opening interval.
     let late = a

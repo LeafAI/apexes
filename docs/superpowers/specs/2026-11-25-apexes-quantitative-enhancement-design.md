@@ -165,3 +165,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Receipt-bound successor continuity](2026-11-29-apexes-receipt-bound-successor-design.md) independently requalifies both linked historical runs and their receipt-bound witnesses before comparing exact wallets, flat tracked allocation, ordered complete collection intervals and disjoint execution identities. No startup authorization or risk carryover is inferred.
 
 [Cross-boundary risk state continuity](2026-11-29-apexes-cross-boundary-risk-continuity-design.md) retains actual pre-event registered and separate market risk state and independently compares the successor opening to exact prior closing state within the selected collection chronology. No live carryover or restart authority is inferred.
+
+[Durable risk-bound successor receipt](2026-11-29-apexes-risk-bound-successor-receipt-design.md) binds both complete historical checkpoint boundaries, independently selected receipt-bound transition witness digests and the exact opening risk snapshot digest and timestamp after full independent requalification. No startup authority is issued.
