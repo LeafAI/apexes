@@ -964,7 +964,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             leverage: intent.leverage,
                             margin_mode: intent.margin_mode,
                         };
-                        match ems.submit_algo_order(request).await {
+                        match ems.submit_correlated_algo_order(request, executor.intent_run_scope().zip(intent_id)).await {
                             Ok(parent_id) => {
                                 if let Some(journal)=submission_journal.as_deref_mut() {journal.parent_returned(parent_id)?;}
                                 trace.parent_accepted(parent_id);

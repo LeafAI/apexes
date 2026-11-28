@@ -22,6 +22,24 @@ impl IntentLink {
     }
 }
 
+/// Exact EMS scheduling identity, independent of capital allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildLink {
+    pub parent_id: apexes_strategy::ParentOrderId,
+    pub dispatch_id: uuid::Uuid,
+}
+
+impl ChildLink {
+    pub(crate) fn validate(self) -> Result<Self, crate::OmsError> {
+        if self.parent_id.0.is_nil() || self.dispatch_id.is_nil() {
+            return Err(crate::OmsError::InvalidRow {
+                reason: "invalid EMS child identity".into(),
+            });
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteIdentity {
     /// Actual client-ID lookup response, consistent with the stored exchange ID.
@@ -43,6 +61,7 @@ pub struct IdentityEvidence {
     pub local: Order,
     pub submission_state: SubmissionState,
     pub intent_link: Option<IntentLink>,
+    pub child_link: Option<ChildLink>,
     pub remote: RemoteIdentity,
 }
 
@@ -51,6 +70,7 @@ pub(crate) async fn observe(
     local: Order,
     submission_state: SubmissionState,
     intent_link: Option<IntentLink>,
+    child_link: Option<ChildLink>,
 ) -> IdentityEvidence {
     let remote = match gateway.query_order_by_client_id(&local).await {
         Ok(Some((exchange_order_id, status))) => {
@@ -76,6 +96,7 @@ pub(crate) async fn observe(
         local,
         submission_state,
         intent_link,
+        child_link,
         remote,
     }
 }
@@ -114,7 +135,14 @@ mod tests {
     async fn client_lookup_preserves_local_snapshot_and_distinguishes_conflict() {
         let gateway = MockExecutionGateway::new();
         let mut local = order();
-        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting, None).await;
+        let evidence = observe(
+            &gateway,
+            local.clone(),
+            SubmissionState::Submitting,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(evidence.remote, RemoteIdentity::NotFound);
         assert_eq!(evidence.local.exchange_order_id, None);
         gateway.force_register_exchange_order(
@@ -123,7 +151,14 @@ mod tests {
             OrderStatus::Filled,
             local.asset_class,
         );
-        let evidence = observe(&gateway, local.clone(), SubmissionState::Submitting, None).await;
+        let evidence = observe(
+            &gateway,
+            local.clone(),
+            SubmissionState::Submitting,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(
             evidence.remote,
             RemoteIdentity::Found {
@@ -135,28 +170,46 @@ mod tests {
         assert_eq!(evidence.local.filled_quantity, Decimal::ZERO);
         assert_eq!(evidence.submission_state, SubmissionState::Submitting);
         assert_eq!(
-            observe(&gateway, local.clone(), SubmissionState::Rejected, None)
-                .await
-                .remote,
+            observe(
+                &gateway,
+                local.clone(),
+                SubmissionState::Rejected,
+                None,
+                None
+            )
+            .await
+            .remote,
             RemoteIdentity::Conflict
         );
         local.exchange_order_id = Some("456".into());
         assert_eq!(
-            observe(&gateway, local.clone(), SubmissionState::Accepted, None)
-                .await
-                .remote,
+            observe(
+                &gateway,
+                local.clone(),
+                SubmissionState::Accepted,
+                None,
+                None
+            )
+            .await
+            .remote,
             RemoteIdentity::Conflict
         );
         local.exchange_order_id = Some("123".into());
         assert!(matches!(
-            observe(&gateway, local.clone(), SubmissionState::Accepted, None)
-                .await
-                .remote,
+            observe(
+                &gateway,
+                local.clone(),
+                SubmissionState::Accepted,
+                None,
+                None
+            )
+            .await
+            .remote,
             RemoteIdentity::Found { .. }
         ));
         gateway.force_register_exchange_order(local.id, "", OrderStatus::New, local.asset_class);
         assert_eq!(
-            observe(&gateway, local, SubmissionState::Uncertain, None)
+            observe(&gateway, local, SubmissionState::Uncertain, None, None)
                 .await
                 .remote,
             RemoteIdentity::Conflict
@@ -192,9 +245,15 @@ mod tests {
     #[tokio::test]
     async fn unsupported_lookup_is_unavailable_not_negative() {
         assert_eq!(
-            observe(&Unsupported, order(), SubmissionState::Uncertain, None)
-                .await
-                .remote,
+            observe(
+                &Unsupported,
+                order(),
+                SubmissionState::Uncertain,
+                None,
+                None
+            )
+            .await
+            .remote,
             RemoteIdentity::Unavailable
         );
     }

@@ -141,9 +141,18 @@ impl PostgresEms {
         sqlx::query(PARENT_ORDERS_TABLE_DDL).execute(&pool).await?;
         sqlx::query("ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS dispatch_pending BOOLEAN NOT NULL DEFAULT FALSE")
             .execute(&pool).await?;
+        sqlx::query("ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS intent_scope UUID, ADD COLUMN IF NOT EXISTS intent_ordinal NUMERIC(20,0), ADD COLUMN IF NOT EXISTS pending_dispatch_id UUID")
+            .execute(&pool).await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_scoped_intent ON parent_orders(intent_scope,intent_ordinal) WHERE intent_scope IS NOT NULL AND intent_ordinal IS NOT NULL")
+            .execute(&pool).await?;
         sqlx::query(PARENT_ORDER_CHILDREN_TABLE_DDL)
             .execute(&pool)
             .await?;
+        sqlx::query("ALTER TABLE parent_order_children ADD COLUMN IF NOT EXISTS dispatch_id UUID")
+            .execute(&pool)
+            .await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_children_dispatch ON parent_order_children(dispatch_id) WHERE dispatch_id IS NOT NULL")
+            .execute(&pool).await?;
 
         let state = Arc::new(SchedulingState::new(kill_switch));
         let (pov_tx, pov_rx) = mpsc::channel(POV_QUEUE_CAPACITY);
@@ -162,6 +171,38 @@ impl PostgresEms {
         Self::spawn_pov_worker(&ems, pov_rx);
         Self::spawn_health_monitor(&ems);
         Ok(ems)
+    }
+
+    /// Read-only lookup of a persisted strategy parent identity.
+    pub async fn parent_for_intent(
+        &self,
+        scope: Uuid,
+        id: apexes_strategy::IntentId,
+    ) -> Result<Option<ParentOrderId>, EmsError> {
+        if scope.is_nil() || id.0 == 0 {
+            return Err(EmsError::ParentAdmissionRejected {
+                reason: "invalid scoped parent intent".into(),
+            });
+        }
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM parent_orders WHERE intent_scope=$1 AND intent_ordinal=$2",
+        )
+        .bind(scope)
+        .bind(Decimal::from(id.0))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(ParentOrderId))
+    }
+
+    /// Exact pending dispatch identity, not evidence of successful submission.
+    pub async fn pending_dispatch(&self, parent: ParentOrderId) -> Result<Option<Uuid>, EmsError> {
+        let id: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT pending_dispatch_id FROM parent_orders WHERE id=$1 AND dispatch_pending",
+        )
+        .bind(parent.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.flatten())
     }
 
     fn scheduling_deps(&self) -> SchedulingDeps {
@@ -543,8 +584,9 @@ impl SchedulingDeps {
         }
         // A committed reservation prevents another dispatcher (including
         // after restart) from treating an interrupted child as unsent.
-        let reserved = sqlx::query("UPDATE parent_orders SET dispatch_pending = TRUE WHERE id = $1 AND status = 'Scheduling' AND NOT dispatch_pending AND filled_quantity + $2 <= total_quantity")
-            .bind(parent_id.0).bind(quantity).execute(&self.pool).await?;
+        let dispatch_id = Uuid::new_v4();
+        let reserved = sqlx::query("UPDATE parent_orders SET dispatch_pending = TRUE, pending_dispatch_id = $3 WHERE id = $1 AND status = 'Scheduling' AND NOT dispatch_pending AND filled_quantity + $2 <= total_quantity")
+            .bind(parent_id.0).bind(quantity).bind(dispatch_id).execute(&self.pool).await?;
         if reserved.rows_affected() != 1 || !self.state.allowed() {
             return Err(EmsError::SchedulingSuspended);
         }
@@ -557,7 +599,7 @@ impl SchedulingDeps {
         // this return value.
         let (child_order_id, _fills) = self
             .sink
-            .submit_allocated_child(parent_id, ChildOrderIntent {
+            .submit_dispatched_child(parent_id, dispatch_id, ChildOrderIntent {
                 symbol: row.symbol.clone(),
                 venue,
                 // See in_memory/routing.rs's Fixed-routing note (Task
@@ -598,23 +640,28 @@ impl SchedulingDeps {
             })?;
 
         sqlx::query(
-            "INSERT INTO parent_order_children (parent_order_id, child_order_id, sequence_number, created_at) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO parent_order_children (parent_order_id, child_order_id, sequence_number, created_at, dispatch_id) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(parent_id.0)
         .bind(child_order_id.0)
         .bind(sequence_number)
         .bind(Utc::now())
+        .bind(dispatch_id)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE parent_orders SET filled_quantity = filled_quantity + $2, updated_at = $3, dispatch_pending = FALSE WHERE id = $1",
+        let updated = sqlx::query(
+            "UPDATE parent_orders SET filled_quantity = filled_quantity + $2, updated_at = $3, dispatch_pending = FALSE, pending_dispatch_id = NULL WHERE id = $1 AND dispatch_pending AND pending_dispatch_id = $4",
         )
         .bind(parent_id.0)
         .bind(quantity)
         .bind(Utc::now())
+        .bind(dispatch_id)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(EmsError::SchedulingSuspended);
+        }
         tx.commit().await?;
 
         Ok(child_order_id)
@@ -667,7 +714,11 @@ impl SchedulingDeps {
 }
 
 impl PostgresEms {
-    async fn submit_parent(&self, request: AlgoOrderRequest) -> Result<ParentOrderId, EmsError> {
+    async fn submit_parent(
+        &self,
+        request: AlgoOrderRequest,
+        link: Option<(Uuid, apexes_strategy::IntentId)>,
+    ) -> Result<ParentOrderId, EmsError> {
         if !self.state.allowed() {
             return Err(EmsError::SchedulingSuspended);
         }
@@ -684,6 +735,19 @@ impl PostgresEms {
                 "PostgresEms: leveraged parent order received, but leverage/margin_mode \
                  are not persisted to parent_orders -- child orders will be spot-accounted"
             );
+        }
+        if let Some((scope, id)) = link {
+            if scope.is_nil() || id.0 == 0 {
+                return Err(EmsError::ParentAdmissionRejected {
+                    reason: "invalid scoped parent intent".into(),
+                });
+            }
+            let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM parent_orders WHERE intent_scope=$1 AND intent_ordinal=$2)").bind(scope).bind(Decimal::from(id.0)).fetch_one(&self.pool).await?;
+            if exists {
+                return Err(EmsError::ParentAdmissionRejected {
+                    reason: "scoped parent intent already exists".into(),
+                });
+            }
         }
         let parent_id = ParentOrderId(Uuid::new_v4());
         let now = Utc::now();
@@ -703,8 +767,8 @@ impl PostgresEms {
         // an unfunded scheduling parent. Audit is required to release it.
         self.sink.reserve_parent(parent_id, &request).await?;
         let row: ParentOrderRow = sqlx::query_as(
-            "INSERT INTO parent_orders (id, symbol, venue, side, total_quantity, filled_quantity, algo_spec, routing, status, failure_reason, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Scheduling', NULL, $9, $9) RETURNING *",
+            "INSERT INTO parent_orders (id, symbol, venue, side, total_quantity, filled_quantity, algo_spec, routing, status, failure_reason, created_at, updated_at, intent_scope, intent_ordinal)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Scheduling', NULL, $9, $9, $10, $11) RETURNING *",
         )
         .bind(parent_id.0)
         .bind(&request.symbol)
@@ -715,6 +779,8 @@ impl PostgresEms {
         .bind(algo_spec_json)
         .bind(routing_json)
         .bind(now)
+        .bind(link.map(|(scope,_)|scope))
+        .bind(link.map(|(_,id)|Decimal::from(id.0)))
         .fetch_one(&self.pool)
         .await?;
 
@@ -731,10 +797,18 @@ impl Ems for PostgresEms {
         &self,
         request: AlgoOrderRequest,
     ) -> Result<ParentOrderId, EmsError> {
+        self.submit_correlated_algo_order(request, None).await
+    }
+
+    async fn submit_correlated_algo_order(
+        &self,
+        request: AlgoOrderRequest,
+        link: Option<(Uuid, apexes_strategy::IntentId)>,
+    ) -> Result<ParentOrderId, EmsError> {
         if !self.state.trading_ready() {
             return Err(EmsError::SchedulingSuspended);
         }
-        let result = self.submit_parent(request).await;
+        let result = self.submit_parent(request, link).await;
         if result
             .as_ref()
             .is_err_and(|e| !matches!(e, EmsError::ParentAdmissionRejected { .. }))

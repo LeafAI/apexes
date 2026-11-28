@@ -56,6 +56,10 @@ pub trait OrderExecutor: Send + Sync {
 
     /// Optional strategy correlation at the actual submission boundary.
     /// Legacy/simulated executors retain the original submission path.
+    fn intent_run_scope(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
     async fn submit_correlated(
         &self,
         intent: &OrderIntent,
