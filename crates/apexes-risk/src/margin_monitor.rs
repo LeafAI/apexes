@@ -30,6 +30,17 @@ pub struct MarginMonitor {
 }
 
 impl MarginMonitor {
+    /// Only used by the private isolated offline reconstruction.
+    pub(crate) fn reconstruct_offline(
+        snapshot: &crate::MarginStateSnapshot,
+    ) -> Result<Self, crate::RiskStateError> {
+        snapshot.validate()?;
+        Ok(Self {
+            warning_threshold: snapshot.warning_threshold,
+            tripped_symbols: snapshot.tripped_symbols.iter().cloned().collect(),
+        })
+    }
+
     pub fn new(warning_threshold: Decimal) -> Self {
         Self {
             warning_threshold,
@@ -107,7 +118,7 @@ impl MarginMonitor {
     }
 }
 
-pub struct MarginMonitorPreTradeAdapter(Arc<Mutex<MarginMonitor>>);
+pub struct MarginMonitorPreTradeAdapter(pub(crate) Arc<Mutex<MarginMonitor>>);
 
 impl PreTradeCheck for MarginMonitorPreTradeAdapter {
     fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
@@ -139,7 +150,7 @@ impl PreTradeCheck for MarginMonitorPreTradeAdapter {
     }
 }
 
-pub struct MarginMonitorPositionAdapter(Arc<Mutex<MarginMonitor>>);
+pub struct MarginMonitorPositionAdapter(pub(crate) Arc<Mutex<MarginMonitor>>);
 
 impl PositionMonitor for MarginMonitorPositionAdapter {
     fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {

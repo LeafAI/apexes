@@ -81,6 +81,21 @@ struct DailyState {
 }
 
 impl LimitChecker {
+    /// Only used by the private isolated offline reconstruction.
+    pub(crate) fn reconstruct_offline(
+        snapshot: &crate::LimitStateSnapshot,
+    ) -> Result<Self, crate::RiskStateError> {
+        snapshot.validate()?;
+        Ok(Self {
+            limits: snapshot.limits.clone(),
+            daily_state: Mutex::new(DailyState {
+                day: snapshot.day,
+                trade_count: snapshot.trade_count,
+                traded_volume: snapshot.traded_volume,
+            }),
+        })
+    }
+
     pub fn new(limits: RiskLimits) -> Self {
         Self {
             limits,

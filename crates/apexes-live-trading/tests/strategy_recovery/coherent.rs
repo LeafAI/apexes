@@ -456,6 +456,34 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
             Some(&independent_tiers),
         )
         .unwrap();
+    recovered
+        .qualify_isolated_risk_restoration(
+            &independent_scope,
+            Some(&candidate_snapshot),
+            Some(&candidate_market),
+            Some(&independent_tiers),
+        )
+        .unwrap();
+    assert!(
+        recovered
+            .qualify_isolated_risk_restoration(
+                &independent_scope,
+                Some(registered),
+                Some(&candidate_market),
+                Some(&independent_tiers),
+            )
+            .is_err()
+    );
+    assert!(
+        recovered
+            .qualify_isolated_risk_restoration(
+                &independent_scope,
+                Some(&candidate_snapshot),
+                None,
+                Some(&independent_tiers),
+            )
+            .is_err()
+    );
     assert_eq!(
         candidate_snapshot,
         candidate.inspect_registered_state().unwrap()

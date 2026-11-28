@@ -36,6 +36,18 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
+    /// Only used by the private isolated offline reconstruction.
+    pub(crate) fn reconstruct_offline(
+        snapshot: &crate::CircuitStateSnapshot,
+    ) -> Result<Self, crate::RiskStateError> {
+        snapshot.validate()?;
+        Ok(Self {
+            limits: snapshot.limits.clone(),
+            tripped_symbols: snapshot.tripped_symbols.iter().cloned().collect(),
+            account_tripped: snapshot.account_tripped,
+        })
+    }
+
     pub fn new(limits: RiskLimits) -> Self {
         Self {
             limits,
@@ -203,7 +215,7 @@ impl PreTradeCheck for CircuitBreaker {
 
 /// Shares a [`CircuitBreaker`]'s state as a [`PreTradeCheck`]. See
 /// [`CircuitBreaker::split`].
-pub struct CircuitBreakerPreTradeAdapter(Arc<Mutex<CircuitBreaker>>);
+pub struct CircuitBreakerPreTradeAdapter(pub(crate) Arc<Mutex<CircuitBreaker>>);
 
 impl CircuitBreakerPreTradeAdapter {
     pub fn inspect_checkpoint(&self) -> Result<crate::CircuitStateSnapshot, crate::RiskStateError> {
@@ -246,7 +258,7 @@ impl PreTradeCheck for CircuitBreakerPreTradeAdapter {
 
 /// Shares a [`CircuitBreaker`]'s state as an [`InTradeMonitor`]. See
 /// [`CircuitBreaker::split`].
-pub struct CircuitBreakerInTradeAdapter(Arc<Mutex<CircuitBreaker>>);
+pub struct CircuitBreakerInTradeAdapter(pub(crate) Arc<Mutex<CircuitBreaker>>);
 
 impl InTradeMonitor for CircuitBreakerInTradeAdapter {
     fn shared_monitor(&self) -> Option<crate::SharedMonitorRef<'_>> {
