@@ -2554,3 +2554,196 @@ async fn opening_collection_requires_unclaimed_checkpoint_and_independent_alloca
     drop(store);
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn receipt_bound_transition_requires_both_selected_collections_and_full_qualification() {
+    use apexes_live_trading as live;
+    use apexes_oms::SpotEvidenceBalance;
+    let fixture = Fixture::new().await;
+    let selection = fixture.seed().await;
+    let mut store = fixture.store().await;
+    let instruments = base_config().instruments;
+    let strategy = serde_json::json!({"RustNative":{"name":"fixture"}});
+    let tracked: Vec<(String, rust_decimal::Decimal)> =
+        vec![("BTC".into(), dec!(0)), ("USDT".into(), dec!(100000))];
+    let source = CollectionSource {
+        terminal: None,
+        owner: OWNER_SHA256.into(),
+        open: 0,
+        wallet: Some(
+            tracked
+                .iter()
+                .map(|(asset, free)| {
+                    (
+                        asset.clone(),
+                        SpotEvidenceBalance {
+                            free: *free,
+                            locked: dec!(0),
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        calls: Default::default(),
+    };
+    let opening = selection
+        .collect_opening_spot_receipt(
+            &mut store,
+            &fixture.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    let alternate_opening = selection
+        .collect_opening_spot_receipt(
+            &mut store,
+            &fixture.url,
+            &source,
+            &strategy,
+            &instruments,
+            &tracked,
+        )
+        .await
+        .unwrap();
+    assert_ne!(opening.sha256(), alternate_opening.sha256());
+    assert_eq!(fixture.claim_count().await, 0);
+    drop(store);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut run = flat_boundary_at(&fixture, selection, Utc::now()).await;
+    let mut store = fixture.store().await;
+    let closing = run
+        .selection
+        .collect_spot_evidence_receipt(&mut store, &fixture.url, &source, &strategy, &instruments)
+        .await
+        .unwrap();
+    let retained = run
+        .selection
+        .inspect_spot_collection_receipt(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            &closing,
+            closing.sha256(),
+        )
+        .await
+        .unwrap();
+    // Mock independent position observation within the closing wallet window.
+    run.positions.captured_at = retained.wallet.window.finished_at;
+    let mut inputs = live::ReceiptTransitionEvidence {
+        instruments: &instruments,
+        collections: live::OpeningClosingEvidenceSelection {
+            opening: &opening,
+            opening_sha256: opening.sha256(),
+            tracked_balances: &tracked,
+            closing: &closing,
+            closing_sha256: closing.sha256(),
+        },
+        positions: &run.positions,
+        fees: &run.fees,
+        marks: &run.marks,
+        conversion: &run.conversion,
+        observations: &run.observations,
+        registered_risk: None,
+        market_monitor: None,
+        margin_tiers: None,
+    };
+    let witness = run
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &inputs,
+        )
+        .await
+        .unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("apexes-bound-transition-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("witness.json");
+    witness.write_new(&path).unwrap();
+    assert!(witness.write_new(&path).is_err());
+    assert!(live::ReceiptBoundTransitionWitness::read(&path, &"0".repeat(64)).is_err());
+    assert!(live::OfflineTransitionWitness::read(&path).is_err());
+    let reopened = live::ReceiptBoundTransitionWitness::read(&path, witness.sha256()).unwrap();
+    let requalified = run
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &inputs,
+        )
+        .await
+        .unwrap();
+    reopened.compare(&requalified).unwrap();
+    inputs.collections.opening = &alternate_opening;
+    assert!(
+        run.selection
+            .inspect_receipt_bound_transition(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &inputs,
+            )
+            .await
+            .is_err()
+    );
+    inputs.collections.opening_sha256 = alternate_opening.sha256();
+    let alternate = run
+        .selection
+        .inspect_receipt_bound_transition(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &inputs,
+        )
+        .await
+        .unwrap();
+    assert!(reopened.compare(&alternate).is_err());
+    inputs.collections.closing_sha256 = opening.sha256();
+    assert!(
+        run.selection
+            .inspect_receipt_bound_transition(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &inputs,
+            )
+            .await
+            .is_err()
+    );
+    inputs.collections.closing_sha256 = closing.sha256();
+    let mut wrong = run.positions.clone();
+    wrong.owner_fingerprint = "0".repeat(64);
+    inputs.positions = &wrong;
+    assert!(
+        run.selection
+            .inspect_receipt_bound_transition(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &inputs,
+            )
+            .await
+            .is_err()
+    );
+    let mut modified: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    modified["body"]["opening_sha256"] = serde_json::json!(alternate_opening.sha256());
+    let altered = dir.join("altered.json");
+    std::fs::write(&altered, serde_json::to_vec(&modified).unwrap()).unwrap();
+    assert!(live::ReceiptBoundTransitionWitness::read(&altered, witness.sha256()).is_err());
+    assert_eq!(fixture.claim_count().await, 1);
+    store
+        .verify_coherent_boundary(run.selection.receipt())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    drop(store);
+    fixture.cleanup().await;
+}

@@ -182,3 +182,149 @@ impl OfflineTransitionWitness {
         Ok(())
     }
 }
+
+/// Independent non-wallet inputs. Wallets, allocation and historical
+/// inspection time are taken exclusively from selected collection receipts.
+pub struct ReceiptTransitionEvidence<'a> {
+    pub instruments: &'a [Instrument],
+    pub collections: crate::OpeningClosingEvidenceSelection<'a>,
+    pub positions: &'a ClosingPositionEvidence,
+    pub fees: &'a ThirdAssetFeeEvidence,
+    pub marks: &'a ClosingFeeMarkEvidence,
+    pub conversion: &'a ConversionScopeEvidence,
+    pub observations: &'a ObservationBoundaryEvidence,
+    pub registered_risk: Option<&'a RegisteredRiskSnapshot>,
+    pub market_monitor: Option<&'a MarketConditionSnapshot>,
+    pub margin_tiers: Option<&'a [(String, MarginTierTable)]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptBoundBody {
+    version: u32,
+    opening_sha256: String,
+    closing_sha256: String,
+    transition: OfflineTransitionWitness,
+}
+
+/// Historical receipt-bound result, distinct from the supplied evidence
+/// witness. Reopen and independently rerun qualification before comparing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptBoundTransitionWitness {
+    body: ReceiptBoundBody,
+    sha256: String,
+}
+
+impl ReceiptBoundTransitionWitness {
+    fn issue(
+        transition: OfflineTransitionWitness,
+        opening_sha256: &str,
+        closing_sha256: &str,
+    ) -> Result<Self, StrategyRecoveryError> {
+        let body = ReceiptBoundBody {
+            version: 1,
+            opening_sha256: opening_sha256.into(),
+            closing_sha256: closing_sha256.into(),
+            transition,
+        };
+        let sha256 = digest(b"apexes-receipt-bound-transition-v1:", &body)?;
+        let witness = Self { body, sha256 };
+        witness.encode()?;
+        Ok(witness)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StrategyRecoveryError> {
+        self.body.transition.encode()?;
+        if self.body.version != 1
+            || !digest_valid(&self.body.opening_sha256)
+            || !digest_valid(&self.body.closing_sha256)
+            || self.body.opening_sha256 == self.body.closing_sha256
+            || self.sha256 != digest(b"apexes-receipt-bound-transition-v1:", &self.body)?
+        {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
+        if bytes.len() > MAX_RECEIPT_FILE_BYTES {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(bytes)
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn write_new(&self, path: &Path) -> Result<(), StrategyRecoveryError> {
+        write_receipt_file(path, &self.encode()?)
+    }
+
+    pub fn read(
+        path: &Path,
+        independently_selected_sha256: &str,
+    ) -> Result<Self, StrategyRecoveryError> {
+        let bytes = read_receipt_file(path)?;
+        let witness: Self =
+            serde_json::from_slice(&bytes).map_err(|_| StrategyRecoveryError::InvalidReceipt)?;
+        if witness.sha256 != independently_selected_sha256 || witness.encode()? != bytes {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(witness)
+    }
+
+    /// Compare only to a newly independently requalified result.
+    pub fn compare(&self, qualified: &Self) -> Result<(), StrategyRecoveryError> {
+        self.encode()?;
+        qualified.encode()?;
+        if self != qualified {
+            return Err(StrategyRecoveryError::InvalidReceipt);
+        }
+        Ok(())
+    }
+}
+
+impl crate::CoherentRecoverySelection {
+    /// Reinspect both exact collection receipts and derive all wallet
+    /// inputs from them. Run the unchanged complete isolated accounting,
+    /// observation and risk qualification. Never authorize startup.
+    pub async fn inspect_receipt_bound_transition<S: apexes_strategy::Strategy>(
+        &self,
+        store: &mut apexes_oms::OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        evidence: &ReceiptTransitionEvidence<'_>,
+    ) -> Result<ReceiptBoundTransitionWitness, crate::CoherentInspectionError> {
+        let (opening, closing) = self
+            .inspect_opening_closing_pair(
+                store,
+                ems_postgres_url,
+                evidence.instruments,
+                evidence.collections,
+            )
+            .await?;
+        let inputs = TransitionEvidence {
+            instruments: evidence.instruments,
+            opening: &opening.opening,
+            window: &closing.window,
+            closing: &closing.wallet,
+            inspected_at: closing.inspected_at,
+            positions: evidence.positions,
+            allocation: &opening.allocation,
+            fees: evidence.fees,
+            marks: evidence.marks,
+            conversion: evidence.conversion,
+            observations: evidence.observations,
+            registered_risk: evidence.registered_risk,
+            market_monitor: evidence.market_monitor,
+            margin_tiers: evidence.margin_tiers,
+        };
+        let transition = self
+            .inspect_offline_transition(store, ems_postgres_url, strategies, &inputs)
+            .await?;
+        Ok(ReceiptBoundTransitionWitness::issue(
+            transition,
+            evidence.collections.opening_sha256,
+            evidence.collections.closing_sha256,
+        )?)
+    }
+}
