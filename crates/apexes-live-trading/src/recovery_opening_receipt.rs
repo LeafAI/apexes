@@ -206,6 +206,7 @@ impl RecoverySelection {
 /// Both receipts and allocation amounts must be independently selected.
 /// The opening receipt is collected before any claim; the closing
 /// receipt is collected only after the coherent boundary is durable.
+#[derive(Clone, Copy)]
 pub struct OpeningClosingEvidenceSelection<'a> {
     pub opening: &'a OpeningCollectionReceipt,
     pub opening_sha256: &'a str,
@@ -225,6 +226,20 @@ impl CoherentRecoverySelection {
         instruments: &[Instrument],
         evidence: OpeningClosingEvidenceSelection<'_>,
     ) -> Result<CollectedOpeningEvidence, CoherentInspectionError> {
+        let (opening, _) = self
+            .inspect_opening_closing_pair(store, ems_postgres_url, instruments, evidence)
+            .await?;
+        Ok(opening)
+    }
+
+    pub(crate) async fn inspect_opening_closing_pair(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: OpeningClosingEvidenceSelection<'_>,
+    ) -> Result<(CollectedOpeningEvidence, crate::CollectedSpotEvidence), CoherentInspectionError>
+    {
         let opening = evidence.opening.select(
             &self.predecessor,
             instruments,
@@ -294,6 +309,6 @@ impl CoherentRecoverySelection {
                 ems_postgres_url,
             )
             .await?;
-        Ok(opening)
+        Ok((opening, closing))
     }
 }

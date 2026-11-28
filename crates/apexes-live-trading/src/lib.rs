@@ -84,7 +84,10 @@ pub use recovery_warmup::{WarmupInspectionError, inspect_no_order_warmup};
 mod recovery_ledger_application;
 
 mod recovery_transition;
-pub use recovery_transition::{OfflineTransitionWitness, TransitionEvidence};
+pub use recovery_transition::{
+    OfflineTransitionWitness, ReceiptBoundTransitionWitness, ReceiptTransitionEvidence,
+    TransitionEvidence,
+};
 
 mod recovery_successor;
 pub use recovery_successor::{

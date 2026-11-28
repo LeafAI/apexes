@@ -159,3 +159,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Read-only opening wallet collection](2026-11-29-apexes-opening-wallet-collection-design.md) checks the unclaimed exact opening head, brackets full wallet observations with account-wide open-order checks and compares independently selected tracked amounts without inferring funding ownership.
 
 [Durable opening collection receipt](2026-11-29-apexes-opening-collection-receipt-design.md) binds historical opening wallet, allocation and quiescence intervals to the exact original selection, and reinspects independently selected opening and closing receipts with ordered activity and exact cash-flow checks.
+
+[Receipt-bound offline transition witness](2026-11-29-apexes-receipt-bound-transition-design.md) independently reinspects opening and closing collection receipts, derives all wallet and allocation inputs from them, reruns the full offline accounting, observation and risk qualification, and binds both selected receipt digests without granting startup authority.
