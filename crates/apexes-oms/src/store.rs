@@ -93,6 +93,12 @@ impl OrderStore {
             .execute(&pool).await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_scoped_intent ON orders(intent_scope, intent_ordinal) WHERE intent_scope IS NOT NULL AND intent_ordinal IS NOT NULL")
             .execute(&pool).await?;
+        sqlx::query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS ems_parent_id UUID, ADD COLUMN IF NOT EXISTS ems_dispatch_id UUID")
+            .execute(&pool).await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_ems_dispatch ON orders(ems_dispatch_id) WHERE ems_dispatch_id IS NOT NULL")
+            .execute(&pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_ems_parent ON orders(ems_parent_id) WHERE ems_parent_id IS NOT NULL")
+            .execute(&pool).await?;
         sqlx::query(ORDERS_EXCHANGE_ID_INDEX_DDL)
             .execute(&pool)
             .await?;
@@ -289,8 +295,15 @@ impl OrderStore {
     /// lifecycle: once at creation, again after gateway submission
     /// updates `exchange_order_id`, again on every status change.
     pub async fn upsert_order(&self, order: &Order) -> Result<(), OmsError> {
-        self.write_order(order, SubmissionState::from_order(order), None, None, None)
-            .await
+        self.write_order(
+            order,
+            SubmissionState::from_order(order),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Persist the client ID and a pre-dispatch marker before any exchange I/O.
@@ -300,6 +313,7 @@ impl OrderStore {
         reservation: Option<&SpotReservation>,
         parent: Option<uuid::Uuid>,
         link: Option<crate::IntentLink>,
+        child: Option<crate::ChildLink>,
     ) -> Result<(), OmsError> {
         if self.inventory_bound() && reservation.is_none_or(|r| r.commission.is_none()) {
             return Err(OmsError::InvalidRow {
@@ -307,12 +321,14 @@ impl OrderStore {
             });
         }
         let link = link.map(crate::IntentLink::validate).transpose()?;
+        let child = child.map(crate::ChildLink::validate).transpose()?;
         self.write_order(
             order,
             SubmissionState::Submitting,
             reservation,
             parent,
             link,
+            child,
         )
         .await
     }
@@ -445,6 +461,7 @@ impl OrderStore {
         reservation: Option<&SpotReservation>,
         parent: Option<uuid::Uuid>,
         link: Option<crate::IntentLink>,
+        child: Option<crate::ChildLink>,
     ) -> Result<(), OmsError> {
         let row = OrderRow::from(order);
         let mut tx = self.pool.begin().await?;
@@ -456,8 +473,8 @@ impl OrderStore {
         }
         let result = sqlx::query(
             "INSERT INTO orders (id, exchange_order_id, symbol, venue, asset_class, side, order_type, quantity, price, stop_price, leverage, margin_mode, filled_quantity, status, created_at, updated_at, submission_state,
-                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset, parent_allocation_id, intent_scope, intent_ordinal)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+                reserved_spend_asset, reserved_receipt_asset, reserved_amount, reserved_owned_quantity, reserved_reference_price, reserved_market_buy_cap, reserved_commission_rate, reserved_commission_at, reserved_discount_asset, parent_allocation_id, intent_scope, intent_ordinal, ems_parent_id, ems_dispatch_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
              ON CONFLICT (id) DO UPDATE SET
                 exchange_order_id = EXCLUDED.exchange_order_id,
                 leverage = EXCLUDED.leverage,
@@ -497,6 +514,8 @@ impl OrderStore {
         .bind(parent)
         .bind(link.map(|l|l.run_scope))
         .bind(link.map(|l|rust_decimal::Decimal::from(l.intent_id.0)))
+        .bind(child.map(|c|c.parent_id.0))
+        .bind(child.map(|c|c.dispatch_id))
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
@@ -512,7 +531,15 @@ impl OrderStore {
     pub(crate) async fn identity_snapshot(
         &self,
         id: OrderId,
-    ) -> Result<Option<(Order, SubmissionState, Option<crate::IntentLink>)>, OmsError> {
+    ) -> Result<
+        Option<(
+            Order,
+            SubmissionState,
+            Option<crate::IntentLink>,
+            Option<crate::ChildLink>,
+        )>,
+        OmsError,
+    > {
         #[derive(sqlx::FromRow)]
         struct IdentityRow {
             #[sqlx(flatten)]
@@ -520,6 +547,8 @@ impl OrderStore {
             submission_state: String,
             intent_scope: Option<uuid::Uuid>,
             intent_ordinal: Option<rust_decimal::Decimal>,
+            ems_parent_id: Option<uuid::Uuid>,
+            ems_dispatch_id: Option<uuid::Uuid>,
         }
         let row: Option<IdentityRow> = sqlx::query_as("SELECT * FROM orders WHERE id = $1")
             .bind(id.0)
@@ -530,6 +559,7 @@ impl OrderStore {
                 Order::try_from(row.order)?,
                 SubmissionState::parse(&row.submission_state)?,
                 decode_intent_link(row.intent_scope, row.intent_ordinal)?,
+                decode_child_link(row.ems_parent_id, row.ems_dispatch_id)?,
             ))
         })
         .transpose()
@@ -547,6 +577,22 @@ impl OrderStore {
         )
         .bind(link.run_scope)
         .bind(rust_decimal::Decimal::from(link.intent_id.0))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(OrderId))
+    }
+
+    /// Read-only exact dispatch lookup, including terminal children.
+    pub async fn client_order_for_dispatch(
+        &self,
+        link: crate::ChildLink,
+    ) -> Result<Option<OrderId>, OmsError> {
+        let link = link.validate()?;
+        let id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM orders WHERE ems_parent_id=$1 AND ems_dispatch_id=$2",
+        )
+        .bind(link.parent_id.0)
+        .bind(link.dispatch_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(id.map(OrderId))
@@ -597,6 +643,24 @@ impl OrderStore {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(Fill::try_from).collect()
+    }
+}
+
+fn decode_child_link(
+    parent: Option<uuid::Uuid>,
+    dispatch: Option<uuid::Uuid>,
+) -> Result<Option<crate::ChildLink>, OmsError> {
+    match (parent, dispatch) {
+        (None, None) => Ok(None),
+        (Some(parent), Some(dispatch_id)) => crate::ChildLink {
+            parent_id: apexes_strategy::ParentOrderId(parent),
+            dispatch_id,
+        }
+        .validate()
+        .map(Some),
+        _ => Err(OmsError::InvalidRow {
+            reason: "incomplete EMS child linkage".into(),
+        }),
     }
 }
 

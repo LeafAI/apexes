@@ -133,7 +133,21 @@ async fn managed_pov_parent_reserves_before_dispatch_and_recovers_budget() {
     )
     .await
     .unwrap();
-    let id = ems.submit_algo_order(pov_request()).await.unwrap();
+    let scope = uuid::Uuid::new_v4();
+    let ordinal = apexes_strategy::IntentId(u64::MAX);
+    let id = ems
+        .submit_correlated_algo_order(pov_request(), Some((scope, ordinal)))
+        .await
+        .unwrap();
+    assert_eq!(
+        ems.parent_for_intent(scope, ordinal).await.unwrap(),
+        Some(id)
+    );
+    assert!(matches!(
+        ems.submit_correlated_algo_order(pov_request(), Some((scope, ordinal)))
+            .await,
+        Err(EmsError::ParentAdmissionRejected { .. })
+    ));
     let mut other = pov_request();
     other.symbol = "ETHUSDT".into();
     assert!(matches!(
@@ -173,6 +187,29 @@ async fn managed_pov_parent_reserves_before_dispatch_and_recovers_budget() {
         .bind(child.0).fetch_one(&pool).await.unwrap();
     assert_eq!(allocated, dec!(101));
     assert_eq!(linked, id.0);
+    let evidence = manager
+        .lock()
+        .await
+        .inspect_client_identity(child)
+        .await
+        .unwrap()
+        .unwrap();
+    let link = evidence.child_link.unwrap();
+    assert_eq!(link.parent_id, id);
+    assert_eq!(evidence.intent_link, None);
+    assert_eq!(
+        manager
+            .lock()
+            .await
+            .client_order_for_dispatch(link)
+            .await
+            .unwrap(),
+        Some(child)
+    );
+    assert_eq!(ems.pending_dispatch(id).await.unwrap(), None);
+    let recorded:uuid::Uuid=sqlx::query_scalar("SELECT dispatch_id FROM parent_order_children WHERE parent_order_id=$1 AND child_order_id=$2").bind(id.0).bind(child.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(recorded, link.dispatch_id);
+
     manager.lock().await.cancel_order(child).await.unwrap();
     drop(ems);
     let ems = PostgresEms::new_with_kill_switch(
@@ -193,6 +230,10 @@ async fn managed_pov_parent_reserves_before_dispatch_and_recovers_budget() {
         ems.submit_algo_order(other.clone()).await,
         Err(EmsError::ParentAdmissionRejected { .. })
     ));
+    assert_eq!(
+        ems.parent_for_intent(scope, ordinal).await.unwrap(),
+        Some(id)
+    );
     ems.cancel_parent_order(id).await.unwrap();
     assert!(ems.submit_algo_order(other).await.is_ok());
     drop(ems);
@@ -535,6 +576,8 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
             .await
             .unwrap();
     assert!(pending);
+    let dispatch = ems.pending_dispatch(id).await.unwrap().unwrap();
+    assert!(!dispatch.is_nil());
     assert_eq!(quantity, dec!(0));
     for _ in 0..10 {
         ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))

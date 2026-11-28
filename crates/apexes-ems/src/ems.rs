@@ -44,6 +44,15 @@ pub trait Ems: Send + Sync {
     async fn submit_algo_order(&self, request: AlgoOrderRequest)
     -> Result<ParentOrderId, EmsError>;
 
+    /// Live scope and ordinal, if provided by the executing strategy loop.
+    async fn submit_correlated_algo_order(
+        &self,
+        request: AlgoOrderRequest,
+        _link: Option<(uuid::Uuid, apexes_strategy::IntentId)>,
+    ) -> Result<ParentOrderId, EmsError> {
+        self.submit_algo_order(request).await
+    }
+
     /// Returns the current aggregate status of a parent order, or
     /// `Ok(None)` if unknown to this `Ems` instance.
     async fn parent_order_status(

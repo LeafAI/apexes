@@ -108,6 +108,9 @@ where
 
 #[async_trait]
 impl OrderExecutor for OrderManagerExecutor {
+    fn intent_run_scope(&self) -> Option<uuid::Uuid> {
+        Some(self.intent_scope)
+    }
     fn health_observation(&self) -> Option<apexes_strategy::HealthObservation> {
         if let Some(gate) = &self.submission_gate {
             return Some(gate.health_observation());

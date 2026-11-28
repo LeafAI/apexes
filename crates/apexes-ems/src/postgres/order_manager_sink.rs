@@ -140,6 +140,25 @@ impl ChildOrderSink for OrderManagerChildOrderSink {
             .map_err(|e| parent_error(id, e))?;
         Ok((order_id, Vec::new()))
     }
+    async fn submit_dispatched_child(
+        &self,
+        parent_id: ParentOrderId,
+        dispatch_id: uuid::Uuid,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<apexes_core::Fill>), EmsError> {
+        let link = apexes_oms::ChildLink {
+            parent_id,
+            dispatch_id,
+        };
+        let id = self
+            .order_manager
+            .lock()
+            .await
+            .submit_dispatched_child(link, child_intent(intent))
+            .await
+            .map_err(|e| parent_error(parent_id, e))?;
+        Ok((id, Vec::new()))
+    }
     async fn submit_child_order(
         &self,
         intent: ChildOrderIntent,

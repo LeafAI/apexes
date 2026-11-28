@@ -81,6 +81,15 @@ pub trait ChildOrderSink: Send + Sync {
     ) -> Result<(OrderId, Vec<Fill>), EmsError> {
         self.submit_child_order(intent).await
     }
+    /// Durable live dispatch identifier, allocated before submission.
+    async fn submit_dispatched_child(
+        &self,
+        parent: apexes_strategy::ParentOrderId,
+        _dispatch_id: uuid::Uuid,
+        intent: ChildOrderIntent,
+    ) -> Result<(OrderId, Vec<Fill>), EmsError> {
+        self.submit_allocated_child(parent, intent).await
+    }
     /// Submits `intent` for immediate execution, returning the
     /// resulting `OrderId` and any `Fill`s that happened synchronously
     /// as part of submission (e.g. a Market order against a live local

@@ -35,4 +35,4 @@ pub use mock_gateway::MockExecutionGateway;
 pub use store::{OrderStore, SubmissionState};
 
 pub mod identity_evidence;
-pub use identity_evidence::{IdentityEvidence, IntentLink, RemoteIdentity};
+pub use identity_evidence::{ChildLink, IdentityEvidence, IntentLink, RemoteIdentity};

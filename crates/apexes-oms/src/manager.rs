@@ -278,7 +278,7 @@ impl OrderManager {
         positions: &HashMap<String, Position>,
         balances: &HashMap<String, Decimal>,
     ) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, positions, balances, false, None, None)
+        self.submit_order_inner(intent, positions, balances, false, None, (None, None))
             .await
     }
 
@@ -297,7 +297,7 @@ impl OrderManager {
             balances,
             false,
             None,
-            Some(link.validate()?),
+            (Some(link.validate()?), None),
         )
         .await
     }
@@ -305,8 +305,15 @@ impl OrderManager {
     /// EMS already persisted its dispatch quantity. Refuse rather than
     /// silently changing the quantity recorded by the parent scheduler.
     pub async fn submit_child_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
-        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, None, None)
-            .await
+        self.submit_order_inner(
+            intent,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            None,
+            (None, None),
+        )
+        .await
     }
 
     /// Reserve a complete parent budget before EMS persists/schedules it.
@@ -418,8 +425,35 @@ impl OrderManager {
         intent: OrderIntent,
     ) -> Result<OrderId, OmsError> {
         let parent = self.store.inventory_bound().then_some(parent);
-        self.submit_order_inner(intent, &HashMap::new(), &HashMap::new(), true, parent, None)
-            .await
+        self.submit_order_inner(
+            intent,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            parent,
+            (None, None),
+        )
+        .await
+    }
+
+    /// Preserve dispatch ownership before the actual gateway call,
+    /// even if managed capital allocation is disabled.
+    pub async fn submit_dispatched_child(
+        &mut self,
+        link: crate::ChildLink,
+        intent: OrderIntent,
+    ) -> Result<OrderId, OmsError> {
+        let link = link.validate()?;
+        let allocation = self.store.inventory_bound().then_some(link.parent_id.0);
+        self.submit_order_inner(
+            intent,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            allocation,
+            (None, Some(link)),
+        )
+        .await
     }
 
     async fn submit_order_inner(
@@ -429,8 +463,9 @@ impl OrderManager {
         balances: &HashMap<String, Decimal>,
         exact_quantity: bool,
         parent: Option<Uuid>,
-        link: Option<crate::IntentLink>,
+        correlation: (Option<crate::IntentLink>, Option<crate::ChildLink>),
     ) -> Result<OrderId, OmsError> {
+        let (link, child) = correlation;
         if let Some(kill_switch) = &self.kill_switch
             && kill_switch.blocks_submissions()
         {
@@ -520,7 +555,7 @@ impl OrderManager {
         }
 
         let result = self
-            .place_order(intent, false, reservation, parent, link)
+            .place_order(intent, false, reservation, parent, link, child)
             .await;
         if matches!(
             &result,
@@ -544,7 +579,7 @@ impl OrderManager {
     /// limit). Callers must only pass orders that reduce exposure.
     pub async fn submit_flatten_order(&mut self, intent: OrderIntent) -> Result<OrderId, OmsError> {
         tracing::warn!(symbol = %intent.symbol, side = ?intent.side, quantity = %intent.quantity, "submitting flatten order (bypasses halt and pre-trade risk)");
-        self.place_order(intent, true, None, None, None).await
+        self.place_order(intent, true, None, None, None, None).await
     }
 
     /// Validate fresh rule/availability evidence and reserve the spend
@@ -762,6 +797,7 @@ impl OrderManager {
         reservation: Option<SpotReservation>,
         parent: Option<Uuid>,
         link: Option<crate::IntentLink>,
+        child: Option<crate::ChildLink>,
     ) -> Result<OrderId, OmsError> {
         // Do not rely on strategies checking has_open_order: the OMS is
         // the final guard, including when a caller attempts a flatten.
@@ -804,7 +840,7 @@ impl OrderManager {
             updated_at: now,
         };
         self.store
-            .begin_submission(&order, reservation.as_ref(), parent, link)
+            .begin_submission(&order, reservation.as_ref(), parent, link, child)
             .await?;
         let order_id = order.id;
         // Retain the guard before awaiting network I/O. Cancellation or a
@@ -1323,11 +1359,12 @@ impl OrderManager {
         &self,
         id: OrderId,
     ) -> Result<Option<crate::IdentityEvidence>, OmsError> {
-        let Some((order, state, link)) = self.store.identity_snapshot(id).await? else {
+        let Some((order, state, link, child)) = self.store.identity_snapshot(id).await? else {
             return Ok(None);
         };
         Ok(Some(
-            crate::identity_evidence::observe(self.gateway.as_ref(), order, state, link).await,
+            crate::identity_evidence::observe(self.gateway.as_ref(), order, state, link, child)
+                .await,
         ))
     }
 
@@ -1338,6 +1375,13 @@ impl OrderManager {
         link: crate::IntentLink,
     ) -> Result<Option<OrderId>, OmsError> {
         self.store.client_order_for_intent(link).await
+    }
+
+    pub async fn client_order_for_dispatch(
+        &self,
+        link: crate::ChildLink,
+    ) -> Result<Option<OrderId>, OmsError> {
+        self.store.client_order_for_dispatch(link).await
     }
 
     /// Durable lookup for background EMS reconciliation, including terminal children.
