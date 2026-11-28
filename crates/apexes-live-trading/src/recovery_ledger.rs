@@ -33,6 +33,8 @@ pub enum LedgerContinuityError {
     PositionMismatch,
     #[error("actual captured ledger is missing or differs from qualified independent evidence")]
     CapturedLedgerMismatch,
+    #[error("captured realized P&L differs from the independently reconstructed journal")]
+    RealizedPnlMismatch,
 }
 
 /// Independently retained closing position evidence. Only a read-only
@@ -166,6 +168,88 @@ pub(crate) fn compare_captured_ledger(
             .any(|p| preview.owned_positions.get(&p.symbol) != Some(p))
     {
         return Err(E::CapturedLedgerMismatch);
+    }
+    Ok(())
+}
+
+/// Independent offline gross realized P&L check for an explicitly
+/// restricted fee-free Spot journal. Refuse ambiguous chronology or
+/// unrepresentable arithmetic; never approximate missing evidence.
+pub(crate) fn compare_realized_pnl(
+    captured: &apexes_backtest::ledger_evidence::LedgerEvidence,
+    instruments: &[Instrument],
+    fills: &[Fill],
+) -> Result<(), LedgerContinuityError> {
+    use LedgerContinuityError as E;
+    let scope = instruments
+        .iter()
+        .map(|i| (i.venue, i.symbol.clone()))
+        .collect::<Vec<_>>();
+    captured
+        .validate(&scope)
+        .map_err(|_| E::CapturedLedgerMismatch)?;
+    if fills.len() > 8192
+        || instruments
+            .iter()
+            .any(|i| i.venue != Venue::Binance || i.asset_class != AssetClass::Spot)
+    {
+        return Err(E::Execution);
+    }
+    let mut positions: HashMap<&str, (Decimal, Decimal, chrono::DateTime<chrono::Utc>)> =
+        HashMap::new();
+    let mut realized: HashMap<String, Decimal> = HashMap::new();
+    for f in fills {
+        if f.venue != Venue::Binance
+            || f.leverage.is_some()
+            || f.margin_mode.is_some()
+            || !f.fee.is_zero()
+            || f.price <= Decimal::ZERO
+            || f.quantity <= Decimal::ZERO
+            || !scope.iter().any(|(v, s)| *v == f.venue && s == &f.symbol)
+        {
+            return Err(E::Execution);
+        }
+        let entry = positions.entry(&f.symbol);
+        let (quantity, average, last) = match entry {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((Decimal::ZERO, Decimal::ZERO, f.filled_at))
+            }
+            std::collections::hash_map::Entry::Occupied(v) => {
+                if v.get().2 >= f.filled_at {
+                    return Err(E::Execution);
+                }
+                v.into_mut()
+            }
+        };
+        match f.side {
+            Side::Buy => {
+                let cost = exact_add(
+                    exact_mul(*quantity, *average)?,
+                    exact_mul(f.quantity, f.price)?,
+                )?;
+                *quantity = exact_add(*quantity, f.quantity)?;
+                let price = cost.checked_div(*quantity).ok_or(E::Arithmetic)?;
+                if exact_mul(price, *quantity)? != cost {
+                    return Err(E::Arithmetic);
+                }
+                *average = price;
+            }
+            Side::Sell => {
+                if f.quantity > *quantity {
+                    return Err(E::Execution);
+                }
+                let pnl = exact_mul(exact_add(f.price, -*average)?, f.quantity)?;
+                let total = realized.entry(f.symbol.clone()).or_default();
+                *total = exact_add(*total, pnl)?;
+                *quantity = exact_add(*quantity, -f.quantity)?;
+            }
+        }
+        *last = f.filled_at;
+    }
+    let mut expected = realized.into_iter().collect::<Vec<_>>();
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    if captured.realized_pnl != expected {
+        return Err(E::RealizedPnlMismatch);
     }
     Ok(())
 }
@@ -463,6 +547,88 @@ mod tests {
             vec![instrument],
             fills,
         )
+    }
+
+    #[test]
+    fn realized_pnl_reconciles_weighted_cost_and_multiple_closes() {
+        let (_, _, _, _, instruments, mut fills) = fixture();
+        for fill in &mut fills {
+            fill.fee = Decimal::ZERO;
+            fill.fee_currency = None;
+        }
+        fills[0].quantity = dec!(1);
+        fills[0].price = dec!(100);
+        fills[1].side = Side::Buy;
+        fills[1].quantity = dec!(1);
+        fills[1].price = dec!(120);
+        fills[2].side = Side::Sell;
+        fills[2].quantity = dec!(1);
+        fills[2].price = dec!(130);
+        let mut close = fills[2].clone();
+        close.id = FillId(Uuid::new_v4());
+        close.filled_at = at(5);
+        close.price = dec!(100);
+        fills.push(close);
+        let mut captured = apexes_backtest::ledger_evidence::LedgerEvidence {
+            version: 1,
+            scope: vec![(Venue::Binance, "BTCUSDT".into())],
+            balances: vec![],
+            positions: vec![],
+            realized_pnl: vec![("BTCUSDT".into(), dec!(10))],
+        };
+        compare_realized_pnl(&captured, &instruments, &fills).unwrap();
+        captured.realized_pnl[0].1 = dec!(11);
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &fills),
+            Err(LedgerContinuityError::RealizedPnlMismatch)
+        );
+        captured.realized_pnl.clear();
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &fills),
+            Err(LedgerContinuityError::RealizedPnlMismatch)
+        );
+        compare_realized_pnl(&captured, &instruments, &fills[..2]).unwrap();
+    }
+
+    #[test]
+    fn realized_pnl_refuses_fee_ambiguous_time_and_inexact_average() {
+        let (_, _, _, _, instruments, mut fills) = fixture();
+        let captured = apexes_backtest::ledger_evidence::LedgerEvidence {
+            version: 1,
+            scope: vec![(Venue::Binance, "BTCUSDT".into())],
+            balances: vec![],
+            positions: vec![],
+            realized_pnl: vec![],
+        };
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &fills),
+            Err(LedgerContinuityError::Execution)
+        );
+        for f in &mut fills {
+            f.fee = Decimal::ZERO;
+        }
+        let mut pair = fills[..2].to_vec();
+        pair[1].filled_at = pair[0].filled_at;
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &pair),
+            Err(LedgerContinuityError::Execution)
+        );
+        pair[1].filled_at = at(3);
+        pair[1].side = Side::Buy;
+        pair[0].quantity = dec!(2);
+        pair[0].price = dec!(1);
+        pair[1].quantity = dec!(1);
+        pair[1].price = dec!(2);
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &pair),
+            Err(LedgerContinuityError::Arithmetic)
+        );
+        pair[1].side = Side::Sell;
+        pair[1].quantity = dec!(3);
+        assert_eq!(
+            compare_realized_pnl(&captured, &instruments, &pair),
+            Err(LedgerContinuityError::Execution)
+        );
     }
 
     #[test]

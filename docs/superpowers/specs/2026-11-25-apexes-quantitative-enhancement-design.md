@@ -111,3 +111,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Actual basic Spot ledger evidence](2026-11-28-apexes-ledger-capture-design.md) retains the loop-owned ledger scope, balances, positions and realized P&L in the existing durable attachment; no state is applied.
 
 [Captured basic ledger reconciliation](2026-11-28-apexes-ledger-reconciliation-design.md) compares actual retained basic ledger balances and positions against qualified independently supplied evidence without state application or startup authority.
+
+[Independent fee-free gross realized P&L reconciliation](2026-11-28-apexes-realized-pnl-evidence-design.md) checks the actual captured gross realized map against the exact selected restricted Spot journal, without modifying accounting state.
