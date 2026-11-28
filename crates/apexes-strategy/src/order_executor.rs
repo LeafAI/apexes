@@ -277,4 +277,12 @@ pub trait LiquidationPolicy: Send + Sync {
 /// is a stream that never yields.
 pub trait SupplementalFillSource: Send {
     fn stream(&mut self) -> impl Stream<Item = Vec<Fill>> + Unpin + '_;
+
+    /// After dropping the stream, await any work detached from its polling
+    /// before the opt-in stop checkpoint. Ordinary sources have no such work.
+    fn quiesce_for_checkpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), ApexesError>> + Send {
+        async { Ok(()) }
+    }
 }

@@ -1350,7 +1350,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
         queue.notify_expiry(&mut strategy);
     }
 
+    drop(supplemental_fill_stream);
     if let (Some(previous), Some(cursor)) = (checkpoint_predecessor, checkpoint_cursor) {
+        supplemental_fills.quiesce_for_checkpoint().await?;
         if checkpoint_invalid || cursor.ordinal <= previous.cursor.ordinal {
             return Err(ApexesError::InvalidBacktestConfig {
                 reason: "no valid completed observation boundary for checkpoint publication".into(),

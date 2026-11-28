@@ -141,12 +141,20 @@ impl OrderManagerExecutor {
 /// running to completion whether or not anyone is polling, so the lock is
 /// always released. It also finishes if the waiting side is dropped, rather
 /// than being cancelled half way through a reconcile.
-async fn run_detached<T, F>(future: F) -> Option<T>
+async fn run_detached<T, F>(in_flight: &Arc<tokio::sync::Semaphore>, future: F) -> Option<T>
 where
     T: Send + 'static,
     F: std::future::Future<Output = T> + Send + 'static,
 {
-    match tokio::spawn(future).await {
+    // Acquire before spawning, not inside the detached task: a stop can
+    // otherwise race with a task that has not yet been scheduled.
+    let permit = in_flight.clone().acquire_owned().await.ok()?;
+    match tokio::spawn(async move {
+        let _permit = permit;
+        future.await
+    })
+    .await
+    {
         Ok(value) => Some(value),
         Err(error) => {
             tracing::error!(?error, "order-manager task failed");
@@ -455,23 +463,26 @@ impl LiquidationPolicy for LiveLiquidationPolicy {
 async fn reconcile_detached(
     order_manager: &Arc<tokio::sync::Mutex<OrderManager>>,
     why: &'static str,
+    in_flight: &Arc<tokio::sync::Semaphore>,
 ) -> Vec<Fill> {
     let order_manager = Arc::clone(order_manager);
-    run_detached(async move { order_manager.lock().await.reconcile().await })
-        .await
-        .and_then(|result| {
-            result
-                .map(|changes| changes.into_iter().flat_map(|(_, fills)| fills).collect())
-                .map_err(|error| {
-                    tracing::warn!(
-                        ?error,
-                        why,
-                        "LiveSupplementalFillSource: reconcile() failed"
-                    );
-                })
-                .ok()
-        })
-        .unwrap_or_default()
+    run_detached(in_flight, async move {
+        order_manager.lock().await.reconcile().await
+    })
+    .await
+    .and_then(|result| {
+        result
+            .map(|changes| changes.into_iter().flat_map(|(_, fills)| fills).collect())
+            .map_err(|error| {
+                tracing::warn!(
+                    ?error,
+                    why,
+                    "LiveSupplementalFillSource: reconcile() failed"
+                );
+            })
+            .ok()
+    })
+    .unwrap_or_default()
 }
 
 /// Adapts live trading's real fill sources -- the exchange's push-based
@@ -499,6 +510,7 @@ pub struct LiveSupplementalFillSource<S> {
     /// immediate `reconcile()` instead of waiting for the next tick.
     resync: Option<Arc<tokio::sync::Notify>>,
     terminal_wakeup: Option<Arc<tokio::sync::Notify>>,
+    in_flight: Arc<tokio::sync::Semaphore>,
 }
 
 impl<S> LiveSupplementalFillSource<S>
@@ -516,6 +528,7 @@ where
             reconcile_interval: tokio::time::interval(reconcile_interval),
             resync: None,
             terminal_wakeup: None,
+            in_flight: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -537,6 +550,20 @@ impl<S> SupplementalFillSource for LiveSupplementalFillSource<S>
 where
     S: Stream<Item = ExchangeUpdate> + Unpin + Send,
 {
+    async fn quiesce_for_checkpoint(&mut self) -> Result<(), ApexesError> {
+        // The stream is already dropped, so it cannot spawn new work.
+        // Do not cancel a reconciliation halfway through a durable write.
+        let _permit = tokio::time::timeout(Duration::from_secs(5), self.in_flight.acquire())
+            .await
+            .map_err(|_| ApexesError::InvalidBacktestConfig {
+                reason: "checkpoint supplemental work did not quiesce".into(),
+            })?
+            .map_err(|_| ApexesError::InvalidBacktestConfig {
+                reason: "checkpoint supplemental work tracker closed".into(),
+            })?;
+        Ok(())
+    }
+
     fn stream(&mut self) -> impl Stream<Item = Vec<Fill>> + Unpin + '_ {
         let state = (
             Arc::clone(&self.order_manager),
@@ -544,6 +571,7 @@ where
             &mut self.reconcile_interval,
             self.resync.clone(),
             self.terminal_wakeup.clone(),
+            self.in_flight.clone(),
         );
 
         // Boxed so the resulting stream is unconditionally `Unpin`
@@ -552,12 +580,19 @@ where
         // the boxed value, satisfying this trait method's signature).
         Box::pin(futures::stream::unfold(
             state,
-            |(order_manager, exchange_updates, reconcile_interval, resync, terminal_wakeup)| async move {
+            |(
+                order_manager,
+                exchange_updates,
+                reconcile_interval,
+                resync,
+                terminal_wakeup,
+                in_flight,
+            )| async move {
                 loop {
                     let legacy_fills = tokio::select! {
                         update = exchange_updates.next() => {
                             let update = update?;
-                            run_detached({
+                            run_detached(&in_flight, {
                                 let order_manager = Arc::clone(&order_manager);
                                 async move {
                                     order_manager.lock().await.apply_exchange_update(
@@ -576,7 +611,7 @@ where
                                 None => futures::future::pending::<()>().await,
                             }
                         } => {
-                            reconcile_detached(&order_manager, "resync").await
+                            reconcile_detached(&order_manager, "resync", &in_flight).await
                         }
                         _ = async {
                             match &terminal_wakeup {
@@ -585,13 +620,13 @@ where
                             }
                         } => Vec::new(),
                         _ = reconcile_interval.tick() => {
-                            reconcile_detached(&order_manager, "periodic").await
+                            reconcile_detached(&order_manager, "periodic", &in_flight).await
                         }
                     };
                     // Managed sessions recover committed executions even
                     // if the writer was a cancel sweep or a reconciliation
                     // task which subsequently failed.
-                    let durable = run_detached({
+                    let durable = run_detached(&in_flight, {
                         let order_manager = Arc::clone(&order_manager);
                         async move { order_manager.lock().await.durable_fill_batch().await }
                     })
@@ -603,7 +638,7 @@ where
                     };
                     if fills.is_empty() {
                         let ready =
-                            run_detached({
+                            run_detached(&in_flight, {
                                 let order_manager = Arc::clone(&order_manager);
                                 async move {
                                     order_manager.lock().await.has_ready_terminal_batch().await
@@ -623,6 +658,7 @@ where
                             reconcile_interval,
                             resync,
                             terminal_wakeup,
+                            in_flight,
                         ),
                     ));
                 }
@@ -641,6 +677,35 @@ mod tests {
     use rust_decimal_macros::dec;
 
     const POSTGRES_URL: &str = "postgres://apexes:apexes@localhost:5432/apexes";
+
+    #[tokio::test]
+    async fn dropped_stream_waiter_keeps_detached_work_tracked_until_completion() {
+        let tracker = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (finish, release) = tokio::sync::oneshot::channel();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let mut waiter = Box::pin(run_detached(&tracker, async move {
+            let _ = started.send(());
+            release.await.unwrap();
+            let _ = completed.send(());
+        }));
+        // Poll the caller until the worker has started, then abandon the
+        // caller as a select loop does when the market stream stops.
+        tokio::select! {
+            result = &mut waiter => panic!("worker unexpectedly finished: {result:?}"),
+            result = running => result.unwrap(),
+        }
+        drop(waiter);
+        assert!(tracker.try_acquire().is_err());
+        finish.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), tracker.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        done.await.unwrap();
+        drop(permit);
+        assert!(tracker.try_acquire().is_ok());
+    }
 
     /// Mirrors `apexes-oms::manager`'s and
     /// `live_trading_integration.rs`'s existing test-isolation pattern:
