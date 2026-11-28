@@ -786,6 +786,8 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 diagnostics.decision(&event, timestamp, paused, intents.len());
                 intents
                 };
+                use apexes_strategy::{AttemptStage, OrderOutcomeKind, order_outcome::notify_direct};
+                let stage = if arriving { AttemptStage::Arrival } else { AttemptStage::Decision };
                 for intent in intents {
                     if arriving && let Some(queue) = &mut arrivals {
                         queue.release(&intent);
@@ -794,6 +796,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     if emergency_event && let Some(queue) = &mut arrivals {
                         queue.report.emergency_intents_refused += 1;
                         trace.outcome("rules_rejected", "emergency_preemption");
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "emergency_preemption" });
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, "emergency exit preempts strategy orders");
                         }
@@ -814,6 +817,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         Ok(conformed) => conformed,
                         Err(violation) => {
                             trace.outcome("rules_rejected", rule_code(&violation));
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: rule_code(&violation) });
                             let reason = violation.to_string();
                             tracing::warn!(
                                 symbol = %intent.symbol,
@@ -848,6 +852,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         if available < intent.quantity || open_parent_orders.values().any(|status|
                             matches!(status, apexes_strategy::ParentOrderStatus::Scheduling)) {
                             trace.outcome("rules_rejected", "protective_inventory_unverified");
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "protective_inventory_unverified" });
                             if let Some(log) = &mut order_log {
                                 record_refusal(log, &intent, timestamp, "protective inventory or parent orders not reconciled");
                             }
@@ -869,6 +874,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         )
                     {
                         trace.risk_rejected("risk_rejected", &violations);
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "risk_rejected" });
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -885,6 +891,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         )
                     {
                         trace.risk_rejected("market_condition_rejected", &violations);
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "market_condition_rejected" });
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -901,15 +908,20 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 queue.capital_refused(!arriving);
                                 let reason = result.err().unwrap_or_else(|| "insufficient unreserved capital".into());
                                 trace.outcome("rules_rejected", "capital_reservation");
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "capital_reservation" });
                                 if let Some(log) = &mut order_log { record_refusal(log, &intent, timestamp, &reason); }
                                 continue;
                             }
                         };
                         if !arriving {
                             match queue.schedule(timestamp,intent.clone(),hold) {
-                                Ok(())=>trace.outcome("scheduled","event_latency"),
+                                Ok(())=>{
+                                    trace.outcome("scheduled","event_latency");
+                                    notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Scheduled);
+                                },
                                 Err(reason)=>{
                                     trace.outcome("rules_rejected",reason);
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: reason });
                                     if let Some(log)=&mut order_log {record_refusal(log,&intent,timestamp,reason);}
                                 }
                             }
@@ -1018,9 +1030,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                     }
                                 }
                             }
+                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Returned { order: &order });
                         }
                         Err(error) => {
                             trace.outcome("submission_failed", error_code(&error));
+                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::SubmissionFailed { code: error_code(&error) });
                             tracing::warn!(
                                 reason = error_code(&error),
                                 symbol = %intent.symbol,

@@ -16,3 +16,5 @@ mod symbol_state;
 mod scoped_indicators;
 
 mod context_market;
+
+mod order_outcome;

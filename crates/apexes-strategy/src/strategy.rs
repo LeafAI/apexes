@@ -21,6 +21,10 @@ pub trait Strategy: Send {
         ctx: &StrategyContext,
     ) -> Vec<OrderIntent>;
 
+    /// Optional notification of a direct strategy order attempt.
+    /// Return no new intents; this is not a recursive decision callback.
+    fn on_order_outcome(&mut self, _outcome: &crate::OrderOutcome<'_>) {}
+
     /// Reads all currently-tunable parameter values, for monitoring/
     /// snapshot display. Default: no tunable parameters (empty map) --
     /// existing `Strategy` implementations need no changes to keep
@@ -62,6 +66,10 @@ impl Strategy for Box<dyn Strategy> {
         ctx: &StrategyContext,
     ) -> Vec<OrderIntent> {
         (**self).on_market_event(event, ctx)
+    }
+
+    fn on_order_outcome(&mut self, outcome: &crate::OrderOutcome<'_>) {
+        (**self).on_order_outcome(outcome);
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {

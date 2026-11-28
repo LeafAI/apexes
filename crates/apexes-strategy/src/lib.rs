@@ -44,3 +44,6 @@ pub use capital_context::CapitalObservation;
 
 pub mod health_context;
 pub use health_context::{HealthObservation, HealthPhase};
+
+pub mod order_outcome;
+pub use order_outcome::{AttemptStage, OrderOutcome, OrderOutcomeKind};

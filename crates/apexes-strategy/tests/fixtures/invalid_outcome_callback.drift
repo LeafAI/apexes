@@ -1,0 +1,2 @@
+let on_order_outcome = 123;
+function on_market_event(event, ctx) { return []; }

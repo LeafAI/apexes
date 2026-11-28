@@ -1,0 +1,42 @@
+let filled = false;
+let rejected = false;
+let scheduled = false;
+let duplicate = false;
+
+function on_order_outcome(outcome) {
+    if (outcome.kind == "scheduled" && outcome.stage == "decision" &&
+        outcome.order_id == null && outcome.order_status == null && outcome.quantity == 1) {
+        scheduled = true;
+    }
+    if (outcome.kind == "rejected" && outcome.code == "risk_rejected" &&
+        outcome.quantity == 9 && outcome.order_id == null) {
+        rejected = true;
+    }
+    if (outcome.kind == "rejected" && outcome.code == "event_latency_symbol_pending") {
+        duplicate = true;
+    }
+    if (outcome.kind == "returned" && outcome.stage == "arrival" &&
+        outcome.order_status == "filled" && outcome.order_id != null &&
+        outcome.filled_quantity == 1) {
+        filled = true;
+    }
+    // Notification return values must never cause an order to be submitted.
+    return [{ symbol: outcome.symbol, venue: outcome.venue, asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 500 }];
+}
+
+function on_market_event(event, ctx) {
+    if (event.type == "trade" && event.price == 100) {
+        return [
+            { symbol: event.symbol, venue: event.venue, asset_class: "spot", side: "buy", order_type: "market", quantity: 1 },
+            { symbol: event.symbol, venue: event.venue, asset_class: "spot", side: "buy", order_type: "market", quantity: 9 },
+            { symbol: event.symbol, venue: event.venue, asset_class: "spot", side: "buy", order_type: "market", quantity: 1 },
+        ];
+    }
+    if (event.type == "tick" && filled && rejected && scheduled && duplicate) {
+        filled = false;
+        return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "limit", quantity: 1, price: 99 }];
+    }
+    return [];
+}

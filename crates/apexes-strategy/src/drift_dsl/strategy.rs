@@ -28,6 +28,7 @@ use crate::strategy::{OrderIntent, Strategy, StrategyContext};
 pub struct DriftScriptStrategy {
     interpreter: Interpreter,
     on_market_event_fn: DriftValue,
+    on_order_outcome_fn: Option<DriftValue>,
     params: Arc<ParamStore>,
     symbol_state: super::symbol_state::ScriptState,
 }
@@ -91,8 +92,17 @@ impl DriftScriptStrategy {
             return Err(StrategyError::EntryPointNotCallable);
         }
 
+        let on_order_outcome_fn = interpreter.env().get("on_order_outcome");
+        if on_order_outcome_fn
+            .as_ref()
+            .is_some_and(|f| !matches!(f, DriftValue::Function(_)))
+        {
+            return Err(StrategyError::OrderOutcomeNotCallable);
+        }
+
         Ok(Self {
             interpreter,
+            on_order_outcome_fn,
             on_market_event_fn,
             params,
             symbol_state: Default::default(),
@@ -144,6 +154,21 @@ impl Strategy for DriftScriptStrategy {
                 tracing::error!(symbol = event.symbol(), venue = ?event.venue(), "symbol state operation rejected; discarding callback writes and intents");
             }
             vec![]
+        }
+    }
+
+    fn on_order_outcome(&mut self, outcome: &crate::OrderOutcome<'_>) {
+        if let Some(callback) = &self.on_order_outcome_fn {
+            let handle = tokio::runtime::Handle::current();
+            if handle
+                .block_on(self.interpreter.call(
+                    callback.clone(),
+                    vec![super::order_outcome::to_value(outcome)],
+                ))
+                .is_err()
+            {
+                tracing::error!("on_order_outcome script error");
+            }
         }
     }
 
