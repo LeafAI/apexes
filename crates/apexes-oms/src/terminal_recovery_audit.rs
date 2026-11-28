@@ -11,7 +11,7 @@ const MAX_FILLS: usize = 8192;
 /// Evidence from a separately qualified lookup by client order identity.
 /// NotFound must mean a definite negative lookup, never a timeout or
 /// unsupported lookup. The collector is responsible for completeness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum RemoteTerminalEvidence {
     NotFound,
     Found {
@@ -21,7 +21,7 @@ pub enum RemoteTerminalEvidence {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TerminalOrderEvidence {
     pub client_order_id: OrderId,
     pub venue: Venue,
