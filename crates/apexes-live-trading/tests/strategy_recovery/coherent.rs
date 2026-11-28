@@ -3196,6 +3196,85 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     assert!(
         live::RiskHandoffSuccessorReceipt::read(&changed_handoff_path, handoff.sha256()).is_err()
     );
+    macro_rules! check_dual {
+        ($closing:expr, $closing_sha:expr, $opening:expr, $opening_sha:expr) => {
+            check_risk_pair!(
+                inspect_dual_risk_handoff_successor_receipt,
+                live::DualRiskHandoffSelection {
+                    prior_closing: live::ClosingRiskReceiptSelection {
+                        receipt: $closing,
+                        sha256: $closing_sha,
+                    },
+                    next_opening: live::OpeningRiskReceiptSelection {
+                        receipt: $opening,
+                        sha256: $opening_sha,
+                    },
+                }
+            )
+        };
+    }
+    let dual = check_dual!(
+        &a.closing_risk_receipt,
+        &a.closing_risk_digest,
+        &b.opening_risk_receipt,
+        &b.opening_risk_digest
+    )
+    .unwrap();
+    let dual_path = dir.join("dual.json");
+    dual.write_new(&dual_path).unwrap();
+    assert!(dual.write_new(&dual_path).is_err());
+    assert!(live::DualRiskHandoffSuccessorReceipt::read(&dual_path, &"0".repeat(64)).is_err());
+    assert!(live::DualRiskHandoffSuccessorReceipt::read(&handoff_path, handoff.sha256()).is_err());
+    assert!(live::RiskHandoffSuccessorReceipt::read(&dual_path, dual.sha256()).is_err());
+    let reopened_dual =
+        live::DualRiskHandoffSuccessorReceipt::read(&dual_path, dual.sha256()).unwrap();
+    let requalified_dual = check_dual!(
+        &a.closing_risk_receipt,
+        &a.closing_risk_digest,
+        &b.opening_risk_receipt,
+        &b.opening_risk_digest
+    )
+    .unwrap();
+    reopened_dual.compare(&requalified_dual).unwrap();
+    assert!(
+        check_dual!(
+            &a.closing_risk_receipt,
+            &b.closing_risk_digest,
+            &b.opening_risk_receipt,
+            &b.opening_risk_digest
+        )
+        .is_err()
+    );
+    assert!(
+        check_dual!(
+            &b.closing_risk_receipt,
+            &b.closing_risk_digest,
+            &b.opening_risk_receipt,
+            &b.opening_risk_digest
+        )
+        .is_err()
+    );
+    assert!(
+        check_dual!(
+            &a.closing_risk_receipt,
+            &a.closing_risk_digest,
+            &a.opening_risk_receipt,
+            &a.opening_risk_digest
+        )
+        .is_err()
+    );
+    let mut changed_dual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&dual_path).unwrap()).unwrap();
+    changed_dual["body"]["closing_handoff_sha256"] = serde_json::json!(&b.closing_risk_digest);
+    let changed_dual_path = dir.join("changed-dual.json");
+    std::fs::write(
+        &changed_dual_path,
+        serde_json::to_vec(&changed_dual).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        live::DualRiskHandoffSuccessorReceipt::read(&changed_dual_path, dual.sha256()).is_err()
+    );
     std::fs::remove_dir_all(dir).unwrap();
     // A later valid collection of the prior boundary cannot prove
     // continuity into the already completed successor opening interval.

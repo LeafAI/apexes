@@ -146,6 +146,11 @@ impl ClosingRiskReceipt {
         Ok(bytes)
     }
 
+    /// Original post-acknowledgement retention time, not exchange time.
+    pub fn retained_at(&self) -> DateTime<Utc> {
+        self.body.retained_at
+    }
+
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
