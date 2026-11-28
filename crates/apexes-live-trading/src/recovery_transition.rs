@@ -294,6 +294,26 @@ impl crate::CoherentRecoverySelection {
         strategies: (S, S),
         evidence: &ReceiptTransitionEvidence<'_>,
     ) -> Result<ReceiptBoundTransitionWitness, crate::CoherentInspectionError> {
+        let (witness, _, _) = self
+            .qualify_receipt_bound_transition(store, ems_postgres_url, strategies, evidence)
+            .await?;
+        Ok(witness)
+    }
+
+    pub(crate) async fn qualify_receipt_bound_transition<S: apexes_strategy::Strategy>(
+        &self,
+        store: &mut apexes_oms::OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        evidence: &ReceiptTransitionEvidence<'_>,
+    ) -> Result<
+        (
+            ReceiptBoundTransitionWitness,
+            crate::CollectedOpeningEvidence,
+            crate::CollectedSpotEvidence,
+        ),
+        crate::CoherentInspectionError,
+    > {
         let (opening, closing) = self
             .inspect_opening_closing_pair(
                 store,
@@ -321,10 +341,11 @@ impl crate::CoherentRecoverySelection {
         let transition = self
             .inspect_offline_transition(store, ems_postgres_url, strategies, &inputs)
             .await?;
-        Ok(ReceiptBoundTransitionWitness::issue(
+        let witness = ReceiptBoundTransitionWitness::issue(
             transition,
             evidence.collections.opening_sha256,
             evidence.collections.closing_sha256,
-        )?)
+        )?;
+        Ok((witness, opening, closing))
     }
 }
