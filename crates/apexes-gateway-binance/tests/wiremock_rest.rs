@@ -531,7 +531,7 @@ async fn query_order_by_client_id_returns_exchange_id_and_status() {
         .and(path("/api/v3/order"))
         .and(query_param("origClientOrderId", id.to_string()))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "orderId": 777, "status": "FILLED"
+            "orderId": 777, "status": "FILLED", "symbol": "BTCUSDT", "clientOrderId": id.to_string()
         })))
         .expect(1)
         .mount(&mock_server)
@@ -543,6 +543,79 @@ async fn query_order_by_client_id_returns_exchange_id_and_status() {
         .await
         .unwrap();
     assert_eq!(found, Some(("777".to_string(), OrderStatus::Filled)));
+}
+
+#[tokio::test]
+async fn client_id_lookup_rejects_inconsistent_or_missing_identity() {
+    let id = Uuid::new_v4();
+    for (body, expected_exchange_id) in [
+        (
+            serde_json::json!({"orderId":777,"status":"FILLED","symbol":"ETHUSDT","clientOrderId":id.to_string()}),
+            None,
+        ),
+        (
+            serde_json::json!({"orderId":777,"status":"FILLED","symbol":"BTCUSDT","clientOrderId":Uuid::new_v4().to_string()}),
+            None,
+        ),
+        (
+            serde_json::json!({"orderId":777,"status":"FILLED","symbol":"BTCUSDT"}),
+            None,
+        ),
+        (
+            serde_json::json!({"orderId":0,"status":"FILLED","symbol":"BTCUSDT","clientOrderId":id.to_string()}),
+            None,
+        ),
+        (
+            serde_json::json!({"orderId":777,"status":"FILLED","symbol":"BTCUSDT","clientOrderId":id.to_string()}),
+            Some("778"),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_clock(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .and(query_param("origClientOrderId", id.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut order = sample_order(id);
+        order.exchange_order_id = expected_exchange_id.map(str::to_owned);
+        assert!(
+            gateway_against(&server)
+                .await
+                .query_order_by_client_id(&order)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn futures_client_lookup_verifies_identity_on_correct_api_family() {
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    let id = Uuid::new_v4();
+    Mock::given(method("GET"))
+        .and(path("/fapi/v1/order"))
+        .and(query_param("origClientOrderId", id.to_string()))
+        .and(query_param("symbol", "BTCUSDT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId":777,"status":"NEW","symbol":"BTCUSDT","clientOrderId":id.to_string()
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut order = sample_order(id);
+    order.asset_class = AssetClass::Perpetual;
+    assert_eq!(
+        gateway_against(&server)
+            .await
+            .query_order_by_client_id(&order)
+            .await
+            .unwrap(),
+        Some(("777".into(), OrderStatus::New))
+    );
 }
 
 #[tokio::test]

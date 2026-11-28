@@ -905,6 +905,34 @@ fn is_order_does_not_exist(body: &str) -> bool {
     serde_json::from_str::<BinanceApiError>(body).is_ok_and(|e| e.code == -2013)
 }
 
+/// Validate the response identity before accepting a client-ID lookup.
+fn parse_client_identity(body: &str, order: &Order) -> Result<(String, OrderStatus), String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Response {
+        order_id: i64,
+        client_order_id: String,
+        symbol: String,
+        status: String,
+    }
+    let parsed: Response = serde_json::from_str(body)
+        .map_err(|_| "invalid client-order lookup response".to_owned())?;
+    if parsed.order_id <= 0
+        || parsed.symbol != order.symbol
+        || parsed.client_order_id != order.id.0.to_string()
+        || order
+            .exchange_order_id
+            .as_ref()
+            .is_some_and(|id| *id != parsed.order_id.to_string())
+    {
+        return Err("client-order lookup response identity mismatch".into());
+    }
+    Ok((
+        parsed.order_id.to_string(),
+        parse_binance_status(&parsed.status)?,
+    ))
+}
+
 fn parse_binance_status(status: &str) -> Result<OrderStatus, String> {
     match status {
         "NEW" => Ok(OrderStatus::New),
@@ -1232,18 +1260,7 @@ impl ExecutionGateway for BinanceExecutionGateway {
             return Err(format!("HTTP {status}: {body}"));
         }
 
-        #[derive(Deserialize)]
-        struct OrderByClientId {
-            #[serde(rename = "orderId")]
-            order_id: i64,
-            status: String,
-        }
-        let parsed: OrderByClientId = serde_json::from_str(&body)
-            .map_err(|error| format!("parse error: {error}; body={body}"))?;
-        Ok(Some((
-            parsed.order_id.to_string(),
-            parse_binance_status(&parsed.status)?,
-        )))
+        parse_client_identity(&body, order).map(Some)
     }
 
     async fn query_all_open_orders(

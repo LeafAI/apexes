@@ -38,6 +38,18 @@ impl SubmissionState {
         }
     }
 
+    fn parse(value: &str) -> Result<Self, OmsError> {
+        match value {
+            "Submitting" => Ok(Self::Submitting),
+            "Uncertain" => Ok(Self::Uncertain),
+            "Accepted" => Ok(Self::Accepted),
+            "Rejected" => Ok(Self::Rejected),
+            _ => Err(OmsError::InvalidRow {
+                reason: "invalid submission state".into(),
+            }),
+        }
+    }
+
     fn from_order(order: &Order) -> Self {
         if order.exchange_order_id.is_some() {
             Self::Accepted
@@ -410,17 +422,7 @@ impl OrderStore {
                 .bind(id.0)
                 .fetch_optional(&self.pool)
                 .await?;
-        state
-            .map(|value| match value.as_str() {
-                "Submitting" => Ok(SubmissionState::Submitting),
-                "Uncertain" => Ok(SubmissionState::Uncertain),
-                "Accepted" => Ok(SubmissionState::Accepted),
-                "Rejected" => Ok(SubmissionState::Rejected),
-                _ => Err(OmsError::InvalidRow {
-                    reason: "invalid submission state".into(),
-                }),
-            })
-            .transpose()
+        state.as_deref().map(SubmissionState::parse).transpose()
     }
 
     async fn write_order(
@@ -488,6 +490,30 @@ impl OrderStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Read identity and submission state from the same durable row.
+    pub(crate) async fn identity_snapshot(
+        &self,
+        id: OrderId,
+    ) -> Result<Option<(Order, SubmissionState)>, OmsError> {
+        #[derive(sqlx::FromRow)]
+        struct IdentityRow {
+            #[sqlx(flatten)]
+            order: OrderRow,
+            submission_state: String,
+        }
+        let row: Option<IdentityRow> = sqlx::query_as("SELECT * FROM orders WHERE id = $1")
+            .bind(id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok((
+                Order::try_from(row.order)?,
+                SubmissionState::parse(&row.submission_state)?,
+            ))
+        })
+        .transpose()
     }
 
     pub async fn get_order(&self, id: OrderId) -> Result<Option<Order>, OmsError> {
