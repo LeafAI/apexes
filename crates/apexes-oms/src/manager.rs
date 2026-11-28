@@ -67,12 +67,25 @@ pub struct FillDeliveryProgress {
     pub notification_failed: bool,
 }
 
+/// Process-local terminal progress. A recovered marker is not a receipt
+/// for prior strategy execution, even when its associated fills are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalDeliveryProgress {
+    pub recovered_through: i64,
+    pub notifications_returned_through: Option<i64>,
+    pub staged_count: usize,
+    pub failed: bool,
+    /// An earlier fill delivery/notification failure blocks terminal delivery.
+    pub blocked_by_fill_delivery: bool,
+}
+
 struct FillDelivery {
     recovered_checkpoint: i64,
     checkpoint: i64,
     notification_checkpoint: i64,
     notification_pending: Option<(i64, Vec<FillId>)>,
     notification_failed: bool,
+    recovered_terminal_checkpoint: i64,
     terminal_checkpoint: i64,
     terminal_pending: Option<Vec<crate::TerminalEvidence>>,
     terminal_failed: bool,
@@ -176,6 +189,16 @@ impl OrderManager {
 
     /// The bound store's persisted spot fills after startup reconciliation.
     pub async fn spot_inventory_fills(&mut self) -> Result<Vec<Fill>, OmsError> {
+        // Resetting a running manager would silently skip unacknowledged
+        // executions and erase callback receipt faults. A fresh owner must
+        // reconstruct the ledger before establishing a new baseline.
+        if self.fill_delivery.is_some() {
+            self.report_health_fault("live lifecycle recovery baseline already initialized");
+            return Err(OmsError::InvalidRow {
+                reason: "lifecycle recovery baseline already initialized; restart required".into(),
+            });
+        }
+        self.store.verify_inventory_lease().await?;
         let fills = self.store.spot_inventory_fills().await?;
         // Before any background task or new submission is allowed, all
         // persisted fills are represented by the recovered ledger.
@@ -187,6 +210,7 @@ impl OrderManager {
             notification_checkpoint: checkpoint,
             notification_pending: None,
             notification_failed: false,
+            recovered_terminal_checkpoint: terminal_checkpoint,
             terminal_checkpoint,
             terminal_pending: None,
             terminal_failed: false,
@@ -294,6 +318,20 @@ impl OrderManager {
                     .then_some(delivery.notification_checkpoint),
                 ledger_failed: delivery.failed,
                 notification_failed: delivery.notification_failed,
+            })
+    }
+
+    pub fn terminal_delivery_progress(&self) -> Option<TerminalDeliveryProgress> {
+        self.fill_delivery
+            .as_ref()
+            .map(|delivery| TerminalDeliveryProgress {
+                recovered_through: delivery.recovered_terminal_checkpoint,
+                notifications_returned_through: (delivery.terminal_checkpoint
+                    > delivery.recovered_terminal_checkpoint)
+                    .then_some(delivery.terminal_checkpoint),
+                staged_count: delivery.terminal_pending.as_ref().map_or(0, Vec::len),
+                failed: delivery.terminal_failed,
+                blocked_by_fill_delivery: delivery.failed || delivery.notification_failed,
             })
     }
 
