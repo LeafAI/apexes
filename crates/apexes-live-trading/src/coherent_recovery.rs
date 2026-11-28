@@ -316,6 +316,42 @@ impl CoherentRecoverySelection {
         .await
     }
 
+    /// Compare independent closing strategy-owned positions and cost basis
+    /// with the exact selected journal and cash-flow continuity preview.
+    /// No ledger mutation, callback replay or startup permission.
+    pub async fn inspect_closing_position_evidence<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        retained: &crate::ClosingPositionEvidence,
+    ) -> Result<(), CoherentInspectionError> {
+        let preview = self
+            .inspect_ledger_continuity(
+                store,
+                ems_postgres_url,
+                strategies,
+                instruments,
+                observations,
+            )
+            .await?;
+        retained.compare(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            instruments,
+            observations.2,
+            &preview,
+        )?;
+        Ok(())
+    }
+
     /// Read-only comparison with independently retained risk evidence.
     /// Snapshot equality cannot prove atomic capture or restore a checker.
     pub async fn inspect_risk_evidence(

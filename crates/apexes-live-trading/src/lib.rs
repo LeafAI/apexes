@@ -52,7 +52,9 @@ pub use recovery_evidence_window::{
 
 pub use recovery_wallet::{WalletEvidence, WalletEvidenceError};
 
-pub use recovery_ledger::{LedgerContinuityError, OpeningWalletEvidence};
+pub use recovery_ledger::{
+    ClosingPositionEvidence, ClosingSpotPosition, LedgerContinuityError, OpeningWalletEvidence,
+};
 
 pub use recovery_risk::{RiskBoundaryEvidence, RiskEvidenceError};
 

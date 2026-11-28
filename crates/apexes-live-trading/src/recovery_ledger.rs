@@ -29,6 +29,106 @@ pub enum LedgerContinuityError {
     Negative,
     #[error("closing balance differs from opening balance plus durable cash flows")]
     Mismatch,
+    #[error("independently retained position evidence differs from the journal preview")]
+    PositionMismatch,
+}
+
+/// Independently retained closing position evidence. Only a read-only
+/// comparison is supported; this cannot seed a ledger or authorize startup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosingSpotPosition {
+    pub symbol: String,
+    pub quantity: Decimal,
+    pub average_entry_price: Decimal,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosingPositionEvidence {
+    pub version: u32,
+    pub owner_fingerprint: String,
+    pub boundary: apexes_oms::CoherentCheckpointReceipt,
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    /// Explicit complete scope, including instruments with no position.
+    pub symbols: Vec<String>,
+    /// Sorted nonzero strategy-owned positions, not account inventory.
+    pub positions: Vec<ClosingSpotPosition>,
+}
+
+impl ClosingPositionEvidence {
+    pub(crate) fn compare(
+        &self,
+        boundary: &apexes_oms::CoherentCheckpointReceipt,
+        owner: &str,
+        instruments: &[Instrument],
+        wallet: &WalletEvidence,
+        preview: &crate::CoherentRecoveryPreview,
+    ) -> Result<(), LedgerContinuityError> {
+        use LedgerContinuityError as E;
+        if self.version != 1
+            || &self.boundary != boundary
+            || self.owner_fingerprint != owner
+            || preview.cursor != boundary.checkpoint.cursor
+        {
+            return Err(E::Identity);
+        }
+        if self.captured_at < wallet.window.started_at
+            || self.captured_at > wallet.window.finished_at
+            || self.captured_at < boundary.checkpoint.cursor.observed_at
+        {
+            return Err(E::Interval);
+        }
+        if instruments.is_empty()
+            || instruments.len() > 128
+            || self.symbols.len() != instruments.len()
+            || self.positions.len() > self.symbols.len()
+        {
+            return Err(E::Execution);
+        }
+        let mut symbols = instruments
+            .iter()
+            .map(|i| i.symbol.as_str())
+            .collect::<Vec<_>>();
+        symbols.sort_unstable();
+        if self
+            .symbols
+            .iter()
+            .map(String::as_str)
+            .ne(symbols.iter().copied())
+            || !self.symbols.windows(2).all(|w| w[0] < w[1])
+            || self
+                .symbols
+                .iter()
+                .any(|s| s.is_empty() || s.len() > 128 || s.chars().any(char::is_control))
+            || instruments
+                .iter()
+                .any(|i| i.venue != Venue::Binance || i.asset_class != AssetClass::Spot)
+            || !self.positions.windows(2).all(|w| w[0].symbol < w[1].symbol)
+            || self.positions.iter().any(|p| {
+                self.symbols.binary_search(&p.symbol).is_err()
+                    || p.quantity <= Decimal::ZERO
+                    || p.average_entry_price <= Decimal::ZERO
+            })
+        {
+            return Err(E::Execution);
+        }
+        if preview.owned_positions.len() != self.positions.len()
+            || self.positions.iter().any(|p| {
+                preview.owned_positions.get(&p.symbol).is_none_or(|v| {
+                    v.symbol != p.symbol
+                        || v.quantity != p.quantity
+                        || v.average_entry_price != p.average_entry_price
+                        || v.leverage.is_some()
+                        || v.margin_mode.is_some()
+                        || !v.allocated_margin.is_zero()
+                })
+            })
+        {
+            return Err(E::PositionMismatch);
+        }
+        Ok(())
+    }
 }
 
 fn exact_decimal(mut n: i128, mut scale: u32) -> Result<Decimal, LedgerContinuityError> {
