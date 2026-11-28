@@ -145,3 +145,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Isolated no-order scoped Drift warm-up](2026-11-28-apexes-isolated-no-order-warmup-design.md) qualifies exact checkpoint equality from independently selected opening records and a dedicated restricted-context callback, not runnable state or startup authorization.
 
 [Isolated built-in risk state restoration](2026-11-28-apexes-isolated-risk-restoration-design.md) reconstructs and reinspects private built-ins with exact alias topology after independent pristine configuration qualification; returns no runnable checker or startup authorization.
+
+[Isolated cold-start Spot ledger application](2026-11-28-apexes-isolated-ledger-application-design.md) applies an independently qualified exact journal at actual retained observation prefixes to a private ledger and compares all captured closing maps and fee attribution; no runnable state or startup authority is exposed.

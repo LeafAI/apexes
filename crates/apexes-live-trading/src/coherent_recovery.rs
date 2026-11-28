@@ -877,6 +877,84 @@ impl CoherentRecoverySelection {
         Ok(())
     }
 
+    /// Apply the exact journal to a fresh offline ledger only after
+    /// independent wallet, position, fee and retained observation evidence
+    /// qualification. Compare every captured map and attribution record;
+    /// never return a runnable ledger or advance a startup claim.
+    pub async fn inspect_isolated_ledger_application<S: Strategy>(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        strategies: (S, S),
+        instruments: &[Instrument],
+        observations: (
+            &crate::OpeningWalletEvidence,
+            &crate::RecoveryEvidenceWindow,
+            &crate::WalletEvidence,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        evidence: (
+            (
+                &crate::ClosingPositionEvidence,
+                &crate::OpeningTrackedAssetEvidence,
+                &crate::ThirdAssetFeeEvidence,
+                &crate::ClosingFeeMarkEvidence,
+            ),
+            (
+                &crate::ConversionScopeEvidence,
+                &crate::ObservationBoundaryEvidence,
+            ),
+        ),
+    ) -> Result<(), CoherentInspectionError> {
+        let (evidence, history) = evidence;
+        self.inspect_combined_fee_evidence(
+            store,
+            ems_postgres_url,
+            strategies,
+            instruments,
+            observations,
+            evidence,
+        )
+        .await?;
+        self.inspect_retained_fill_observation_availability(
+            store,
+            ems_postgres_url,
+            instruments,
+            history,
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &snapshot
+                .capture
+                .ok_or(crate::ObservationEvidenceError::Encoding)?,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        crate::recovery_ledger_application::compare_applied_ledger(
+            &capture,
+            instruments,
+            observations.0,
+            evidence.1,
+            &fills,
+        )?;
+        Ok(())
+    }
+
     /// Compare independently retained conversion-only scope to the exact
     /// selected journal and capture. Never filters a recovery allowlist
     /// or establishes ownership, market provenance, or startup authority.
