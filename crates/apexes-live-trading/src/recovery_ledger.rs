@@ -552,6 +552,107 @@ mod tests {
     }
 
     #[test]
+    fn third_asset_fee_evidence_requires_exact_causal_complete_rates() {
+        use crate::{ThirdAssetFeeEvidence, ThirdAssetFeeRate};
+        use apexes_backtest::fee_evidence::{FeeAccountEvidence, FeeValuationEvidence};
+        let (opening, _, _, _, instruments, fills) = fixture();
+        let boundary = apexes_oms::CoherentCheckpointReceipt {
+            version: 1,
+            checkpoint: opening.predecessor,
+            run_scope: Uuid::new_v4(),
+            last_intent: 3,
+            fill_sequence: 3,
+            terminal_sequence: 3,
+            order_count: 3,
+            fill_count: 3,
+            journal_sha256: "c".repeat(64),
+            capture_sha256: Some("d".repeat(64)),
+        };
+        let captured = apexes_backtest::ledger_evidence::LedgerEvidence {
+            version: 1,
+            scope: vec![(Venue::Binance, "BTCUSDT".into())],
+            balances: vec![],
+            positions: vec![],
+            realized_pnl: vec![],
+            fee_valuation: Some(FeeValuationEvidence {
+                version: 1,
+                accounts: vec![FeeAccountEvidence {
+                    symbol: "BTCUSDT".into(),
+                    venue: Venue::Binance,
+                    base: "BTC".into(),
+                    quote: "USDT".into(),
+                    gross_quantity: dec!(0.51),
+                    entry: dec!(100),
+                    gross_realized: dec!(10),
+                    fees: vec![
+                        ("BNB".into(), dec!(0.01)),
+                        ("BTC".into(), dec!(0.01)),
+                        ("USDT".into(), dec!(1)),
+                    ],
+                    external_fees: vec![],
+                    historical_fee: dec!(5),
+                    missing_execution_valuations: 0,
+                }],
+                prices: vec![],
+            }),
+        };
+        let evidence = ThirdAssetFeeEvidence {
+            version: 1,
+            boundary: boundary.clone(),
+            owner_fingerprint: "owner".into(),
+            rates: vec![ThirdAssetFeeRate {
+                fill_id: fills[2].id,
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                asset: "BNB".into(),
+                quote: "USDT".into(),
+                observed_at: at(3),
+                rate: dec!(300),
+            }],
+        };
+        let check = |e: &ThirdAssetFeeEvidence| {
+            e.compare(&boundary, "owner", &captured, &instruments, &fills)
+        };
+        check(&evidence).unwrap();
+        let mut changed = evidence.clone();
+        changed.rates[0].rate = dec!(301);
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed = evidence.clone();
+        changed.rates[0].observed_at = at(5);
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed.rates[0].observed_at = at(-297);
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed = evidence.clone();
+        changed.rates[0].quote = "BTC".into();
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed = evidence.clone();
+        changed.rates.push(changed.rates[0].clone());
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed = evidence.clone();
+        let mut extra = changed.rates[0].clone();
+        extra.fill_id = fills[0].id;
+        changed.rates.push(extra);
+        changed.rates.sort_by_key(|r| r.fill_id.0);
+        assert_eq!(check(&changed), Err(LedgerContinuityError::FeeMismatch));
+        changed = evidence.clone();
+        changed.rates.clear();
+        assert_eq!(check(&changed), Err(LedgerContinuityError::Execution));
+        changed = evidence.clone();
+        changed.boundary.journal_sha256 = "e".repeat(64);
+        assert_eq!(check(&changed), Err(LedgerContinuityError::Identity));
+        changed = evidence.clone();
+        changed.owner_fingerprint = "different".into();
+        assert_eq!(check(&changed), Err(LedgerContinuityError::Identity));
+        let mut changed_capture = captured.clone();
+        changed_capture.fee_valuation.as_mut().unwrap().accounts[0].external_fees =
+            vec![("BNB".into(), dec!(0.01))];
+        assert_eq!(
+            evidence.compare(&boundary, "owner", &changed_capture, &instruments, &fills),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+    }
+
+    #[test]
     fn direct_fee_evidence_checks_exact_amounts_and_subtotal() {
         use crate::recovery_fee::compare_direct_fees;
         use apexes_backtest::fee_evidence::{FeeAccountEvidence, FeeValuationEvidence};

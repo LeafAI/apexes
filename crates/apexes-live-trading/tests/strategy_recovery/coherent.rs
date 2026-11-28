@@ -801,6 +801,23 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    let third_asset_rates = apexes_live_trading::ThirdAssetFeeEvidence {
+        version: 1,
+        boundary: receipt.clone(),
+        owner_fingerprint: wallet_evidence.owner_fingerprint.clone(),
+        rates: vec![],
+    };
+    coherent
+        .inspect_captured_third_asset_fees(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (&retained, &third_asset_rates),
+        )
+        .await
+        .unwrap();
     let mut changed = retained.clone();
     changed.positions[0].average_entry_price = dec!(101);
     assert!(matches!(

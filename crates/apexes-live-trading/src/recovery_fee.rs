@@ -1,10 +1,62 @@
-//! Independent read-only reconciliation of direct Spot fee valuations.
-//! Third-asset conversion decisions require separate per-fill evidence.
+//! Independent read-only reconciliation of Spot fee valuations.
+//! Third-asset rates must be independently supplied for exact fills.
 use crate::recovery_ledger::{LedgerContinuityError as E, exact_add, exact_mul};
 use apexes_backtest::ledger_evidence::LedgerEvidence;
-use apexes_core::{AssetClass, Fill, Instrument, Venue};
+use apexes_core::{AssetClass, Fill, FillId, Instrument, Venue};
+use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+/// Independently supplied historical conversion observation for one exact
+/// third-asset fee. This does not authenticate the observation's source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThirdAssetFeeRate {
+    pub fill_id: FillId,
+    pub venue: Venue,
+    pub symbol: String,
+    pub asset: String,
+    pub quote: String,
+    pub observed_at: DateTime<Utc>,
+    pub rate: Decimal,
+}
+
+/// Bound to the exact selected boundary and owner; no unbound rate lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThirdAssetFeeEvidence {
+    pub version: u32,
+    pub boundary: apexes_oms::CoherentCheckpointReceipt,
+    pub owner_fingerprint: String,
+    /// Exactly one row per nonzero third-asset fee, sorted by fill ID.
+    pub rates: Vec<ThirdAssetFeeRate>,
+}
+
+impl ThirdAssetFeeEvidence {
+    pub(crate) fn compare(
+        &self,
+        boundary: &apexes_oms::CoherentCheckpointReceipt,
+        owner: &str,
+        captured: &LedgerEvidence,
+        instruments: &[Instrument],
+        fills: &[Fill],
+    ) -> Result<(), E> {
+        if self.version != 1 || &self.boundary != boundary || self.owner_fingerprint != owner {
+            return Err(E::Identity);
+        }
+        if self.rates.len() > 8192
+            || !self
+                .rates
+                .windows(2)
+                .all(|w| w[0].fill_id.0 < w[1].fill_id.0)
+        {
+            return Err(E::FeeMismatch);
+        }
+        let rates = self.rates.iter().map(|r| (r.fill_id, r)).collect();
+        compare_fees(captured, instruments, fills, rates)
+    }
+}
 
 #[derive(Default)]
 struct DirectFees {
@@ -12,7 +64,12 @@ struct DirectFees {
     historical: Decimal,
 }
 
-fn accumulate(state: &mut DirectFees, fill: &Fill, instrument: &Instrument) -> Result<(), E> {
+fn accumulate(
+    state: &mut DirectFees,
+    fill: &Fill,
+    instrument: &Instrument,
+    rates: &mut HashMap<FillId, &ThirdAssetFeeRate>,
+) -> Result<(), E> {
     let base = instrument.base_currency.as_deref().ok_or(E::Execution)?;
     let quote = instrument.quote_currency.as_deref().ok_or(E::Execution)?;
     if base.is_empty()
@@ -36,7 +93,18 @@ fn accumulate(state: &mut DirectFees, fill: &Fill, instrument: &Instrument) -> R
     } else if asset == quote {
         fill.fee
     } else {
-        return Err(E::Execution);
+        let evidence = rates.remove(&fill.id).ok_or(E::Execution)?;
+        if evidence.venue != fill.venue
+            || evidence.symbol != fill.symbol
+            || evidence.asset != asset
+            || evidence.quote != quote
+            || evidence.rate <= Decimal::ZERO
+            || evidence.observed_at > fill.filled_at
+            || fill.filled_at.signed_duration_since(evidence.observed_at) > TimeDelta::minutes(5)
+        {
+            return Err(E::FeeMismatch);
+        }
+        exact_mul(fill.fee, evidence.rate)?
     };
     let total = state.quantities.entry(asset.to_string()).or_default();
     *total = exact_add(*total, fill.fee)?;
@@ -51,6 +119,15 @@ pub(crate) fn compare_direct_fees(
     captured: &LedgerEvidence,
     instruments: &[Instrument],
     fills: &[Fill],
+) -> Result<(), E> {
+    compare_fees(captured, instruments, fills, HashMap::new())
+}
+
+fn compare_fees(
+    captured: &LedgerEvidence,
+    instruments: &[Instrument],
+    fills: &[Fill],
+    mut rates: HashMap<FillId, &ThirdAssetFeeRate>,
 ) -> Result<(), E> {
     let scope = instruments
         .iter()
@@ -74,9 +151,14 @@ pub(crate) fn compare_direct_fees(
     let mut expected = HashMap::<&str, DirectFees>::new();
     for f in fills {
         let instrument = instruments.get(f.symbol.as_str()).ok_or(E::Execution)?;
-        accumulate(expected.entry(&f.symbol).or_default(), f, instrument)?;
+        accumulate(
+            expected.entry(&f.symbol).or_default(),
+            f,
+            instrument,
+            &mut rates,
+        )?;
     }
-    if expected.len() != evidence.accounts.len() {
+    if !rates.is_empty() || expected.len() != evidence.accounts.len() {
         return Err(E::FeeMismatch);
     }
     for account in &evidence.accounts {

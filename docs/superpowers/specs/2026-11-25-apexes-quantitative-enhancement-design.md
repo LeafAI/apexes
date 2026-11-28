@@ -117,3 +117,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Retained Spot fee-valuation evidence](2026-11-28-apexes-fee-valuation-evidence-design.md) captures actual bounded attribution aggregates and retained conversion windows, preserving missing-valuation counts without applying state.
 
 [Independent direct Spot fee reconciliation](2026-11-28-apexes-direct-fee-reconciliation-design.md) verifies direct base/quote fee quantities and historical valuation subtotals against the exact selected journal; third-asset valuations remain unqualified.
+
+[Independent per-fill third-asset valuation evidence](2026-11-28-apexes-third-asset-fee-evidence-design.md) compares the exact selected journal and supplied causal per-fill rates against retained fee totals and valuation subtotals; actual runtime conversion decisions and provenance remain unqualified.
