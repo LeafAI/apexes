@@ -25,6 +25,9 @@ pub trait Strategy: Send {
     /// Return no new intents; this is not a recursive decision callback.
     fn on_order_outcome(&mut self, _outcome: &crate::OrderOutcome<'_>) {}
 
+    /// Notification of a locally applied execution. No recursive orders.
+    fn on_fill(&mut self, _outcome: &crate::FillOutcome<'_>) {}
+
     /// Reads all currently-tunable parameter values, for monitoring/
     /// snapshot display. Default: no tunable parameters (empty map) --
     /// existing `Strategy` implementations need no changes to keep
@@ -70,6 +73,10 @@ impl Strategy for Box<dyn Strategy> {
 
     fn on_order_outcome(&mut self, outcome: &crate::OrderOutcome<'_>) {
         (**self).on_order_outcome(outcome);
+    }
+
+    fn on_fill(&mut self, outcome: &crate::FillOutcome<'_>) {
+        (**self).on_fill(outcome);
     }
 
     fn current_params(&self) -> HashMap<String, Decimal> {

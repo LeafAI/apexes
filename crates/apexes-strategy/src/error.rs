@@ -32,6 +32,9 @@ pub enum StrategyError {
     #[error("`on_order_outcome` is defined but is not a function")]
     OrderOutcomeNotCallable,
 
+    #[error("`on_fill` is defined but is not a function")]
+    FillCallbackNotCallable,
+
     #[error("unknown parameter: {name}")]
     UnknownParam { name: String },
 }

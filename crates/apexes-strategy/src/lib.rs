@@ -47,3 +47,6 @@ pub use health_context::{HealthObservation, HealthPhase};
 
 pub mod order_outcome;
 pub use order_outcome::{AttemptStage, OrderOutcome, OrderOutcomeKind};
+
+pub mod fill_outcome;
+pub use fill_outcome::{FillOutcome, FillSource};
