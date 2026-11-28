@@ -50,7 +50,8 @@ pub use order_executor_adapter::{
 pub use runner::{
     LiveTradingConfig, LiveTradingReport, run_live_trading,
     run_live_trading_with_checkpoint_on_stop, run_live_trading_with_observation_capture_on_stop,
-    run_live_trading_with_opening_risk_handoff_on_stop, run_live_trading_with_startup,
+    run_live_trading_with_opening_risk_handoff_on_stop,
+    run_live_trading_with_risk_boundary_handoffs_on_stop, run_live_trading_with_startup,
 };
 pub use spot_recovery::{SpotRecoveryError, SpotWalletBalance, recover_spot_positions};
 pub use startup_recovery::{
@@ -116,3 +117,8 @@ pub use recovery_risk_successor_receipt::{
 
 mod recovery_opening_risk_receipt;
 pub use recovery_opening_risk_receipt::{OpeningRiskHandoff, OpeningRiskReceipt};
+
+mod recovery_closing_risk_receipt;
+pub use recovery_closing_risk_receipt::{
+    ClosingRiskHandoff, ClosingRiskReceipt, ClosingRiskSnapshot, RiskBoundaryHandoffs,
+};

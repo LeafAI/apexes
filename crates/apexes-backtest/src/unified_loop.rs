@@ -1454,6 +1454,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 tiers.sort_by(|a, b| a.0.cmp(&b.0));
                 capture.margin_tiers = Some(tiers);
             }
+            capture.closing_risk_captured_at = Some(chrono::Utc::now());
         }
         if let Some(capture) = &captured {
             let bytes =

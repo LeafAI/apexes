@@ -242,6 +242,9 @@ pub struct CapturedObservations {
     /// None on legacy captures; Some records actual pre-event inspection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opening_risk: Option<OpeningRiskSnapshot>,
+    /// Consumer UTC at the actual closing risk inspection; absent on legacy captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_risk_captured_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
@@ -258,6 +261,11 @@ impl CapturedObservations {
         self.receipt.verify(&self.scope, &self.records)?;
         if let Some(opening) = &self.opening_risk {
             opening.validate()?;
+        }
+        if let (Some(opening), Some(closing)) = (&self.opening_risk, self.closing_risk_captured_at)
+            && closing < opening.captured_at
+        {
+            return Err(ObservationError::Time);
         }
         if let Some(ledger) = &self.ledger {
             ledger.validate(&self.scope)?;
@@ -521,6 +529,7 @@ impl ObservationCapture {
             ledger: None,
             fill_observation_prefixes: self.fill_observation_prefixes,
             opening_risk: None,
+            closing_risk_captured_at: None,
         })
     }
 }
