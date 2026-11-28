@@ -85,3 +85,8 @@ mod recovery_ledger_application;
 
 mod recovery_transition;
 pub use recovery_transition::{OfflineTransitionWitness, TransitionEvidence};
+
+mod recovery_successor;
+pub use recovery_successor::{
+    SuccessorContinuityError, SuccessorInspectionError, SuccessorRun, inspect_offline_successor,
+};
