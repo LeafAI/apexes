@@ -1,0 +1,36 @@
+let parent_id = null;
+let completed = false;
+let failed = false;
+let unavailable = false;
+let submission_failed = false;
+
+function on_parent_outcome(outcome) {
+    if (outcome.kind == "submitted" && outcome.symbol == "BTCUSDT" &&
+        outcome.quantity == 1 && outcome.parent_id != null && outcome.status == null) {
+        parent_id = outcome.parent_id;
+    }
+    if (outcome.kind == "status_changed" && outcome.parent_id == parent_id &&
+        outcome.previous == "scheduling" && outcome.status == "completed") {
+        completed = true;
+    }
+    if (outcome.kind == "status_changed" && outcome.status == "failed") {
+        failed = true;
+    }
+    if (outcome.kind == "unavailable" && outcome.parent_id == parent_id && outcome.status == null) {
+        unavailable = true;
+    }
+    if (outcome.kind == "submission_failed" && outcome.parent_id == null &&
+        outcome.symbol == "BTCUSDT" && outcome.status == null) {
+        submission_failed = true;
+    }
+    return [{symbol: "BTCUSDT", venue: "binance", asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 999}];
+}
+
+function on_market_event(event, ctx) {
+    if (completed && failed && unavailable && submission_failed) {
+        return [{symbol: event.symbol, venue: event.venue, asset_class: "spot",
+            side: "buy", order_type: "market", quantity: 1}];
+    }
+    return [];
+}

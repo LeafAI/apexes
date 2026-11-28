@@ -38,6 +38,9 @@ pub enum StrategyError {
     #[error("`on_order_terminal` is defined but is not a function")]
     TerminalCallbackNotCallable,
 
+    #[error("`on_parent_outcome` is defined but is not a function")]
+    ParentCallbackNotCallable,
+
     #[error("unknown parameter: {name}")]
     UnknownParam { name: String },
 }

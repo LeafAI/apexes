@@ -922,3 +922,60 @@ fn optional_outcome_callback_validates_entry_point_and_isolates_runtime_errors()
         assert_eq!(legacy.on_market_event(&event, &ctx).len(), 1);
     });
 }
+
+#[test]
+fn parent_callback_distinguishes_submission_status_failure_and_missing() {
+    use apexes_strategy::{ParentOrderId, ParentOutcome, ParentOutcomeKind, ParentPhase};
+    with_runtime(|| {
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("parent_outcome.drift")).unwrap();
+        let mut donor = DriftScriptStrategy::from_file(&fixture_path("always_buy.drift")).unwrap();
+        let event = sample_trade_event();
+        let ctx = StrategyContext {
+            health: None,
+            capital: None,
+            costs: None,
+            book: None,
+            market: None,
+            positions: &HashMap::new(),
+            balances: &HashMap::new(),
+            open_orders: &HashMap::new(),
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now: Utc::now(),
+        };
+        let mut intents = donor.on_market_event(&event, &ctx);
+        let mut intent = intents.remove(0);
+        intent.execution_algo = Some(apexes_strategy::ExecutionAlgoSpec::Twap {
+            duration: std::time::Duration::from_secs(1),
+            slices: 1,
+        });
+        let id = ParentOrderId(uuid::Uuid::from_u128(1));
+        let other = ParentOrderId(uuid::Uuid::from_u128(2));
+        let outcomes = [
+            ParentOutcomeKind::Submitted {
+                id,
+                intent: &intent,
+            },
+            ParentOutcomeKind::StatusChanged {
+                id,
+                previous: ParentPhase::Scheduling,
+                current: ParentPhase::Completed,
+            },
+            ParentOutcomeKind::StatusChanged {
+                id: other,
+                previous: ParentPhase::Scheduling,
+                current: ParentPhase::Failed,
+            },
+            ParentOutcomeKind::Unavailable { id },
+            ParentOutcomeKind::SubmissionFailed { intent: &intent },
+        ];
+        for (index, kind) in outcomes.into_iter().enumerate() {
+            strategy.on_parent_outcome(&ParentOutcome { at: ctx.now, kind });
+            assert_eq!(
+                strategy.on_market_event(&event, &ctx).len(),
+                usize::from(index == 4)
+            );
+        }
+    });
+}

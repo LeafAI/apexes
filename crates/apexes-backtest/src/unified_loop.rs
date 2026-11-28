@@ -243,7 +243,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut supplemental_seen = HashSet::new();
     let mut notifications = crate::fill_notifications::FillNotifications::default();
-    use apexes_strategy::{FillSource, TerminalKind, TerminalOutcome};
+    use apexes_strategy::{
+        FillSource, ParentOutcome, ParentOutcomeKind, TerminalKind, TerminalOutcome,
+    };
     let mut recorded_initial_equity = false;
     let mut diagnostics = Diagnostics::new();
     let mut risk_checker = config.risk_checker;
@@ -555,7 +557,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     }
                     notifications.deliver(&mut strategy, timestamp, FillSource::Ems, &ems_fills);
                 }
-                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders).await;
+                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
                 if let Some(queue) = &mut arrivals {
                     queue.reconcile_parents(&open_parent_orders);
                 }
@@ -967,9 +969,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 if let Some(checker) = &risk_checker {
                                     checker.on_order_accepted(&intent, timestamp);
                                 }
+                                strategy.on_parent_outcome(&ParentOutcome { at: timestamp, kind: ParentOutcomeKind::Submitted { id: parent_id, intent: &intent } });
                             }
                             Err(_) => {
                                 trace.outcome("parent_submission_failed", "ems_error");
+                                strategy.on_parent_outcome(&ParentOutcome { at: timestamp, kind: ParentOutcomeKind::SubmissionFailed { intent: &intent } });
                                 tracing::warn!(reason = "ems_error", symbol = %intent.symbol, "algo order submission failed");
                             }
                         }
@@ -1668,7 +1672,9 @@ async fn preempt_simulated_orders(
     strategy: &mut impl Strategy,
     at: chrono::DateTime<chrono::Utc>,
 ) {
-    use apexes_strategy::{TerminalKind, TerminalOutcome};
+    use apexes_strategy::{
+        ParentOutcome, ParentOutcomeKind, ParentPhase, TerminalKind, TerminalOutcome,
+    };
     queue.report.emergency_events += 1;
     let cancelled_transit = queue.cancel_transit_for_emergency();
     let mut cancelled_ids = Vec::new();
@@ -1688,11 +1694,13 @@ async fn preempt_simulated_orders(
         .filter(|(_, status)| **status == ParentOrderStatus::Scheduling)
         .map(|(id, _)| *id)
         .collect();
+    let mut cancelled_parents = Vec::new();
     for id in ids {
         match ems.cancel_parent_order(id).await {
             Ok(()) => {
                 parents.insert(id, ParentOrderStatus::Cancelled);
                 queue.report.emergency_parents_cancelled += 1;
+                cancelled_parents.push(id);
             }
             Err(error) => {
                 queue.report.emergency_cancel_failures += 1;
@@ -1715,21 +1723,53 @@ async fn preempt_simulated_orders(
             kind: TerminalKind::Cancelled { order_id },
         });
     }
+    cancelled_parents.sort_unstable_by_key(|id| id.0);
+    for id in cancelled_parents {
+        strategy.on_parent_outcome(&ParentOutcome {
+            at,
+            kind: ParentOutcomeKind::StatusChanged {
+                id,
+                previous: ParentPhase::Scheduling,
+                current: ParentPhase::Cancelled,
+            },
+        });
+    }
 }
 
 async fn refresh_open_parent_orders(
     ems: &dyn Ems,
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
+    strategy: &mut impl Strategy,
+    at: chrono::DateTime<chrono::Utc>,
 ) {
+    use apexes_strategy::{ParentOutcome, ParentOutcomeKind, ParentPhase};
     let mut ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
     ids.sort_unstable_by_key(|id| id.0);
     for id in ids {
         match ems.parent_order_status(id).await {
             Ok(Some(status)) => {
-                open_parent_orders.insert(id, status);
+                let current = ParentPhase::from(&status);
+                if let Some(previous) = open_parent_orders.insert(id, status) {
+                    let previous = ParentPhase::from(&previous);
+                    if previous != current {
+                        strategy.on_parent_outcome(&ParentOutcome {
+                            at,
+                            kind: ParentOutcomeKind::StatusChanged {
+                                id,
+                                previous,
+                                current,
+                            },
+                        });
+                    }
+                }
             }
             Ok(None) => {
-                open_parent_orders.remove(&id);
+                if open_parent_orders.remove(&id).is_some() {
+                    strategy.on_parent_outcome(&ParentOutcome {
+                        at,
+                        kind: ParentOutcomeKind::Unavailable { id },
+                    });
+                }
             }
             Err(_) => {
                 tracing::warn!(reason = "ems_error", parent_id = ?id, "failed to refresh parent order status");
@@ -1825,6 +1865,89 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(ledger.positions()["BTCUSDT"].quantity, dec!(0.5));
         assert_eq!(ledger.balances()["USDT"], dec!(70000));
+    }
+
+    #[tokio::test]
+    async fn parent_status_observation_distinguishes_failure_missing_and_poll_error() {
+        use apexes_ems::{AlgoOrderRequest, EmsError};
+        use apexes_strategy::{ParentOutcome, ParentOutcomeKind, ParentPhase};
+        type Response = Result<Option<ParentOrderStatus>, EmsError>;
+        struct Polls(std::sync::Mutex<std::collections::VecDeque<Response>>);
+        #[async_trait::async_trait]
+        impl Ems for Polls {
+            async fn submit_algo_order(
+                &self,
+                _: AlgoOrderRequest,
+            ) -> Result<ParentOrderId, EmsError> {
+                unreachable!()
+            }
+            async fn cancel_parent_order(&self, _: ParentOrderId) -> Result<(), EmsError> {
+                unreachable!()
+            }
+            async fn on_market_event(&self, _: &MarketEvent) -> Result<Vec<Fill>, EmsError> {
+                unreachable!()
+            }
+            async fn parent_order_status(&self, _: ParentOrderId) -> Response {
+                self.0.lock().unwrap().pop_front().unwrap()
+            }
+        }
+        type Evidence = Vec<(ParentOrderId, Option<ParentPhase>)>;
+        #[derive(Default)]
+        struct Probe(Evidence);
+        impl Strategy for Probe {
+            fn on_market_event(
+                &mut self,
+                _: &MarketEvent,
+                _: &StrategyContext,
+            ) -> Vec<OrderIntent> {
+                vec![]
+            }
+            fn on_parent_outcome(&mut self, outcome: &ParentOutcome<'_>) {
+                match outcome.kind {
+                    ParentOutcomeKind::StatusChanged {
+                        id,
+                        previous,
+                        current,
+                    } => {
+                        assert_eq!(previous, ParentPhase::Scheduling);
+                        self.0.push((id, Some(current)));
+                    }
+                    ParentOutcomeKind::Unavailable { id } => self.0.push((id, None)),
+                    _ => panic!("unexpected outcome"),
+                }
+            }
+        }
+        let id = ParentOrderId(uuid::Uuid::from_u128(1));
+        let mut tracked = HashMap::from([(id, ParentOrderStatus::Scheduling)]);
+        let ems = Polls(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Err(EmsError::QueryFailed {
+                reason: "poll failure".into(),
+            }),
+            Ok(Some(ParentOrderStatus::Scheduling)),
+            Ok(Some(ParentOrderStatus::Failed {
+                reason: "private detail".into(),
+            })),
+            Ok(Some(ParentOrderStatus::Failed {
+                reason: "changed private detail".into(),
+            })),
+            Ok(None),
+        ])));
+        let mut probe = Probe::default();
+        let now = Utc::now();
+        for _ in 0..2 {
+            refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+            assert_eq!(tracked[&id], ParentOrderStatus::Scheduling);
+            assert!(probe.0.is_empty());
+        }
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        assert_eq!(probe.0, vec![(id, Some(ParentPhase::Failed))]);
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        assert_eq!(probe.0.len(), 1);
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        assert!(tracked.is_empty());
+        assert_eq!(probe.0, vec![(id, Some(ParentPhase::Failed)), (id, None)]);
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        assert_eq!(probe.0.len(), 2);
     }
 
     #[test]
