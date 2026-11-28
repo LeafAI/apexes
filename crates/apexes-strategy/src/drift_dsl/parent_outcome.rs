@@ -33,6 +33,12 @@ pub(super) fn to_value(outcome: &ParentOutcome<'_>) -> DriftValue {
             ("kind", string(kind)),
             ("at", string(&outcome.at.to_rfc3339())),
             (
+                "intent_id",
+                outcome
+                    .intent_id
+                    .map_or(DriftValue::Null, |id| string(&id.0.to_string())),
+            ),
+            (
                 "parent_id",
                 id.map_or(DriftValue::Null, |id| string(&id.0.to_string())),
             ),

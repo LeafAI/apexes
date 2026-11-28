@@ -40,6 +40,12 @@ pub(super) fn to_value(outcome: &OrderOutcome<'_>) -> DriftValue {
             ("code", code.map_or(DriftValue::Null, string)),
             ("stage", string(stage)),
             ("at", string(&outcome.at.to_rfc3339())),
+            (
+                "intent_id",
+                outcome
+                    .intent_id
+                    .map_or(DriftValue::Null, |id| string(&id.0.to_string())),
+            ),
             ("symbol", string(&intent.symbol)),
             ("venue", string(super::convert::venue_to_str(intent.venue))),
             (

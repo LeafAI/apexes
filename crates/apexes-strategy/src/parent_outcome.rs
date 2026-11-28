@@ -53,6 +53,8 @@ pub enum ParentOutcomeKind<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ParentOutcome<'a> {
+    /// Known local decision identity; absent for uncorrelated evidence.
+    pub intent_id: Option<crate::IntentId>,
     pub at: DateTime<Utc>,
     pub kind: ParentOutcomeKind<'a>,
 }

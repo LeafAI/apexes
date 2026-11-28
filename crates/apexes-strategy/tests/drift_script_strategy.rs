@@ -901,6 +901,7 @@ fn optional_outcome_callback_validates_entry_point_and_isolates_runtime_errors()
         let intents = strategy.on_market_event(&event, &ctx);
         assert_eq!(intents.len(), 1);
         strategy.on_order_outcome(&OrderOutcome {
+            intent_id: None,
             at: ctx.now,
             stage: AttemptStage::Decision,
             intent: &intents[0],
@@ -912,6 +913,7 @@ fn optional_outcome_callback_validates_entry_point_and_isolates_runtime_errors()
         // Existing script with no callback remains valid.
         let mut legacy = DriftScriptStrategy::from_file(&fixture_path("always_buy.drift")).unwrap();
         legacy.on_order_outcome(&OrderOutcome {
+            intent_id: None,
             at: ctx.now,
             stage: AttemptStage::Decision,
             intent: &intents[0],
@@ -971,7 +973,11 @@ fn parent_callback_distinguishes_submission_status_failure_and_missing() {
             ParentOutcomeKind::SubmissionFailed { intent: &intent },
         ];
         for (index, kind) in outcomes.into_iter().enumerate() {
-            strategy.on_parent_outcome(&ParentOutcome { at: ctx.now, kind });
+            strategy.on_parent_outcome(&ParentOutcome {
+                intent_id: None,
+                at: ctx.now,
+                kind,
+            });
             assert_eq!(
                 strategy.on_market_event(&event, &ctx).len(),
                 usize::from(index == 4)

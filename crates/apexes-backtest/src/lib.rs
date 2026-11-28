@@ -105,3 +105,5 @@ pub mod funding_attribution;
 pub mod exit_attribution;
 
 mod fill_notifications;
+
+mod lifecycle_correlation;

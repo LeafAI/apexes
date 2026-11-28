@@ -222,7 +222,11 @@ fn validate_closing(
 }
 
 pub(crate) struct ArrivalQueue {
-    pending: VecDeque<(DateTime<Utc>, OrderIntent)>,
+    pending: VecDeque<(
+        DateTime<Utc>,
+        OrderIntent,
+        Option<apexes_strategy::IntentId>,
+    )>,
     holds: HashMap<(Venue, String), CapitalHold>,
     parents: HashMap<ParentOrderId, ParentCapital>,
     resting: HashMap<OrderId, RestingCapital>,
@@ -652,11 +656,22 @@ impl ArrivalQueue {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn schedule(
         &mut self,
         at: DateTime<Utc>,
         intent: OrderIntent,
         hold: Option<CapitalHold>,
+    ) -> Result<(), &'static str> {
+        self.schedule_correlated(at, intent, hold, None)
+    }
+
+    pub fn schedule_correlated(
+        &mut self,
+        at: DateTime<Utc>,
+        intent: OrderIntent,
+        hold: Option<CapitalHold>,
+        intent_id: Option<apexes_strategy::IntentId>,
     ) -> Result<(), &'static str> {
         let deadline = at.checked_add_signed(TimeDelta::milliseconds(i64::from(
             self.report.policy.delay_ms,
@@ -664,7 +679,7 @@ impl ArrivalQueue {
         let reason = if self
             .pending
             .iter()
-            .any(|(_, p)| p.venue == intent.venue && p.symbol == intent.symbol)
+            .any(|(_, p, _)| p.venue == intent.venue && p.symbol == intent.symbol)
         {
             Some("event_latency_symbol_pending")
         } else if self.pending.len() >= 1024 {
@@ -683,28 +698,44 @@ impl ArrivalQueue {
             self.holds
                 .insert((intent.venue, intent.symbol.clone()), hold);
         }
-        self.pending.push_back((deadline, intent));
+        self.pending.push_back((deadline, intent, intent_id));
         self.report.scheduled += 1;
         Ok(())
     }
-    pub fn cancel_transit_for_emergency(&mut self) -> Vec<OrderIntent> {
-        let intents: Vec<_> = self.pending.drain(..).map(|(_, intent)| intent).collect();
-        for intent in &intents {
+    pub fn cancel_transit_for_emergency(
+        &mut self,
+    ) -> Vec<(OrderIntent, Option<apexes_strategy::IntentId>)> {
+        let intents: Vec<_> = self
+            .pending
+            .drain(..)
+            .map(|(_, intent, id)| (intent, id))
+            .collect();
+        for (intent, _) in &intents {
             self.release(intent);
         }
         self.report.emergency_transit_cancelled += intents.len() as u64;
         intents
     }
 
+    #[cfg(test)]
     pub fn due(&mut self, at: DateTime<Utc>) -> Vec<OrderIntent> {
+        self.due_correlated(at)
+            .into_iter()
+            .map(|(intent, _)| intent)
+            .collect()
+    }
+    pub fn due_correlated(
+        &mut self,
+        at: DateTime<Utc>,
+    ) -> Vec<(OrderIntent, Option<apexes_strategy::IntentId>)> {
         let mut due = Vec::new();
         while self
             .pending
             .front()
-            .is_some_and(|(deadline, _)| *deadline <= at)
+            .is_some_and(|(deadline, _, _)| *deadline <= at)
         {
-            if let Some((_, intent)) = self.pending.pop_front() {
-                due.push(intent);
+            if let Some((_, intent, id)) = self.pending.pop_front() {
+                due.push((intent, id));
                 self.report.arrived += 1;
             }
         }
@@ -714,9 +745,10 @@ impl ArrivalQueue {
     pub(crate) fn notify_expiry(&self, strategy: &mut impl apexes_strategy::Strategy) {
         use apexes_strategy::{TerminalKind, TerminalOutcome};
         if let Some(at) = self.watermark {
-            for (_, intent) in &self.pending {
+            for (_, intent, id) in &self.pending {
                 if intent.execution_algo.is_none() {
                     strategy.on_order_terminal(&TerminalOutcome {
+                        intent_id: *id,
                         at,
                         kind: TerminalKind::TransitExpired { intent },
                     });

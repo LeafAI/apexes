@@ -1773,7 +1773,12 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
     };
     use apexes_backtest::replay_identity::{ReplayIdentityPolicy, canonical_report_sha256};
     use apexes_strategy::{ParentOrderId, ParentOutcome, ParentOutcomeKind, ParentPhase};
-    type Lifecycle = Vec<(chrono::DateTime<Utc>, ParentOrderId, Option<ParentPhase>)>;
+    type Lifecycle = Vec<(
+        chrono::DateTime<Utc>,
+        ParentOrderId,
+        Option<ParentPhase>,
+        Option<apexes_strategy::IntentId>,
+    )>;
     use std::sync::{Arc, Mutex};
     struct Parents {
         sent: bool,
@@ -1803,7 +1808,10 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
                 }
                 _ => panic!("unexpected parent outcome {outcome:?}"),
             };
-            self.lifecycle.lock().unwrap().push((outcome.at, id, phase));
+            self.lifecycle
+                .lock()
+                .unwrap()
+                .push((outcome.at, id, phase, outcome.intent_id));
         }
 
         fn on_market_event(
@@ -1983,20 +1991,30 @@ async fn deterministic_ems_repeats_parent_ids_child_arrivals_and_report() {
         assert_eq!(
             lifecycle
                 .iter()
-                .filter(|(_, _, phase)| phase.is_none())
+                .filter(|(_, _, phase, _)| phase.is_none())
                 .count(),
             2
         );
         for id in ids.iter().collect::<HashSet<_>>() {
             let parent: Vec<_> = lifecycle
                 .iter()
-                .filter(|(_, parent, _)| parent == id)
+                .filter(|(_, parent, _, _)| parent == id)
                 .collect();
             assert_eq!(parent.len(), 2);
             assert_eq!(parent[0].2, None);
             assert_eq!(parent[1].2, Some(ParentPhase::Completed));
+            assert!(parent[0].3.is_some());
+            assert_eq!(parent[0].3, parent[1].3);
             assert!(parent[0].0 <= parent[1].0);
         }
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|x| x.2.is_none())
+                .map(|x| x.3.unwrap().0)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let result = (ids, fingerprint, lifecycle);
         if let Some(previous) = &expected {
             assert_eq!(&result, previous);

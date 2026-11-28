@@ -5,7 +5,7 @@ let resting_completed = false;
 
 function on_order_terminal(outcome) {
     if (outcome.kind == "filled" && outcome.symbol == "BTCUSDT" &&
-        outcome.quantity == 3 && outcome.filled_quantity == 3 &&
+        outcome.intent_id == "2" && outcome.quantity == 3 && outcome.filled_quantity == 3 &&
         outcome.order_id != null && resting_quantity == 3) {
         resting_completed = true;
     }
@@ -21,11 +21,11 @@ function on_order_outcome(outcome) {
 
 function on_fill(fill) {
     if (fill.symbol == "BTCUSDT" && fill.venue == "binance" &&
-        fill.source == "direct" && fill.order_id == returned_id &&
+        fill.source == "direct" && fill.intent_id == "1" && fill.order_id == returned_id &&
         fill.price == 100 && fill.fee_currency == null && fill.fee == 0.1) {
         direct_quantity = direct_quantity + fill.quantity;
     }
-    if (fill.source == "resting" && fill.price == 99) {
+    if (fill.source == "resting" && fill.intent_id == "2" && fill.price == 99) {
         resting_quantity = resting_quantity + fill.quantity;
     }
     return [{ symbol: fill.symbol, venue: fill.venue, asset_class: "spot",

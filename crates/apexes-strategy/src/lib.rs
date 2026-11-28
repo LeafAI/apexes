@@ -56,3 +56,7 @@ pub use terminal_outcome::{TerminalKind, TerminalOutcome};
 
 pub mod parent_outcome;
 pub use parent_outcome::{ParentOutcome, ParentOutcomeKind, ParentPhase};
+
+/// Session-local decision ordinal; never an exchange id or cross-session key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IntentId(pub u64);

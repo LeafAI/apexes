@@ -1242,6 +1242,7 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
         String,
         Decimal,
         Option<apexes_core::OrderId>,
+        Option<apexes_strategy::IntentId>,
     )>;
     struct Probe {
         script: DriftScriptStrategy,
@@ -1276,6 +1277,7 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
                 kind,
                 outcome.intent.quantity,
                 id,
+                outcome.intent_id,
             ));
             self.script.on_order_outcome(outcome);
         }
@@ -1321,7 +1323,7 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
         let seen = outcomes.lock().unwrap();
         assert_eq!(
             seen.iter()
-                .map(|(ms, stage, kind, qty, _)| (*ms, *stage, kind.as_str(), *qty))
+                .map(|(ms, stage, kind, qty, _, _)| (*ms, *stage, kind.as_str(), *qty))
                 .collect::<Vec<_>>(),
             vec![
                 (0, AttemptStage::Decision, "scheduled", dec!(1)),
@@ -1336,6 +1338,10 @@ fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision
                 (500, AttemptStage::Decision, "scheduled", dec!(1)),
                 (1000, AttemptStage::Arrival, "returned:New", dec!(1)),
             ]
+        );
+        assert_eq!(
+            seen.iter().map(|x| x.5.unwrap().0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 1, 4, 4]
         );
         assert_eq!(report.trades.len(), 2);
         assert_eq!(seen[3].4, Some(report.trades[0].order_id));
@@ -1434,6 +1440,7 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
             let TerminalKind::Filled { order } = outcome.kind else {
                 panic!("unexpected terminal");
             };
+            assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(2)));
             assert_eq!(order.filled_quantity, dec!(3));
             assert_eq!(order.quantity, dec!(3));
             assert_eq!(order.status, apexes_core::OrderStatus::Filled);
@@ -1445,6 +1452,14 @@ fn committed_fill_callbacks_drive_next_decision_and_repeat_with_partial_resting_
             self.script.on_order_terminal(outcome);
         }
         fn on_fill(&mut self, outcome: &FillOutcome<'_>) {
+            let expected = match self.seen.lock().unwrap().len() {
+                0 => 1,
+                1 | 2 => 2,
+                3 => 3,
+                _ => panic!("unexpected fill"),
+            };
+            assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(expected)));
+
             self.seen
                 .lock()
                 .unwrap()
@@ -1540,11 +1555,13 @@ async fn transit_expiry_notifies_only_unsubmitted_direct_intents_at_observed_end
             }
         }
         fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(1)));
             assert_eq!(outcome.stage, AttemptStage::Decision);
             assert!(matches!(outcome.kind, OrderOutcomeKind::Scheduled));
             self.0.lock().unwrap().scheduled += 1;
         }
         fn on_order_terminal(&mut self, outcome: &TerminalOutcome<'_>) {
+            assert_eq!(outcome.intent_id, Some(apexes_strategy::IntentId(1)));
             let TerminalKind::TransitExpired { intent } = outcome.kind else {
                 panic!("unexpected terminal");
             };
