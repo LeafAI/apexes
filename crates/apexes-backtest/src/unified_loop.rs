@@ -1370,6 +1370,12 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 reason: format!("completed observation receipt refused: {error}"),
             })?;
         if let Some(capture) = &mut captured {
+            capture.ledger = Some(ledger.inspect_evidence().map_err(|error| {
+                ApexesError::InvalidBacktestConfig {
+                    reason: format!("ledger evidence capture refused: {error}"),
+                }
+            })?);
+
             capture.registered_risk = risk_checker
                 .as_ref()
                 .map(|checker| checker.inspect_registered_state())

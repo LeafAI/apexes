@@ -202,6 +202,9 @@ pub struct CapturedObservations {
     /// Ordered actual configured tables, not exchange provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub margin_tiers: Option<Vec<(String, apexes_strategy::MarginTierTable)>>,
+    /// Actual basic loop-local ledger maps; absent on legacy receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<crate::ledger_evidence::LedgerEvidence>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
@@ -216,6 +219,10 @@ struct CaptureEnvelope {
 impl CapturedObservations {
     fn validate(&self) -> Result<(), ObservationError> {
         self.receipt.verify(&self.scope, &self.records)?;
+        if let Some(ledger) = &self.ledger {
+            ledger.validate(&self.scope)?;
+        }
+
         if let Some(market) = &self.market_monitor {
             if self.market_monitor_unqualified {
                 return Err(ObservationError::Encoding);
@@ -409,6 +416,7 @@ impl ObservationCapture {
             margin_monitor_unqualified: false,
             market_monitor: None,
             margin_tiers: None,
+            ledger: None,
         })
     }
 }

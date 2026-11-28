@@ -156,6 +156,12 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
         .unwrap();
     let (manager, mut config, health) = fixture.manager(&registry).await;
+    let mut expected_ledger_balances = config.initial_balances.clone();
+    *expected_ledger_balances.entry("BTC".into()).or_default() += dec!(1);
+    *expected_ledger_balances.entry("USDT".into()).or_default() -= dec!(100);
+    let mut expected_ledger_balances = expected_ledger_balances.into_iter().collect::<Vec<_>>();
+    expected_ledger_balances.sort_by(|a, b| a.0.cmp(&b.0));
+
     let market_config = apexes_risk::MarketConditionConfig {
         volatility_threshold: dec!(1000),
         jump_threshold_pct: dec!(0.10),
@@ -322,6 +328,16 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     // Actual completed iteration capture, compared to independent
     // mock-source fixtures. The first depth event was filtered.
     use apexes_backtest::observation_receipt::{CompletedObservation, ObservationClock};
+    let ledger_evidence = captured.ledger.as_ref().unwrap();
+    assert_eq!(
+        ledger_evidence.scope,
+        vec![(Venue::Binance, "BTCUSDT".into())]
+    );
+    assert_eq!(ledger_evidence.balances, expected_ledger_balances);
+    assert_eq!(ledger_evidence.positions.len(), 1);
+    assert_eq!(ledger_evidence.positions[0].quantity, dec!(1));
+    assert_eq!(ledger_evidence.positions[0].average_entry_price, dec!(100));
+    assert!(ledger_evidence.realized_pnl.is_empty());
     let registered = captured.registered_risk.as_ref().unwrap();
     assert!(!registered.has_unsupported_slots());
     let aliases = registered.aliases.as_ref().unwrap();
