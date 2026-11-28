@@ -54,8 +54,25 @@ fn status_carries_fills(status: OrderStatus) -> bool {
 /// Default for [`OrderManager::with_unsent_order_grace`].
 const DEFAULT_UNSENT_ORDER_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Process-local progress over the durable fill journal. Recovery establishes
+/// an inventory baseline, not proof of strategy callback delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillDeliveryProgress {
+    pub recovered_through: i64,
+    pub ledger_acknowledged_through: i64,
+    /// Contiguous notification returns after the recovery baseline only.
+    /// None until this process has observed at least one such return.
+    pub notifications_returned_through: Option<i64>,
+    pub ledger_failed: bool,
+    pub notification_failed: bool,
+}
+
 struct FillDelivery {
+    recovered_checkpoint: i64,
     checkpoint: i64,
+    notification_checkpoint: i64,
+    notification_pending: Option<(i64, Vec<FillId>)>,
+    notification_failed: bool,
     pending: Option<(i64, Vec<FillId>)>,
     dirty: bool,
     failed: bool,
@@ -157,8 +174,13 @@ impl OrderManager {
         let fills = self.store.spot_inventory_fills().await?;
         // Before any background task or new submission is allowed, all
         // persisted fills are represented by the recovered ledger.
+        let checkpoint = self.store.latest_fill_sequence().await?;
         self.fill_delivery = Some(FillDelivery {
-            checkpoint: self.store.latest_fill_sequence().await?,
+            recovered_checkpoint: checkpoint,
+            checkpoint,
+            notification_checkpoint: checkpoint,
+            notification_pending: None,
+            notification_failed: false,
             pending: None,
             dirty: false,
             failed: false,
@@ -210,6 +232,15 @@ impl OrderManager {
             self.fail_fill_delivery();
             return;
         }
+        // Do not advance notification progress across a missing earlier
+        // acknowledgement. Ledger progress remains independently authoritative.
+        delivery.notification_pending = if !delivery.notification_failed
+            && delivery.notification_checkpoint == delivery.checkpoint
+        {
+            Some((high, pending))
+        } else {
+            None
+        };
         delivery.checkpoint = high;
         // Another task may have recorded fills while the loop applied
         // this batch. Keep the submission gate closed until they arrive.
@@ -217,6 +248,55 @@ impl OrderManager {
             Ok(latest) => delivery.dirty = latest > high,
             Err(_) => self.fail_fill_delivery(),
         }
+    }
+
+    /// Called only after synchronous strategy callbacks return for the exact
+    /// newly applied batch. This is not a durable strategy-state checkpoint.
+    pub fn acknowledge_fill_notifications(&mut self, ids: &[FillId], returned: bool) {
+        let Some(delivery) = &mut self.fill_delivery else {
+            return;
+        };
+        if delivery.failed || delivery.notification_failed {
+            return;
+        }
+        match delivery.notification_pending.take() {
+            Some((high, pending)) if returned && pending == ids => {
+                delivery.notification_checkpoint = high;
+            }
+            _ => {
+                // Notification receipt errors cannot invalidate a correctly
+                // applied ledger. Keep ingesting and acknowledging executions.
+                delivery.notification_failed = true;
+                tracing::error!("live fill notification progress inconsistent");
+                self.report_health_fault("live fill notification progress discrepancy");
+            }
+        }
+    }
+
+    pub fn fill_delivery_progress(&self) -> Option<FillDeliveryProgress> {
+        self.fill_delivery
+            .as_ref()
+            .map(|delivery| FillDeliveryProgress {
+                recovered_through: delivery.recovered_checkpoint,
+                ledger_acknowledged_through: delivery.checkpoint,
+                notifications_returned_through: (delivery.notification_checkpoint
+                    > delivery.recovered_checkpoint)
+                    .then_some(delivery.notification_checkpoint),
+                ledger_failed: delivery.failed,
+                notification_failed: delivery.notification_failed,
+            })
+    }
+
+    /// Local read-only execution attribution, including terminal orders.
+    pub async fn fill_identity(&self, id: FillId) -> Result<Option<crate::FillIdentity>, OmsError> {
+        self.store.fill_identity(id).await
+    }
+
+    pub async fn fill_identities(
+        &self,
+        ids: &[FillId],
+    ) -> Result<Vec<Option<crate::FillIdentity>>, OmsError> {
+        self.store.fill_identities(ids).await
     }
 
     fn fail_fill_delivery(&mut self) {
@@ -480,14 +560,19 @@ impl OrderManager {
                     .unwrap_or_default(),
             });
         }
-        if self
-            .fill_delivery
-            .as_ref()
-            .is_some_and(|delivery| delivery.dirty || delivery.failed)
-        {
-            return Err(OmsError::TradingHalted {
-                reason: "durable executions await ledger acknowledgement".into(),
-            });
+        if let Some(delivery) = &self.fill_delivery {
+            let reason = if delivery.notification_failed {
+                Some("live fill notification progress requires recovery")
+            } else if delivery.dirty || delivery.failed {
+                Some("durable executions await ledger acknowledgement")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(OmsError::TradingHalted {
+                    reason: reason.into(),
+                });
+            }
         }
         if self.reservation_breached {
             self.report_health_fault(

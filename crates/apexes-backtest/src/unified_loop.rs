@@ -1236,7 +1236,15 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 }
                 let equity = ledger.equity(&last_prices)?;
                 let now = chrono::Utc::now();
-                notifications.deliver(&mut strategy, now, FillSource::Supplemental, &all_fills[before..], &correlation);
+                let newly_applied = &all_fills[before..];
+                let evidence = crate::live_fill_attribution::resolve(executor.as_ref(), ems.as_ref(), newly_applied).await;
+                let returned = match evidence {
+                    Some(evidence) => notifications.deliver_persisted(&mut strategy, now, newly_applied, &evidence),
+                    None => notifications.deliver(&mut strategy, now, FillSource::Supplemental, newly_applied, &correlation),
+                };
+                if applied {
+                    executor.acknowledge_supplemental_notifications(newly_applied, returned).await;
+                }
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {
                     tracker.observe_fills(&all_fills);

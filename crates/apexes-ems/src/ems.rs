@@ -3,12 +3,34 @@
 //! (backtest/paper) and [`crate::postgres::PostgresEms`] (live
 //! trading) -- see this crate's `lib.rs` docs.
 
-use apexes_core::{Fill, MarginMode, MarketEvent, Side, Venue};
+use apexes_core::{Fill, MarginMode, MarketEvent, OrderId, Side, Venue};
+use apexes_oms::{ChildLink, IntentLink};
 use apexes_strategy::{ExecutionAlgoSpec, OrderRouting, ParentOrderId, ParentOrderStatus};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::error::EmsError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildAssociation {
+    Recorded,
+    /// Exact pending dispatch; the association may be in flight or interrupted.
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillParentEvidence {
+    Unavailable,
+    MissingFill,
+    NotChild,
+    Conflict,
+    Linked {
+        order_id: OrderId,
+        link: ChildLink,
+        intent_link: Option<IntentLink>,
+        association: ChildAssociation,
+    },
+}
 
 /// A request to schedule an algorithmically-paced "parent" order.
 /// Constructed by a caller (`apexes_backtest`'s shared unified event
@@ -51,6 +73,15 @@ pub trait Ems: Send + Sync {
         _link: Option<(uuid::Uuid, apexes_strategy::IntentId)>,
     ) -> Result<ParentOrderId, EmsError> {
         self.submit_algo_order(request).await
+    }
+
+    /// Durable live-only child attribution. Unsupported backends never
+    /// infer membership from locally absent orders.
+    async fn inspect_live_fill_parents(
+        &self,
+        ids: &[apexes_core::FillId],
+    ) -> Result<Vec<FillParentEvidence>, EmsError> {
+        Ok(vec![FillParentEvidence::Unavailable; ids.len()])
     }
 
     /// Returns the current aggregate status of a parent order, or

@@ -40,6 +40,17 @@ impl ChildLink {
     }
 }
 
+/// Durable execution identity from the persisted fill and its actual OMS order.
+/// No inferred strategy ownership for legacy rows; child intent is owned by EMS.
+#[derive(Debug, Clone)]
+pub struct FillIdentity {
+    pub fill: apexes_core::Fill,
+    pub delivery_sequence: i64,
+    pub exchange_trade_id: String,
+    pub intent_link: Option<IntentLink>,
+    pub child_link: Option<ChildLink>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteIdentity {
     /// Actual client-ID lookup response, consistent with the stored exchange ID.

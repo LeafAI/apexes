@@ -49,7 +49,7 @@ pub mod order_outcome;
 pub use order_outcome::{AttemptStage, OrderOutcome, OrderOutcomeKind};
 
 pub mod fill_outcome;
-pub use fill_outcome::{FillOutcome, FillSource};
+pub use fill_outcome::{FillOutcome, FillSource, PersistedFillLink};
 
 pub mod terminal_outcome;
 pub use terminal_outcome::{TerminalKind, TerminalOutcome};
