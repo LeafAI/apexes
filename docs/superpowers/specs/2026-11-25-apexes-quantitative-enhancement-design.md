@@ -169,3 +169,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Durable risk-bound successor receipt](2026-11-29-apexes-risk-bound-successor-receipt-design.md) binds both complete historical checkpoint boundaries, independently selected receipt-bound transition witness digests and the exact opening risk snapshot digest and timestamp after full independent requalification. No startup authority is issued.
 
 [Pre-event opening risk snapshot handoff](2026-11-29-apexes-opening-risk-handoff-design.md) binds the actual opening risk snapshot to the exact original checkpoint, owner and executor run scope in a separate durable file and delivers its digest at capture time before consuming events. No restart authority is inferred.
+
+[Opening risk handoff-bound successor qualification](2026-11-29-apexes-risk-handoff-successor-design.md) derives opening risk from the independently selected capture-time handoff and binds its digest to the complete requalified risk-bound successor receipt, without granting restart authority.

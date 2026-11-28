@@ -3085,6 +3085,63 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     let noncanonical = dir.join("noncanonical.json");
     std::fs::write(&noncanonical, padded).unwrap();
     assert!(live::RiskBoundSuccessorReceipt::read(&noncanonical, receipt.sha256()).is_err());
+    let handoff = check_risk_pair!(
+        inspect_risk_handoff_successor_receipt,
+        live::OpeningRiskReceiptSelection {
+            receipt: &b.opening_risk_receipt,
+            sha256: &b.opening_risk_digest,
+        }
+    )
+    .unwrap();
+    let handoff_path = dir.join("handoff.json");
+    handoff.write_new(&handoff_path).unwrap();
+    assert!(handoff.write_new(&handoff_path).is_err());
+    assert!(live::RiskHandoffSuccessorReceipt::read(&handoff_path, &"0".repeat(64)).is_err());
+    assert!(live::RiskBoundSuccessorReceipt::read(&handoff_path, handoff.sha256()).is_err());
+    assert!(live::RiskHandoffSuccessorReceipt::read(&path, receipt.sha256()).is_err());
+    let reopened_handoff =
+        live::RiskHandoffSuccessorReceipt::read(&handoff_path, handoff.sha256()).unwrap();
+    let qualified_handoff = check_risk_pair!(
+        inspect_risk_handoff_successor_receipt,
+        live::OpeningRiskReceiptSelection {
+            receipt: &b.opening_risk_receipt,
+            sha256: &b.opening_risk_digest,
+        }
+    )
+    .unwrap();
+    reopened_handoff.compare(&qualified_handoff).unwrap();
+    assert!(
+        check_risk_pair!(
+            inspect_risk_handoff_successor_receipt,
+            live::OpeningRiskReceiptSelection {
+                receipt: &b.opening_risk_receipt,
+                sha256: &a.opening_risk_digest,
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        check_risk_pair!(
+            inspect_risk_handoff_successor_receipt,
+            live::OpeningRiskReceiptSelection {
+                receipt: &a.opening_risk_receipt,
+                sha256: &a.opening_risk_digest,
+            }
+        )
+        .is_err()
+    );
+    let mut changed_handoff: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&handoff_path).unwrap()).unwrap();
+    changed_handoff["body"]["opening_handoff_sha256"] = serde_json::json!(&a.opening_risk_digest);
+    let changed_handoff_path = dir.join("changed-handoff.json");
+    std::fs::write(
+        &changed_handoff_path,
+        serde_json::to_vec(&changed_handoff).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        live::RiskHandoffSuccessorReceipt::read(&changed_handoff_path, handoff.sha256()).is_err()
+    );
     std::fs::remove_dir_all(dir).unwrap();
     // A later valid collection of the prior boundary cannot prove
     // continuity into the already completed successor opening interval.
