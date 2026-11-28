@@ -391,6 +391,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
             event = market_events.next() => {
                 let Some(event) = event else { break };
 
+                let before = all_fills.len();
                 let timestamp=clock.logical_timestamp(&event, arrivals.is_some())?;
                 if arrivals.as_mut().is_some_and(|q|!q.observe(timestamp)){continue;}
                 if !recorded_initial_equity {
@@ -1188,6 +1189,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             capture.record(*cursor, &event).map_err(|error| ApexesError::InvalidBacktestConfig {
                                 reason: format!("completed observation capture refused: {error}"),
                             })?;
+                            // Every applied market-arm fill saw this iteration's
+                            // price maintenance and no later market observation.
+                            capture.record_applied_fills(&all_fills[before..]).map_err(|error| ApexesError::InvalidBacktestConfig {
+                                reason: format!("fill observation prefix capture refused: {error}"),
+                            })?;
                         }
                     } else {
                         checkpoint_invalid = true;
@@ -1323,6 +1329,12 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     if returned {
                         crate::live_terminal_notifications::deliver(&mut strategy, executor.as_ref(), ems.as_ref()).await;
                     }
+                }
+                if let Some(capture) = &mut observation_capture {
+                    // No market price maintenance occurs in this select arm.
+                    capture.record_applied_fills(newly_applied).map_err(|error| ApexesError::InvalidBacktestConfig {
+                        reason: format!("fill observation prefix capture refused: {error}"),
+                    })?;
                 }
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {

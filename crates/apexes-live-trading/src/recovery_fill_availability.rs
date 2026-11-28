@@ -6,21 +6,14 @@ use apexes_backtest::{
     ledger_evidence::LedgerEvidence,
     observation_receipt::CompletedObservation,
 };
-use apexes_core::{Fill, FillId, MarketEvent, Venue};
+use apexes_core::{Fill, MarketEvent, Venue};
 use apexes_oms::CoherentCheckpointReceipt;
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FillObservationPrefix {
-    pub fill_id: FillId,
-    /// Number of market observations processed through price maintenance
-    /// before this attribution decision, including an in-progress iteration.
-    pub observations: usize,
-}
+pub use apexes_backtest::observation_receipt::FillObservationPrefix;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
