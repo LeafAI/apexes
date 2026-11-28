@@ -173,3 +173,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Opening risk handoff-bound successor qualification](2026-11-29-apexes-risk-handoff-successor-design.md) derives opening risk from the independently selected capture-time handoff and binds its digest to the complete requalified risk-bound successor receipt, without granting restart authority.
 
 [Independently retained closing risk handoff](2026-11-29-apexes-closing-risk-handoff-design.md) binds the original closing risk snapshot and timestamp to the actual acknowledged checkpoint and run scope, with separate digest retention and read-only reinspection. Post-commit handoff failure faults the gate without undoing the acknowledged boundary.
+
+[Dual risk handoff-bound successor qualification](2026-11-29-apexes-dual-risk-handoff-successor-design.md) binds independently selected prior closing and successor opening risk handoffs with exact state and local chronology into a durable historical qualification, without granting restart authority.

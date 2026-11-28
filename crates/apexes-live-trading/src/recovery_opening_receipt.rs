@@ -127,6 +127,10 @@ impl OpeningCollectionReceipt {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
+    pub(crate) fn collection_started_at(&self) -> DateTime<Utc> {
+        self.body.open_before.started_at
+    }
+
     pub fn collected_at(&self) -> DateTime<Utc> {
         self.body.inspected_at
     }
