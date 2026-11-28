@@ -107,3 +107,8 @@ pub use recovery_opening_collection::{CollectedOpeningEvidence, OpeningCollectio
 
 mod recovery_opening_receipt;
 pub use recovery_opening_receipt::{OpeningClosingEvidenceSelection, OpeningCollectionReceipt};
+
+mod recovery_risk_successor_receipt;
+pub use recovery_risk_successor_receipt::{
+    RiskBoundSuccessorReceipt, inspect_risk_bound_successor_receipt,
+};
