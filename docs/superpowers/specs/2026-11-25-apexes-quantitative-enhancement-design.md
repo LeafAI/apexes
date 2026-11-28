@@ -139,3 +139,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Offline fill observation-prefix comparison](2026-11-28-apexes-fill-observation-availability-design.md) checks conditional valuation consistency with independently supplied observation-prefix witnesses, not actual callback interleaving or recovery authority.
 
 [Retained loop-local fill observation prefixes](2026-11-28-apexes-retained-fill-prefix-design.md) qualify actual successful fill application availability against the selected journal and independently selected completed observations, without callback provenance or recovery authority.
+
+[Opening causal valuation history preview](2026-11-28-apexes-opening-valuation-preview-design.md) compares actual cold-start valuation decisions with independently selected pre-start observations and the same retained runtime prefixes; this is an offline counterfactual, not strategy warm-up or recovery authority.

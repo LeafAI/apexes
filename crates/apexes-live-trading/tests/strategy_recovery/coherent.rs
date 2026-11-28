@@ -975,6 +975,78 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    // Select the independent opening history, ending at the original
+    // checkpoint. This fee-free fixture cannot prove external-fee continuity.
+    let opening_cursor = apexes_strategy::checkpoint::StateCursor {
+        ordinal: cursor().ordinal - 1,
+        observed_at: cursor().observed_at - chrono::TimeDelta::minutes(6),
+    };
+    let mut opening_event = records[0].event.clone();
+    if let MarketEvent::Trade(t) = &mut opening_event {
+        t.timestamp = cursor().observed_at;
+    } else {
+        panic!("expected trade fixture");
+    }
+    let opening_records = vec![CompletedObservation {
+        cursor: cursor(),
+        event: opening_event,
+    }];
+    let opening_history = apexes_backtest::observation_receipt::ObservationReceipt::build(
+        opening_cursor,
+        cursor(),
+        ObservationClock::SourceAvailability,
+        &[(Venue::Binance, "BTCUSDT".into())],
+        &opening_records,
+    )
+    .unwrap();
+    let opening_receipt = apexes_live_trading::OpeningObservationEvidence::new(
+        OWNER_SHA256.into(),
+        selection.receipt().clone(),
+        opening_history,
+    )
+    .unwrap();
+    let opening_path = dir.join("opening-observations.json");
+    opening_receipt.write_new(&opening_path).unwrap();
+    assert!(opening_receipt.write_new(&opening_path).is_err());
+    let opening_receipt =
+        apexes_live_trading::OpeningObservationEvidence::read(&opening_path).unwrap();
+    let preview = coherent
+        .inspect_opening_valuation_preview(
+            &mut store,
+            &fixture.url,
+            &instruments,
+            (
+                &scope,
+                &independent_observation_receipt,
+                &opening_receipt,
+                &opening_records,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.compared_fills, 1);
+    assert_eq!(preview.missing_after_warmup, 0);
+    assert!(preview.differences.is_empty());
+    let mut altered_opening = opening_records.clone();
+    if let MarketEvent::Trade(t) = &mut altered_opening[0].event {
+        t.price += dec!(1);
+    }
+    assert!(
+        coherent
+            .inspect_opening_valuation_preview(
+                &mut store,
+                &fixture.url,
+                &instruments,
+                (
+                    &scope,
+                    &independent_observation_receipt,
+                    &opening_receipt,
+                    &altered_opening
+                ),
+            )
+            .await
+            .is_err()
+    );
     let prefix = apexes_live_trading::FillObservationAvailability {
         version: 1,
         boundary: receipt.clone(),

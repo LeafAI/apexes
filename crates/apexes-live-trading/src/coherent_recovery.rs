@@ -1005,6 +1005,81 @@ impl CoherentRecoverySelection {
         .await
     }
 
+    /// Compare the actual retained cold-start valuation decisions to a
+    /// counterfactual opening history, without invoking strategy or ledger
+    /// mutation. A matching result does not prove source completeness.
+    pub async fn inspect_opening_valuation_preview(
+        &self,
+        store: &mut OrderStore,
+        ems_postgres_url: &str,
+        instruments: &[Instrument],
+        evidence: (
+            &crate::ConversionScopeEvidence,
+            &crate::ObservationBoundaryEvidence,
+            &crate::OpeningObservationEvidence,
+            &[apexes_backtest::observation_receipt::CompletedObservation],
+        ),
+    ) -> Result<crate::OpeningValuationPreview, CoherentInspectionError> {
+        self.inspect_retained_fill_observation_availability(
+            store,
+            ems_postgres_url,
+            instruments,
+            (evidence.0, evidence.1),
+        )
+        .await?;
+        let snapshot = store
+            .inspect_coherent_recovery(
+                self.predecessor.receipt(),
+                &self.boundary,
+                self.predecessor.owner_fingerprint(),
+                ems_postgres_url,
+            )
+            .await?;
+        let fills = snapshot
+            .fills
+            .into_iter()
+            .map(Fill::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CoherentInspectionError::Fill)?;
+        let bytes = snapshot
+            .capture
+            .ok_or(crate::ObservationEvidenceError::Encoding)?;
+        let capture = apexes_backtest::observation_receipt::CapturedObservations::decode_durable(
+            &bytes,
+            self.predecessor.receipt().cursor,
+            self.boundary.checkpoint.cursor,
+        )
+        .map_err(crate::ObservationEvidenceError::History)?;
+        evidence.2.compare(
+            self.predecessor.owner_fingerprint(),
+            self.predecessor.receipt(),
+            &capture.scope,
+            evidence.3,
+            fills.iter().map(|f| f.filled_at).min(),
+        )?;
+        let ledger = capture
+            .ledger
+            .as_ref()
+            .ok_or(crate::LedgerContinuityError::CapturedLedgerMismatch)?;
+        let witness = crate::FillObservationAvailability {
+            version: 1,
+            boundary: self.boundary.clone(),
+            owner_fingerprint: self.predecessor.owner_fingerprint().into(),
+            prefixes: capture
+                .fill_observation_prefixes
+                .ok_or(crate::LedgerContinuityError::FeeMismatch)?,
+        };
+        Ok(witness.compare_with_opening(
+            &self.boundary,
+            self.predecessor.owner_fingerprint(),
+            evidence.0,
+            ledger,
+            &capture.records,
+            &fills,
+            evidence.3,
+        )?)
+    }
+
     async fn compare_fill_observation_availability(
         &self,
         store: &mut OrderStore,
