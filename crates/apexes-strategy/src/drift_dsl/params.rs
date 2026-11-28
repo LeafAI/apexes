@@ -41,7 +41,64 @@ pub struct ParamStore {
     declared: Mutex<HashMap<String, Decimal>>,
 }
 
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ParamCheckpoint {
+    values: Vec<(String, Decimal)>,
+    declared: Vec<(String, Decimal)>,
+}
+
+impl ParamCheckpoint {
+    fn map(
+        entries: &[(String, Decimal)],
+    ) -> Result<HashMap<String, Decimal>, crate::checkpoint::CheckpointError> {
+        let map: HashMap<_, _> = entries.iter().cloned().collect();
+        if map.len() != entries.len() || !entries.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(crate::checkpoint::CheckpointError::Payload);
+        }
+        Ok(map)
+    }
+}
+
 impl ParamStore {
+    pub(super) fn checkpoint(&self) -> Result<ParamCheckpoint, crate::checkpoint::CheckpointError> {
+        use crate::checkpoint::CheckpointError::Payload;
+        let declared = self.declared.lock().map_err(|_| Payload)?;
+        let values = self.values.lock().map_err(|_| Payload)?;
+        let sorted = |map: &HashMap<String, Decimal>| {
+            let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        Ok(ParamCheckpoint {
+            values: sorted(&values),
+            declared: sorted(&declared),
+        })
+    }
+
+    pub(super) fn restore_checkpoint(
+        &self,
+        state: ParamCheckpoint,
+        initial: &ParamCheckpoint,
+    ) -> Result<(), crate::checkpoint::CheckpointError> {
+        use crate::checkpoint::CheckpointError::Payload;
+        let values = ParamCheckpoint::map(&state.values)?;
+        let declared = ParamCheckpoint::map(&state.declared)?;
+        if initial.values.iter().any(|(k, _)| !values.contains_key(k))
+            || initial
+                .declared
+                .iter()
+                .any(|(k, v)| declared.get(k) != Some(v))
+        {
+            return Err(Payload);
+        }
+        let mut current_declared = self.declared.lock().map_err(|_| Payload)?;
+        let mut current_values = self.values.lock().map_err(|_| Payload)?;
+        *current_declared = declared;
+        *current_values = values;
+        Ok(())
+    }
+
     pub fn new(initial_overrides: HashMap<String, Decimal>) -> Self {
         Self {
             values: Mutex::new(initial_overrides),

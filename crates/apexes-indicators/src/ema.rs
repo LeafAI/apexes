@@ -13,10 +13,10 @@ use crate::indicator::Indicator;
 /// below for the exact boundary.
 #[derive(Clone)]
 pub struct Ema {
-    period: usize,
+    pub(crate) period: usize,
     alpha: Decimal,
-    value: Option<Decimal>,
-    count: usize,
+    pub(crate) value: Option<Decimal>,
+    pub(crate) count: usize,
 }
 
 impl Ema {

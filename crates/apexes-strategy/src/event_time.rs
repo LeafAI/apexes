@@ -61,7 +61,77 @@ pub struct TimeState {
     bar_ends: HashMap<BarInterval, DateTime<Utc>>,
 }
 
+/// Ordered wire representation; duplicate names/intervals are rejected.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimeCheckpoint {
+    last_observed: Option<DateTime<Utc>>,
+    last_grants: Vec<(String, DateTime<Utc>)>,
+    bar_ends: Vec<(BarInterval, DateTime<Utc>)>,
+}
+
+impl TimeCheckpoint {
+    pub(crate) fn restore(
+        self,
+        through: DateTime<Utc>,
+    ) -> Result<TimeState, crate::checkpoint::CheckpointError> {
+        use crate::checkpoint::CheckpointError::Payload;
+        if self.last_grants.len() > MAX_COOLDOWNS
+            || self.bar_ends.len() > 6
+            || !self.last_grants.windows(2).all(|w| w[0].0 < w[1].0)
+            || !self
+                .bar_ends
+                .windows(2)
+                .all(|w| format!("{:?}", w[0].0) < format!("{:?}", w[1].0))
+            || self.last_observed.is_some_and(|at| at > through)
+        {
+            return Err(Payload);
+        }
+        let valid_at = |at| self.last_observed.is_some_and(|last| at <= last);
+        let mut last_grants = HashMap::new();
+        let mut bar_ends = HashMap::new();
+        for (name, at) in self.last_grants {
+            if name.is_empty()
+                || name.len() > 64
+                || !valid_at(at)
+                || last_grants.insert(name, at).is_some()
+            {
+                return Err(Payload);
+            }
+        }
+        for (interval, at) in self.bar_ends {
+            if !valid_at(at) || bar_ends.insert(interval, at).is_some() {
+                return Err(Payload);
+            }
+        }
+        if self.last_observed.is_some() && last_grants.is_empty() && bar_ends.is_empty() {
+            return Err(Payload);
+        }
+        Ok(TimeState {
+            last_observed: self.last_observed,
+            last_grants,
+            bar_ends,
+        })
+    }
+}
+
 impl TimeState {
+    pub(crate) fn checkpoint(&self) -> TimeCheckpoint {
+        let mut last_grants: Vec<_> = self
+            .last_grants
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        last_grants.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut bar_ends: Vec<_> = self.bar_ends.iter().map(|(k, v)| (*k, *v)).collect();
+        bar_ends.sort_by_key(|(interval, _)| format!("{interval:?}"));
+        TimeCheckpoint {
+            last_observed: self.last_observed,
+            last_grants,
+            bar_ends,
+        }
+    }
+
     fn check(&self, observation: TimeObservation) -> Result<(), TimeGateError> {
         if self.last_observed.is_some_and(|last| observation.at < last) {
             return Err(TimeGateError::RegressingObservation);

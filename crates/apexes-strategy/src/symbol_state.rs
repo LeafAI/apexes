@@ -17,6 +17,18 @@ impl<T> SymbolState<T> {
         }
     }
 
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&(Venue, String), &T)> {
+        self.values.iter()
+    }
+
+    pub(crate) fn insert_checkpoint(&mut self, key: (Venue, String), value: T) -> Result<(), T> {
+        if self.values.len() >= self.max_symbols || self.values.contains_key(&key) {
+            return Err(value);
+        }
+        self.values.insert(key, value);
+        Ok(())
+    }
+
     pub fn get(&self, event: &MarketEvent) -> Option<&T> {
         self.values.get(&(event.venue(), event.symbol().to_owned()))
     }

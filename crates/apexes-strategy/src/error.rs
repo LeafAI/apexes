@@ -41,6 +41,9 @@ pub enum StrategyError {
     #[error("`on_parent_outcome` is defined but is not a function")]
     ParentCallbackNotCallable,
 
+    #[error("invalid scoped checkpoint configuration: {0}")]
+    Checkpoint(#[from] crate::checkpoint::CheckpointError),
+
     #[error("unknown parameter: {name}")]
     UnknownParam { name: String },
 }

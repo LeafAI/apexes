@@ -7,7 +7,10 @@ use apexes_indicators::{Atr, AtrInput, Bollinger, Ema, Indicator, Macd, RollingS
 use drift_script::DriftValue;
 use rust_decimal::Decimal;
 
-const MAX_PERIOD: usize = 512;
+use crate::checkpoint::CheckpointError;
+use apexes_indicators::checkpoint::{
+    AtrState, BollingerState, EmaState, MAX_PERIOD, MacdState, RsiState, SmaState, StddevState,
+};
 pub(super) const MAX_INDICATORS: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,6 +180,136 @@ impl Instance {
                 .map_or(DriftValue::Null, bollinger_output_to_drift_value),
             (NativeIndicator::Atr(i), Input::Bar(b)) => number(i.update(b)),
             _ => return Err(error_object("scoped indicator input mismatch".into())),
+        })
+    }
+}
+
+/// Schema-1 state stores native accumulators, not a truncated replay history.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub(super) enum InstanceCheckpoint {
+    Sma {
+        period: usize,
+        state: SmaState,
+    },
+    Ema {
+        period: usize,
+        state: EmaState,
+    },
+    Rsi {
+        period: usize,
+        state: RsiState,
+    },
+    Stddev {
+        period: usize,
+        state: StddevState,
+    },
+    Atr {
+        period: usize,
+        state: AtrState,
+    },
+    Macd {
+        fast: usize,
+        slow: usize,
+        signal: usize,
+        state: MacdState,
+    },
+    Bollinger {
+        period: usize,
+        width: Decimal,
+        state: BollingerState,
+    },
+}
+
+impl Instance {
+    pub(super) fn checkpoint(&self) -> Result<InstanceCheckpoint, CheckpointError> {
+        use InstanceCheckpoint as C;
+        let checkpoint = match (&self.native, self.spec) {
+            (NativeIndicator::Sma(i), Spec::Single(Kind::Sma, period)) => C::Sma {
+                period,
+                state: SmaState::capture(i),
+            },
+            (NativeIndicator::Ema(i), Spec::Single(Kind::Ema, period)) => C::Ema {
+                period,
+                state: EmaState::capture(i),
+            },
+            (NativeIndicator::Rsi(i), Spec::Single(Kind::Rsi, period)) => C::Rsi {
+                period,
+                state: RsiState::capture(i),
+            },
+            (NativeIndicator::Stddev(i), Spec::Single(Kind::Stddev, period)) => C::Stddev {
+                period,
+                state: StddevState::capture(i),
+            },
+            (NativeIndicator::Atr(i), Spec::Single(Kind::Atr, period)) => C::Atr {
+                period,
+                state: AtrState::capture(i),
+            },
+            (NativeIndicator::Macd(i), Spec::Macd(fast, slow, signal)) => C::Macd {
+                fast,
+                slow,
+                signal,
+                state: MacdState::capture(i),
+            },
+            (NativeIndicator::Bollinger(i), Spec::Bollinger(period, width)) => C::Bollinger {
+                period,
+                width,
+                state: BollingerState::capture(i),
+            },
+            _ => return Err(CheckpointError::Payload),
+        };
+        // Do not publish a snapshot that the validated native restore
+        // contract would refuse (including excessive accumulated drift).
+        checkpoint.clone().restore()?;
+        Ok(checkpoint)
+    }
+}
+
+impl InstanceCheckpoint {
+    pub(super) fn restore(self) -> Result<Instance, CheckpointError> {
+        use InstanceCheckpoint as C;
+        let (spec, native) = match self {
+            C::Sma { period, state } => (
+                Spec::Single(Kind::Sma, period),
+                state.restore(period).map(NativeIndicator::Sma),
+            ),
+            C::Ema { period, state } => (
+                Spec::Single(Kind::Ema, period),
+                state.restore(period).map(NativeIndicator::Ema),
+            ),
+            C::Rsi { period, state } => (
+                Spec::Single(Kind::Rsi, period),
+                state.restore(period).map(NativeIndicator::Rsi),
+            ),
+            C::Stddev { period, state } => (
+                Spec::Single(Kind::Stddev, period),
+                state.restore(period).map(NativeIndicator::Stddev),
+            ),
+            C::Atr { period, state } => (
+                Spec::Single(Kind::Atr, period),
+                state.restore(period).map(NativeIndicator::Atr),
+            ),
+            C::Macd {
+                fast,
+                slow,
+                signal,
+                state,
+            } => (
+                Spec::Macd(fast, slow, signal),
+                state.restore(fast, slow, signal).map(NativeIndicator::Macd),
+            ),
+            C::Bollinger {
+                period,
+                width,
+                state,
+            } => (
+                Spec::Bollinger(period, width),
+                state.restore(period, width).map(NativeIndicator::Bollinger),
+            ),
+        };
+        Ok(Instance {
+            spec,
+            native: native.map_err(|_| CheckpointError::Payload)?,
         })
     }
 }
