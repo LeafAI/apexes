@@ -16,10 +16,12 @@
 //! `filled_quantity` last left off -- mirroring
 //! `apexes_oms::OrderManager::new`'s open-order recovery pattern.
 
+mod dispatch_inspection;
 mod order_manager_sink;
 mod schema;
 mod state;
 
+pub use dispatch_inspection::{DispatchEvidence, inspect_pending_dispatch};
 pub use order_manager_sink::OrderManagerChildOrderSink;
 pub use schema::PARENT_ORDERS_TABLE_DDL;
 

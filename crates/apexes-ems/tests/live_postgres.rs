@@ -517,6 +517,44 @@ async fn unresolved_child_marker_refuses_restart_without_submitting_replacement(
         .execute(&pool)
         .await
         .unwrap();
+    use apexes_ems::postgres::{DispatchEvidence, inspect_pending_dispatch};
+    let store = apexes_oms::OrderStore::new(&fixture.url).await.unwrap();
+    assert_eq!(
+        inspect_pending_dispatch(&pool, id).await.unwrap(),
+        DispatchEvidence::LegacyPending
+    );
+    let dispatch = uuid::Uuid::new_v4();
+    sqlx::query("UPDATE parent_orders SET pending_dispatch_id=$2 WHERE id=$1")
+        .bind(id.0)
+        .bind(dispatch)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        inspect_pending_dispatch(&pool, id).await.unwrap(),
+        DispatchEvidence::MissingOms {
+            link: apexes_oms::ChildLink {
+                parent_id: id,
+                dispatch_id: dispatch
+            }
+        }
+    );
+    sqlx::query("UPDATE parent_orders SET pending_dispatch_id=$2 WHERE id=$1")
+        .bind(id.0)
+        .bind(uuid::Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        inspect_pending_dispatch(&pool, id).await.unwrap(),
+        DispatchEvidence::Conflict
+    );
+    sqlx::query("UPDATE parent_orders SET pending_dispatch_id=NULL WHERE id=$1")
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop(store);
     let ks = Arc::new(apexes_oms::KillSwitch::new());
     let result = PostgresEms::new_with_kill_switch(
         &fixture.url,
@@ -537,7 +575,25 @@ async fn unresolved_child_marker_refuses_restart_without_submitting_replacement(
 #[ignore]
 async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     let fixture = TestSchema::new().await;
-    let sink = Arc::new(RecordingSink::new());
+    use apexes_core::{AssetClass, registry::Registry};
+    use apexes_ems::postgres::{
+        DispatchEvidence, OrderManagerChildOrderSink, inspect_pending_dispatch,
+    };
+    use apexes_oms::{
+        ChildLink, ExecutionGateway, MockExecutionGateway, OrderManager, OrderStore,
+        RemoteIdentity, SubmissionState,
+    };
+    let gateway = Arc::new(MockExecutionGateway::new());
+    let registry = Registry::new();
+    registry
+        .register::<Arc<dyn ExecutionGateway>, ()>((), gateway.clone())
+        .unwrap();
+    let manager = Arc::new(TokioMutex::new(
+        OrderManager::new(OrderStore::new(&fixture.url).await.unwrap(), &registry)
+            .await
+            .unwrap(),
+    ));
+    let sink = Arc::new(OrderManagerChildOrderSink::new(manager.clone()));
     let ks = Arc::new(apexes_oms::KillSwitch::new());
     let ems = PostgresEms::new_with_kill_switch(
         &fixture.url,
@@ -551,6 +607,16 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     .unwrap();
     let id = ems.submit_algo_order(pov_request()).await.unwrap();
     let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
+    assert_eq!(
+        inspect_pending_dispatch(&pool, id).await.unwrap(),
+        DispatchEvidence::NotPending
+    );
+    assert_eq!(
+        inspect_pending_dispatch(&pool, apexes_strategy::ParentOrderId(uuid::Uuid::new_v4()))
+            .await
+            .unwrap(),
+        DispatchEvidence::ParentMissing
+    );
     // Make the child-link INSERT fail after the sink has accepted the order.
     sqlx::query(
         "ALTER TABLE parent_order_children ADD CONSTRAINT inject_link_failure CHECK (FALSE)",
@@ -568,7 +634,14 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     })
     .await
     .unwrap();
-    assert_eq!(sink.submitted.lock().await.len(), 1);
+    assert_eq!(
+        gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let (pending, quantity): (bool, rust_decimal::Decimal) =
         sqlx::query_as("SELECT dispatch_pending, filled_quantity FROM parent_orders WHERE id=$1")
             .bind(id.0)
@@ -579,12 +652,50 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     let dispatch = ems.pending_dispatch(id).await.unwrap().unwrap();
     assert!(!dispatch.is_nil());
     assert_eq!(quantity, dec!(0));
+    let link = ChildLink {
+        parent_id: id,
+        dispatch_id: dispatch,
+    };
+    let child = manager
+        .lock()
+        .await
+        .client_order_for_dispatch(link)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = DispatchEvidence::Linked {
+        link,
+        order_id: child,
+        submission_state: SubmissionState::Accepted,
+    };
+    assert_eq!(inspect_pending_dispatch(&pool, id).await.unwrap(), expected);
+    let gateway_evidence = manager
+        .lock()
+        .await
+        .inspect_client_identity(child)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gateway_evidence.child_link, Some(link));
+    assert!(matches!(
+        gateway_evidence.remote,
+        RemoteIdentity::Found { .. }
+    ));
+
     for _ in 0..10 {
         ems.on_market_event(&trade(Venue::Binance, "BTCUSDT"))
             .await
             .unwrap();
     }
     drop(ems);
+    drop(sink);
+    drop(manager);
+    let manager = Arc::new(TokioMutex::new(
+        OrderManager::new(OrderStore::new(&fixture.url).await.unwrap(), &registry)
+            .await
+            .unwrap(),
+    ));
+    let sink = Arc::new(OrderManagerChildOrderSink::new(manager.clone()));
     let result = PostgresEms::new(
         &fixture.url,
         sink.clone(),
@@ -594,7 +705,55 @@ async fn child_link_write_failure_latches_halt_and_preserves_pending_marker() {
     )
     .await;
     assert!(matches!(result, Err(EmsError::SchedulingSuspended)));
-    assert_eq!(sink.submitted.lock().await.len(), 1);
+    assert_eq!(
+        gateway
+            .query_all_open_orders(AssetClass::Spot)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(inspect_pending_dispatch(&pool, id).await.unwrap(), expected);
+    let reopened_evidence = manager
+        .lock()
+        .await
+        .inspect_client_identity(child)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_evidence.child_link, Some(link));
+    assert!(matches!(
+        reopened_evidence.remote,
+        RemoteIdentity::Found { .. }
+    ));
+    let still_pending: bool =
+        sqlx::query_scalar("SELECT dispatch_pending FROM parent_orders WHERE id=$1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(still_pending);
+    // Simulate contradictory ownership evidence in this isolated fixture.
+    sqlx::query("UPDATE orders SET ems_parent_id=$2 WHERE id=$1")
+        .bind(child.0)
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        inspect_pending_dispatch(&pool, id).await.unwrap(),
+        DispatchEvidence::Conflict
+    );
+    sqlx::query("UPDATE orders SET ems_parent_id=$2 WHERE id=$1")
+        .bind(child.0)
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(inspect_pending_dispatch(&pool, id).await.unwrap(), expected);
+    drop(sink);
+    drop(manager);
+    pool.close().await;
     fixture.cleanup().await;
 }
 
