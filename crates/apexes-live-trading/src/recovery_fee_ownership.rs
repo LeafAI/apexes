@@ -25,7 +25,10 @@ pub struct OpeningTrackedAssetEvidence {
 }
 
 impl OpeningTrackedAssetEvidence {
-    fn opening_map(&self, opening: &OpeningWalletEvidence) -> Result<BTreeMap<String, Decimal>, E> {
+    pub(crate) fn opening_map(
+        &self,
+        opening: &OpeningWalletEvidence,
+    ) -> Result<BTreeMap<String, Decimal>, E> {
         if self.version != 1
             || self.predecessor != opening.predecessor
             || self.owner_fingerprint != opening.wallet.owner_fingerprint

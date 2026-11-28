@@ -37,6 +37,8 @@ pub enum LedgerContinuityError {
     RealizedPnlMismatch,
     #[error("captured fee attribution differs from independently reconstructed evidence")]
     FeeMismatch,
+    #[error("isolated ledger fill application failed or exact closing state differed")]
+    ApplicationMismatch,
 }
 
 /// Independently retained closing position evidence. Only a read-only
@@ -549,6 +551,103 @@ mod tests {
             vec![instrument],
             fills,
         )
+    }
+
+    #[test]
+    fn isolated_application_reproduces_full_ledger_and_refuses_changed_application_order() {
+        use apexes_backtest::{
+            ledger::PortfolioLedger,
+            observation_receipt::{
+                CapturedObservations, CompletedObservation, FillObservationPrefix,
+                ObservationClock, ObservationReceipt,
+            },
+        };
+        use apexes_core::{MarketEvent, TradeEvent};
+        let (opening, _, _, _, instruments, fills) = fixture();
+        let allocation = crate::OpeningTrackedAssetEvidence {
+            version: 1,
+            predecessor: opening.predecessor.clone(),
+            owner_fingerprint: "owner".into(),
+            captured_at: opening.wallet.window.finished_at,
+            balances: vec![("BTC".into(), dec!(4)), ("USDT".into(), dec!(1000))],
+        };
+        let scope = vec![(Venue::Binance, "BTCUSDT".into())];
+        let mut records = Vec::new();
+        let mut ledger = PortfolioLedger::new(
+            instruments
+                .iter()
+                .map(|i| (i.symbol.clone(), i.clone()))
+                .collect(),
+            allocation.balances.iter().cloned().collect(),
+        );
+        let mut prefixes = Vec::new();
+        for (i, fill) in fills.iter().enumerate() {
+            let event = MarketEvent::Trade(TradeEvent {
+                symbol: fill.symbol.clone(),
+                venue: fill.venue,
+                price: fill.price,
+                quantity: fill.quantity,
+                side: None,
+                trade_id: None,
+                timestamp: fill.filled_at,
+            });
+            let cursor = StateCursor {
+                ordinal: 2 + i as u64,
+                observed_at: fill.filled_at,
+            };
+            records.push(CompletedObservation { cursor, event });
+            ledger.observe_spot_price(&fill.symbol, fill.filled_at, fill.price);
+            ledger.apply_fill(fill).unwrap();
+            prefixes.push(FillObservationPrefix {
+                fill_id: fill.id,
+                observations: i + 1,
+            });
+        }
+        let receipt = ObservationReceipt::build(
+            opening.predecessor.cursor,
+            StateCursor {
+                ordinal: 4,
+                observed_at: fills[2].filled_at,
+            },
+            ObservationClock::SourceAvailability,
+            &scope,
+            &records,
+        )
+        .unwrap();
+        let capture = CapturedObservations {
+            receipt,
+            scope,
+            records,
+            registered_risk: None,
+            market_monitor_unqualified: false,
+            margin_monitor_unqualified: false,
+            market_monitor: None,
+            margin_tiers: None,
+            ledger: Some(ledger.inspect_evidence().unwrap()),
+            fill_observation_prefixes: Some(prefixes),
+        };
+        let compare = |capture: &apexes_backtest::observation_receipt::CapturedObservations| {
+            crate::recovery_ledger_application::compare_applied_ledger(
+                capture,
+                &instruments,
+                &opening,
+                &allocation,
+                &fills,
+            )
+        };
+        compare(&capture).unwrap();
+        let mut altered = capture.clone();
+        altered.ledger.as_mut().unwrap().balances[0].1 += dec!(1);
+        assert_eq!(
+            compare(&altered),
+            Err(LedgerContinuityError::ApplicationMismatch)
+        );
+        let mut altered = capture.clone();
+        altered.fill_observation_prefixes.as_mut().unwrap()[1].fill_id = fills[0].id;
+        assert_eq!(compare(&altered), Err(LedgerContinuityError::FeeMismatch));
+        let mut altered = capture;
+        altered.fill_observation_prefixes = None;
+        assert_eq!(compare(&altered), Err(LedgerContinuityError::FeeMismatch));
     }
 
     #[test]

@@ -80,3 +80,5 @@ pub use recovery_observation::{
 
 mod recovery_warmup;
 pub use recovery_warmup::{WarmupInspectionError, inspect_no_order_warmup};
+
+mod recovery_ledger_application;

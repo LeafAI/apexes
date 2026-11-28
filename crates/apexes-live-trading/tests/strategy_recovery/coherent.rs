@@ -1003,6 +1003,38 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    coherent
+        .inspect_isolated_ledger_application(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            (
+                (&retained, &allocation, &third_asset_rates, &marks),
+                (&scope, &independent_observation_receipt),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut wrong_allocation = allocation.clone();
+    wrong_allocation.balances[0].1 += dec!(1);
+    assert!(
+        coherent
+            .inspect_isolated_ledger_application(
+                &mut store,
+                &fixture.url,
+                (Probe::new(0), Probe::new(0)),
+                &instruments,
+                (&exact_opening, &window, &exact_wallet, wallet_at),
+                (
+                    (&retained, &wrong_allocation, &third_asset_rates, &marks),
+                    (&scope, &independent_observation_receipt)
+                ),
+            )
+            .await
+            .is_err()
+    );
     // Select the independent opening history, ending at the original
     // checkpoint. This fee-free fixture cannot prove external-fee continuity.
     let opening_cursor = apexes_strategy::checkpoint::StateCursor {
