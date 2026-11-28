@@ -1,0 +1,7 @@
+function on_order_outcome(outcome) {
+    return this_variable_does_not_exist.foo;
+}
+function on_market_event(event, ctx) {
+    return [{ symbol: event.symbol, venue: event.venue, asset_class: "spot",
+        side: "buy", order_type: "market", quantity: 1 }];
+}

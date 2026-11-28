@@ -1192,3 +1192,181 @@ fn causal_book_context_uses_remaining_execution_depth_and_rejects_stale_or_gappe
         }
     }
 }
+
+#[test]
+fn direct_order_outcomes_are_ordered_and_available_to_drift_before_next_decision() {
+    use apexes_core::OrderStatus;
+    use apexes_strategy::{
+        AttemptStage, OrderOutcome, OrderOutcomeKind, drift_dsl::DriftScriptStrategy,
+    };
+    type Evidence = Vec<(
+        i64,
+        AttemptStage,
+        String,
+        Decimal,
+        Option<apexes_core::OrderId>,
+    )>;
+    struct Probe {
+        script: DriftScriptStrategy,
+        outcomes: Arc<std::sync::Mutex<Evidence>>,
+    }
+    impl Strategy for Probe {
+        fn on_market_event(
+            &mut self,
+            event: &MarketEvent,
+            ctx: &StrategyContext,
+        ) -> Vec<OrderIntent> {
+            self.script.on_market_event(event, ctx)
+        }
+        fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            let (kind, id) = match outcome.kind {
+                OrderOutcomeKind::Rejected { code } => (code.to_owned(), None),
+                OrderOutcomeKind::Scheduled => ("scheduled".into(), None),
+                OrderOutcomeKind::Returned { order } => {
+                    assert!(matches!(
+                        order.status,
+                        OrderStatus::New | OrderStatus::Filled
+                    ));
+                    (format!("returned:{:?}", order.status), Some(order.id))
+                }
+                OrderOutcomeKind::SubmissionFailed { code } => {
+                    panic!("unexpected submission failure {code}")
+                }
+            };
+            self.outcomes.lock().unwrap().push((
+                (outcome.at - at(0)).num_milliseconds(),
+                outcome.stage,
+                kind,
+                outcome.intent.quantity,
+                id,
+            ));
+            self.script.on_order_outcome(outcome);
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/direct_order_outcomes.drift");
+    let events = vec![
+        depth(0, 1, dec!(100)),
+        trade(0, dec!(100), "open"),
+        tick(500),
+        tick(1000),
+        trade(1500, dec!(99), "maker"),
+    ];
+    let mut previous = None;
+    for _ in 0..2 {
+        let r = registry(&events, "direct-order-outcomes");
+        r.register::<_, ()>((), EventLatencyPolicy { delay_ms: 500 })
+            .unwrap();
+        r.register::<Arc<CompositeRiskChecker>, ()>(
+            (),
+            Arc::new(CompositeRiskChecker::new().with_pre_trade_check(Box::new(
+                LimitChecker::new(RiskLimits {
+                    max_order_quantity: Some(dec!(2)),
+                    ..Default::default()
+                }),
+            ))),
+        )
+        .unwrap();
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let strategy: Box<dyn Strategy> = Box::new(Probe {
+            script: DriftScriptStrategy::from_file(&script).unwrap(),
+            outcomes: outcomes.clone(),
+        });
+        let report = futures::executor::block_on(run_backtest(
+            configuration(AssetClass::Spot, None),
+            &r,
+            InMemoryMarketDataSource::new(events.clone()),
+            strategy,
+        ))
+        .unwrap();
+        let seen = outcomes.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|(ms, stage, kind, qty, _)| (*ms, *stage, kind.as_str(), *qty))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, AttemptStage::Decision, "scheduled", dec!(1)),
+                (0, AttemptStage::Decision, "risk_rejected", dec!(9)),
+                (
+                    0,
+                    AttemptStage::Decision,
+                    "event_latency_symbol_pending",
+                    dec!(1)
+                ),
+                (500, AttemptStage::Arrival, "returned:Filled", dec!(1)),
+                (500, AttemptStage::Decision, "scheduled", dec!(1)),
+                (1000, AttemptStage::Arrival, "returned:New", dec!(1)),
+            ]
+        );
+        assert_eq!(report.trades.len(), 2);
+        assert_eq!(seen[3].4, Some(report.trades[0].order_id));
+        assert_eq!(seen[5].4, Some(report.trades[1].order_id));
+        let digest = canonical_report_sha256(&report).unwrap();
+        if let Some((previous_seen, previous_digest)) = &previous {
+            assert_eq!(&*seen, previous_seen);
+            assert_eq!(&digest, previous_digest);
+        }
+        previous = Some((seen.clone(), digest));
+    }
+}
+
+#[tokio::test]
+async fn direct_outcomes_distinguish_cancelled_order_from_executor_error() {
+    use apexes_core::OrderStatus;
+    use apexes_strategy::{AttemptStage, OrderOutcome, OrderOutcomeKind};
+    type Evidence = Vec<(String, Option<apexes_core::OrderId>)>;
+    struct Probe {
+        seen: Arc<std::sync::Mutex<Evidence>>,
+    }
+    impl Strategy for Probe {
+        fn on_market_event(&mut self, _: &MarketEvent, _: &StrategyContext) -> Vec<OrderIntent> {
+            vec![intent(AssetClass::Spot, Side::Buy, dec!(1), None)]
+        }
+        fn on_order_outcome(&mut self, outcome: &OrderOutcome<'_>) {
+            assert_eq!(outcome.stage, AttemptStage::Decision);
+            let result = match outcome.kind {
+                OrderOutcomeKind::Returned { order } => {
+                    assert_eq!(order.status, OrderStatus::Cancelled);
+                    assert_eq!(order.filled_quantity, Decimal::ZERO);
+                    ("cancelled".to_owned(), Some(order.id))
+                }
+                OrderOutcomeKind::SubmissionFailed { code } => (code.to_owned(), None),
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            self.seen.lock().unwrap().push(result);
+        }
+    }
+    for strict in [false, true] {
+        let r = Registry::new();
+        if strict {
+            r.register::<_, ()>(
+                (),
+                SimulatedDepthPolicy {
+                    sequence: DepthSequence::SnapshotOnly,
+                    max_age_ms: 1000,
+                },
+            )
+            .unwrap();
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let report = run_backtest(
+            configuration(AssetClass::Spot, None),
+            &r,
+            InMemoryMarketDataSource::new(vec![trade(0, dec!(100), "no-book")]),
+            Probe { seen: seen.clone() },
+        )
+        .await
+        .unwrap();
+        assert!(report.trades.is_empty());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        if strict {
+            assert_eq!(seen[0], ("order_rejected".into(), None));
+        } else {
+            assert_eq!(seen[0].0, "cancelled");
+            assert!(seen[0].1.is_some());
+        }
+    }
+}

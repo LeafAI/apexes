@@ -873,3 +873,52 @@ fn health_context_drift_distinguishes_unknown_unmanaged_and_managed_phases() {
         }
     });
 }
+
+#[test]
+fn optional_outcome_callback_validates_entry_point_and_isolates_runtime_errors() {
+    use apexes_strategy::{AttemptStage, OrderOutcome, OrderOutcomeKind};
+    with_runtime(|| {
+        assert!(matches!(
+            DriftScriptStrategy::from_file(&fixture_path("invalid_outcome_callback.drift")),
+            Err(apexes_strategy::error::StrategyError::OrderOutcomeNotCallable)
+        ));
+        let mut strategy =
+            DriftScriptStrategy::from_file(&fixture_path("error_outcome_callback.drift")).unwrap();
+        let event = sample_trade_event();
+        let ctx = StrategyContext {
+            health: None,
+            capital: None,
+            costs: None,
+            book: None,
+            market: None,
+            positions: &HashMap::new(),
+            balances: &HashMap::new(),
+            open_orders: &HashMap::new(),
+            open_parent_orders: &HashMap::new(),
+            margin_status: &HashMap::new(),
+            now: Utc::now(),
+        };
+        let intents = strategy.on_market_event(&event, &ctx);
+        assert_eq!(intents.len(), 1);
+        strategy.on_order_outcome(&OrderOutcome {
+            at: ctx.now,
+            stage: AttemptStage::Decision,
+            intent: &intents[0],
+            kind: OrderOutcomeKind::Rejected {
+                code: "risk_rejected",
+            },
+        });
+        assert_eq!(strategy.on_market_event(&event, &ctx).len(), 1);
+        // Existing script with no callback remains valid.
+        let mut legacy = DriftScriptStrategy::from_file(&fixture_path("always_buy.drift")).unwrap();
+        legacy.on_order_outcome(&OrderOutcome {
+            at: ctx.now,
+            stage: AttemptStage::Decision,
+            intent: &intents[0],
+            kind: OrderOutcomeKind::Rejected {
+                code: "risk_rejected",
+            },
+        });
+        assert_eq!(legacy.on_market_event(&event, &ctx).len(), 1);
+    });
+}
