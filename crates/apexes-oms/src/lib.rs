@@ -41,3 +41,8 @@ pub mod identity_evidence;
 pub use identity_evidence::{
     ChildLink, FillIdentity, IdentityEvidence, IntentLink, RemoteIdentity,
 };
+
+pub mod terminal_recovery_audit;
+pub use terminal_recovery_audit::{
+    RemoteTerminalEvidence, TerminalAuditError, TerminalOrderEvidence, compare_terminal_evidence,
+};

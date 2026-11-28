@@ -137,8 +137,43 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let driver = tokio::spawn(async move {
         let (id, exchange_id, _) =
             wait_for_callback_order(&driver_pool, uuid::Uuid::nil(), false).await;
-        publish_mock_fill(&gateway, &updates, id, exchange_id, "coherent-fill");
-        id
+        // Preserve an independent copy of the synthetic exchange fixture;
+        // do not reconstruct the comparison evidence from the database.
+        let trade = ExchangeFill {
+            exchange_trade_id: "coherent-fill".into(),
+            price: dec!(100),
+            quantity: dec!(1),
+            fee: dec!(0),
+            fee_currency: None,
+            filled_at: Utc::now(),
+        };
+        gateway.set_fills_for_order(id, vec![trade.clone()]);
+        gateway.set_exchange_state(id, OrderStatus::Filled);
+        updates
+            .unbounded_send(ExchangeUpdate {
+                client_order_id: id,
+                exchange_order_id: exchange_id.clone(),
+                status: OrderStatus::Filled,
+            })
+            .unwrap();
+        (
+            id,
+            apexes_oms::TerminalOrderEvidence {
+                client_order_id: id,
+                venue: Venue::Binance,
+                asset_class: AssetClass::Spot,
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                remote: apexes_oms::RemoteTerminalEvidence::Found {
+                    exchange_order_id: exchange_id.unwrap(),
+                    execution: apexes_oms::OrderExecutionSnapshot {
+                        status: OrderStatus::Filled,
+                        executed_quantity: dec!(1),
+                    },
+                    trades: vec![trade],
+                },
+            },
+        )
     });
     let (stop, receiver) = oneshot::channel();
     let (report, receipt) = tokio::time::timeout(
@@ -155,7 +190,7 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     .await
     .unwrap()
     .unwrap();
-    let id = driver.await.unwrap();
+    let (id, evidence) = driver.await.unwrap();
     assert_eq!(report.trades.len(), 1);
     assert_eq!(report.trades[0].order_id, id);
     assert!(!health.is_engaged(), "{:?}", health.reason());
@@ -240,6 +275,31 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     let path = dir.join("coherent.json");
     coherent.write_new(&path).unwrap();
     let coherent = apexes_live_trading::CoherentRecoverySelection::read(&path).unwrap();
+    coherent
+        .inspect_terminal_evidence(&mut store, &fixture.url, std::slice::from_ref(&evidence))
+        .await
+        .unwrap();
+    let mut revised = evidence.clone();
+    if let apexes_oms::RemoteTerminalEvidence::Found { trades, .. } = &mut revised.remote {
+        trades[0].fee = dec!(0.01);
+    }
+    assert!(matches!(
+        coherent
+            .inspect_terminal_evidence(&mut store, &fixture.url, &[revised])
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Terminal(
+            apexes_oms::TerminalAuditError::Trade
+        ))
+    ));
+    assert!(matches!(
+        coherent
+            .inspect_terminal_evidence(&mut store, &fixture.url, &[])
+            .await,
+        Err(apexes_live_trading::CoherentInspectionError::Terminal(
+            apexes_oms::TerminalAuditError::MissingOrder
+        ))
+    ));
+
     let wallet = HashMap::from([
         (
             "BTC".into(),
@@ -408,6 +468,12 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
                 &instruments,
                 &wallet
             )
+            .await
+            .is_err()
+    );
+    assert!(
+        coherent
+            .inspect_terminal_evidence(&mut store, &fixture.url, &[evidence])
             .await
             .is_err()
     );
