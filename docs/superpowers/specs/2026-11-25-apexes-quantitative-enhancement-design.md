@@ -99,3 +99,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Atomic durable observation and partial-risk evidence](2026-11-28-apexes-durable-capture-design.md) persists the actual opt-in capture in the same coherent checkpoint transaction, binds its digest to the independently selected receipt, and exposes read-only validation after reopening. Complete monitor coverage, external shared-state atomicity and restoration remain open.
 
 [Additional registered monitor evidence](2026-11-28-apexes-monitor-coverage-design.md) retains list configuration, self-trade prevention version and margin-monitor threshold/trip state with explicit legacy and unsupported position coverage. Market-condition and margin-tier evidence remain open.
+
+[Market-condition and margin-tier evidence](2026-11-28-apexes-market-risk-evidence-design.md) retains bounded actual volatility state and configured margin tables in the existing durable observation/risk attachment. Shared identity, atomicity and restoration remain unqualified.

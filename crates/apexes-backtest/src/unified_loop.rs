@@ -1377,8 +1377,29 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 .map_err(|error| ApexesError::InvalidBacktestConfig {
                     reason: format!("registered risk capture refused: {error}"),
                 })?;
-            capture.market_monitor_unqualified = market_condition_monitor.is_some();
-            capture.margin_monitor_unqualified = !config.margin_tiers.is_empty();
+            capture.market_monitor = market_condition_monitor
+                .as_ref()
+                .map(|(_, _, monitor)| monitor.inspect_checkpoint())
+                .transpose()
+                .map_err(|error| ApexesError::InvalidBacktestConfig {
+                    reason: format!("market monitor inspection refused: {error}"),
+                })?;
+            if !config.margin_tiers.is_empty() {
+                if config.margin_tiers.len() > 128
+                    || config.margin_tiers.values().any(|t| t.tiers.len() > 128)
+                {
+                    return Err(ApexesError::InvalidBacktestConfig {
+                        reason: "margin tier evidence exceeds capacity".into(),
+                    });
+                }
+                let mut tiers = config
+                    .margin_tiers
+                    .iter()
+                    .map(|(symbol, table)| (symbol.clone(), table.clone()))
+                    .collect::<Vec<_>>();
+                tiers.sort_by(|a, b| a.0.cmp(&b.0));
+                capture.margin_tiers = Some(tiers);
+            }
         }
         if let Some(capture) = &captured {
             let bytes =

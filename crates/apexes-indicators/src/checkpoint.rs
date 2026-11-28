@@ -84,7 +84,7 @@ impl SmaState {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StddevState {
     period: usize,
@@ -94,6 +94,15 @@ pub struct StddevState {
 }
 
 impl StddevState {
+    /// Inspect the retained tail without changing any accumulator.
+    pub fn last(&self) -> Option<Decimal> {
+        self.window.back().copied()
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.window.len()
+    }
+
     pub fn capture(i: &RollingStdDev) -> Self {
         Self {
             period: i.period,

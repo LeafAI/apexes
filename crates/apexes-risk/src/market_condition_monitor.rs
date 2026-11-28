@@ -27,6 +27,12 @@ use crate::pre_trade::PreTradeCheck;
 /// margin state, no raw price) because volatility/jump detection needs
 /// the actual price, not a derived margin ratio.
 pub trait MarketConditionEventMonitor: Send + Sync {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        Ok(crate::RegisteredRiskState::Unsupported)
+    }
+
     fn on_market_event(&mut self, event: &MarketEvent) -> Result<(), Vec<RiskViolation>>;
 }
 
@@ -52,6 +58,43 @@ impl MarketConditionMonitor {
             reduce_fractions: HashMap::new(),
             account_wide_reduce_fraction: None,
         }
+    }
+
+    pub fn inspect_checkpoint(
+        &self,
+    ) -> Result<crate::MarketConditionSnapshot, crate::RiskStateError> {
+        use crate::RiskStateError as E;
+        use apexes_indicators::checkpoint::{MAX_PERIOD, StddevState};
+        if self.volatility.len() > 128
+            || self.last_price.len() != self.volatility.len()
+            || self.reduce_fractions.len() > self.volatility.len()
+            || !(1..=MAX_PERIOD).contains(&self.config.volatility_window)
+            || self
+                .reduce_fractions
+                .keys()
+                .any(|s| !self.volatility.contains_key(s))
+        {
+            return Err(E::Invalid);
+        }
+        let mut symbols = Vec::with_capacity(self.volatility.len());
+        for (symbol, volatility) in &self.volatility {
+            symbols.push(crate::MarketSymbolSnapshot {
+                symbol: symbol.clone(),
+                last_price: *self.last_price.get(symbol).ok_or(E::Invalid)?,
+                volatility: StddevState::capture(volatility),
+                reduce_fraction: self.reduce_fractions.get(symbol).copied(),
+            });
+        }
+        symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        let snapshot = crate::MarketConditionSnapshot {
+            version: 1,
+            config: self.config.clone(),
+            symbols,
+            equity_volatility: self.equity_volatility.as_ref().map(StddevState::capture),
+            account_wide_reduce_fraction: self.account_wide_reduce_fraction,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Splits into three adapters sharing this same instance: a
@@ -201,6 +244,16 @@ impl MarketConditionMonitor {
 pub struct MarketConditionPreTradeAdapter(Arc<Mutex<MarketConditionMonitor>>);
 
 impl PreTradeCheck for MarketConditionPreTradeAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+            .map(crate::RegisteredRiskState::MarketCondition)
+    }
+
     fn check(
         &self,
         intent: &OrderIntent,
@@ -217,6 +270,16 @@ impl PreTradeCheck for MarketConditionPreTradeAdapter {
 pub struct MarketConditionEventAdapter(Arc<Mutex<MarketConditionMonitor>>);
 
 impl MarketConditionEventMonitor for MarketConditionEventAdapter {
+    fn inspect_registered_state(
+        &self,
+    ) -> Result<crate::RegisteredRiskState, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+            .map(crate::RegisteredRiskState::MarketCondition)
+    }
+
     fn on_market_event(&mut self, event: &MarketEvent) -> Result<(), Vec<RiskViolation>> {
         let mut monitor = self.0.lock().unwrap_or_else(|p| p.into_inner());
         monitor.on_market_event_impl(event)
@@ -226,6 +289,15 @@ impl MarketConditionEventMonitor for MarketConditionEventAdapter {
 pub struct MarketConditionReadHandle(Arc<Mutex<MarketConditionMonitor>>);
 
 impl MarketConditionReadHandle {
+    pub fn inspect_checkpoint(
+        &self,
+    ) -> Result<crate::MarketConditionSnapshot, crate::RiskStateError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::RiskStateError::Poisoned)?
+            .inspect_checkpoint()
+    }
+
     /// Feeds a fresh `PortfolioLedger::equity()` reading into the
     /// account-level equity-volatility detector (a no-op if
     /// `MarketConditionConfig.account_equity_volatility_threshold` is
@@ -303,6 +375,46 @@ mod tests {
             leverage: None,
             margin_mode: None,
         }
+    }
+
+    #[test]
+    fn inspect_retains_actual_price_windows_and_equity_state() {
+        let mut config = sample_config();
+        config.account_equity_volatility_threshold = Some(dec!(1));
+        let (pre, mut event, read) = MarketConditionMonitor::new(config.clone()).split();
+        event
+            .on_market_event(&trade_event("ETHUSDT", dec!(50)))
+            .unwrap();
+        event
+            .on_market_event(&trade_event("BTCUSDT", dec!(100)))
+            .unwrap();
+        event
+            .on_market_event(&trade_event("BTCUSDT", dec!(120)))
+            .unwrap_err();
+        read.on_equity_update(dec!(100)).unwrap();
+        read.on_equity_update(dec!(110)).unwrap();
+        read.on_equity_update(dec!(120)).unwrap_err();
+        let state = read.inspect_checkpoint().unwrap();
+        assert_eq!(state.config, config);
+        assert_eq!(state.symbols[0].symbol, "BTCUSDT");
+        assert_eq!(state.symbols[0].last_price, dec!(120));
+        assert_eq!(state.symbols[0].volatility.sample_count(), 2);
+        assert_eq!(state.symbols[0].reduce_fraction, Some(dec!(1)));
+        assert_eq!(state.symbols[1].symbol, "ETHUSDT");
+        assert_eq!(state.equity_volatility.as_ref().unwrap().sample_count(), 3);
+        assert!(state.account_wide_reduce_fraction.is_some());
+        assert_eq!(
+            pre.inspect_registered_state().unwrap(),
+            crate::RegisteredRiskState::MarketCondition(state.clone())
+        );
+        assert_eq!(
+            event.inspect_registered_state().unwrap(),
+            crate::RegisteredRiskState::MarketCondition(state.clone())
+        );
+        assert_eq!(state, read.inspect_checkpoint().unwrap());
+        let mut invalid = state;
+        invalid.symbols[0].last_price = dec!(121);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

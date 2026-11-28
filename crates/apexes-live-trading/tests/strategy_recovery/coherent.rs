@@ -151,7 +151,26 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     registry
         .register::<Arc<apexes_risk::CompositeRiskChecker>, ()>((), checker.clone())
         .unwrap();
-    let (manager, config, health) = fixture.manager(&registry).await;
+    let (manager, mut config, health) = fixture.manager(&registry).await;
+    let market_config = apexes_risk::MarketConditionConfig {
+        volatility_threshold: dec!(1000),
+        jump_threshold_pct: dec!(0.10),
+        sensitivity: dec!(1),
+        volatility_window: 3,
+        price_source: apexes_risk::PriceSource::Trade,
+        account_equity_volatility_threshold: None,
+        include_spot: false,
+    };
+    config.market_condition_config = Some(market_config.clone());
+    let table = apexes_strategy::MarginTierTable {
+        tiers: vec![apexes_strategy::MarginTier {
+            notional_floor: dec!(0),
+            max_leverage: dec!(10),
+            maintenance_margin_rate: dec!(0.01),
+            maintenance_amount: dec!(0),
+        }],
+    };
+    config.margin_tiers.insert("BTCUSDT".into(), table.clone());
     let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
     let driver_pool = pool.clone();
     let (updates, stream) = futures::channel::mpsc::unbounded();
@@ -303,6 +322,16 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
     assert!(!registered.has_unsupported_slots());
     assert!(!captured.market_monitor_unqualified);
     assert!(!captured.margin_monitor_unqualified);
+    let market = captured.market_monitor.as_ref().unwrap();
+    assert_eq!(market.config, market_config);
+    assert_eq!(market.symbols.len(), 1);
+    assert_eq!(market.symbols[0].symbol, "BTCUSDT");
+    assert_eq!(market.symbols[0].volatility.sample_count(), 1);
+    assert_eq!(
+        captured.margin_tiers.as_ref().unwrap(),
+        &vec![("BTCUSDT".into(), table)]
+    );
+
     assert_eq!(registered, &checker.inspect_registered_state().unwrap());
     assert!(
         matches!(&registered.pre_trade[0], apexes_risk::RegisteredRiskState::Limits(s)

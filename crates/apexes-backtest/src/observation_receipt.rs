@@ -192,10 +192,16 @@ pub struct CapturedObservations {
     pub records: Vec<CompletedObservation>,
     /// Actual registered risk slots captured by the loop, if present.
     pub registered_risk: Option<apexes_risk::RegisteredRiskSnapshot>,
-    /// Separately configured market monitor is not yet serialized.
+    /// Legacy or otherwise unqualified separate market monitor coverage.
     pub market_monitor_unqualified: bool,
-    /// Margin-tier monitoring is outside the supported capture contract.
+    /// Legacy or otherwise unqualified margin-tier coverage.
     pub margin_monitor_unqualified: bool,
+    /// Absent in legacy captures or when no separate monitor is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_monitor: Option<apexes_risk::MarketConditionSnapshot>,
+    /// Ordered actual configured tables, not exchange provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_tiers: Option<Vec<(String, apexes_strategy::MarginTierTable)>>,
 }
 
 const MAX_CAPTURE_BYTES: usize = 68 * 1024 * 1024;
@@ -210,6 +216,39 @@ struct CaptureEnvelope {
 impl CapturedObservations {
     fn validate(&self) -> Result<(), ObservationError> {
         self.receipt.verify(&self.scope, &self.records)?;
+        if let Some(market) = &self.market_monitor {
+            if self.market_monitor_unqualified {
+                return Err(ObservationError::Encoding);
+            }
+            market.validate().map_err(|_| ObservationError::Encoding)?;
+        }
+        if let Some(tiers) = &self.margin_tiers
+            && (self.margin_monitor_unqualified
+                || tiers.is_empty()
+                || tiers.len() > 128
+                || !tiers.windows(2).all(|w| w[0].0 < w[1].0)
+                || tiers.iter().any(|(symbol, table)| {
+                    symbol.is_empty()
+                        || symbol.len() > 128
+                        || symbol.chars().any(char::is_control)
+                        || table.tiers.is_empty()
+                        || table.tiers.len() > 128
+                        || !table
+                            .tiers
+                            .windows(2)
+                            .all(|w| w[0].notional_floor < w[1].notional_floor)
+                        || table.tiers.iter().any(|t| {
+                            t.notional_floor < rust_decimal::Decimal::ZERO
+                                || t.max_leverage < rust_decimal::Decimal::ONE
+                                || t.maintenance_margin_rate < rust_decimal::Decimal::ZERO
+                                || t.maintenance_margin_rate > rust_decimal::Decimal::ONE
+                                || t.maintenance_amount < rust_decimal::Decimal::ZERO
+                        })
+                }))
+        {
+            return Err(ObservationError::Encoding);
+        }
+
         if let Some(risk) = &self.registered_risk {
             risk.validate().map_err(|_| ObservationError::Encoding)?;
             if risk.pre_trade.iter().any(|s| matches!(s,apexes_risk::RegisteredRiskState::Limits(l) if l.day.is_some_and(|d|d>self.receipt.through.observed_at.date_naive()))) {
@@ -333,6 +372,8 @@ impl ObservationCapture {
             registered_risk: None,
             market_monitor_unqualified: false,
             margin_monitor_unqualified: false,
+            market_monitor: None,
+            margin_tiers: None,
         })
     }
 }
@@ -372,6 +413,36 @@ mod tests {
     }
 
     #[test]
+    fn durable_capture_preserves_margin_tables_and_rejects_invalid_order() {
+        use apexes_strategy::{MarginTier, MarginTierTable};
+        let mut capture =
+            ObservationCapture::new(cursor(10, 0), ObservationClock::SourceAvailability, scope());
+        let item = trade(11, 1, 1);
+        capture.record(item.cursor, &item.event).unwrap();
+        let mut captured = capture.finish(item.cursor).unwrap();
+        let tier = MarginTier {
+            notional_floor: dec!(0),
+            max_leverage: dec!(10),
+            maintenance_margin_rate: dec!(0.01),
+            maintenance_amount: dec!(0),
+        };
+        captured.margin_tiers = Some(vec![(
+            "BTCUSDT".into(),
+            MarginTierTable { tiers: vec![tier] },
+        )]);
+        let bytes = captured.encode_durable().unwrap();
+        assert_eq!(
+            CapturedObservations::decode_durable(&bytes, cursor(10, 0), item.cursor).unwrap(),
+            captured
+        );
+        captured.margin_tiers.as_mut().unwrap()[0]
+            .1
+            .tiers
+            .push(tier);
+        assert!(captured.encode_durable().is_err());
+    }
+
+    #[test]
     fn durable_capture_round_trip_refuses_noncanonical_and_wrong_cursor() {
         let mut capture =
             ObservationCapture::new(cursor(10, 0), ObservationClock::SourceAvailability, scope());
@@ -398,6 +469,7 @@ mod tests {
             position_monitor_count: 0,
             position: None,
             market_condition_monitor_count: 0,
+            market_condition: None,
         });
         assert!(captured.encode_durable().is_err());
     }
