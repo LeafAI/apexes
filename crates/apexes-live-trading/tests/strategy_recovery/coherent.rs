@@ -1819,6 +1819,8 @@ struct FlatTransitionFixture {
     instruments: Vec<Instrument>,
     opening_risk_receipt: apexes_live_trading::OpeningRiskReceipt,
     opening_risk_digest: String,
+    closing_risk_receipt: apexes_live_trading::ClosingRiskReceipt,
+    closing_risk_digest: String,
     opening: apexes_live_trading::OpeningWalletEvidence,
     window: apexes_live_trading::RecoveryEvidenceWindow,
     closing: apexes_live_trading::WalletEvidence,
@@ -1901,18 +1903,26 @@ async fn flat_boundary_at(
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("opening.json");
     let (digest_sender, digest_receiver) = oneshot::channel();
+    let closing_path = dir.join("closing.json");
+    let (closing_sender, closing_receiver) = oneshot::channel();
     let boundary_result = tokio::time::timeout(
         Duration::from_secs(20),
-        live::run_live_trading_with_opening_risk_handoff_on_stop(
+        live::run_live_trading_with_risk_boundary_handoffs_on_stop(
             config,
             &registry,
             restore_startup(previous.clone(), candidate),
             manager,
             futures::stream::empty(),
             receiver,
-            live::OpeningRiskHandoff {
-                path: path.clone(),
-                digest: digest_sender,
+            live::RiskBoundaryHandoffs {
+                opening: live::OpeningRiskHandoff {
+                    path: path.clone(),
+                    digest: digest_sender,
+                },
+                closing: live::ClosingRiskHandoff {
+                    path: closing_path.clone(),
+                    digest: closing_sender,
+                },
             },
         ),
     )
@@ -1935,6 +1945,28 @@ async fn flat_boundary_at(
         .await
         .unwrap();
     assert_eq!(Some(inspected), capture.opening_risk);
+    let closing_risk_digest = closing_receiver.await.unwrap();
+    let closing_risk_receipt =
+        live::ClosingRiskReceipt::read(&closing_path, &closing_risk_digest).unwrap();
+    assert!(live::ClosingRiskReceipt::read(&closing_path, &"0".repeat(64)).is_err());
+    let closing = selection
+        .inspect_closing_risk_receipt(
+            &mut store,
+            &fixture.url,
+            &closing_risk_receipt,
+            &closing_risk_digest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(Some(closing.captured_at), capture.closing_risk_captured_at);
+    assert_eq!(closing.registered_risk, capture.registered_risk);
+    assert_eq!(closing.market_monitor, capture.market_monitor);
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&closing_path).unwrap()).unwrap();
+    tampered["body"]["owner_fingerprint"] = serde_json::json!("0".repeat(64));
+    let tampered_path = dir.join("tampered.json");
+    std::fs::write(&tampered_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    assert!(live::ClosingRiskReceipt::read(&tampered_path, &closing_risk_digest).is_err());
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
     let expected_cursor = StateCursor {
@@ -2009,6 +2041,8 @@ async fn flat_boundary_at(
         instruments,
         opening_risk_receipt,
         opening_risk_digest,
+        closing_risk_receipt,
+        closing_risk_digest,
         opening,
         window,
         closing: wallet(closing_at),
@@ -3005,6 +3039,26 @@ async fn receipt_bound_successor_requalifies_two_preserved_runs_and_rejects_late
     assert!(check_pair!(&ae, &aw, &"0".repeat(64), &bw, bw.sha256()).is_err());
     assert!(check_pair!(&ae, &aw, aw.sha256(), &aw, aw.sha256()).is_err());
 
+    assert!(
+        b.selection
+            .inspect_closing_risk_receipt(
+                &mut second_store,
+                &second.url,
+                &a.closing_risk_receipt,
+                &a.closing_risk_digest,
+            )
+            .await
+            .is_err()
+    );
+    b.selection
+        .inspect_closing_risk_receipt(
+            &mut second_store,
+            &second.url,
+            &b.closing_risk_receipt,
+            &b.closing_risk_digest,
+        )
+        .await
+        .unwrap();
     let independent = b
         .selection
         .inspect_opening_risk_receipt(
@@ -3252,6 +3306,88 @@ async fn opening_risk_handoff_refuses_existing_file_before_callbacks() {
     assert!(health.is_engaged());
     assert_eq!(std::fs::read(&path).unwrap(), b"independently retained");
     assert_old_head(&fixture, &selection).await;
+    assert_eq!(fixture.claim_count().await, 1);
+    std::fs::remove_dir_all(dir).unwrap();
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn closing_risk_handoff_collision_preserves_acknowledged_boundary() {
+    use apexes_live_trading as live;
+    let fixture = Fixture::new().await;
+    let selection = fixture.seed().await;
+    let registry = registry();
+    let (manager, config, health) = fixture.manager(&registry).await;
+    let candidate = Probe::new(0);
+    let observed = candidate.observed.clone();
+    let observed_driver = observed.clone();
+    let (stop, receiver) = oneshot::channel();
+    let driver = tokio::spawn(async move {
+        loop {
+            if !observed_driver.lock().unwrap().is_empty() {
+                let _ = stop.send(());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let (opening_sender, opening_selected) = oneshot::channel();
+    let (closing_sender, closing_selected) = oneshot::channel();
+    let dir = std::env::temp_dir().join(format!(
+        "apexes-closing-risk-collision-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("closing.json");
+    std::fs::write(&path, b"independently retained").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        live::run_live_trading_with_risk_boundary_handoffs_on_stop(
+            config,
+            &registry,
+            restore_startup(selection.clone(), candidate),
+            manager,
+            futures::stream::empty(),
+            receiver,
+            live::RiskBoundaryHandoffs {
+                opening: live::OpeningRiskHandoff {
+                    path: dir.join("opening.json"),
+                    digest: opening_sender,
+                },
+                closing: live::ClosingRiskHandoff {
+                    path: path.clone(),
+                    digest: closing_sender,
+                },
+            },
+        ),
+    )
+    .await;
+    driver.abort();
+    assert!(
+        matches!(result.unwrap(), Err(ApexesError::InvalidBacktestConfig { ref reason })
+        if reason.contains("closing risk handoff refused after acknowledged checkpoint commit"))
+    );
+    assert!(opening_selected.await.is_ok());
+    assert!(closing_selected.await.is_err());
+    assert!(!observed.lock().unwrap().is_empty());
+    assert!(health.is_engaged());
+    assert_eq!(std::fs::read(&path).unwrap(), b"independently retained");
+    let mut store = fixture.store().await;
+    assert!(
+        store
+            .load_strategy_checkpoint(Some(selection.receipt()))
+            .await
+            .is_err()
+    );
+    drop(store);
+    let pool = sqlx::PgPool::connect(&fixture.url).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM strategy_checkpoint_boundary")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    pool.close().await;
     assert_eq!(fixture.claim_count().await, 1);
     std::fs::remove_dir_all(dir).unwrap();
     fixture.cleanup().await;

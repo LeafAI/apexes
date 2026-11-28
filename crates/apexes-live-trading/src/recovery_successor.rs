@@ -597,6 +597,7 @@ mod tests {
             ledger: None,
             fill_observation_prefixes: None,
             opening_risk: None,
+            closing_risk_captured_at: None,
         };
         // Unit-only DTOs: complete receipt/journal qualification is exercised
         // separately by the two-store PostgreSQL fixture.

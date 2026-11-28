@@ -317,6 +317,57 @@ pub async fn run_live_trading_with_opening_risk_handoff_on_stop<S: Strategy>(
     .await
 }
 
+/// Explicit paired handoff path. A closing handoff failure occurs after
+/// the acknowledged checkpoint commit; it cannot undo that commit or
+/// permit another startup claim. The existing gate is faulted.
+pub async fn run_live_trading_with_risk_boundary_handoffs_on_stop<S: Strategy>(
+    config: LiveTradingConfig,
+    registry: &Registry,
+    startup: StrategyStartup<S>,
+    order_manager: OrderManager,
+    exchange_updates: impl Stream<Item = ExchangeUpdate> + Unpin + Send,
+    stop_signal: oneshot::Receiver<()>,
+    handoffs: crate::RiskBoundaryHandoffs,
+) -> Result<
+    (
+        LiveTradingReport,
+        apexes_oms::CoherentCheckpointReceipt,
+        CapturedObservations,
+    ),
+    ApexesError,
+> {
+    let StrategyStartup::Restore { selection, .. } = &startup else {
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: "risk handoffs require explicit restored startup".into(),
+        });
+    };
+    let selection = selection.as_ref().clone();
+    let gate = config.kill_switch.clone();
+    let result = run_live_trading_with_opening_risk_handoff_on_stop(
+        config,
+        registry,
+        startup,
+        order_manager,
+        exchange_updates,
+        stop_signal,
+        handoffs.opening,
+    )
+    .await?;
+    if let Err(error) =
+        crate::ClosingRiskReceipt::retain(&selection, &result.1, &result.2, handoffs.closing)
+    {
+        if let Some(gate) = gate {
+            gate.fault("closing risk handoff failed after checkpoint commit");
+        }
+        return Err(ApexesError::InvalidBacktestConfig {
+            reason: format!(
+                "closing risk handoff refused after acknowledged checkpoint commit: {error}"
+            ),
+        });
+    }
+    Ok(result)
+}
+
 async fn run_observation_capture<S: Strategy>(
     config: LiveTradingConfig,
     registry: &Registry,
