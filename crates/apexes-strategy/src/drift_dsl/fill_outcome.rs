@@ -19,6 +19,12 @@ pub(super) fn to_value(outcome: &FillOutcome<'_>) -> DriftValue {
         [
             ("source", string(outcome.source.as_str())),
             ("at", string(&outcome.at.to_rfc3339())),
+            (
+                "intent_id",
+                outcome
+                    .intent_id
+                    .map_or(DriftValue::Null, |id| string(&id.0.to_string())),
+            ),
             ("filled_at", string(&f.filled_at.to_rfc3339())),
             ("fill_id", string(&f.id.0.to_string())),
             ("order_id", string(&f.order_id.0.to_string())),

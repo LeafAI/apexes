@@ -1,23 +1,25 @@
 let filled = false;
 let rejected = false;
 let scheduled = false;
+let scheduled_id = null;
 let duplicate = false;
 
 function on_order_outcome(outcome) {
     if (outcome.kind == "scheduled" && outcome.stage == "decision" &&
         outcome.order_id == null && outcome.order_status == null && outcome.quantity == 1) {
-        scheduled = true;
+        scheduled = outcome.intent_id == "1" || outcome.intent_id == "4";
+        scheduled_id = outcome.intent_id;
     }
     if (outcome.kind == "rejected" && outcome.code == "risk_rejected" &&
         outcome.quantity == 9 && outcome.order_id == null) {
-        rejected = true;
+        rejected = outcome.intent_id == "2";
     }
     if (outcome.kind == "rejected" && outcome.code == "event_latency_symbol_pending") {
-        duplicate = true;
+        duplicate = outcome.intent_id == "3";
     }
     if (outcome.kind == "returned" && outcome.stage == "arrival" &&
         outcome.order_status == "filled" && outcome.order_id != null &&
-        outcome.filled_quantity == 1) {
+        outcome.filled_quantity == 1 && outcome.intent_id == scheduled_id) {
         filled = true;
     }
     // Notification return values must never cause an order to be submitted.

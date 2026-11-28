@@ -25,6 +25,8 @@ pub enum OrderOutcomeKind<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct OrderOutcome<'a> {
+    /// Known local decision identity; absent for uncorrelated evidence.
+    pub intent_id: Option<crate::IntentId>,
     pub at: DateTime<Utc>,
     pub stage: AttemptStage,
     /// Original intent on rule failure; otherwise the conformed intent.
@@ -40,9 +42,11 @@ pub fn notify_direct(
     at: DateTime<Utc>,
     stage: AttemptStage,
     kind: OrderOutcomeKind<'_>,
+    intent_id: Option<crate::IntentId>,
 ) {
     if intent.execution_algo.is_none() {
         strategy.on_order_outcome(&OrderOutcome {
+            intent_id,
             at,
             stage,
             intent,

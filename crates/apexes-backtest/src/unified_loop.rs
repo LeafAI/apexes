@@ -243,6 +243,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
     let mut all_fills: Vec<Fill> = Vec::new();
     let mut supplemental_seen = HashSet::new();
     let mut notifications = crate::fill_notifications::FillNotifications::default();
+    let mut correlation = crate::lifecycle_correlation::LifecycleCorrelation::default();
     use apexes_strategy::{
         FillSource, ParentOutcome, ParentOutcomeKind, TerminalKind, TerminalOutcome,
     };
@@ -402,7 +403,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             !ledger.check_de_risking(&monitor.reduce_fractions(&symbols), market_condition_include_spot).is_empty()
                         });
                     if margin_breach || extreme {
-                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp, &correlation).await;
                         emergency_event = true;
                     }
                 }
@@ -466,11 +467,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             }
                         }
                     }
-                    notifications.deliver(&mut strategy, timestamp, FillSource::Resting, &fills);
+                    notifications.deliver(&mut strategy, timestamp, FillSource::Resting, &fills, &correlation);
                 }
 
                 for order in executor.take_simulated_completions() {
-                    strategy.on_order_terminal(&TerminalOutcome { at: timestamp, kind: TerminalKind::Filled { order: &order } });
+                    strategy.on_order_terminal(&TerminalOutcome { intent_id: correlation.order(order.id), at: timestamp, kind: TerminalKind::Filled { order: &order } });
                 }
 
                 let mut checked_child_fills = HashSet::new();
@@ -555,9 +556,9 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             }
                         }
                     }
-                    notifications.deliver(&mut strategy, timestamp, FillSource::Ems, &ems_fills);
+                    notifications.deliver(&mut strategy, timestamp, FillSource::Ems, &ems_fills, &correlation);
                 }
-                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
+                refresh_open_parent_orders(ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp, &correlation).await;
                 if let Some(queue) = &mut arrivals {
                     queue.reconcile_parents(&open_parent_orders);
                 }
@@ -634,7 +635,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         margin_mode: position.margin_mode,
                     };
                     if !emergency_event && let Some(queue) = &mut arrivals {
-                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
+                        preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp, &correlation).await;
                         emergency_event = true;
                     }
                     let trace = diagnostics.intent(&liquidation_intent, "liquidation", timestamp);
@@ -655,7 +656,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 &fills,
                                 config.risk_free_return,
                             )?;
-                            notifications.deliver(&mut strategy, timestamp, FillSource::Liquidation, &fills);
+                            notifications.deliver(&mut strategy, timestamp, FillSource::Liquidation, &fills, &correlation);
                         }
                         Err(error) => {
                             trace.outcome("submission_failed", error_code(&error));
@@ -728,7 +729,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                             margin_mode: position.margin_mode,
                         };
                         if !emergency_event && let Some(queue) = &mut arrivals {
-                            preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp).await;
+                            preempt_simulated_orders(queue, executor.as_ref(), ems.as_ref(), &mut open_parent_orders, &mut strategy, timestamp, &correlation).await;
                             emergency_event = true;
                         }
                         let trace = diagnostics.intent(&de_risk_intent, "derisk", timestamp);
@@ -749,7 +750,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                     &fills,
                                     config.risk_free_return,
                                 )?;
-                                notifications.deliver(&mut strategy, timestamp, FillSource::Derisk, &fills);
+                                notifications.deliver(&mut strategy, timestamp, FillSource::Derisk, &fills, &correlation);
                             }
                             Err(error) => {
                                 trace.outcome("submission_failed", error_code(&error));
@@ -763,7 +764,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 // mode the first pass is empty.
                 for arriving in [true,false] {
                 let intents = if arriving {
-                    arrivals.as_mut().map_or_else(Vec::new,|q|q.due(timestamp))
+                    arrivals.as_mut().map_or_else(Vec::new,|q|q.due_correlated(timestamp))
                 } else {
                 // `open_orders` comes from the executor, fetched fresh --
                 // this loop no longer keeps its own map.
@@ -796,11 +797,11 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 };
 
                 diagnostics.decision(&event, timestamp, paused, intents.len());
-                intents
+                intents.into_iter().map(|intent|(intent,correlation.allocate())).collect()
                 };
                 use apexes_strategy::{AttemptStage, OrderOutcomeKind, order_outcome::notify_direct};
                 let stage = if arriving { AttemptStage::Arrival } else { AttemptStage::Decision };
-                for intent in intents {
+                for (intent,intent_id) in intents {
                     if arriving && let Some(queue) = &mut arrivals {
                         queue.release(&intent);
                     }
@@ -808,7 +809,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                     if emergency_event && let Some(queue) = &mut arrivals {
                         queue.report.emergency_intents_refused += 1;
                         trace.outcome("rules_rejected", "emergency_preemption");
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "emergency_preemption" });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "emergency_preemption" }, intent_id);
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, "emergency exit preempts strategy orders");
                         }
@@ -829,7 +830,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         Ok(conformed) => conformed,
                         Err(violation) => {
                             trace.outcome("rules_rejected", rule_code(&violation));
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: rule_code(&violation) });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: rule_code(&violation) }, intent_id);
                             let reason = violation.to_string();
                             tracing::warn!(
                                 symbol = %intent.symbol,
@@ -864,7 +865,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         if available < intent.quantity || open_parent_orders.values().any(|status|
                             matches!(status, apexes_strategy::ParentOrderStatus::Scheduling)) {
                             trace.outcome("rules_rejected", "protective_inventory_unverified");
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "protective_inventory_unverified" });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "protective_inventory_unverified" }, intent_id);
                             if let Some(log) = &mut order_log {
                                 record_refusal(log, &intent, timestamp, "protective inventory or parent orders not reconciled");
                             }
@@ -886,7 +887,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         )
                     {
                         trace.risk_rejected("risk_rejected", &violations);
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "risk_rejected" });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "risk_rejected" }, intent_id);
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by risk checker");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -903,7 +904,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                         )
                     {
                         trace.risk_rejected("market_condition_rejected", &violations);
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "market_condition_rejected" });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "market_condition_rejected" }, intent_id);
                         tracing::warn!(?violations, symbol = %intent.symbol, "order rejected by market condition monitor");
                         if let Some(log) = &mut order_log {
                             record_refusal(log, &intent, timestamp, &join_violations(&violations));
@@ -920,20 +921,20 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 queue.capital_refused(!arriving);
                                 let reason = result.err().unwrap_or_else(|| "insufficient unreserved capital".into());
                                 trace.outcome("rules_rejected", "capital_reservation");
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "capital_reservation" });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: "capital_reservation" }, intent_id);
                                 if let Some(log) = &mut order_log { record_refusal(log, &intent, timestamp, &reason); }
                                 continue;
                             }
                         };
                         if !arriving {
-                            match queue.schedule(timestamp,intent.clone(),hold) {
+                            match queue.schedule_correlated(timestamp,intent.clone(),hold,intent_id) {
                                 Ok(())=>{
                                     trace.outcome("scheduled","event_latency");
-                                    notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Scheduled);
+                                    notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Scheduled, intent_id);
                                 },
                                 Err(reason)=>{
                                     trace.outcome("rules_rejected",reason);
-                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: reason });
+                        notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Rejected { code: reason }, intent_id);
                                     if let Some(log)=&mut order_log {record_refusal(log,&intent,timestamp,reason);}
                                 }
                             }
@@ -969,11 +970,12 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                 if let Some(checker) = &risk_checker {
                                     checker.on_order_accepted(&intent, timestamp);
                                 }
-                                strategy.on_parent_outcome(&ParentOutcome { at: timestamp, kind: ParentOutcomeKind::Submitted { id: parent_id, intent: &intent } });
+                                correlation.bind_parent(parent_id,intent_id);
+                                strategy.on_parent_outcome(&ParentOutcome { intent_id, at: timestamp, kind: ParentOutcomeKind::Submitted { id: parent_id, intent: &intent } });
                             }
                             Err(_) => {
                                 trace.outcome("parent_submission_failed", "ems_error");
-                                strategy.on_parent_outcome(&ParentOutcome { at: timestamp, kind: ParentOutcomeKind::SubmissionFailed { intent: &intent } });
+                                strategy.on_parent_outcome(&ParentOutcome { intent_id, at: timestamp, kind: ParentOutcomeKind::SubmissionFailed { intent: &intent } });
                                 tracing::warn!(reason = "ems_error", symbol = %intent.symbol, "algo order submission failed");
                             }
                         }
@@ -1044,12 +1046,13 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                                     }
                                 }
                             }
-                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Returned { order: &order });
-                            notifications.deliver(&mut strategy, timestamp, FillSource::Direct, &fills);
+                            correlation.bind_order(order.id,intent_id);
+                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::Returned { order: &order }, intent_id);
+                            notifications.deliver(&mut strategy, timestamp, FillSource::Direct, &fills, &correlation);
                         }
                         Err(error) => {
                             trace.outcome("submission_failed", error_code(&error));
-                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::SubmissionFailed { code: error_code(&error) });
+                            notify_direct(&mut strategy, &intent, timestamp, stage, OrderOutcomeKind::SubmissionFailed { code: error_code(&error) }, intent_id);
                             tracing::warn!(
                                 reason = error_code(&error),
                                 symbol = %intent.symbol,
@@ -1221,7 +1224,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 }
                 let equity = ledger.equity(&last_prices)?;
                 let now = chrono::Utc::now();
-                notifications.deliver(&mut strategy, now, FillSource::Supplemental, &all_fills[before..]);
+                notifications.deliver(&mut strategy, now, FillSource::Supplemental, &all_fills[before..], &correlation);
                 overall_tracker.record_equity_point(now, equity);
                 if let Some(tracker) = &mut evaluation {
                     tracker.observe_fills(&all_fills);
@@ -1671,6 +1674,7 @@ async fn preempt_simulated_orders(
     parents: &mut HashMap<ParentOrderId, ParentOrderStatus>,
     strategy: &mut impl Strategy,
     at: chrono::DateTime<chrono::Utc>,
+    correlation: &crate::lifecycle_correlation::LifecycleCorrelation,
 ) {
     use apexes_strategy::{
         ParentOutcome, ParentOutcomeKind, ParentPhase, TerminalKind, TerminalOutcome,
@@ -1709,9 +1713,10 @@ async fn preempt_simulated_orders(
         }
     }
     queue.reconcile_parents(parents);
-    for intent in &cancelled_transit {
+    for (intent, intent_id) in &cancelled_transit {
         if intent.execution_algo.is_none() {
             strategy.on_order_terminal(&TerminalOutcome {
+                intent_id: *intent_id,
                 at,
                 kind: TerminalKind::TransitCancelled { intent },
             });
@@ -1719,6 +1724,7 @@ async fn preempt_simulated_orders(
     }
     for order_id in cancelled_ids {
         strategy.on_order_terminal(&TerminalOutcome {
+            intent_id: correlation.order(order_id),
             at,
             kind: TerminalKind::Cancelled { order_id },
         });
@@ -1726,6 +1732,7 @@ async fn preempt_simulated_orders(
     cancelled_parents.sort_unstable_by_key(|id| id.0);
     for id in cancelled_parents {
         strategy.on_parent_outcome(&ParentOutcome {
+            intent_id: correlation.parent(id),
             at,
             kind: ParentOutcomeKind::StatusChanged {
                 id,
@@ -1741,6 +1748,7 @@ async fn refresh_open_parent_orders(
     open_parent_orders: &mut HashMap<ParentOrderId, ParentOrderStatus>,
     strategy: &mut impl Strategy,
     at: chrono::DateTime<chrono::Utc>,
+    correlation: &crate::lifecycle_correlation::LifecycleCorrelation,
 ) {
     use apexes_strategy::{ParentOutcome, ParentOutcomeKind, ParentPhase};
     let mut ids: Vec<ParentOrderId> = open_parent_orders.keys().copied().collect();
@@ -1753,6 +1761,7 @@ async fn refresh_open_parent_orders(
                     let previous = ParentPhase::from(&previous);
                     if previous != current {
                         strategy.on_parent_outcome(&ParentOutcome {
+                            intent_id: correlation.parent(id),
                             at,
                             kind: ParentOutcomeKind::StatusChanged {
                                 id,
@@ -1766,6 +1775,7 @@ async fn refresh_open_parent_orders(
             Ok(None) => {
                 if open_parent_orders.remove(&id).is_some() {
                     strategy.on_parent_outcome(&ParentOutcome {
+                        intent_id: correlation.parent(id),
                         at,
                         kind: ParentOutcomeKind::Unavailable { id },
                     });
@@ -1935,18 +1945,19 @@ mod tests {
         let mut probe = Probe::default();
         let now = Utc::now();
         for _ in 0..2 {
-            refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+            refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default())
+                .await;
             assert_eq!(tracked[&id], ParentOrderStatus::Scheduling);
             assert!(probe.0.is_empty());
         }
-        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default()).await;
         assert_eq!(probe.0, vec![(id, Some(ParentPhase::Failed))]);
-        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default()).await;
         assert_eq!(probe.0.len(), 1);
-        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default()).await;
         assert!(tracked.is_empty());
         assert_eq!(probe.0, vec![(id, Some(ParentPhase::Failed)), (id, None)]);
-        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now).await;
+        refresh_open_parent_orders(&ems, &mut tracked, &mut probe, now, &Default::default()).await;
         assert_eq!(probe.0.len(), 2);
     }
 
@@ -1976,9 +1987,21 @@ mod tests {
         assert_eq!(applied, vec![accepted.clone()]);
         let mut notifications = crate::fill_notifications::FillNotifications::default();
         let mut probe = Probe::default();
-        notifications.deliver(&mut probe, Utc::now(), FillSource::Supplemental, &applied);
+        notifications.deliver(
+            &mut probe,
+            Utc::now(),
+            FillSource::Supplemental,
+            &applied,
+            &Default::default(),
+        );
         // Re-delivery through another path must not notify twice.
-        notifications.deliver(&mut probe, Utc::now(), FillSource::Direct, &applied);
+        notifications.deliver(
+            &mut probe,
+            Utc::now(),
+            FillSource::Direct,
+            &applied,
+            &Default::default(),
+        );
         assert_eq!(probe.0, vec![(FillSource::Supplemental, accepted)]);
     }
 

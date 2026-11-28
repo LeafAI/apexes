@@ -19,10 +19,16 @@ impl FillNotifications {
         at: DateTime<Utc>,
         source: FillSource,
         fills: &[Fill],
+        correlation: &crate::lifecycle_correlation::LifecycleCorrelation,
     ) {
         for fill in fills {
             if self.seen.insert(fill.id) {
-                strategy.on_fill(&FillOutcome { at, source, fill });
+                strategy.on_fill(&FillOutcome {
+                    intent_id: correlation.order(fill.order_id),
+                    at,
+                    source,
+                    fill,
+                });
             } else {
                 tracing::warn!(fill_id=?fill.id, "duplicate fill notification suppressed");
             }

@@ -28,6 +28,8 @@ impl FillSource {
 
 #[derive(Debug, Clone, Copy)]
 pub struct FillOutcome<'a> {
+    /// Known local decision identity; absent for uncorrelated evidence.
+    pub intent_id: Option<crate::IntentId>,
     /// Local delivery/decision clock; not the execution timestamp.
     pub at: DateTime<Utc>,
     pub source: FillSource,

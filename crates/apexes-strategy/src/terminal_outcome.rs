@@ -18,6 +18,8 @@ pub enum TerminalKind<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalOutcome<'a> {
+    /// Known local decision identity; absent for uncorrelated evidence.
+    pub intent_id: Option<crate::IntentId>,
     pub at: DateTime<Utc>,
     pub kind: TerminalKind<'a>,
 }
