@@ -119,3 +119,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Independent direct Spot fee reconciliation](2026-11-28-apexes-direct-fee-reconciliation-design.md) verifies direct base/quote fee quantities and historical valuation subtotals against the exact selected journal; third-asset valuations remain unqualified.
 
 [Independent per-fill third-asset valuation evidence](2026-11-28-apexes-third-asset-fee-evidence-design.md) compares the exact selected journal and supplied causal per-fill rates against retained fee totals and valuation subtotals; actual runtime conversion decisions and provenance remain unqualified.
+
+[Actual per-fill valuation decision evidence](2026-11-28-apexes-per-fill-valuation-evidence-design.md) retains bounded actual attribution decisions and validates local aggregate consistency; independent per-fill reconciliation and external provenance remain open.
