@@ -79,6 +79,27 @@ impl KillSwitch {
         self.is_engaged() || self.phase().is_some_and(|p| p != SessionPhase::Running)
     }
 
+    /// Coherent read of the submission gate. All gate transitions hold
+    /// the health lock; no free-form fault message is returned to scripts.
+    pub fn health_observation(&self) -> apexes_strategy::HealthObservation {
+        use apexes_strategy::{HealthObservation, HealthPhase};
+        let health = self.health_lock();
+        let phase = health.as_ref().map(|h| match h.phase {
+            SessionPhase::Initializing => HealthPhase::Initializing,
+            SessionPhase::Reconciling => HealthPhase::Reconciling,
+            SessionPhase::Running => HealthPhase::Running,
+            SessionPhase::Degraded => HealthPhase::Degraded,
+            SessionPhase::Halted => HealthPhase::Halted,
+        });
+        let kill_switch_engaged = self.is_engaged();
+        HealthObservation {
+            phase,
+            kill_switch_engaged,
+            blocks_submissions: kill_switch_engaged
+                || phase.is_some_and(|p| p != HealthPhase::Running),
+        }
+    }
+
     pub fn begin_reconciliation(&self) {
         let mut health = self.health_lock();
         if let Some(h) = health.as_mut()
@@ -262,6 +283,56 @@ mod tests {
             .await
             .unwrap();
     }
+    #[test]
+    fn health_observation_matches_gate_through_managed_and_legacy_transitions() {
+        use apexes_strategy::{HealthObservation, HealthPhase};
+        let gate = KillSwitch::managed();
+        let assert_state = |phase, engaged, blocked| {
+            assert_eq!(
+                gate.health_observation(),
+                HealthObservation {
+                    phase: Some(phase),
+                    kill_switch_engaged: engaged,
+                    blocks_submissions: blocked
+                }
+            );
+            assert_eq!(gate.blocks_submissions(), blocked);
+        };
+        assert_state(HealthPhase::Initializing, false, true);
+        gate.begin_reconciliation();
+        assert_state(HealthPhase::Reconciling, false, true);
+        gate.startup_ready();
+        assert_state(HealthPhase::Running, false, false);
+        let saved = gate.health_observation();
+        gate.fault("test internal detail");
+        assert_state(HealthPhase::Degraded, true, true);
+        gate.cancel_sweep_complete();
+        assert_state(HealthPhase::Halted, true, true);
+        assert!(gate.try_release().is_err());
+        assert_state(HealthPhase::Halted, true, true);
+        assert!(!saved.blocks_submissions);
+        let legacy = KillSwitch::new();
+        assert_eq!(
+            legacy.health_observation(),
+            HealthObservation {
+                phase: None,
+                kill_switch_engaged: false,
+                blocks_submissions: false
+            }
+        );
+        legacy.engage("legacy halt");
+        assert_eq!(
+            legacy.health_observation(),
+            HealthObservation {
+                phase: None,
+                kill_switch_engaged: true,
+                blocks_submissions: true
+            }
+        );
+        legacy.release();
+        assert!(!legacy.health_observation().blocks_submissions);
+    }
+
     #[test]
     fn managed_health_is_fail_closed_and_cannot_be_released_by_operator() {
         let ks = KillSwitch::managed();

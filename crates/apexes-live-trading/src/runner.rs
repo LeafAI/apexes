@@ -189,6 +189,7 @@ pub async fn run_live_trading(
     // expected type): every critical section the executor/sink runs
     // awaits `OrderManager`'s async methods while holding the guard, so
     // a `std::sync::Mutex` would be wrong here.
+    let submission_gate = order_manager.submission_gate();
     let order_manager = Arc::new(tokio::sync::Mutex::new(order_manager));
     let child_order_sink: Arc<dyn apexes_ems::ChildOrderSink> =
         Arc::new(OrderManagerChildOrderSink::new(Arc::clone(&order_manager)));
@@ -303,8 +304,10 @@ pub async fn run_live_trading(
     // costs nothing in the common case.
     let exchange_updates = exchange_updates.chain(futures::stream::pending());
 
-    let executor: Arc<dyn OrderExecutor> =
-        Arc::new(OrderManagerExecutor::new(Arc::clone(&order_manager)));
+    let executor: Arc<dyn OrderExecutor> = Arc::new(OrderManagerExecutor::with_submission_gate(
+        Arc::clone(&order_manager),
+        submission_gate,
+    ));
     let liquidation_policy = Arc::new(LiveLiquidationPolicy::new(config.auto_derisk_live));
     let mut supplemental_fills = LiveSupplementalFillSource::new(
         Arc::clone(&order_manager),

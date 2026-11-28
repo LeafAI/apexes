@@ -242,6 +242,12 @@ impl OrderManager {
         self
     }
 
+    /// Clone the exact submission gate before sharing the manager with
+    /// async exchange tasks. Reading it never requires the manager lock.
+    pub fn submission_gate(&self) -> Option<Arc<KillSwitch>> {
+        self.kill_switch.clone()
+    }
+
     /// Submits a new order:
     /// 1. Runs `risk_checker` (if configured) against `intent`; returns
     ///    `Err(OmsError::RiskCheckFailed)` without creating any order if

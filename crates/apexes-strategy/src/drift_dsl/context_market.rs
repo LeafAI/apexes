@@ -169,8 +169,40 @@ fn capital_value(capital: &HashMap<String, crate::CapitalObservation>) -> DriftV
     ])
 }
 
+fn health_value(health: &crate::HealthObservation) -> DriftValue {
+    use crate::HealthPhase;
+    let phase = health.phase.map_or(DriftValue::Null, |phase| {
+        string(match phase {
+            HealthPhase::Initializing => "initializing",
+            HealthPhase::Reconciling => "reconciling",
+            HealthPhase::Running => "running",
+            HealthPhase::Degraded => "degraded",
+            HealthPhase::Halted => "halted",
+        })
+    });
+    object([
+        ("source", string("oms_submission_gate")),
+        ("phase", phase),
+        (
+            "kill_switch_engaged",
+            DriftValue::Bool(health.kill_switch_engaged),
+        ),
+        (
+            "blocks_submissions",
+            DriftValue::Bool(health.blocks_submissions),
+        ),
+    ])
+}
+
 pub(super) fn attach(ctx: &mut DriftValue, event: &MarketEvent, context: &StrategyContext<'_>) {
     if let DriftValue::Object(fields) = ctx {
+        fields.insert(
+            "health".into(),
+            context
+                .health
+                .as_ref()
+                .map_or(DriftValue::Null, health_value),
+        );
         let market = context.market.filter(|m| m.matches(event));
         fields.insert(
             "market".into(),

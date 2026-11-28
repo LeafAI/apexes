@@ -106,6 +106,12 @@ pub trait OrderExecutor: Send + Sync {
         None
     }
 
+    /// Optional snapshot of a real OMS submission gate. Simulation and
+    /// unsupported executors do not imply a healthy live session.
+    fn health_observation(&self) -> Option<crate::HealthObservation> {
+        None
+    }
+
     /// Cancel all local simulated working orders before emergency execution.
     /// Never dispatches a live cancellation by default.
     fn cancel_simulated_working(&self) -> Result<Vec<OrderId>, ApexesError> {

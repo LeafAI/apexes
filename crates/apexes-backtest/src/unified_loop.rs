@@ -759,6 +759,7 @@ pub(crate) async fn run_unified_event_loop_with_attribution(
                 let arrived_margin_status = arrivals.as_ref().map(|_| ledger.margin_status(&mark_prices, &config.margin_tiers));
                 let market = apexes_strategy::InstrumentContext::for_event(&event, &config.instruments, &config.symbol_rules);
                 let ctx = StrategyContext {
+                    health: executor.health_observation(),
                     capital: arrivals.as_ref().and_then(|q| q.capital_snapshot(&config.instruments, ledger.positions(), ledger.balances())),
                     market,
                     costs: market.and_then(|m| executor.cost_observation(m.instrument())).filter(|costs| market.is_some_and(|m| costs.matches(&event, m.instrument()))),

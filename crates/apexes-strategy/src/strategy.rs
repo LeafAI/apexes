@@ -123,6 +123,8 @@ pub struct StrategyContext<'a> {
     pub costs: Option<crate::CostObservation>,
     /// Tracked local Spot reservations; absent when unsupported. Missing asset entries are unknown.
     pub capital: Option<HashMap<String, crate::CapitalObservation>>,
+    /// Snapshot of the actual OMS submission gate when available.
+    pub health: Option<crate::HealthObservation>,
 }
 
 impl StrategyContext<'_> {
@@ -319,6 +321,7 @@ mod tests {
         let open_orders = HashMap::new();
         let open_parent_orders = HashMap::new();
         let ctx = StrategyContext {
+            health: None,
             capital: None,
             costs: None,
             book: None,
@@ -368,6 +371,7 @@ mod tests {
         let now = Utc::now();
 
         let ctx = StrategyContext {
+            health: None,
             capital: None,
             costs: None,
             book: None,
