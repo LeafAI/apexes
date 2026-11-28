@@ -90,3 +90,6 @@ mod recovery_successor;
 pub use recovery_successor::{
     SuccessorContinuityError, SuccessorInspectionError, SuccessorRun, inspect_offline_successor,
 };
+
+mod recovery_collection;
+pub use recovery_collection::{CollectedSpotEvidence, SpotCollectionError};

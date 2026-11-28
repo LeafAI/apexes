@@ -926,20 +926,12 @@ async fn run_live_mode(
     // Bind the dedicated database before reconciling any old client IDs
     // against the exchange. Session IDs are ephemeral; strategy reference,
     // credential fingerprint, network and instrument identity are stable.
-    let mut scope: Vec<_> = launch_config
-        .instruments
-        .iter()
-        .map(|i| (&i.symbol, &i.base_currency, &i.quote_currency))
-        .collect();
-    scope.sort();
-    let owner = serde_json::json!({
-        "version": 1,
-        "network": network.to_string(),
-        "credential": binance_gateway.credential_fingerprint(),
-        "strategy": &launch_config.strategy_ref,
-        "instruments": scope,
-    })
-    .to_string();
+    let owner = binance_gateway
+        .spot_inventory_owner(
+            &serde_json::to_value(&launch_config.strategy_ref)?,
+            &launch_config.instruments,
+        )
+        .map_err(|reason| apexes_oms::OmsError::InvalidRow { reason })?;
     let mut order_store = OrderStore::new(&ems_postgres_url).await?;
     order_store.bind_spot_inventory(&owner).await?;
     let fee_journal =

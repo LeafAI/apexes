@@ -151,3 +151,5 @@ See also [authoritative managed live terminal callbacks](2026-11-28-apexes-live-
 [Durable offline transition witness](2026-11-28-apexes-offline-transition-witness-design.md) binds the exact selected coherent journal/capture and independently qualified accounting, observation and risk inputs; durable canonical historical evidence, not startup authority.
 
 [Offline successor-boundary continuity](2026-11-29-apexes-offline-successor-boundary-design.md) independently requalifies consecutive historical boundaries and verifies flat-inventory accounting and disjoint execution identities without changing startup authority.
+
+[Strict owner-bound Spot evidence collection](2026-11-29-apexes-spot-evidence-collection-design.md) qualifies read-only terminal, raw account-wide open-order and wallet observations against the exact selected journal, without startup authority.

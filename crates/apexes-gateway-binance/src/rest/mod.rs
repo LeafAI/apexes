@@ -160,6 +160,13 @@ impl BinanceRestClient {
         hex::encode(Sha256::digest(self.config.api_key.as_bytes()))
     }
 
+    pub(crate) fn spot_network(&self) -> Option<apexes_core::binance_network::BinanceNetwork> {
+        use apexes_core::binance_network::BinanceNetwork;
+        [BinanceNetwork::Mainnet, BinanceNetwork::Testnet]
+            .into_iter()
+            .find(|network| self.config.spot_base_url == network.endpoints().spot_rest)
+    }
+
     pub fn new(config: BinanceGatewayConfig) -> Self {
         Self {
             http: build_http_client(),

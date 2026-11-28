@@ -742,3 +742,166 @@ async fn server_error_with_order_not_found_body_is_not_a_definitive_negative_loo
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn strict_spot_evidence_reads_complete_terminal_and_account_responses() {
+    use apexes_oms::{RemoteTerminalEvidence, SpotEvidenceSource};
+    let server = MockServer::start().await;
+    mount_clock(&server).await;
+    let mut order = sample_order(Uuid::new_v4());
+    order.exchange_order_id = Some("12345".into());
+    order.status = OrderStatus::Filled;
+    order.filled_quantity = dec!(1);
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .and(query_param("origClientOrderId", order.id.0.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId": 12345, "clientOrderId": order.id.0.to_string(), "symbol": "BTCUSDT",
+            "side": "BUY", "status": "FILLED", "executedQty": "1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/myTrades"))
+        .and(query_param("symbol", "BTCUSDT"))
+        .and(query_param("orderId", "12345"))
+        .and(query_param("limit", "1000"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": 1, "orderId": 12345, "symbol": "BTCUSDT", "isBuyer": true,
+                "price": "100", "qty": "1", "commission": "0.01",
+                "commissionAsset": "USDT", "time": 1800000000000_i64
+            }])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"orderId": 1, "clientOrderId": "manual", "status": "PENDING_CANCEL"},
+            {"orderId": 2, "clientOrderId": Uuid::new_v4().to_string(), "status": "UNKNOWN"}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account"))
+        .and(query_param("omitZeroBalances", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [{"asset":"BTC","free":"0","locked":"0"},
+                         {"asset":"USDT","free":"100","locked":"0"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gateway = gateway_against(&server).await;
+    let terminal = gateway.terminal_order(&order).await.unwrap();
+    let RemoteTerminalEvidence::Found {
+        execution, trades, ..
+    } = terminal.remote
+    else {
+        panic!("expected terminal evidence");
+    };
+    assert_eq!(execution.executed_quantity, dec!(1));
+    assert_eq!(trades[0].fee, dec!(0.01));
+    assert_eq!(gateway.account_open_order_count().await.unwrap(), 2);
+    let wallet = gateway.account_wallet().await.unwrap();
+    assert_eq!(wallet["BTC"].free, dec!(0));
+    assert_eq!(wallet["USDT"].free, dec!(100));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == wiremock::http::Method::GET)
+    );
+}
+
+#[tokio::test]
+async fn strict_spot_evidence_refuses_partial_trades_and_invalid_identity() {
+    use apexes_oms::SpotEvidenceSource;
+    for (symbol, quantity) in [("BTCUSDT", "0.5"), ("ETHUSDT", "1")] {
+        let server = MockServer::start().await;
+        mount_clock(&server).await;
+        let mut order = sample_order(Uuid::new_v4());
+        order.exchange_order_id = Some("12345".into());
+        Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 12345, "clientOrderId": order.id.0.to_string(), "symbol": "BTCUSDT",
+                "side": "BUY", "status": "FILLED", "executedQty": "1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/api/v3/myTrades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": 1, "orderId": 12345, "symbol": symbol, "isBuyer": true, "price": "100",
+                "qty": quantity, "commission": "0", "commissionAsset": "USDT", "time": 1800000000000_i64
+            }]))).mount(&server).await;
+        assert!(
+            gateway_against(&server)
+                .await
+                .terminal_order(&order)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn strict_spot_owner_matches_legacy_engine_encoding_and_binds_network() {
+    use apexes_core::{Instrument, MarketType, binance_network::BinanceNetwork};
+    use apexes_oms::SpotEvidenceSource;
+    use sha2::{Digest, Sha256};
+    let instruments = vec![
+        Instrument::new(
+            "BTCUSDT",
+            MarketType::Crypto,
+            Venue::Binance,
+            AssetClass::Spot,
+            Some("BTC".into()),
+            Some("USDT".into()),
+            dec!(0.01),
+            dec!(0.001),
+            dec!(1),
+        )
+        .unwrap(),
+    ];
+    let strategy = serde_json::json!({"RustNative":{"name":"test"}});
+    let gateway = BinanceExecutionGateway::for_network(
+        BinanceNetwork::Testnet,
+        "fixture-key".into(),
+        "fixture-secret".into(),
+    );
+    let scope: Vec<_> = instruments
+        .iter()
+        .map(|i| (&i.symbol, &i.base_currency, &i.quote_currency))
+        .collect();
+    let expected = serde_json::json!({
+        "version": 1, "network": BinanceNetwork::Testnet.to_string(),
+        "credential": gateway.credential_fingerprint(), "strategy": strategy, "instruments": scope,
+    })
+    .to_string();
+    assert_eq!(
+        gateway
+            .spot_inventory_owner(&strategy, &instruments)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        gateway.owner_fingerprint(&strategy, &instruments).unwrap(),
+        format!("{:x}", Sha256::digest(expected.as_bytes()))
+    );
+    let other = BinanceExecutionGateway::for_network(
+        BinanceNetwork::Mainnet,
+        "fixture-key".into(),
+        "fixture-secret".into(),
+    );
+    assert_ne!(
+        gateway.owner_fingerprint(&strategy, &instruments).unwrap(),
+        other.owner_fingerprint(&strategy, &instruments).unwrap()
+    );
+}
