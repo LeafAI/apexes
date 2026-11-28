@@ -46,3 +46,6 @@ pub mod terminal_recovery_audit;
 pub use terminal_recovery_audit::{
     RemoteTerminalEvidence, TerminalAuditError, TerminalOrderEvidence, compare_terminal_evidence,
 };
+
+pub mod spot_evidence_source;
+pub use spot_evidence_source::{SpotEvidenceBalance, SpotEvidenceSource};

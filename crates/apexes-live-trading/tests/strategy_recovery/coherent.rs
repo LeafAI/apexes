@@ -2062,3 +2062,115 @@ async fn independently_preserved_flat_successor_boundaries_requalify_without_cla
     first.cleanup().await;
     second.cleanup().await;
 }
+
+struct CollectionSource {
+    owner: String,
+    open: usize,
+    wallet: Option<HashMap<String, apexes_oms::SpotEvidenceBalance>>,
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+#[async_trait::async_trait]
+impl apexes_oms::SpotEvidenceSource for CollectionSource {
+    fn owner_fingerprint(&self, _: &serde_json::Value, _: &[Instrument]) -> Result<String, String> {
+        Ok(self.owner.clone())
+    }
+    async fn terminal_order(&self, _: &Order) -> Result<apexes_oms::TerminalOrderEvidence, String> {
+        self.calls.lock().unwrap().push("terminal");
+        Err("unexpected terminal lookup".into())
+    }
+    async fn account_open_order_count(&self) -> Result<usize, String> {
+        self.calls.lock().unwrap().push("open");
+        Ok(self.open)
+    }
+    async fn account_wallet(
+        &self,
+    ) -> Result<HashMap<String, apexes_oms::SpotEvidenceBalance>, String> {
+        self.calls.lock().unwrap().push("wallet");
+        self.wallet.clone().ok_or("wallet unavailable".into())
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn read_only_collection_refuses_owner_mismatch_open_orders_and_incomplete_wallet() {
+    use apexes_live_trading as live;
+    use apexes_oms::SpotEvidenceBalance;
+    let fixture = Fixture::new().await;
+    let a = flat_boundary(&fixture, fixture.seed().await).await;
+    let mut store = fixture.store().await;
+    let strategy = serde_json::json!({"RustNative":{"name":"fixture"}});
+    let balances = HashMap::from([
+        (
+            "BTC".into(),
+            SpotEvidenceBalance {
+                free: dec!(0),
+                locked: dec!(0),
+            },
+        ),
+        (
+            "USDT".into(),
+            SpotEvidenceBalance {
+                free: dec!(100000),
+                locked: dec!(0),
+            },
+        ),
+    ]);
+    let mut source = CollectionSource {
+        owner: "0".repeat(64),
+        open: 0,
+        wallet: Some(balances.clone()),
+        calls: Default::default(),
+    };
+    assert!(matches!(
+        a.selection
+            .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+            .await,
+        Err(live::SpotCollectionError::Owner)
+    ));
+    assert!(source.calls.lock().unwrap().is_empty());
+    source.owner = OWNER_SHA256.into();
+    source.open = 1;
+    assert!(matches!(
+        a.selection
+            .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+            .await,
+        Err(live::SpotCollectionError::Inspection(
+            live::CoherentInspectionError::EvidenceWindow(live::EvidenceWindowError::OpenOrders)
+        ))
+    ));
+    assert_eq!(*source.calls.lock().unwrap(), vec!["open"]);
+    source.calls.lock().unwrap().clear();
+    source.open = 0;
+    source.wallet = None;
+    assert!(matches!(
+        a.selection
+            .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+            .await,
+        Err(live::SpotCollectionError::Source)
+    ));
+    source.wallet = Some(HashMap::from([("USDT".into(), balances["USDT"])]));
+    assert!(
+        a.selection
+            .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+            .await
+            .is_err()
+    );
+    source.wallet = Some(balances);
+    let result = a
+        .selection
+        .collect_spot_evidence(&mut store, &fixture.url, &source, &strategy, &a.instruments)
+        .await
+        .unwrap();
+    assert!(result.window.terminal_orders.is_empty());
+    assert_eq!(result.wallet.balances["BTC"].free, dec!(0));
+    assert!(result.window.open_orders.window.finished_at <= result.wallet.window.started_at);
+    assert!(result.wallet.window.finished_at <= result.inspected_at);
+    assert_eq!(fixture.claim_count().await, 1);
+    store
+        .verify_coherent_boundary(a.selection.receipt())
+        .await
+        .unwrap();
+    drop(store);
+    fixture.cleanup().await;
+}

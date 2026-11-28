@@ -8,6 +8,9 @@ use apexes_core::{
 use apexes_oms::{ExchangeFill, ExecutionGateway, GatewayOutcome};
 use apexes_strategy::{OrderIntent, Position};
 
+#[path = "spot_evidence.rs"]
+mod spot_evidence;
+
 #[path = "spot_preflight.rs"]
 mod spot_preflight;
 use async_trait::async_trait;
