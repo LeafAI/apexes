@@ -790,6 +790,17 @@ async fn completed_direct_callbacks_and_checkpoint_commit_as_one_exact_boundary(
         )
         .await
         .unwrap();
+    coherent
+        .inspect_captured_direct_fees(
+            &mut store,
+            &fixture.url,
+            (Probe::new(0), Probe::new(0)),
+            &instruments,
+            (&exact_opening, &window, &exact_wallet, wallet_at),
+            &retained,
+        )
+        .await
+        .unwrap();
     let mut changed = retained.clone();
     changed.positions[0].average_entry_price = dec!(101);
     assert!(matches!(

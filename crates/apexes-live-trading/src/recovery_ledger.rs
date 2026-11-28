@@ -35,6 +35,8 @@ pub enum LedgerContinuityError {
     CapturedLedgerMismatch,
     #[error("captured realized P&L differs from the independently reconstructed journal")]
     RealizedPnlMismatch,
+    #[error("captured fee attribution differs from independently reconstructed evidence")]
+    FeeMismatch,
 }
 
 /// Independently retained closing position evidence. Only a read-only
@@ -262,7 +264,7 @@ fn exact_decimal(mut n: i128, mut scale: u32) -> Result<Decimal, LedgerContinuit
     Decimal::try_from_i128_with_scale(n, scale).map_err(|_| LedgerContinuityError::Arithmetic)
 }
 
-fn exact_add(a: Decimal, b: Decimal) -> Result<Decimal, LedgerContinuityError> {
+pub(crate) fn exact_add(a: Decimal, b: Decimal) -> Result<Decimal, LedgerContinuityError> {
     let a = a.normalize();
     let b = b.normalize();
     let scale = a.scale().max(b.scale());
@@ -273,7 +275,7 @@ fn exact_add(a: Decimal, b: Decimal) -> Result<Decimal, LedgerContinuityError> {
     exact_decimal(n, scale)
 }
 
-fn exact_mul(a: Decimal, b: Decimal) -> Result<Decimal, LedgerContinuityError> {
+pub(crate) fn exact_mul(a: Decimal, b: Decimal) -> Result<Decimal, LedgerContinuityError> {
     let a = a.normalize();
     let b = b.normalize();
     let n = a
@@ -547,6 +549,84 @@ mod tests {
             vec![instrument],
             fills,
         )
+    }
+
+    #[test]
+    fn direct_fee_evidence_checks_exact_amounts_and_subtotal() {
+        use crate::recovery_fee::compare_direct_fees;
+        use apexes_backtest::fee_evidence::{FeeAccountEvidence, FeeValuationEvidence};
+        let (_, _, _, _, instruments, fills) = fixture();
+        let mut captured = apexes_backtest::ledger_evidence::LedgerEvidence {
+            version: 1,
+            scope: vec![(Venue::Binance, "BTCUSDT".into())],
+            balances: vec![],
+            positions: vec![],
+            realized_pnl: vec![],
+            fee_valuation: Some(FeeValuationEvidence {
+                version: 1,
+                accounts: vec![FeeAccountEvidence {
+                    symbol: "BTCUSDT".into(),
+                    venue: Venue::Binance,
+                    base: "BTC".into(),
+                    quote: "USDT".into(),
+                    gross_quantity: dec!(0.5),
+                    entry: dec!(100),
+                    gross_realized: dec!(10),
+                    fees: vec![("BTC".into(), dec!(0.01)), ("USDT".into(), dec!(1))],
+                    external_fees: vec![],
+                    historical_fee: dec!(2),
+                    missing_execution_valuations: 0,
+                }],
+                prices: vec![],
+            }),
+        };
+        compare_direct_fees(&captured, &instruments, &fills[..2]).unwrap();
+        assert_eq!(
+            compare_direct_fees(&captured, &instruments, &fills),
+            Err(LedgerContinuityError::Execution)
+        );
+        let mut changed = captured.clone();
+        changed.fee_valuation.as_mut().unwrap().accounts[0].historical_fee = dec!(3);
+        assert_eq!(
+            compare_direct_fees(&changed, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut changed = captured.clone();
+        changed.fee_valuation.as_mut().unwrap().accounts[0].fees[0].1 = dec!(0.02);
+        assert_eq!(
+            compare_direct_fees(&changed, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut changed = captured.clone();
+        changed.fee_valuation.as_mut().unwrap().accounts[0].missing_execution_valuations = 1;
+        assert_eq!(
+            compare_direct_fees(&changed, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut changed = captured.clone();
+        changed.fee_valuation.as_mut().unwrap().accounts[0].external_fees =
+            vec![("BTC".into(), dec!(0.01))];
+        assert_eq!(
+            compare_direct_fees(&changed, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut changed = captured.clone();
+        changed.fee_valuation.as_mut().unwrap().accounts[0].quote = "USD".into();
+        assert_eq!(
+            compare_direct_fees(&changed, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
+        let mut changed_fills = fills[..2].to_vec();
+        changed_fills[0].fee_currency = None;
+        assert_eq!(
+            compare_direct_fees(&captured, &instruments, &changed_fills),
+            Err(LedgerContinuityError::Execution)
+        );
+        captured.fee_valuation = None;
+        assert_eq!(
+            compare_direct_fees(&captured, &instruments, &fills[..2]),
+            Err(LedgerContinuityError::FeeMismatch)
+        );
     }
 
     #[test]
